@@ -131,6 +131,7 @@ class SegmentCheck:
     arc_pos_frac: float = np.nan
     hf_lf_ratio: float = np.nan
     median_coh: float = np.nan
+    hf_coh: float = np.nan          # coherence over the top third of the band
     kk_pct: float = np.nan
     flipped: bool = False
 
@@ -215,12 +216,12 @@ def run_checks(results, cond, limits, rejected=None, seg_area_cm2=None,
         Z = np.asarray(d['Z'], complex)
         c = SegmentCheck(segment=seg, card=card, condition=cond, n_pts=len(f))
 
+        order = np.argsort(f)
         rs_ohm, measured = rs_from_spectrum(f, Z)
         c.Rs_mOhm = rs_ohm * 1000
         c.Rs_asr = c.Rs_mOhm * seg_area_cm2
         c.Rs_is_measured = measured
 
-        order = np.argsort(f)
         n_lf = max(3, len(f) // 5)
         c.Z_lf_real_asr = float(np.median(Z[order][:n_lf].real)) * 1000 * seg_area_cm2
         c.Rct_asr = c.Z_lf_real_asr - c.Rs_asr
@@ -232,7 +233,14 @@ def run_checks(results, cond, limits, rejected=None, seg_area_cm2=None,
         # 'coherence' - accept either rather than silently skipping the check.
         coh = d.get('coh', d.get('coherence'))
         if coh is not None and np.size(coh):
-            c.median_coh = float(np.median(np.asarray(coh, float)))
+            coh = np.asarray(coh, float)
+            c.median_coh = float(np.median(coh))
+            # Rs is placed from the top of the band, so the coherence *there*
+            # is what decides whether the intercept is measurable at all.  A
+            # segment can have excellent median coherence and still have an
+            # unusable high-frequency end.
+            top = coh[order][-max(3, len(coh) // 3):]
+            c.hf_coh = float(np.median(top))
         if d.get('kk_pct') is not None:
             c.kk_pct = float(d['kk_pct'])
         c.flipped = bool(d.get('flipped', False))
@@ -444,6 +452,41 @@ def run_checks(results, cond, limits, rejected=None, seg_area_cm2=None,
     summary['card_medians'] = card_medians
     summary['card_verdicts'] = card_verdicts
 
+    # Per-card breakdown.  A card-level timing or reference fault shows up as
+    # a card whose Rs scatters wildly while its *total* stays tight - the
+    # signature of an intercept that cannot be placed, not of 16 different
+    # membranes.  Reported per card so the cause can be localised instead of
+    # averaged away over the plate.
+    card_stats = {}
+    for card in sorted({c.card for c in checks.values()}):
+        members = [c for c in checks.values()
+                   if c.card == card and np.isfinite(c.Rs_asr)
+                   and np.isfinite(c.Rct_asr)]
+        if len(members) < 4:
+            continue
+        r = np.array([c.Rs_asr for c in members])
+        t = r + np.array([c.Rct_asr for c in members])
+        hf = np.array([c.hf_coh for c in members if np.isfinite(c.hf_coh)])
+        scatter = (1.4826 * np.median(np.abs(r - np.median(r))) / max(np.median(r), 1e-9))
+        scatter_t = (1.4826 * np.median(np.abs(t - np.median(t))) / max(np.median(t), 1e-9))
+        ratio = np.nan
+        if r.std() > 0 and t.std() > 0:
+            ratio = float(np.corrcoef(r, t)[0, 1]) / (r.std() / t.std())
+        card_stats[card] = {
+            'n': len(members), 'rs_median': float(np.median(r)),
+            'rs_scatter': float(scatter), 'total_scatter': float(scatter_t),
+            'split_independence': ratio,
+            'hf_coherence': float(np.median(hf)) if hf.size else np.nan,
+        }
+        if np.isfinite(ratio) and ratio < limits.split_independence_fail \
+                and scatter > 2.5 * scatter_t:
+            plate_flags.append((FAIL, (
+                f"card {card}: Rs scatters {scatter:.0%} while its total scatters "
+                f"only {scatter_t:.0%} (split independence {ratio:.2f}). The "
+                f"intercept cannot be placed on this card - check its cell-voltage "
+                f"reference and its delay correction, not its membrane.")))
+    summary['card_stats'] = card_stats
+
     # --- 4b. is the Rs/Rct split stable? ----------------------------------
     # Rs and Rct are physically independent, so if they were both measured
     # cleanly, corr(Rs, Rs+Rct) would come out at exactly sigma_Rs/sigma_total.
@@ -467,9 +510,20 @@ def run_checks(results, cond, limits, rejected=None, seg_area_cm2=None,
             summary['total_span'] = float(
                 np.percentile(tot_arr, 90) / max(np.percentile(tot_arr, 10), 1e-9))
             if np.isfinite(ratio) and ratio < limits.split_independence_fail:
+                # sigma_Rs > sigma_total is impossible for independent
+                # quantities that add, so when it happens it is the proof by
+                # itself and quoting an "expected correlation" above 1 would be
+                # meaningless.
+                if expected > 1.0:
+                    evidence = (f"Rs scatters more than the total does "
+                                f"(sigma {rs_arr.std():.1f} vs {tot_arr.std():.1f} "
+                                f"mOhm*cm2), which two independent quantities that "
+                                f"add cannot do")
+                else:
+                    evidence = (f"corr(Rs,Rs+Rct)={observed:.2f} against "
+                                f"{expected:.2f} expected for an independent split")
                 plate_flags.append((FAIL, (
-                    f"the Rs/Rct split is not independent (corr(Rs,Rs+Rct)="
-                    f"{observed:.2f} against {expected:.2f} expected, ratio "
+                    f"the Rs/Rct split is not independent ({evidence}; ratio "
                     f"{ratio:.2f}): Rs spans {summary['rs_span']:.1f}x while the "
                     f"total spans only {summary['total_span']:.1f}x. The total is "
                     f"stable and the intercept is wandering - a high-frequency "
@@ -615,14 +669,26 @@ def print_segment_report(checks, summary, cond, leepa):
              "upper bound"))
 
     cm, cv = summary.get('card_medians', {}), summary.get('card_verdicts', {})
+    cs = summary.get('card_stats', {})
     if cm:
         basis = ('step away from the fitted spatial trend'
                  if summary.get('card_bias_detrended') else 'offset from the median')
-        print(f"\n  per-card median Rs [mOhm*cm2]  (judged on the {basis}):")
+        print(f"\n  per-card breakdown  (bias judged on the {basis}):")
+        print(f"    {'card':>4} {'n':>4} {'Rs med':>8} {'vs plate':>9} "
+              f"{'Rs scat':>8} {'tot scat':>9} {'split':>7} {'HF coh':>7}  verdict")
         for card, value in sorted(cm.items()):
             dev = value / summary['Rs_asr_median'] - 1.0
-            print(f"    card {card}: {value:.1f}  ({dev:+.0%} vs plate median)  "
-                  f"[{cv.get(card, OK)}]")
+            st = cs.get(card, {})
+            f_ = lambda k, w, p: (f"{st[k]:{w}.{p}%}" if k in st
+                                  and np.isfinite(st[k]) else f"{'-':>{w}}")
+            g_ = lambda k, w, p: (f"{st[k]:{w}.{p}f}" if k in st
+                                  and np.isfinite(st[k]) else f"{'-':>{w}}")
+            print(f"    {card:>4} {st.get('n', 0):>4} {value:>8.1f} {dev:>+9.0%} "
+                  f"{f_('rs_scatter', 8, 0)} {f_('total_scatter', 9, 0)} "
+                  f"{g_('split_independence', 7, 2)} {g_('hf_coherence', 7, 2)}"
+                  f"  [{cv.get(card, OK)}]")
+        print("    (Rs scat >> tot scat with split near 0 = the intercept is "
+              "wandering, not the membrane)")
 
     if 'neighbour_check' in summary:
         print(f"\n  note: {summary['neighbour_check']}")
@@ -641,16 +707,17 @@ def print_segment_report(checks, summary, cond, leepa):
 
     print(f"\n{'-' * 104}")
     print(f"  {'seg':>4} {'card':>4} {'Rs[mOhm*cm2]':>13} {'Rct[mOhm*cm2]':>14} "
-          f"{'Rs/med':>7} {'MAD':>6} {'nbr%':>6} {'arc+':>5} {'coh':>5} {'pts':>4} "
+          f"{'Rs/med':>7} {'MAD':>6} {'nbr%':>6} {'arc+':>5} {'HFcoh':>6} {'pts':>4} "
           f"{'verdict':>7}")
     print(f"{'-' * 104}")
     for c in sorted(checks.values(), key=lambda x: x.segment):
         nbr = f"{c.neighbour_rel:.0%}" if np.isfinite(c.neighbour_rel) else '-'
         arc = f"{c.arc_pos_frac:.0%}" if np.isfinite(c.arc_pos_frac) else '-'
-        coh = f"{c.median_coh:.2f}" if np.isfinite(c.median_coh) else '-'
+        coh = f"{c.hf_coh:.2f}" if np.isfinite(c.hf_coh) else (
+            f"{c.median_coh:.2f}" if np.isfinite(c.median_coh) else '-')
         print(f"  {c.segment:>4} {c.card:>4} {c.Rs_asr:>13.1f} {c.Rct_asr:>14.1f} "
               f"{c.uniformity:>7.2f} {c.outlier_score:>6.1f} {nbr:>6} {arc:>5} "
-              f"{coh:>5} {c.n_pts:>4} {c.verdict:>7}")
+              f"{coh:>6} {c.n_pts:>4} {c.verdict:>7}")
 
     flagged = [c for c in checks.values() if c.verdict != OK]
     if flagged:

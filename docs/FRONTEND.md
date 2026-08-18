@@ -79,6 +79,41 @@ Note that the bind address is not the address to visit: binding to `0.0.0.0` is
 what lets a container be reached from outside, but `0.0.0.0` is not a
 destination, so the link printed is always the loopback one.
 
+### Starting it from a notebook cell
+
+A web server does not return. The cell stays busy for as long as the server is
+up — that is the server working, not a hang — and the link is live within a
+second or two of the banner appearing. Interrupt the cell to stop it.
+
+What matters is *which machine* it started on. If the output says something
+like
+
+```
+ * Running on http://127.0.0.1:8050
+ * Running on http://10.128.20.129:8050
+```
+
+then a private address is in that list and the server is on a **remote** host —
+a cluster driver or a VM. `127.0.0.1` typed into your own browser then means
+*your laptop*, where nothing is listening, so the page never loads. Three ways
+out, best first:
+
+1. **Deploy as a Databricks App** (below). This is the answer for anything
+   colleagues are meant to use: a real, shareable URL, authentication handled,
+   nothing tied to a running notebook.
+2. **Driver proxy**, for a quick look from a Databricks notebook. The banner
+   prints the proxy URL automatically when the workspace exposes one:
+   `https://<workspace>/driver-proxy/o/<org id>/<cluster id>/8050/`. Some
+   workspaces disable it; the banner says so rather than printing a link that
+   404s.
+3. **SSH port forwarding**, if it is a plain remote VM:
+
+   ```bash
+   ssh -L 8050:localhost:8050 you@the-vm      # from your own machine
+   ```
+
+   then open `http://127.0.0.1:8050` locally.
+
 As a Databricks App, from the repository root so that both `app` and `eis`
 are importable:
 

@@ -80,3 +80,88 @@ def test_launcher_is_runnable_from_any_working_directory(tmp_path, monkeypatch):
     import importlib
     importlib.reload(run_dashboard)
     assert str(ROOT) in sys.path
+
+
+# ---------------------------------------------------------------------------
+# started from a notebook cell on a cluster driver
+# ---------------------------------------------------------------------------
+
+class _FakeConf:
+    def __init__(self, values):
+        self._values = values
+
+    def get(self, key, default=None):
+        return self._values.get(key, default)
+
+
+class _FakeSpark:
+    def __init__(self, values):
+        self.conf = _FakeConf(values)
+
+
+def _fake_pyspark(monkeypatch, session):
+    """Stand in for pyspark, which is not installed outside a cluster."""
+    import types
+    module = types.ModuleType("pyspark.sql")
+    module.SparkSession = type("SparkSession", (),
+                               {"getActiveSession": staticmethod(lambda: session)})
+    parent = types.ModuleType("pyspark")
+    parent.sql = module
+    monkeypatch.setitem(sys.modules, "pyspark", parent)
+    monkeypatch.setitem(sys.modules, "pyspark.sql", module)
+
+
+def test_driver_proxy_url_is_built_from_the_cluster_tags(monkeypatch):
+    from app import app as app_module
+    _fake_pyspark(monkeypatch, _FakeSpark({
+        "spark.databricks.clusterUsageTags.clusterOwnerOrgId": "1234567890",
+        "spark.databricks.clusterUsageTags.clusterId": "0101-abc-xyz",
+        "spark.databricks.workspaceUrl": "example.cloud.databricks.com",
+    }))
+    monkeypatch.delenv("DATABRICKS_HOST", raising=False)
+    assert app_module.driver_proxy_url(8050) == (
+        "https://example.cloud.databricks.com/driver-proxy/o/1234567890/"
+        "0101-abc-xyz/8050/")
+
+
+def test_no_proxy_url_is_invented_when_the_tags_are_missing(monkeypatch):
+    from app import app as app_module
+    _fake_pyspark(monkeypatch, _FakeSpark({}))
+    monkeypatch.delenv("DATABRICKS_HOST", raising=False)
+    # Printing a link that 404s is worse than printing none.
+    assert app_module.driver_proxy_url(8050) == ""
+
+
+def test_no_proxy_url_without_a_spark_session(monkeypatch):
+    from app import app as app_module
+    _fake_pyspark(monkeypatch, None)
+    assert app_module.driver_proxy_url(8050) == ""
+
+
+def test_banner_in_a_notebook_prefers_the_proxy_link(monkeypatch):
+    from app import app as app_module
+    monkeypatch.setenv("DATABRICKS_RUNTIME_VERSION", "15.4")
+    monkeypatch.setattr(app_module, "driver_proxy_url",
+                        lambda port: f"https://ws/driver-proxy/o/1/c/{port}/")
+    text = app_module.banner("0.0.0.0", 8050)
+    assert "https://ws/driver-proxy/o/1/c/8050/" in text
+    assert "Open this link:   http://127.0.0.1" not in text
+    assert "stay busy" in text                       # the cell does not finish
+
+
+def test_banner_in_a_notebook_says_so_when_there_is_no_proxy(monkeypatch):
+    from app import app as app_module
+    monkeypatch.setenv("DATABRICKS_RUNTIME_VERSION", "15.4")
+    monkeypatch.setattr(app_module, "driver_proxy_url", lambda port: "")
+    text = app_module.banner("0.0.0.0", 8050)
+    assert "your browser cannot reach" in text
+    assert "Databricks App" in text
+
+
+def test_banner_outside_a_notebook_is_unchanged(monkeypatch):
+    from app import app as app_module
+    monkeypatch.delenv("DATABRICKS_RUNTIME_VERSION", raising=False)
+    text = app_module.banner("0.0.0.0", 8050)
+    assert "http://127.0.0.1:8050" in text
+    assert "driver-proxy" not in text
+    assert "stay busy" not in text

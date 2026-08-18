@@ -49,6 +49,18 @@ Both flags can be given together, and both just set the corresponding
 environment variable, so `EIS_RESULTS_ROOT=... python run_dashboard.py` works
 equally well.
 
+## If you started it in a notebook cell
+
+The cell will never finish — a web server runs until you stop it, so a busy
+cell *is* the running server. The link works within a second or two.
+
+If the output lists a private address (`10.x.x.x`, `172.16–31.x.x`,
+`192.168.x.x`) alongside `127.0.0.1`, the server is on a remote machine and
+`127.0.0.1` in your browser points at your own laptop instead. On Databricks,
+use the driver-proxy link the banner prints, or — for anything your colleagues
+will use — deploy it as a Databricks App. On a plain remote VM, forward the
+port: `ssh -L 8050:localhost:8050 you@the-vm`. See `docs/FRONTEND.md`.
+
 ## Check the plate geometry before trusting any map
 
 ```bash

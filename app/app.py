@@ -19,6 +19,8 @@ place, so that nothing in this application knows a personal file path:
 
 from __future__ import annotations
 
+import os
+
 from dash import Dash, Input, Output, State, dcc, html
 
 from app.data.sources import _condition_sort_key
@@ -241,16 +243,52 @@ app = build_app()
 server = app.server                     # gunicorn / Databricks Apps entry point
 
 
+def in_databricks_notebook() -> bool:
+    return bool(os.environ.get("DATABRICKS_RUNTIME_VERSION"))
+
+
+def driver_proxy_url(port: int) -> str:
+    """The URL that reaches this port when the server runs on a cluster driver.
+
+    Started from a Databricks notebook, the server listens on the *driver node*.
+    ``127.0.0.1`` there is the driver's own loopback, not the browser's, so the
+    ordinary local link cannot resolve. Databricks exposes driver ports through
+    a proxy path instead, which is what has to be printed in that case.
+
+    Returns an empty string when the workspace does not expose the proxy, or
+    when the tags this is built from are unavailable - better to print nothing
+    than a link that 404s.
+    """
+    try:
+        from pyspark.sql import SparkSession        # type: ignore
+        spark = SparkSession.getActiveSession()
+        if spark is None:
+            return ""
+        conf = spark.conf
+        org = conf.get("spark.databricks.clusterUsageTags.clusterOwnerOrgId")
+        cluster = conf.get("spark.databricks.clusterUsageTags.clusterId")
+        host = (os.environ.get("DATABRICKS_HOST")
+                or conf.get("spark.databricks.workspaceUrl", ""))
+    except Exception:
+        return ""
+    if not (org and cluster and host):
+        return ""
+    host = host.replace("https://", "").rstrip("/")
+    return f"https://{host}/driver-proxy/o/{org}/{cluster}/{port}/"
+
+
 def banner(host: str, port: int) -> str:
     """What to print at startup, including a URL that can actually be opened.
 
     Dash does not reliably print its own banner when the reloader is off, and a
     server that starts in silence looks like a server that did not start. The
-    bind address is also not the address to visit: binding to 0.0.0.0 is
+    bind address is also not the address to visit either: binding to 0.0.0.0 is
     required so a container can be reached from outside, but 0.0.0.0 is not a
-    destination - so the link shown is always a loopback one.
+    destination - so the link shown is a loopback one, or, on a cluster driver,
+    the proxy path that actually reaches it.
     """
     url = f"http://127.0.0.1:{port}"
+    proxy = driver_proxy_url(port) if in_databricks_notebook() else ""
     catalog = store.current_catalog()
     runs = catalog.runs
     orders = sorted({r.measurement_id for r in runs})
@@ -260,10 +298,25 @@ def banner(host: str, port: int) -> str:
         "=" * 68,
         f"  {SETTINGS.title}",
         "=" * 68,
-        f"  Open this link:   {url}",
+        f"  Open this link:   {proxy or url}",
         f"  (listening on {host}:{port} — press Ctrl+C to stop)",
         "",
     ]
+    if in_databricks_notebook():
+        lines += [
+            "  Running on the cluster driver, so this cell will stay busy for",
+            "  as long as the server is up - that is the server working, not a",
+            "  hang. Interrupt the cell to stop it.",
+            "",
+        ]
+        if not proxy:
+            lines += [
+                "  This workspace did not expose a driver-proxy URL, so the link",
+                "  above is the DRIVER's loopback and your browser cannot reach",
+                "  it. Deploy as a Databricks App instead - see app.yaml and",
+                "  docs/FRONTEND.md - which gives a real, shareable URL.",
+                "",
+            ]
     if runs:
         lines.append(f"  Found {len(runs)} run(s) across {len(orders)} order id(s): "
                      f"{', '.join(orders[:6])}{' …' if len(orders) > 6 else ''}")

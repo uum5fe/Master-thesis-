@@ -86,6 +86,31 @@ use the driver-proxy link the banner prints, or — for anything your colleagues
 will use — deploy it as a Databricks App. On a plain remote VM, forward the
 port: `ssh -L 8050:localhost:8050 you@the-vm`. See `docs/FRONTEND.md`.
 
+## "No runs discovered" — find out why in one command
+
+```powershell
+python run_dashboard.py --check
+```
+
+It reports what it can and cannot see, and names the fix: whether a `.env` was
+read at all (and whether one was saved as `.env.txt` by mistake), whether each
+folder exists, how many `.DAT` files it holds and whether their names are
+recognised, and whether the results folders are laid out the way the app
+expects. In VS Code it is the *Check configuration* entry in the Run menu.
+
+The four usual causes, in order:
+
+1. **No `.env`** — or Notepad saved it as `.env.txt`. Explorer hides the
+   extension by default; turn on *View > File name extensions* to see it.
+2. **`.env` in the wrong folder** — it belongs beside `run_dashboard.py`. If
+   you unzipped into `local-eis-viewer\local-eis-viewer\`, that is the inner
+   folder.
+3. **`EIS_RESULTS_ROOT` at the wrong level** — the app expects
+   `<root>\<order id>\<condition>\gold\plate_summary.csv`. Pointing it
+   straight at a folder that contains `gold` and `silver` gives one unnamed
+   entry instead of a picker.
+4. **`.DAT` filenames in an unfamiliar convention** — set `EIS_FAMOS_REGEX`.
+
 ## Where do I change the paths?
 
 **In `.env`, and nowhere else.** Copy `.env.example` to `.env` (same folder as

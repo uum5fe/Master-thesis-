@@ -6,10 +6,25 @@
       "type": "debugpy",
       "request": "launch",
       "program": "${workspaceFolder}/run_dashboard.py",
-      "args": ["--results", "${input:resultsRoot}", "--open"],
+      "args": [
+        "--results",
+        "${input:resultsRoot}",
+        "--open"
+      ],
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
       "justMyCode": true
+    },
+    {
+      "name": "Check configuration (why is it empty?)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/run_dashboard.py",
+      "args": [
+        "--check"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
     },
     {
       "name": "Local EIS Viewer (no data, just start it)",
@@ -32,7 +47,10 @@
       "type": "debugpy",
       "request": "launch",
       "module": "pytest",
-      "args": ["tests", "-q"],
+      "args": [
+        "tests",
+        "-q"
+      ],
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal"
     }

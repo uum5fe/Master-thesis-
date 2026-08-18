@@ -198,9 +198,9 @@ def test_future_imports_are_the_first_statement():
             continue
         before = [line for line in lines[:future[0]]
                   if line.strip() and not line.lstrip().startswith("#")]
-        # Only the module docstring may precede it.
-        joined = "\n".join(before).strip()
-        assert not joined or joined.startswith(('"""', "'''")), (
+        # Only the module docstring may precede it - possibly a raw one.
+        joined = "\n".join(before).strip().lstrip("rRuUbBfF")
+        assert not joined or joined.lstrip().startswith(("\"", "'")), (
             f"{path.relative_to(ROOT)}: code before the future import: {before[:3]}")
 
 

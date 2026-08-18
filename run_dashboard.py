@@ -49,6 +49,9 @@ def main(argv=None) -> int:
                    help="open the dashboard in your browser once it is up")
     p.add_argument("--debug", action="store_true",
                    help="Dash debug mode with hot reload")
+    p.add_argument("--check", action="store_true",
+                   help="report what the app can and cannot find, and why, "
+                        "then exit without starting the server")
     a = p.parse_args(argv)
 
     # Command-line paths win over whatever is already in the environment, and
@@ -62,6 +65,11 @@ def main(argv=None) -> int:
                 print(f"error: {name}: not a directory: {path}", file=sys.stderr)
                 return 2
             os.environ[name] = str(path)
+
+    if a.check:
+        from app.diagnose import report
+        print(report())
+        return 0
 
     try:
         from app.app import serve

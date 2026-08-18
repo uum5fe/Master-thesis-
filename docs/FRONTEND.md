@@ -34,6 +34,18 @@ arrangement produced the data.
 Everything else follows from those three. No module in `app/` contains a
 hard-coded path.
 
+## Diagnosing an empty picker
+
+```bash
+python run_dashboard.py --check      # or: python -m app.diagnose
+```
+
+Reports which `.env` was read, whether each configured root exists, how many
+`.DAT` files were found and whether their names matched a known convention,
+what layout was detected under each results root, and what the app will
+therefore show. Each failure is reported with the fix that applies to it rather
+than with the message that sent the reader here.
+
 ## Where the paths live
 
 One file: `.env`, next to `run_dashboard.py`. Copy `.env.example` and edit it.

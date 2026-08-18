@@ -34,6 +34,28 @@ arrangement produced the data.
 Everything else follows from those three. No module in `app/` contains a
 hard-coded path.
 
+## Where the paths live
+
+One file: `.env`, next to `run_dashboard.py`. Copy `.env.example` and edit it.
+Nothing under `app/` or `eis/` contains a path, so pointing the viewer at
+different data is never a code change.
+
+Precedence, strongest first:
+
+1. command-line flags — `run_dashboard.py --famos "D:\campaign"`
+2. the real environment — `set EIS_FAMOS_ROOT=...`
+3. `.env`
+
+so a flag overrides the file for a one-off without editing it and having to
+remember to change it back. On Databricks Apps, `app.yaml` supplies the same
+variables and `.env` is not used.
+
+Windows values are written exactly as Explorer shows them — no quoting, no
+escaped backslashes. `export` prefixes, surrounding quotes and a UTF-8 BOM are
+all tolerated, because those are what a file picks up from being edited in
+different tools. Several roots at once are separated by `;` on Windows and `:`
+on Linux/macOS.
+
 ## Environment variables
 
 | Variable | Meaning |

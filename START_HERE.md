@@ -86,6 +86,68 @@ use the driver-proxy link the banner prints, or — for anything your colleagues
 will use — deploy it as a Databricks App. On a plain remote VM, forward the
 port: `ssh -L 8050:localhost:8050 you@the-vm`. See `docs/FRONTEND.md`.
 
+## Where do I change the paths?
+
+**In `.env`, and nowhere else.** Copy `.env.example` to `.env` (same folder as
+`run_dashboard.py`) and edit it. No Python file in this project contains a
+personal path, so none of them ever needs editing to point the viewer at
+different data.
+
+```ini
+# .env
+EIS_FAMOS_ROOT=C:\Users\uum5fe\OneDrive - Bosch Group\Local_Eis\2611976_16_07
+EIS_RESULTS_ROOT=C:\Users\uum5fe\OneDrive - Bosch Group\Local_Eis\results
+```
+
+Windows paths go in exactly as Explorer shows them — no quotes, no doubled
+backslashes, spaces are fine. Restart the app after editing. The startup banner
+prints which `.env` it read, so there is no doubt about which file is in force.
+
+| What you want to change | Variable |
+| --- | --- |
+| Folder of raw FAMOS `.DAT` | `EIS_FAMOS_ROOT` |
+| Folder of processed results (CSV/Parquet) | `EIS_RESULTS_ROOT` |
+| A different `.DAT` naming convention | `EIS_FAMOS_REGEX` |
+| Shunt / temperature calibration | `EIS_CURR_CAL`, `EIS_TEMP_CAL` |
+| Let the app process `.DAT` itself | `EIS_ALLOW_INLINE_PIPELINE=1` |
+| Where an inline run writes results | `EIS_SCRATCH_RESULTS` |
+| Extra plate generations (Gen 2, Gen 3) | `EIS_PLATE_SPEC_DIR` |
+| Port | `PORT` |
+
+Subfolders are searched, so `EIS_FAMOS_ROOT` can point at the campaign folder
+or at its parent — pointing at `...\Local_Eis` finds `2611976_16_07` and every
+other campaign beside it, and each shows up under its own order id.
+
+For a one-off that should not change the file, use a flag instead — it wins
+over `.env`:
+
+```powershell
+python run_dashboard.py --famos "D:\some other campaign" --open
+```
+
+## Viewing raw .DAT
+
+Pointing at FAMOS recordings lists them; it does not produce spectra, because
+bronze/silver/gold has to run first. To let the app do that itself, add to
+`.env`:
+
+```ini
+EIS_ALLOW_INLINE_PIPELINE=1
+EIS_CURR_CAL=C:\Users\uum5fe\OneDrive - Bosch Group\Local_Eis\cal\curr.csv
+EIS_TEMP_CAL=C:\Users\uum5fe\OneDrive - Bosch Group\Local_Eis\cal\temp.csv
+EIS_SCRATCH_RESULTS=C:\Users\uum5fe\Local_Eis_results
+```
+
+Then the Overview tab offers *Run pipeline on this selection*, which runs as a
+background job with progress. The shunt calibration is not optional: it is the
+only absolute scale in the chain once the potentiostat is gone, and without it
+the impedances come out in shunt volts per amp rather than in ohms. The app
+says so rather than producing numbers with the wrong units.
+
+Results land in `EIS_SCRATCH_RESULTS`, which is automatically also a results
+root — press *Refresh sources* and switch the format selector to processed
+results.
+
 ## Check the plate geometry before trusting any map
 
 ```bash

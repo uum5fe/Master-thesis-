@@ -7,8 +7,19 @@ using it.  Nothing here has a personal path in it: every location is an
 environment variable with a neutral default, so the same image runs on a
 laptop, on a Databricks App and in CI.
 
-In Databricks Apps these go in ``app.yaml`` under ``env:``; locally, export
-them or drop them in a ``.env`` that your shell sources.
+In Databricks Apps these go in ``app.yaml`` under ``env:``.  Locally, put them
+in a ``.env`` file next to ``run_dashboard.py`` - copy ``.env.example`` and edit
+it.  That file is the one place a path is ever written down; no module in this
+project contains a personal path, and none needs editing to point the viewer
+somewhere new.
+
+Precedence, strongest first:
+
+    1. command-line flags   (``run_dashboard.py --famos ...``)
+    2. the real environment (``set EIS_FAMOS_ROOT=...``)
+    3. ``.env``
+
+so a flag can always override the file for a one-off, without editing it.
 """
 
 from __future__ import annotations
@@ -17,13 +28,60 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+#: Set to the .env actually read, for the startup banner to report.
+DOTENV_LOADED: str = ""
+
+
+def load_dotenv(path: str | Path | None = None) -> str:
+    r"""Fill in unset variables from a ``.env`` file.
+
+    Deliberately does not overwrite anything already in the environment: a
+    command-line flag or a shell export has to beat the file, or a one-off
+    override would mean editing the file and remembering to change it back.
+
+    Windows paths are the reason quoting is handled: a value like
+    ``C:\Users\me\OneDrive - Bosch Group\Local_Eis`` contains spaces and
+    backslashes, and neither needs escaping here - the whole rest of the line
+    is the value, with surrounding quotes stripped if present.
+    """
+    global DOTENV_LOADED
+    candidates = ([Path(path)] if path else
+                  [Path(__file__).resolve().parent.parent / ".env",
+                   Path.cwd() / ".env"])
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        for line in candidate.read_text(encoding="utf-8-sig").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip().removeprefix("export ").strip()
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]
+            if key and key not in os.environ:
+                os.environ[key] = value
+        DOTENV_LOADED = str(candidate)
+        return DOTENV_LOADED
+    return ""
+
+
+load_dotenv()
+
 
 def _env(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
 
 
 def _env_list(name: str) -> list[str]:
-    return [p for p in _env(name).split(os.pathsep) if p.strip()]
+    r"""Split on the platform's path separator, but not on a Windows drive colon.
+
+    ``os.pathsep`` is ``;`` on Windows and ``:`` on POSIX, so ``C:\data`` stays
+    one path on Windows. Several roots are given by separating them with that
+    same character.
+    """
+    return [p.strip() for p in _env(name).split(os.pathsep) if p.strip()]
 
 
 @dataclass(frozen=True)
@@ -92,6 +150,7 @@ class Settings:
             ("SQL warehouse", self.warehouse_id or "(not configured)"),
             ("Scratch results", self.scratch_results_root),
             ("Inline pipeline", "enabled" if self.allow_inline_pipeline else "disabled"),
+            (".env file", DOTENV_LOADED or "(none found)"),
         ]
 
 

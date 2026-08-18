@@ -202,3 +202,61 @@ def test_future_imports_are_the_first_statement():
         joined = "\n".join(before).strip()
         assert not joined or joined.startswith(('"""', "'''")), (
             f"{path.relative_to(ROOT)}: code before the future import: {before[:3]}")
+
+
+# ---------------------------------------------------------------------------
+# .env — the one place a path is written down
+# ---------------------------------------------------------------------------
+
+def test_dotenv_reads_a_windows_path_with_spaces(tmp_path, monkeypatch):
+    from app import settings
+    env = tmp_path / ".env"
+    env.write_text(
+        "# where the recordings live\n"
+        "EIS_FAMOS_ROOT=C:\\Users\\uum5fe\\OneDrive - Bosch Group\\Local_Eis\n",
+        encoding="utf-8")
+    monkeypatch.delenv("EIS_FAMOS_ROOT", raising=False)
+    settings.load_dotenv(env)
+    # Backslashes are not escapes and spaces do not need quoting.
+    assert os.environ["EIS_FAMOS_ROOT"] == \
+        "C:\\Users\\uum5fe\\OneDrive - Bosch Group\\Local_Eis"
+
+
+def test_dotenv_tolerates_quotes_export_and_a_bom(tmp_path, monkeypatch):
+    from app import settings
+    env = tmp_path / ".env"
+    env.write_text('\ufeffexport EIS_TITLE="Local EIS Viewer"\n'
+                   "EIS_DEFAULT_PLATE='gen1_r2d2_72'\n", encoding="utf-8")
+    for key in ("EIS_TITLE", "EIS_DEFAULT_PLATE"):
+        monkeypatch.delenv(key, raising=False)
+    settings.load_dotenv(env)
+    assert os.environ["EIS_TITLE"] == "Local EIS Viewer"
+    assert os.environ["EIS_DEFAULT_PLATE"] == "gen1_r2d2_72"
+
+
+def test_the_real_environment_beats_the_file(tmp_path, monkeypatch):
+    """A --famos flag must not need the file edited and changed back."""
+    from app import settings
+    env = tmp_path / ".env"
+    env.write_text("EIS_FAMOS_ROOT=C:\\from-the-file\n", encoding="utf-8")
+    monkeypatch.setenv("EIS_FAMOS_ROOT", "D:\\from-the-flag")
+    settings.load_dotenv(env)
+    assert os.environ["EIS_FAMOS_ROOT"] == "D:\\from-the-flag"
+
+
+def test_blank_and_comment_lines_are_ignored(tmp_path, monkeypatch):
+    from app import settings
+    env = tmp_path / ".env"
+    env.write_text("\n# just a comment\n\n   \nEIS_TITLE=x\n", encoding="utf-8")
+    monkeypatch.delenv("EIS_TITLE", raising=False)
+    settings.load_dotenv(env)
+    assert os.environ["EIS_TITLE"] == "x"
+
+
+def test_example_env_documents_every_setting_the_app_reads():
+    """The example file is the documentation; it must not fall behind."""
+    text = (ROOT / ".env.example").read_text(encoding="utf-8")
+    for name in ("EIS_FAMOS_ROOT", "EIS_RESULTS_ROOT", "EIS_CURR_CAL",
+                 "EIS_PLATE_SPEC_DIR", "EIS_ALLOW_INLINE_PIPELINE",
+                 "EIS_FAMOS_REGEX"):
+        assert name in text, f"{name} is not mentioned in .env.example"

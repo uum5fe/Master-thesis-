@@ -26,6 +26,7 @@ from dash import Dash, Input, Output, State, dcc, html
 from app.data.sources import _condition_sort_key
 from app.plates import registry
 from app.services import store
+from app.settings import DOTENV_LOADED as SETTINGS_DOTENV
 from app.settings import SETTINGS
 from app.views import common as ui
 from app.views import compare, ecm, heatmap, overview, plates, spectra
@@ -332,6 +333,10 @@ def banner(host: str, port: int) -> str:
         ]
     for message in catalog.messages:
         lines.append(f"  note: {message}")
+    if SETTINGS_DOTENV:
+        lines.append(f"  settings from: {SETTINGS_DOTENV}")
+    elif not runs:
+        lines.append("  tip: copy .env.example to .env and put your paths in it")
     lines += ["", "=" * 68, ""]
     return "\n".join(lines)
 

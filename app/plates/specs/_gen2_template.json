@@ -1,0 +1,57 @@
+{
+  "_README": [
+    "TEMPLATE for a new plate generation. Copy to gen2_<something>.json (drop the",
+    "leading underscore - files starting with '_' are ignored by the scanner) and",
+    "edit. Nothing in the application code needs to change: the new generation",
+    "appears in the dropdown on the next restart, and `python -m app.plates.registry`",
+    "checks that the segments tile the pad grid exactly once before you trust a map.",
+    "",
+    "Two ways to describe the segments:",
+    "  strips   - generative. Use when the plate is cut into full-height vertical",
+    "             strips, each strip cut into bands of pad rows (the Gen-1 pattern).",
+    "  segments - explicit. A rectangle per segment on the pad grid. Use for ANY",
+    "             arrangement, including ones that are not strip-based. Shown below.",
+    "",
+    "Pad indices are 1-based and inclusive at both ends, matching the drawings.",
+    "A segment is a union of whole pads, so its area comes out exact.",
+    "Optional per-segment 'area_cm2' overrides the computed area (use only when",
+    "the copper is not a full rectangle). Optional 'wiring' maps segment -> card",
+    "and channel, kept separate so a re-wiring does not touch the layout."
+  ],
+
+  "key": "gen2_example_24",
+  "name": "Gen 2 - example, 24 segments",
+  "pad_w_mm": 6.00,
+  "pad_h_mm": 6.00,
+  "n_cols": 12,
+  "n_rows": 8,
+  "flow_axis": "x",
+  "temp_sensor_x_mm": {"temp1": 0.0, "temp2": 36.0, "temp3": 72.0},
+  "flow_channel_y_mm": [24.0],
+  "known_bad": {},
+  "notes": "Replace with the drawing this was taken from, its revision and date.",
+
+  "segments": [
+    {"name": "1", "col0": 1, "col1": 3, "row0": 1, "row1": 2},
+    {"name": "2", "col0": 4, "col1": 6, "row0": 1, "row1": 2},
+    {"name": "3", "col0": 7, "col1": 9, "row0": 1, "row1": 2},
+    {"name": "4", "col0": 10, "col1": 12, "row0": 1, "row1": 2},
+    {"name": "5", "col0": 1, "col1": 3, "row0": 3, "row1": 4},
+    {"name": "6", "col0": 4, "col1": 6, "row0": 3, "row1": 4},
+    {"name": "7", "col0": 7, "col1": 9, "row0": 3, "row1": 4},
+    {"name": "8", "col0": 10, "col1": 12, "row0": 3, "row1": 4},
+    {"name": "9", "col0": 1, "col1": 3, "row0": 5, "row1": 6},
+    {"name": "10", "col0": 4, "col1": 6, "row0": 5, "row1": 6},
+    {"name": "11", "col0": 7, "col1": 9, "row0": 5, "row1": 6},
+    {"name": "12", "col0": 10, "col1": 12, "row0": 5, "row1": 6},
+    {"name": "13", "col0": 1, "col1": 3, "row0": 7, "row1": 8},
+    {"name": "14", "col0": 4, "col1": 6, "row0": 7, "row1": 8},
+    {"name": "15", "col0": 7, "col1": 9, "row0": 7, "row1": 8},
+    {"name": "16", "col0": 10, "col1": 12, "row0": 7, "row1": 8}
+  ],
+
+  "wiring": {
+    "1": {"card": "Karte_1", "channel": "seg_01"},
+    "2": {"card": "Karte_1", "channel": "seg_02"}
+  }
+}

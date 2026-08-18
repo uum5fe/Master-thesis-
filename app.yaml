@@ -1,0 +1,70 @@
+# Databricks App manifest.
+#
+# Deploy from the repository root, so that `app.app` and `eis` are both
+# importable:
+#
+#   databricks sync . /Workspace/Shared/local-eis-viewer
+#   databricks apps deploy local-eis-viewer \
+#       --source-code-path /Workspace/Shared/local-eis-viewer
+#
+# The container's port arrives as DATABRICKS_APP_PORT and `python -m app.app`
+# reads it. For a heavier deployment put gunicorn in front, but keep it to ONE
+# worker with threads:
+#
+#   command: ["gunicorn", "-b", "0.0.0.0:8000", "-w", "1", "--threads", "8",
+#             "--timeout", "300", "app.app:server"]
+#
+# One worker matters: the run cache and the background fit jobs live in the
+# process, so several workers would each hold their own copy and a job started
+# on one would be invisible to the next request.
+
+command: ["python", "-m", "app.app"]
+
+env:
+  # ---- where finished pipeline results live -------------------------------
+  # Colon-separated list; each root holds <order id>/<condition>/{gold,silver}.
+  - name: "EIS_RESULTS_ROOT"
+    value: "/Volumes/<catalog>/<schema>/<volume>/eis_results"
+
+  # ---- where the raw FAMOS recordings live --------------------------------
+  - name: "EIS_FAMOS_ROOT"
+    value: "/Volumes/<catalog>/<schema>/<volume>/Famos"
+
+  # ---- datago metadata, for the order-id picker ---------------------------
+  - name: "EIS_DATAGO_METADATA_TABLE"
+    value: "<catalog>.<schema>.datago_advtec_metadata"
+  - name: "EIS_DATAGO_PROPERTIES_TABLE"
+    value: "<catalog>.<schema>.datago_advtec_generalproperties"
+  - name: "EIS_DATAGO_MEASUREMENT_TYPE"
+    value: "GALVEIS"
+  # The SQL warehouse the app queries datago through. Grant the app's service
+  # principal USE CATALOG / SELECT on the tables above and CAN USE on this
+  # warehouse; the app never carries a personal token.
+  - name: "DATABRICKS_WAREHOUSE_ID"
+    valueFrom: "sql-warehouse"
+
+  # ---- calibration --------------------------------------------------------
+  # The per-segment shunt calibration is the only absolute scale in the chain
+  # once the potentiostat is gone. Without it impedances are in shunt volts
+  # per amp, not ohms.
+  - name: "EIS_CURR_CAL"
+    value: "/Volumes/<catalog>/<schema>/<volume>/cal/curr.csv"
+  - name: "EIS_TEMP_CAL"
+    value: "/Volumes/<catalog>/<schema>/<volume>/cal/temp.csv"
+
+  # ---- plate generations --------------------------------------------------
+  # Extra generation specs, so a Gen-2 plate can be added by dropping a JSON
+  # file in a Volume - no redeploy.
+  - name: "EIS_PLATE_SPEC_DIR"
+    value: "/Volumes/<catalog>/<schema>/<volume>/plate_specs"
+  - name: "EIS_DEFAULT_PLATE"
+    value: "gen1_r2d2_72"
+
+  # ---- app ----------------------------------------------------------------
+  - name: "EIS_TITLE"
+    value: "Local EIS Viewer"
+  # Processing raw .DAT inside the app is off by default: an Apps container is
+  # sized to serve a UI, not to grind through gigabytes of recordings. Run the
+  # pipeline as a Databricks Job writing into EIS_RESULTS_ROOT instead.
+  - name: "EIS_ALLOW_INLINE_PIPELINE"
+    value: "0"

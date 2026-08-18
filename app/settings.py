@@ -1,0 +1,98 @@
+"""Deployment settings, all from the environment.
+
+The pipeline this frontend sits on top of grew up inside one notebook with one
+person's paths baked into it (``/Workspace/Users/<user>/...``,
+``/Volumes/<catalog>/.../Famos``).  That is exactly what stops a colleague from
+using it.  Nothing here has a personal path in it: every location is an
+environment variable with a neutral default, so the same image runs on a
+laptop, on a Databricks App and in CI.
+
+In Databricks Apps these go in ``app.yaml`` under ``env:``; locally, export
+them or drop them in a ``.env`` that your shell sources.
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+
+
+def _env(name: str, default: str = "") -> str:
+    return os.environ.get(name, default).strip()
+
+
+def _env_list(name: str) -> list[str]:
+    return [p for p in _env(name).split(os.pathsep) if p.strip()]
+
+
+@dataclass(frozen=True)
+class Settings:
+    # -- where computed results live ----------------------------------------
+    #: One or more roots holding finished pipeline output, laid out as
+    #: ``<root>/<measurement_id>/<condition>/{silver,gold}/*.csv``.
+    #: On Databricks this is normally a Volumes path.
+    results_roots: list[str] = field(default_factory=lambda: _env_list("EIS_RESULTS_ROOT"))
+
+    # -- where raw FAMOS recordings live ------------------------------------
+    famos_roots: list[str] = field(default_factory=lambda: _env_list("EIS_FAMOS_ROOT"))
+    famos_glob: str = field(default_factory=lambda: _env(
+        "EIS_FAMOS_GLOB", "Leepa_*_Current_*_Test_*_Karte_*.DAT"))
+
+    # -- datago (Unity Catalog) ---------------------------------------------
+    datago_metadata_table: str = field(default_factory=lambda: _env("EIS_DATAGO_METADATA_TABLE"))
+    datago_properties_table: str = field(default_factory=lambda: _env("EIS_DATAGO_PROPERTIES_TABLE"))
+    datago_signal_table: str = field(default_factory=lambda: _env("EIS_DATAGO_SIGNAL_TABLE"))
+    datago_measurement_type: str = field(default_factory=lambda: _env(
+        "EIS_DATAGO_MEASUREMENT_TYPE", "GALVEIS"))
+    warehouse_id: str = field(default_factory=lambda: _env("DATABRICKS_WAREHOUSE_ID"))
+    databricks_host: str = field(default_factory=lambda: _env("DATABRICKS_HOST"))
+
+    # -- calibration --------------------------------------------------------
+    curr_cal: str = field(default_factory=lambda: _env("EIS_CURR_CAL"))
+    temp_cal: str = field(default_factory=lambda: _env("EIS_TEMP_CAL"))
+
+    # -- plates -------------------------------------------------------------
+    default_plate: str = field(default_factory=lambda: _env("EIS_DEFAULT_PLATE"))
+
+    # -- app ----------------------------------------------------------------
+    cache_dir: str = field(default_factory=lambda: _env(
+        "EIS_CACHE_DIR", str(Path.home() / ".cache" / "eis-viewer")))
+    #: Databricks Apps injects the port to listen on.
+    port: int = field(default_factory=lambda: int(_env("DATABRICKS_APP_PORT", "") or
+                                                  _env("PORT", "8050")))
+    host: str = field(default_factory=lambda: _env("EIS_HOST", "0.0.0.0"))
+    debug: bool = field(default_factory=lambda: _env("EIS_DEBUG", "0") not in ("", "0", "false"))
+    title: str = field(default_factory=lambda: _env("EIS_TITLE", "Local EIS Viewer"))
+
+    #: Running the pipeline on raw .DAT inside the app is heavy. Off by default;
+    #: turn it on only where the app has the compute and the mount to do it.
+    allow_inline_pipeline: bool = field(default_factory=lambda: _env(
+        "EIS_ALLOW_INLINE_PIPELINE", "0") not in ("", "0", "false"))
+    #: Where an inline run writes; it then becomes a normal results root.
+    scratch_results_root: str = field(default_factory=lambda: _env(
+        "EIS_SCRATCH_RESULTS", str(Path.home() / ".cache" / "eis-viewer" / "runs")))
+
+    def resolved_results_roots(self) -> list[Path]:
+        roots = [Path(p) for p in self.results_roots]
+        scratch = Path(self.scratch_results_root)
+        if scratch not in roots:
+            roots.append(scratch)
+        return roots
+
+    def datago_configured(self) -> bool:
+        return bool(self.datago_metadata_table and self.warehouse_id)
+
+    def summary(self) -> list[tuple[str, str]]:
+        """What the app is pointed at, for the Sources panel."""
+        return [
+            ("Results roots", ", ".join(self.results_roots) or "(none set)"),
+            ("FAMOS roots", ", ".join(self.famos_roots) or "(none set)"),
+            ("datago", self.datago_metadata_table or "(not configured)"),
+            ("SQL warehouse", self.warehouse_id or "(not configured)"),
+            ("Scratch results", self.scratch_results_root),
+            ("Inline pipeline", "enabled" if self.allow_inline_pipeline else "disabled"),
+        ]
+
+
+SETTINGS = Settings()

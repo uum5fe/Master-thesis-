@@ -264,6 +264,44 @@ Two hardware/protocol changes that remove problems rather than correcting them:
   of base periods enables the synchronous path *and* separates nonlinear
   distortion from noise, for no extra measurement time.
 
+## Frontend (`app/`)
+
+A Dash application so that colleagues can read the results without a notebook
+and without anybody's personal path. It reads what the pipeline already wrote —
+it never re-derives a spectrum of its own.
+
+```bash
+pip install -r requirements.txt
+EIS_RESULTS_ROOT=/path/to/results python -m app.app     # http://127.0.0.1:8050
+```
+
+Three choices drive everything: **where** the data is (a Volumes / file-system
+root, or the datago metadata tables), **what format** it is in (finished
+results as CSV/Parquet, or raw FAMOS `.DAT` that still has to be processed),
+and **which plate generation** produced it.
+
+| Tab | What it answers |
+| --- | --- |
+| Overview | Is this result trustworthy? DC closure, quality tiers, inferred fraction, per-card acquisition skew |
+| Plate map | Any per-segment scalar in true plate geometry; click a segment for its spectrum |
+| Spectra | Nyquist and Bode for any set of segments, against the area-weighted cell aggregate |
+| ECM fitting | Weighted circuit fits with uncertainties, an AICc-selected ladder, residuals, and fitted-parameter maps |
+| Conditions | The same parameter across operating currents, plus difference maps against a reference condition |
+| Plate & sources | Geometry self-check for the selected generation, and every path the app is reading |
+
+### Plate generations are data, not code
+
+Gen 1 is `app/plates/specs/gen1_r2d2_72.json`: 15 full-height strips, 72
+segments over 900 pads, areas from 0.678 to 8.470 cm². Gen 2 and Gen 3 are new
+JSON files — in the repository or in a Volume named by `EIS_PLATE_SPEC_DIR` —
+and they appear in the dropdown with no redeploy. `python -m app.plates.registry`
+(and the **Plate & sources** tab) checks that a spec's segments cover every pad
+exactly once and that their areas add up to the active area, because a spec
+with a typo draws a heat map that looks entirely plausible and is wrong.
+
+Deployment as a Databricks App, the full environment-variable list, and how to
+add a generation: **[docs/FRONTEND.md](docs/FRONTEND.md)**.
+
 ## Layout
 
 ```
@@ -279,10 +317,19 @@ eis/
   model/ecm.py     weighted fitting, model selection, CIs
   pipeline.py      orchestration
   viz.py           figures
+app/
+  app.py           Dash frontend: sidebar selection, tabs, callbacks
+  settings.py      every path from the environment - no personal paths
+  plates/          plate geometry as data; one JSON spec per generation
+  data/            canonical run model, loaders, source discovery
+  services/        figures, ECM fitting, pipeline jobs, caching
+  views/           one module per tab
+app.yaml           Databricks App manifest
 run_pipeline.py    CLI
-tests/             synthetic generator + 33 tests
+tests/             synthetic generator + tests for pipeline and frontend
 config/example.yaml
 docs/EIS_PIPELINE_DEVELOPMENT_PLAN.md   three-tier development plan
+docs/FRONTEND.md                        frontend architecture and deployment
 ```
 
 Notebooks contain no algorithms: every numerical step is an importable, tested

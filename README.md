@@ -272,8 +272,12 @@ it never re-derives a spectrum of its own.
 
 ```bash
 pip install -r requirements.txt
-EIS_RESULTS_ROOT=/path/to/results python -m app.app     # http://127.0.0.1:8050
+python run_dashboard.py --results /path/to/results --open
 ```
+
+`run_dashboard.py` prints the link (`http://127.0.0.1:8050`) and a count of the
+runs it discovered before the server starts, so an empty dropdown is diagnosable
+without opening the browser.
 
 Three choices drive everything: **where** the data is (a Volumes / file-system
 root, or the datago metadata tables), **what format** it is in (finished
@@ -325,7 +329,8 @@ app/
   services/        figures, ECM fitting, pipeline jobs, caching
   views/           one module per tab
 app.yaml           Databricks App manifest
-run_pipeline.py    CLI
+run_dashboard.py   start the dashboard (prints the link)
+run_pipeline.py    pipeline CLI
 tests/             synthetic generator + tests for pipeline and frontend
 config/example.yaml
 docs/EIS_PIPELINE_DEVELOPMENT_PLAN.md   three-tier development plan

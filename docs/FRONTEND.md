@@ -5,6 +5,7 @@ results without a notebook, without a personal file path and without the
 pipeline having to be re-run for every question.
 
 ```
+run_dashboard.py       start the dashboard locally; prints the link
 app/
   app.py               Dash shell: sidebar selection, tabs, callbacks
   settings.py          every path, from the environment - no personal paths
@@ -53,13 +54,30 @@ hard-coded path.
 
 ## Running it
 
-Locally:
+Locally, `run_dashboard.py` is the entry point:
 
 ```bash
 pip install -r requirements.txt
-EIS_RESULTS_ROOT=/path/to/results python -m app.app
-# http://127.0.0.1:8050
+python run_dashboard.py --results /path/to/results --open
 ```
+
+| Flag | Effect |
+|---|---|
+| `--results DIR` | sets `EIS_RESULTS_ROOT` |
+| `--famos DIR` | sets `EIS_FAMOS_ROOT` |
+| `--plate-specs DIR` | sets `EIS_PLATE_SPEC_DIR` |
+| `--port N` | listen on another port (default 8050) |
+| `--open` | open the browser once the server is up |
+| `--debug` | Dash debug mode with hot reload |
+
+It puts the project root on the import path itself, so it works from any
+working directory, and it prints the URL plus a count of discovered runs before
+starting — a server that starts in silence looks like a server that did not
+start. `python -m app.app` does the same thing without the flags.
+
+Note that the bind address is not the address to visit: binding to `0.0.0.0` is
+what lets a container be reached from outside, but `0.0.0.0` is not a
+destination, so the link printed is always the loopback one.
 
 As a Databricks App, from the repository root so that both `app` and `eis`
 are importable:

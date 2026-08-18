@@ -11,11 +11,26 @@ cd local-eis-viewer
 python -m venv .venv && source .venv/bin/activate     # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 
-# point it at a folder of finished results, then start it
-export EIS_RESULTS_ROOT=/path/to/results              # Windows: set EIS_RESULTS_ROOT=...
-python -m app.app
-# open http://127.0.0.1:8050
+python run_dashboard.py --results /path/to/results --open
 ```
+
+`run_dashboard.py` is the file to run. It prints the link before the server
+starts:
+
+```
+====================================================================
+  Local EIS Viewer
+====================================================================
+  Open this link:   http://127.0.0.1:8050
+  (listening on 0.0.0.0:8050 — press Ctrl+C to stop)
+
+  Found 2 run(s) across 1 order id(s): 2611976
+====================================================================
+```
+
+`--open` launches your browser for you; drop it and click the link instead.
+`--port 8060` if 8050 is taken. If it reports *no measurements found*, the
+`--results` path is not laid out the way it expects — see below.
 
 `EIS_RESULTS_ROOT` expects this layout — the same one the pipeline writes:
 
@@ -28,6 +43,11 @@ python -m app.app
 So for your existing 45 A output, copy `results_true_areas/` to
 `<root>/2611976/45A/` and it appears in the dropdowns immediately. Point the
 root at several conditions (45A, 60A, 150A, 450A) to unlock the Conditions tab.
+
+Raw recordings instead: `python run_dashboard.py --famos /path/to/Famos`.
+Both flags can be given together, and both just set the corresponding
+environment variable, so `EIS_RESULTS_ROOT=... python run_dashboard.py` works
+equally well.
 
 ## Check the plate geometry before trusting any map
 
@@ -49,6 +69,7 @@ pip install pytest && python -m pytest tests -q      # 63 tests
 
 | Path | What it is |
 | --- | --- |
+| `run_dashboard.py` | **Run this to open the dashboard** |
 | `app/app.py` | Dash shell: sidebar selection, tabs, callbacks |
 | `app/settings.py` | Every path, from environment variables — no personal paths anywhere |
 | `app/plates/registry.py` | Plate geometry as data, with the tiling self-check |

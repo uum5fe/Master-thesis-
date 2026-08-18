@@ -233,8 +233,11 @@ class DatagoSource:
     def scan(self) -> list[RunRef]:
         s = self.settings
         if not self.available():
-            self.error = ("datago not configured: set EIS_DATAGO_METADATA_TABLE "
-                          "and DATABRICKS_WAREHOUSE_ID")
+            # Not configured at all is a deployment choice, not a problem worth
+            # reporting on every scan; half-configured is worth reporting.
+            self.error = (
+                "datago not configured: set EIS_DATAGO_METADATA_TABLE and "
+                "DATABRICKS_WAREHOUSE_ID" if s.datago_metadata_table else "")
             return []
         where = ""
         select_cond = "NULL AS condition"

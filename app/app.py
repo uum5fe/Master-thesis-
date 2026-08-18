@@ -241,5 +241,64 @@ app = build_app()
 server = app.server                     # gunicorn / Databricks Apps entry point
 
 
+def banner(host: str, port: int) -> str:
+    """What to print at startup, including a URL that can actually be opened.
+
+    Dash does not reliably print its own banner when the reloader is off, and a
+    server that starts in silence looks like a server that did not start. The
+    bind address is also not the address to visit: binding to 0.0.0.0 is
+    required so a container can be reached from outside, but 0.0.0.0 is not a
+    destination - so the link shown is always a loopback one.
+    """
+    url = f"http://127.0.0.1:{port}"
+    catalog = store.current_catalog()
+    runs = catalog.runs
+    orders = sorted({r.measurement_id for r in runs})
+
+    lines = [
+        "",
+        "=" * 68,
+        f"  {SETTINGS.title}",
+        "=" * 68,
+        f"  Open this link:   {url}",
+        f"  (listening on {host}:{port} — press Ctrl+C to stop)",
+        "",
+    ]
+    if runs:
+        lines.append(f"  Found {len(runs)} run(s) across {len(orders)} order id(s): "
+                     f"{', '.join(orders[:6])}{' …' if len(orders) > 6 else ''}")
+    else:
+        lines += [
+            "  No measurements found. The app will start, but every dropdown",
+            "  will be empty. Point it at your data and restart:",
+            "",
+            "      EIS_RESULTS_ROOT=/path/to/results   finished pipeline output",
+            "      EIS_FAMOS_ROOT=/path/to/Famos       raw .DAT recordings",
+            "",
+            "  EIS_RESULTS_ROOT expects <root>/<order id>/<condition>/{gold,silver}/",
+        ]
+    for message in catalog.messages:
+        lines.append(f"  note: {message}")
+    lines += ["", "=" * 68, ""]
+    return "\n".join(lines)
+
+
+def serve(host: str | None = None, port: int | None = None,
+          debug: bool | None = None, open_browser: bool = False) -> None:
+    """Start the development server, having said where to find it."""
+    host = host or SETTINGS.host
+    port = int(port or SETTINGS.port)
+    debug = SETTINGS.debug if debug is None else debug
+
+    print(banner(host, port), flush=True)
+    if open_browser:
+        import threading
+        import webbrowser
+        threading.Timer(1.5, webbrowser.open,
+                        args=(f"http://127.0.0.1:{port}",)).start()
+
+    app.run(host=host, port=port, debug=debug)
+
+
 if __name__ == "__main__":
-    app.run(host=SETTINGS.host, port=SETTINGS.port, debug=SETTINGS.debug)
+    serve()

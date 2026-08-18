@@ -165,3 +165,40 @@ def test_banner_outside_a_notebook_is_unchanged(monkeypatch):
     assert "http://127.0.0.1:8050" in text
     assert "driver-proxy" not in text
     assert "stay busy" not in text
+
+
+# ---------------------------------------------------------------------------
+# source integrity
+# ---------------------------------------------------------------------------
+
+def test_every_app_module_compiles():
+    """Catches the commonest local edit that breaks the app.
+
+    Anything inserted above ``from __future__ import annotations`` - an
+    ``import sys``, a ``sys.path.append``, a stray cell marker - is a
+    SyntaxError, and the message ("must occur at the beginning of the file")
+    points at the future import rather than at the inserted line. Compiling
+    every module here turns that into one obvious failure.
+    """
+    failures = []
+    for path in sorted((ROOT / "app").rglob("*.py")):
+        try:
+            compile(path.read_text(encoding="utf-8"), str(path), "exec")
+        except SyntaxError as exc:
+            failures.append(f"{path.relative_to(ROOT)}:{exc.lineno}: {exc.msg}")
+    assert not failures, "\n".join(failures)
+
+
+def test_future_imports_are_the_first_statement():
+    for path in sorted((ROOT / "app").rglob("*.py")):
+        lines = path.read_text(encoding="utf-8").splitlines()
+        future = [i for i, line in enumerate(lines)
+                  if line.startswith("from __future__")]
+        if not future:
+            continue
+        before = [line for line in lines[:future[0]]
+                  if line.strip() and not line.lstrip().startswith("#")]
+        # Only the module docstring may precede it.
+        joined = "\n".join(before).strip()
+        assert not joined or joined.startswith(('"""', "'''")), (
+            f"{path.relative_to(ROOT)}: code before the future import: {before[:3]}")

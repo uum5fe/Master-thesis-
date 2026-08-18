@@ -49,6 +49,31 @@ Both flags can be given together, and both just set the corresponding
 environment variable, so `EIS_RESULTS_ROOT=... python run_dashboard.py` works
 equally well.
 
+## Using it from VS Code
+
+Open the folder that contains `run_dashboard.py`, `app/` and `eis/` as the
+workspace root — not its parent. If you unzipped into
+`Downloads\local-eis-viewer\local-eis-viewer\`, the inner folder is the one
+to open.
+
+Then either press **F5** and pick *Local EIS Viewer (dashboard)* — `.vscode/`
+already has the configuration — or run this in the VS Code terminal:
+
+```powershell
+python run_dashboard.py --results C:\path\to\results --open
+```
+
+Do **not** press ▶ on `app/app.py`. That runs the file directly rather than as
+part of the package, and it is what leads people to paste `sys.path` lines at
+the top of it. Anything inserted above `from __future__ import annotations` is
+an immediate `SyntaxError: from __future__ imports must occur at the beginning
+of the file` — the message points at the future import, not at the line that
+actually broke it. `run_dashboard.py` exists precisely so no such edit is ever
+needed: it puts the project root on the import path itself.
+
+If you have already edited `app/app.py`, restore it from this archive rather
+than trying to repair it.
+
 ## If you started it in a notebook cell
 
 The cell will never finish — a web server runs until you stop it, so a busy

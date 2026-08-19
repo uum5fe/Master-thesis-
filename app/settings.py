@@ -153,18 +153,27 @@ class Settings:
         return bool(self.datago_metadata_table and self.warehouse_id)
 
     def summary(self) -> list[tuple[str, str]]:
-        """What the app is pointed at, for the Sources panel."""
-        return [
+        """What the app is pointed at, for the Sources panel.
+
+        Databricks rows appear only where Databricks is configured: a row
+        reading "datago: (not configured)" tells a reader running on a laptop
+        nothing except that there is something they might be missing.
+        """
+        rows = [
             ("Results roots", ", ".join(self.results_roots) or "(none set)"),
             ("FAMOS roots", ", ".join(self.famos_roots) or "(none set)"),
-            ("datago", self.datago_metadata_table or "(not configured)"),
-            ("SQL warehouse", self.warehouse_id or "(not configured)"),
             ("Pipeline", self.pipeline_dir or "(bundled local_eis/)"),
             ("Calibration", self.curr_cal or "(not set)"),
-            ("Scratch results", self.scratch_results_root),
-            ("Inline pipeline", "enabled" if self.allow_inline_pipeline else "disabled"),
+            ("Process .DAT in the app",
+             "enabled" if self.allow_inline_pipeline else "disabled"),
             (".env file", DOTENV_LOADED or "(none found)"),
         ]
+        if self.datago_metadata_table or self.warehouse_id:
+            rows += [
+                ("datago", self.datago_metadata_table or "(not set)"),
+                ("SQL warehouse", self.warehouse_id or "(not set)"),
+            ]
+        return rows
 
 
 SETTINGS = Settings()

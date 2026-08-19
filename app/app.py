@@ -31,10 +31,41 @@ from app.settings import SETTINGS
 from app.views import common as ui
 from app.views import compare, ecm, heatmap, overview, plates, spectra
 
-LOCATIONS = [
-    {"label": "Volumes / file system", "value": "volumes"},
-    {"label": "datago (Unity Catalog)", "value": "datago"},
-]
+def location_options() -> list[dict]:
+    """Where data can come from — as this deployment is actually configured.
+
+    "Volumes" and "datago" are Databricks vocabulary. On a laptop reading a
+    local folder or a network share they are noise, and offering a source that
+    cannot work is worse than noise: it invites the reader to pick it and
+    wonder why nothing appears. So the file-system option is named after what
+    it reads here, and datago is offered only where it is configured.
+    """
+    on_databricks = bool(SETTINGS.databricks_host or SETTINGS.warehouse_id)
+    options = [{
+        "label": "Volumes / file system" if on_databricks
+                 else "Local or network folder",
+        "value": "volumes",
+    }]
+    if SETTINGS.datago_metadata_table:
+        options.append({"label": "datago (Unity Catalog)", "value": "datago"})
+    return options
+
+
+def location_hint(options: list[dict]) -> str:
+    if len(options) > 1:
+        return ("The file system reads a mounted or network path; datago "
+                "queries the measurement metadata tables.")
+    roots = SETTINGS.results_roots + SETTINGS.famos_roots
+    if roots:
+        # A deep share path is longer than the sidebar; the tail identifies the
+        # folder, the head rarely does.
+        shown = [r if len(r) <= 46 else "…" + r[-45:] for r in roots[:3]]
+        if len(roots) > 3:
+            shown.append(f"… and {len(roots) - 3} more")
+        return "Reading: " + " · ".join(shown)
+    return ("No folders configured. Run `python run_dashboard.py --init`, "
+            "then set EIS_FAMOS_ROOT and EIS_RESULTS_ROOT in .env.")
+
 
 FORMATS = [
     {"label": "Auto-detect", "value": "auto"},
@@ -55,6 +86,7 @@ def kinds_for(location: str, fmt: str) -> tuple[str, ...]:
 
 def sidebar() -> html.Div:
     plate_options = registry.options()
+    locations = location_options()
     default_plate = SETTINGS.default_plate or (
         plate_options[0]["value"] if plate_options else None)
 
@@ -67,14 +99,19 @@ def sidebar() -> html.Div:
         ], style={"marginBottom": "16px"}),
 
         ui.panel([
-            ui.field("Data location",
-                     dcc.RadioItems(id="sel-location", options=LOCATIONS,
+            ui.field("Where the data is",
+                     dcc.RadioItems(id="sel-location", options=locations,
                                     value="volumes",
                                     labelStyle={"display": "block",
                                                 "fontSize": "13px",
-                                                "marginBottom": "3px"}),
-                     "Volumes reads a mounted path; datago queries the "
-                     "measurement metadata tables."),
+                                                "marginBottom": "3px"},
+                                    # One choice is not a choice: keep the
+                                    # component so the callbacks still have it,
+                                    # but do not draw a radio button nobody can
+                                    # move.
+                                    style={} if len(locations) > 1
+                                    else {"display": "none"}),
+                     location_hint(locations)),
             ui.field("File format",
                      dcc.Dropdown(id="sel-format", options=FORMATS, value="auto",
                                   clearable=False),

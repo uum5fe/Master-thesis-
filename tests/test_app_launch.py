@@ -347,3 +347,68 @@ def test_force_replaces_it(tmp_path, monkeypatch):
 
     run_dashboard.write_env_file(_InitArgs(famos=r"C:\new"), force=True)
     assert "old" not in (tmp_path / ".env").read_text()
+
+
+# ---------------------------------------------------------------------------
+# the sidebar reflects the deployment, not Databricks
+# ---------------------------------------------------------------------------
+
+def _reload_app():
+    import importlib
+    from app import app as app_module, settings as settings_module
+    importlib.reload(settings_module)
+    importlib.reload(app_module)
+    return app_module
+
+
+def test_datago_is_not_offered_when_it_is_not_configured(monkeypatch):
+    for key in ("EIS_DATAGO_METADATA_TABLE", "DATABRICKS_WAREHOUSE_ID",
+                "DATABRICKS_HOST"):
+        monkeypatch.delenv(key, raising=False)
+    module = _reload_app()
+    options = module.location_options()
+    # Offering a source that cannot work invites picking it and wondering why
+    # nothing appears.
+    assert [o["value"] for o in options] == ["volumes"]
+    assert options[0]["label"] == "Local or network folder"
+
+
+def test_databricks_vocabulary_returns_where_it_means_something(monkeypatch):
+    monkeypatch.setenv("EIS_DATAGO_METADATA_TABLE", "cat.sch.meta")
+    monkeypatch.setenv("DATABRICKS_WAREHOUSE_ID", "abc123")
+    module = _reload_app()
+    options = module.location_options()
+    assert [o["value"] for o in options] == ["volumes", "datago"]
+    assert options[0]["label"] == "Volumes / file system"
+
+
+def test_the_hint_names_the_folders_actually_being_read(monkeypatch, tmp_path):
+    for key in ("EIS_DATAGO_METADATA_TABLE", "DATABRICKS_WAREHOUSE_ID",
+                "DATABRICKS_HOST"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("EIS_RESULTS_ROOT", str(tmp_path / "results"))
+    module = _reload_app()
+    hint = module.location_hint(module.location_options())
+    assert "Reading:" in hint and "results" in hint
+
+
+def test_the_hint_says_what_to_do_when_nothing_is_configured(monkeypatch):
+    for key in ("EIS_RESULTS_ROOT", "EIS_FAMOS_ROOT",
+                "EIS_DATAGO_METADATA_TABLE", "DATABRICKS_WAREHOUSE_ID",
+                "DATABRICKS_HOST"):
+        monkeypatch.delenv(key, raising=False)
+    module = _reload_app()
+    hint = module.location_hint(module.location_options())
+    assert "--init" in hint
+    _reload_app()
+
+
+def test_settings_summary_hides_databricks_rows_when_unconfigured(monkeypatch):
+    from app.settings import Settings
+    rows = dict(Settings(datago_metadata_table="", warehouse_id="").summary())
+    assert "datago" not in rows
+    assert "SQL warehouse" not in rows
+    assert "Pipeline" in rows and "FAMOS roots" in rows
+
+    rows = dict(Settings(datago_metadata_table="cat.sch.meta").summary())
+    assert rows["datago"] == "cat.sch.meta"

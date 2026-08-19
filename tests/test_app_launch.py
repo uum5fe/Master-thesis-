@@ -281,3 +281,69 @@ def test_a_unc_path_is_not_split_into_several_roots(monkeypatch):
     unc = r"\\bosch.com\DfsRB\Charan\Lokale_EIS\Daten"
     monkeypatch.setenv("EIS_FAMOS_ROOT", unc)
     assert settings.Settings().famos_roots == [unc]
+
+
+# ---------------------------------------------------------------------------
+# creating the settings file
+# ---------------------------------------------------------------------------
+
+class _InitArgs:
+    def __init__(self, **kwargs):
+        self.famos = kwargs.get("famos")
+        self.results = kwargs.get("results")
+        self.plate_specs = kwargs.get("plate_specs")
+
+
+def test_init_writes_an_env_file(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(run_dashboard, "ROOT", tmp_path)
+    (tmp_path / ".env.example").write_text(
+        "# comment\nEIS_FAMOS_ROOT=C:\\placeholder\n", encoding="utf-8")
+
+    assert run_dashboard.write_env_file(_InitArgs()) == 0
+    assert (tmp_path / ".env").is_file()
+    # The absolute path is printed: which file is read must never be in doubt.
+    assert str(tmp_path / ".env") in capsys.readouterr().out
+
+
+def test_init_fills_in_paths_given_on_the_command_line(tmp_path, monkeypatch):
+    monkeypatch.setattr(run_dashboard, "ROOT", tmp_path)
+    (tmp_path / ".env.example").write_text(
+        "EIS_FAMOS_ROOT=C:\\placeholder\n# EIS_RESULTS_ROOT=C:\\other\n",
+        encoding="utf-8")
+
+    unc = r"\\bosch.com\DfsRB\Charan\Lokale_EIS\Daten\2611976_16_07"
+    run_dashboard.write_env_file(_InitArgs(famos=unc, results=r"C:\results"))
+
+    written = (tmp_path / ".env").read_text(encoding="utf-8")
+    active = [l for l in written.splitlines() if l.strip()
+              and not l.strip().startswith("#")]
+    assert f"EIS_FAMOS_ROOT={unc}" in active            # UNC written verbatim
+    assert r"EIS_RESULTS_ROOT=C:\results" in active     # added even if commented out
+
+
+def test_init_does_not_need_the_folders_to_exist(tmp_path, monkeypatch):
+    """The share may be offline, or the paths may be for another machine."""
+    monkeypatch.setattr(run_dashboard, "ROOT", tmp_path)
+    (tmp_path / ".env.example").write_text("", encoding="utf-8")
+    assert run_dashboard.write_env_file(
+        _InitArgs(famos=r"\\server\share\nothing-here")) == 0
+    assert r"\\server\share\nothing-here" in (tmp_path / ".env").read_text()
+
+
+def test_init_refuses_to_clobber_an_existing_file(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(run_dashboard, "ROOT", tmp_path)
+    (tmp_path / ".env.example").write_text("", encoding="utf-8")
+    (tmp_path / ".env").write_text("EIS_FAMOS_ROOT=keep me\n", encoding="utf-8")
+
+    run_dashboard.write_env_file(_InitArgs(famos=r"C:\other"))
+    assert "keep me" in (tmp_path / ".env").read_text()
+    assert "already exists" in capsys.readouterr().out
+
+
+def test_force_replaces_it(tmp_path, monkeypatch):
+    monkeypatch.setattr(run_dashboard, "ROOT", tmp_path)
+    (tmp_path / ".env.example").write_text("", encoding="utf-8")
+    (tmp_path / ".env").write_text("EIS_FAMOS_ROOT=old\n", encoding="utf-8")
+
+    run_dashboard.write_env_file(_InitArgs(famos=r"C:\new"), force=True)
+    assert "old" not in (tmp_path / ".env").read_text()

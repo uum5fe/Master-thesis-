@@ -48,7 +48,9 @@ than with the message that sent the reader here.
 
 ## Where the paths live
 
-One file: `.env`, next to `run_dashboard.py`. Copy `.env.example` and edit it.
+One file: `.env`, next to `run_dashboard.py`. It does not exist until you
+create it — `python run_dashboard.py --init` writes it and prints its path,
+optionally filled in from `--famos` / `--results`.
 Nothing under `app/` or `eis/` contains a path, so pointing the viewer at
 different data is never a code change.
 

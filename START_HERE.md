@@ -113,20 +113,35 @@ The four usual causes, in order:
 
 ## Where do I change the paths?
 
-**In `.env`, and nowhere else.** Copy `.env.example` to `.env` (same folder as
-`run_dashboard.py`) and edit it. No Python file in this project contains a
-personal path, so none of them ever needs editing to point the viewer at
-different data.
+**In `.env`** — a file next to `run_dashboard.py`. It does not exist until you
+make one, and the tool will make it for you:
+
+```powershell
+python run_dashboard.py --init
+```
+
+That writes `.env` and prints its full path. Creating a file whose name starts
+with a dot is awkward on Windows — Explorer resists it and Notepad appends
+`.txt`, which then *looks* right because Explorer hides the extension — so let
+the tool do it.
+
+You can fill it in at the same time:
+
+```powershell
+python run_dashboard.py --init --famos "\\bosch.com\DfsRB\...\Daten\2611976_16_07" --results "C:\Users\uum5fe\Lokale_EIS\results"
+```
+
+Otherwise open the created file in VS Code and set the paths by hand:
 
 ```ini
-# .env
 EIS_FAMOS_ROOT=C:\Users\uum5fe\OneDrive - Bosch Group\Local_Eis\2611976_16_07
 EIS_RESULTS_ROOT=C:\Users\uum5fe\OneDrive - Bosch Group\Local_Eis\results
 ```
 
 Windows paths go in exactly as Explorer shows them — no quotes, no doubled
-backslashes, spaces are fine. Restart the app after editing. The startup banner
-prints which `.env` it read, so there is no doubt about which file is in force.
+backslashes, spaces are fine, and a `\\server\share` network path works too.
+Restart the app after editing. The startup banner prints which `.env` it read,
+so there is no doubt about which file is in force.
 
 | What you want to change | Variable |
 | --- | --- |

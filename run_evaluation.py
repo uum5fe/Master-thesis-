@@ -89,8 +89,23 @@ def main(argv=None) -> int:
         return 0 if ok else 1
 
     if not SETTINGS.famos_roots:
-        print("error: EIS_FAMOS_ROOT is not set. Put it in .env, or pass "
-              "--famos.", file=sys.stderr)
+        from app.settings import DOTENV_LOADED
+        env_path = ROOT / ".env"
+        print("error: EIS_FAMOS_ROOT is not set.\n", file=sys.stderr)
+        if DOTENV_LOADED:
+            print(f"  {DOTENV_LOADED} was read, but it does not set "
+                  f"EIS_FAMOS_ROOT.\n"
+                  f"  Add a line to it:\n"
+                  f"      EIS_FAMOS_ROOT=<folder holding the .DAT files>",
+                  file=sys.stderr)
+        else:
+            print(f"  There is no settings file yet. Create one:\n"
+                  f"      python run_dashboard.py --init\n"
+                  f"  It will be written to:\n"
+                  f"      {env_path}", file=sys.stderr)
+        print("\n  Or pass the folder directly, just this once:\n"
+              '      python run_evaluation.py --famos "<folder>" --list',
+              file=sys.stderr)
         return 2
 
     refs = FamosSource(SETTINGS.famos_roots, SETTINGS.famos_glob).scan()

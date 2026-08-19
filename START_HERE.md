@@ -74,6 +74,23 @@ needed: it puts the project root on the import path itself.
 If you have already edited `app/app.py`, restore it from this archive rather
 than trying to repair it.
 
+### "Terminal environment injection is disabled"
+
+A VS Code notification, not an error — and it means VS Code has *found* your
+`.env`, so the file is where it should be. Dismiss it: the application reads
+`.env` itself and does not depend on VS Code or the shell putting anything into
+the environment. The setting it offers is already enabled in `.vscode/settings.json`
+for consistency, so the prompt should not return.
+
+To confirm the file is actually being read, ask the application rather than the
+editor:
+
+```powershell
+python run_dashboard.py --check
+```
+
+The first line of its report names the `.env` it read.
+
 ## If you started it in a notebook cell
 
 The cell will never finish — a web server runs until you stop it, so a busy

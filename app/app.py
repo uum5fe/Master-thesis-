@@ -378,6 +378,21 @@ def banner(host: str, port: int) -> str:
     return "\n".join(lines)
 
 
+def quiet_request_log() -> None:
+    """Stop logging one line per HTTP request.
+
+    A Dash page is dozens of requests - one per callback, plus a poll every two
+    seconds while a background job runs. Every line says 200 and none of them
+    says anything, and together they bury the one message that would matter.
+
+    Only the INFO-level access log is suppressed. Warnings and errors from the
+    server still print, and so do tracebacks from callbacks, which Flask logs
+    through its own logger.
+    """
+    import logging
+    logging.getLogger("werkzeug").setLevel(logging.WARNING)
+
+
 def serve(host: str | None = None, port: int | None = None,
           debug: bool | None = None, open_browser: bool = False) -> None:
     """Start the development server, having said where to find it."""
@@ -386,6 +401,10 @@ def serve(host: str | None = None, port: int | None = None,
     debug = SETTINGS.debug if debug is None else debug
 
     print(banner(host, port), flush=True)
+
+    if not debug:
+        quiet_request_log()
+
     if open_browser:
         import threading
         import webbrowser

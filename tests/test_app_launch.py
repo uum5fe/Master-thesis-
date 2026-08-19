@@ -412,3 +412,17 @@ def test_settings_summary_hides_databricks_rows_when_unconfigured(monkeypatch):
 
     rows = dict(Settings(datago_metadata_table="cat.sch.meta").summary())
     assert rows["datago"] == "cat.sch.meta"
+
+
+def test_request_logging_is_quieted_but_errors_are_not(monkeypatch):
+    """A quiet log that also hides failures would be worse than a noisy one."""
+    import logging
+    from app import app as app_module
+
+    logger = logging.getLogger("werkzeug")
+    monkeypatch.setattr(logger, "level", logging.INFO)
+    app_module.quiet_request_log()
+
+    assert not logger.isEnabledFor(logging.INFO)        # access lines: gone
+    assert logger.isEnabledFor(logging.WARNING)         # warnings: kept
+    assert logger.isEnabledFor(logging.ERROR)           # errors: kept

@@ -134,8 +134,21 @@ def main(argv=None) -> int:
                   file=sys.stderr)
             return 1
     elif not a.all:
-        print("\nNothing selected. Pass --all, or --condition <name>, "
-              "or --list to look first.")
+        # Listing is not the same as asking for hours of processing, so nothing
+        # runs without being asked. Print the command to ask with, rather than
+        # the flag names on their own.
+        remote = any(staging.is_network_path(r.path) for r in refs)
+        stage = " --stage-local" if remote else ""
+        one = refs[0].condition
+        print("\nNothing processed yet — that needs asking for explicitly.\n")
+        print(f"  every condition:   python run_evaluation.py --all{stage}")
+        print(f"  just one:          python run_evaluation.py "
+              f"--condition {one}{stage}")
+        if remote:
+            print("\n  --stage-local copies each condition's cards to local disk "
+                  "first.\n  The recordings are on a network share, where the "
+                  "reader memory-maps\n  each card and bronze walks it "
+                  "repeatedly, so every page fault is\n  an SMB round trip.")
         return 0
 
     for note in runner.warnings_for(SETTINGS):

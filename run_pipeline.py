@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
-"""Command-line driver for the locally-resolved EIS pipeline.
+"""Command-line driver for the `eis/` pipeline.
+
+NOT the script for the Local EIS evaluation and dashboard. There are three
+entry points at the top of this project and only one of them is this file:
+
+    run_dashboard.py    start the dashboard
+    run_evaluation.py   raw FAMOS .DAT -> gold/silver results, using local_eis/
+    run_pipeline.py     this file: the separate `eis/` pipeline
+
+`eis/` is a different implementation with a different output shape - measured
+inter-card skew and clock drift, tables rather than a gold layer. It takes its
+paths as arguments rather than from `.env`, and it does not compute the DRT
+process split, the inferred segments or the fault labels. If what you want is
+the evaluation that ran on Databricks, use `run_evaluation.py`.
 
 Examples
 --------
@@ -201,7 +214,20 @@ def main(argv: list[str] | None = None) -> int:
         cfg.output_dir = cfg.output_dir or "./out/demo"
         truth = make_demo(cfg, verbose=not args.quiet)
     if not cfg.raw_dir or cfg.raw_dir == ".":
-        print("error: --raw-dir is required (or use --demo)", file=sys.stderr)
+        print("error: --raw-dir is required (or use --demo)\n", file=sys.stderr)
+        print("  This is run_pipeline.py, the CLI for the separate `eis/`\n"
+              "  pipeline. It takes its paths as arguments, not from .env.\n",
+              file=sys.stderr)
+        print("  For the Local EIS evaluation - the bronze/silver/gold pipeline\n"
+              "  that ran on Databricks, reading its paths from .env - you want:\n"
+              "\n"
+              "      python run_evaluation.py --list\n"
+              "      python run_evaluation.py --all\n"
+              "\n"
+              "  and then:\n"
+              "\n"
+              "      python run_dashboard.py --open\n",
+              file=sys.stderr)
         return 2
     cfg.output_dir = cfg.output_dir or "./out"
 

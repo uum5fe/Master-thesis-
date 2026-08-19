@@ -4,6 +4,14 @@ This archive is the complete architecture: the analysis pipeline (`eis/`) and
 the Dash frontend (`app/`) that reads its results. It is the same content as
 branch `claude/impedance-frontend-viz-not3ye` of the Master-thesis repository.
 
+## The three scripts, and which is which
+
+| Run this | For |
+| --- | --- |
+| **`run_dashboard.py`** | Start the dashboard and view results |
+| **`run_evaluation.py`** | Turn raw FAMOS `.DAT` into results, using the bundled `local_eis/` pipeline — the one that ran on Databricks |
+| `run_pipeline.py` | The separate `eis/` pipeline. A different implementation with a different output shape; takes its paths as arguments, not from `.env`. **Not** the one you want for the Local EIS evaluation. |
+
 ## Run it in five minutes, on your own machine
 
 ```bash

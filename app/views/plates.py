@@ -130,7 +130,17 @@ def register(app):
         if check["overlapping_pads"]:
             rows.append(("overlapping pads",
                          ", ".join(list(check["overlapping_pads"])[:12])))
+        unverified = html.Div() if geom.verified else ui.warnings_block(
+            [geom.verification_note or
+             "This layout is a reconstruction that has not been checked against "
+             "the copper.",
+             "The tiling check below only proves the segments cover the plate "
+             "exactly once — it cannot tell whether they are the RIGHT "
+             "segments. Every map drawn from this generation is marked."],
+            "Layout not verified")
+
         check_block = html.Div([
+            unverified,
             html.Div("PASS" if ok else "FAIL",
                      style={"fontWeight": 700, "marginBottom": "6px",
                             "color": ui.COLOURS["good"] if ok else ui.COLOURS["bad"]}),

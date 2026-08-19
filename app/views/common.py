@@ -27,17 +27,25 @@ def panel(children, style: dict | None = None) -> html.Div:
     return html.Div(children, style={**PANEL, **(style or {})})
 
 
-def field(label: str, control, hint: str = "") -> html.Div:
-    """A labelled control, with an optional one-line explanation under it."""
-    kids = [html.Label(label, style={"fontSize": "12px", "fontWeight": 600,
-                                     "color": COLOURS["muted"],
-                                     "display": "block", "marginBottom": "4px"}),
+def field(label: str, control, hint: str = "", label_id: str = "",
+          field_id: str = "") -> html.Div:
+    """A labelled control, with an optional one-line explanation under it.
+
+    ``label_id`` and ``field_id`` let a callback reword or hide the field: what
+    a picker is *called* depends on what it is picking, and a control that
+    cannot apply should not be shown at all.
+    """
+    kids = [html.Label(label, id=label_id or f"label-{id(control)}",
+                       style={"fontSize": "12px", "fontWeight": 600,
+                              "color": COLOURS["muted"],
+                              "display": "block", "marginBottom": "4px"}),
             control]
     if hint:
         kids.append(html.Div(hint, style={"fontSize": "11px",
                                           "color": COLOURS["muted"],
                                           "marginTop": "3px"}))
-    return html.Div(kids, style={"marginBottom": "12px"})
+    return html.Div(kids, id=field_id or f"field-{id(control)}",
+                    style={"marginBottom": "12px"})
 
 
 def stat(label: str, value: str, tone: str = "text") -> html.Div:

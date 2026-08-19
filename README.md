@@ -297,6 +297,7 @@ and **which plate generation** produced it.
 | Spectra | Nyquist and Bode for any set of segments, against the area-weighted cell aggregate |
 | ECM fitting | Weighted circuit fits with uncertainties, an AICc-selected ladder, residuals, and fitted-parameter maps |
 | Conditions | The same parameter across operating currents, plus difference maps against a reference condition |
+| Calibration | Campaign evaluation: sensitivity and temperature coefficient per segment, sweep linearity, agreement with the shipped coefficients, repeat drift, sensor check |
 | Plate & sources | Geometry self-check for the selected generation, and every path the app is reading |
 
 ### Plate generations are data, not code
@@ -343,6 +344,7 @@ tests/             synthetic generator + tests for pipeline and frontend
 config/example.yaml
 docs/EIS_PIPELINE_DEVELOPMENT_PLAN.md   three-tier development plan
 docs/FRONTEND.md                        frontend architecture and deployment
+docs/CALIBRATION.md                     calibration campaigns and what they evaluate
 ```
 
 Notebooks contain no algorithms: every numerical step is an importable, tested

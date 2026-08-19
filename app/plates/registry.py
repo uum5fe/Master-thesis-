@@ -84,6 +84,12 @@ class PlateGeometry:
     known_bad: dict[str, str] = field(default_factory=dict)
     source: str = ""
     notes: str = ""
+    #: False when the layout is a reconstruction that nobody has checked
+    #: against the copper. A map drawn from an unverified spec looks exactly
+    #: as convincing as one drawn from a verified spec, so the flag travels
+    #: with the geometry and the application says so on every map.
+    verified: bool = True
+    verification_note: str = ""
 
     # -- derived plate dimensions -------------------------------------------
 
@@ -182,13 +188,14 @@ class PlateGeometry:
         }
 
     def describe(self) -> str:
-        a = self.areas().values()
-        return (
+        areas = self.areas().values()
+        text = (
             f"{self.name}: {self.n_segments} segments, "
             f"{self.plate_w_mm:.1f} x {self.plate_h_mm:.1f} mm "
             f"({self.cell_area_cm2:.2f} cm2), "
-            f"areas {min(a):.3f}..{max(a):.3f} cm2"
+            f"areas {min(areas):.3f}..{max(areas):.3f} cm2"
         )
+        return text if self.verified else text + "   [UNVERIFIED LAYOUT]"
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +287,8 @@ def load_spec(path: str | Path) -> PlateGeometry:
         known_bad=spec.get("known_bad", {}),
         source=str(path),
         notes=spec.get("notes", ""),
+        verified=bool(spec.get("verified", True)),
+        verification_note=spec.get("verification_note", ""),
     )
 
     for name, s in geom.segments.items():

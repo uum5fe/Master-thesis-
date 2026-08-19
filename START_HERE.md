@@ -190,6 +190,27 @@ over `.env`:
 python run_dashboard.py --famos "D:\some other campaign" --open
 ```
 
+## Calibration campaigns (no order id needed)
+
+A folder of `Step<n>_<T>Grad.csv` plus `coefficients/` is a calibration
+campaign. It belongs to a plate rather than to a measurement order, so the
+viewer lists it by folder name — "Kashyyyk", "Naboo" — and never asks for an
+order id.
+
+```ini
+EIS_CALIBRATION_ROOT=C:\Users\uum5fe\Lokale_EIS\Abgleichdaten
+```
+
+Leave it unset and the FAMOS and results roots are searched too. Then set
+**File format → Calibration sweeps** and open the **Calibration** tab: shunt
+sensitivity and its temperature coefficient per segment on the plate map,
+linearity of every sweep, whether the shipped `curr.csv` matches the raw data,
+drift between repeats of the same temperature, and the sensors against their
+step labels. Clicking a segment shows the sweeps behind its number.
+
+See `docs/CALIBRATION.md` for what the file format means and how the
+coefficients relate to the sweeps.
+
 ## Processing raw .DAT into results
 
 The pipeline is bundled in `local_eis/` — the same bronze/silver/gold modules

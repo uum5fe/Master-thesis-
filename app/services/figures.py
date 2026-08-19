@@ -163,9 +163,15 @@ def plate_heatmap(
                                   thickness=14, len=0.85)),
     ))
 
+    heading = title or param_label(param)
+    if not geom.verified:
+        # A map from a reconstructed layout looks exactly as convincing as one
+        # from a verified layout. The only defence is to say so on the map.
+        heading += "   ⚠ layout not verified against the copper"
+
     fig.update_layout(
         template=TEMPLATE,
-        title=title or param_label(param),
+        title=heading,
         xaxis=dict(title="x [mm]  →  gas flow" if geom.flow_axis == "x" else "x [mm]",
                    range=[-6, geom.plate_w_mm + 6], constrain="domain"),
         yaxis=dict(title="y [mm]", range=[-8, geom.plate_h_mm + 6],

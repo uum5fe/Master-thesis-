@@ -78,6 +78,10 @@ class RunRef:
     def describe(self) -> str:
         if self.kind == "famos":
             return f"{len(self.files)} card file(s)"
+        if self.kind == "calibration":
+            coeff = "with coefficients" if self.detail.get("has_coefficients") \
+                else "no coefficients"
+            return f"{len(self.files)} temperature step(s), {coeff}"
         return self.layout or self.kind
 
 
@@ -215,6 +219,54 @@ class FamosSource:
 
 
 # ---------------------------------------------------------------------------
+# calibration campaigns
+# ---------------------------------------------------------------------------
+
+class CalibrationSource:
+    """Campaign folders of ``Step*.csv``, identified by folder name.
+
+    Deliberately not keyed by order id. A calibration campaign belongs to a
+    *plate*, not to a measurement order - the folders here are named for the
+    plate ("Kashyyyk", "Naboo") - so asking for an order id before showing one
+    would be asking for something that does not exist.
+    """
+
+    kind = "calibration"
+
+    def __init__(self, roots) -> None:
+        self.roots = [Path(r) for r in roots]
+
+    def scan(self) -> list[RunRef]:
+        from app.data.calibration import is_calibration_folder
+
+        found: dict[str, RunRef] = {}
+        for root in self.roots:
+            if not root.is_dir():
+                continue
+            candidates = [root] + [p for p in root.rglob("*") if p.is_dir()]
+            for directory in candidates:
+                if not is_calibration_folder(directory):
+                    continue
+                steps = sorted(directory.glob("Step*.csv"))
+                # The campaign is named for its folder; where that is generic,
+                # the parent disambiguates it.
+                name = directory.name
+                if name.lower() in ("data", "daten", "csv", "steps"):
+                    name = f"{directory.parent.name}/{name}"
+                found[str(directory)] = RunRef(
+                    kind="calibration", measurement_id=name,
+                    condition="(calibration)", path=str(directory),
+                    layout="calibration",
+                    files=tuple(str(p) for p in steps),
+                    modified=max(p.stat().st_mtime for p in steps),
+                    detail={"n_steps": len(steps),
+                            "has_coefficients":
+                                (directory / "coefficients" / "curr.csv").is_file()},
+                )
+        return list(found.values())
+
+
+# ---------------------------------------------------------------------------
 # datago (Unity Catalog over a SQL warehouse)
 # ---------------------------------------------------------------------------
 
@@ -316,17 +368,19 @@ class Catalog:
         self.settings = settings
         self.results = ResultsSource(settings.resolved_results_roots())
         self.famos = FamosSource(settings.famos_roots, settings.famos_glob)
+        self.calibration = CalibrationSource(settings.resolved_calibration_roots())
         self.datago = DatagoSource(settings)
         self._runs: list[RunRef] = []
         self.messages: list[str] = []
         self.scanned_at: float = 0.0
 
-    def refresh(self, kinds: tuple[str, ...] = ("results", "famos", "datago")):
+    def refresh(self, kinds: tuple[str, ...] =
+                ("results", "famos", "calibration", "datago")):
         runs: list[RunRef] = []
         self.messages = []
         for kind in kinds:
             source = {"results": self.results, "famos": self.famos,
-                      "datago": self.datago}[kind]
+                      "calibration": self.calibration, "datago": self.datago}[kind]
             try:
                 found = source.scan()
             except Exception as exc:

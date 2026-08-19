@@ -29,7 +29,8 @@ from app.services import store
 from app.settings import DOTENV_LOADED as SETTINGS_DOTENV
 from app.settings import SETTINGS
 from app.views import common as ui
-from app.views import compare, ecm, heatmap, overview, plates, spectra
+from app.views import (calibration, compare, ecm, heatmap, overview, plates,
+                       spectra)
 
 def location_options() -> list[dict]:
     """Where data can come from — as this deployment is actually configured.
@@ -71,6 +72,7 @@ FORMATS = [
     {"label": "Auto-detect", "value": "auto"},
     {"label": "Processed results — CSV / Parquet", "value": "results"},
     {"label": "Raw recordings — FAMOS .DAT", "value": "famos"},
+    {"label": "Calibration sweeps — Step*.csv", "value": "calibration"},
 ]
 
 #: Selected (location, format) -> the source kinds the catalogue should offer.
@@ -81,7 +83,9 @@ def kinds_for(location: str, fmt: str) -> tuple[str, ...]:
         return ("results",)
     if fmt == "famos":
         return ("famos",)
-    return ("results", "famos")
+    if fmt == "calibration":
+        return ("calibration",)
+    return ("results", "famos", "calibration")
 
 
 def sidebar() -> html.Div:
@@ -115,16 +119,19 @@ def sidebar() -> html.Div:
             ui.field("File format",
                      dcc.Dropdown(id="sel-format", options=FORMATS, value="auto",
                                   clearable=False),
-                     "Raw .DAT has to go through the pipeline before it has a "
-                     "spectrum to show."),
+                     "Processed results plot straight away; raw .DAT must go "
+                     "through the pipeline first; calibration sweeps are "
+                     "evaluated on the Calibration tab."),
             ui.field("Order ID (Leepa)",
                      dcc.Dropdown(id="sel-measurement", options=[], value=None,
                                   placeholder="select an order id",
-                                  clearable=False)),
+                                  clearable=False),
+                     label_id="label-measurement"),
             ui.field("Current condition",
                      dcc.Dropdown(id="sel-condition", options=[], value=None,
                                   placeholder="select a condition",
-                                  clearable=False)),
+                                  clearable=False),
+                     label_id="label-condition", field_id="field-condition"),
             ui.field("Plate generation",
                      dcc.Dropdown(id="sel-plate", options=plate_options,
                                   value=default_plate, clearable=False),
@@ -158,6 +165,7 @@ def build_app() -> Dash:
                 dcc.Tab(label="Spectra", value="tab-spectra"),
                 dcc.Tab(label="ECM fitting", value="tab-ecm"),
                 dcc.Tab(label="Conditions", value="tab-compare"),
+                dcc.Tab(label="Calibration", value="tab-calibration"),
                 dcc.Tab(label="Plate & sources", value="tab-plates"),
             ]),
             html.Div(id="tab-body", style={"padding": "16px 18px"}),
@@ -167,7 +175,7 @@ def build_app() -> Dash:
               "color": ui.COLOURS["text"], "margin": 0})
 
     register_selection(app)
-    for view in (overview, heatmap, spectra, ecm, compare, plates):
+    for view in (overview, heatmap, spectra, ecm, compare, calibration, plates):
         view.register(app)
 
     @app.callback(Output("tab-body", "children"), Input("tabs", "value"))
@@ -178,6 +186,7 @@ def build_app() -> Dash:
             "tab-spectra": spectra.layout,
             "tab-ecm": ecm.layout,
             "tab-compare": compare.layout,
+            "tab-calibration": calibration.layout,
             "tab-plates": plates.layout,
         }[tab]()
 
@@ -191,6 +200,24 @@ def register_selection(app: Dash) -> None:
     def _refresh(_n):
         registry.reload()
         return store.bump_generation()
+
+    @app.callback(
+        Output("label-measurement", "children"),
+        Output("label-condition", "children"),
+        Output("field-condition", "style"),
+        Input("sel-format", "value"))
+    def _relabel(fmt):
+        """A calibration campaign has no order id and no operating point.
+
+        It belongs to a plate, not to a measurement order, so asking for an
+        order id before showing one would be asking for something that does not
+        exist - and there is no current condition to choose either.
+        """
+        hidden = {"marginBottom": "12px", "display": "none"}
+        shown = {"marginBottom": "12px"}
+        if fmt == "calibration":
+            return "Calibration campaign", "Condition", hidden
+        return "Order ID (Leepa)", "Current condition", shown
 
     @app.callback(
         Output("sel-measurement", "options"),

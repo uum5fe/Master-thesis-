@@ -53,6 +53,26 @@ PARAM_META: dict[str, dict] = {
     "hf_closure":  dict(label="HF closure", unit="-", colorscale="RdYlBu"),
     "kk_res_pct":  dict(label="Kramers-Kronig residual", unit="%", colorscale="Greys"),
     "snr_med_db":  dict(label="Median SNR", unit="dB", colorscale="Viridis"),
+
+    # -- calibration campaigns ----------------------------------------------
+    "H_at_60C":      dict(label="Shunt sensitivity at 60 °C", unit="V/A",
+                          colorscale="Viridis"),
+    "H_c0":          dict(label="Sensitivity at 0 °C", unit="V/A",
+                          colorscale="Viridis"),
+    "H_c1":          dict(label="Temperature coefficient", unit="mV/A/K",
+                          colorscale="Cividis"),
+    "drift_pct_over_span": dict(label="Sensitivity change over the temperature span",
+                                unit="%", colorscale="Plasma"),
+    "linearity_worst_pct": dict(label="Worst deviation from a straight line",
+                                unit="%", colorscale="Reds"),
+    "fit_residual_pct":    dict(label="Residual of the H(T) fit", unit="%",
+                                colorscale="Reds"),
+    "ratio_c0_dev_pct":    dict(label="Departure from the plate's chain constant",
+                                unit="%", colorscale="RdBu_r"),
+    "ratio_c1_dev_pct":    dict(label="Departure, temperature coefficient",
+                                unit="%", colorscale="RdBu_r"),
+    "drift_pct":     dict(label="Drift between repeats of one temperature",
+                          unit="%", colorscale="RdBu_r"),
 }
 
 

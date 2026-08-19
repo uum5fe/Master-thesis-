@@ -132,3 +132,36 @@ def test_extra_spec_directory_is_picked_up(tmp_path, monkeypatch):
 def test_template_is_not_offered_as_a_generation():
     # Files starting with '_' are templates, not plates.
     assert not any(k.startswith("_") for k in registry.available())
+
+
+# ---------------------------------------------------------------------------
+# a layout that has not been checked must say so
+# ---------------------------------------------------------------------------
+
+def test_gen2_is_available_and_marked_unverified():
+    geom = registry.get("gen2_r2d2_naboo_72")
+    assert geom.n_segments == 72
+    assert geom.verified is False
+    # The note has to name what is uncertain, not merely that something is.
+    for segment in ("39", "40", "49", "51", "52", "54", "55", "57", "58",
+                    "60", "69", "70"):
+        assert segment in geom.verification_note
+    assert "UNVERIFIED" in geom.describe()
+
+
+def test_gen2_shares_the_pad_grid_that_the_drawing_confirms():
+    gen1, gen2 = registry.get("gen1_r2d2_72"), registry.get("gen2_r2d2_naboo_72")
+    for attr in ("pad_w_mm", "pad_h_mm", "n_cols", "n_rows"):
+        assert getattr(gen2, attr) == getattr(gen1, attr)
+    assert gen2.self_check()["tiles_exactly"]
+    assert gen2.cell_area_cm2 == pytest.approx(304.92, abs=1e-6)
+
+
+def test_gen1_stays_verified():
+    assert registry.get("gen1_r2d2_72").verified is True
+
+
+def test_verified_defaults_to_true_for_a_spec_that_says_nothing(tmp_path):
+    spec = BASE | {"segments": [
+        {"name": "1", "col0": 1, "col1": 4, "row0": 1, "row1": 2}]}
+    assert registry.load_spec(_write(tmp_path, "quiet", spec)).verified is True

@@ -111,6 +111,13 @@ class Settings:
     temp_cal: str = field(default_factory=lambda: _env("EIS_TEMP_CAL"))
     areas_file: str = field(default_factory=lambda: _env("EIS_AREAS_FILE"))
 
+    # -- calibration campaigns ("Abgleichdaten") ----------------------------
+    #: Roots holding campaign folders: Step*.csv plus coefficients/. Left
+    #: empty, the FAMOS and results roots are searched too, so a campaign
+    #: sitting beside the measurements is found without extra configuration.
+    calibration_roots: list[str] = field(
+        default_factory=lambda: _env_list("EIS_CALIBRATION_ROOT"))
+
     # -- the processing pipeline --------------------------------------------
     #: Folder holding main.py, bronze.py, silver.py and gold.py. Empty means
     #: the copy bundled in this project, which is the same code that ran on
@@ -149,6 +156,13 @@ class Settings:
             roots.append(scratch)
         return roots
 
+    def resolved_calibration_roots(self) -> list[Path]:
+        roots = [Path(p) for p in self.calibration_roots]
+        for extra in self.famos_roots + self.results_roots:
+            if Path(extra) not in roots:
+                roots.append(Path(extra))
+        return roots
+
     def datago_configured(self) -> bool:
         return bool(self.datago_metadata_table and self.warehouse_id)
 
@@ -162,6 +176,8 @@ class Settings:
         rows = [
             ("Results roots", ", ".join(self.results_roots) or "(none set)"),
             ("FAMOS roots", ", ".join(self.famos_roots) or "(none set)"),
+            ("Calibration roots",
+             ", ".join(self.calibration_roots) or "(searched alongside the others)"),
             ("Pipeline", self.pipeline_dir or "(bundled local_eis/)"),
             ("Calibration", self.curr_cal or "(not set)"),
             ("Process .DAT in the app",

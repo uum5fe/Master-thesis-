@@ -85,3 +85,24 @@ only used when `temp.csv` is missing.
 `bode/*.DTA` are Gamry sweeps of the chain's frequency response (100 kHz → 1 Hz
 at 500 mA). They are the input to the pipeline's optional `--gain` correction,
 not to the calibration evaluation, and the viewer does not read them yet.
+
+---
+
+## Appendix: reading a plate drawing
+
+`tools/extract_label_pads.py` reads the segment numbers off a coordinates PDF
+and reports the pad each one sits on, calibrated from the axis tick labels
+whose millimetre values are printed on the drawing:
+
+```bash
+python tools/extract_label_pads.py Coordinates.pdf
+python tools/extract_label_pads.py green.pdf blue.pdf --compare
+```
+
+It reproduces the documented Gen-1 layout exactly from the green drawing, which
+is why its readings on a new drawing can be trusted.
+
+It gives label pads, **not** segment boundaries. A label pad marks where a
+number is printed; on these boards the segments are formed by routing pads to
+shunts, so the boundaries live in the netlist. Use this to see what changed
+between generations, then take the pad-to-segment mapping from the board file.

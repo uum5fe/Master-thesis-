@@ -142,10 +142,14 @@ def test_gen2_is_available_and_marked_unverified():
     geom = registry.get("gen2_r2d2_naboo_72")
     assert geom.n_segments == 72
     assert geom.verified is False
-    # The note has to name what is uncertain, not merely that something is.
-    for segment in ("39", "40", "49", "51", "52", "54", "55", "57", "58",
-                    "60", "69", "70"):
-        assert segment in geom.verification_note
+    # The note has to name what is uncertain, not merely that something is,
+    # and separate the structural change from the one-pad shifts.
+    note = geom.verification_note
+    for segment in ("51", "52", "57", "58"):
+        assert segment in note
+    assert "56 of the 72" in note
+    assert "netlist" in note        # says what would settle it
+    assert "KiCad" in note
     assert "UNVERIFIED" in geom.describe()
 
 

@@ -426,3 +426,26 @@ def test_request_logging_is_quieted_but_errors_are_not(monkeypatch):
     assert not logger.isEnabledFor(logging.INFO)        # access lines: gone
     assert logger.isEnabledFor(logging.WARNING)         # warnings: kept
     assert logger.isEnabledFor(logging.ERROR)           # errors: kept
+
+
+# ---------------------------------------------------------------------------
+# the Windows launchers
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("script,target", [
+    ("run_dashboard.cmd", "run_dashboard.py"),
+    ("run_evaluation.cmd", "run_evaluation.py"),
+])
+def test_windows_launcher_tries_the_interpreters_that_work(script, target):
+    """`python` on a fresh Windows PATH is the Microsoft Store placeholder."""
+    text = (ROOT / script).read_text(encoding="utf-8")
+    assert f"{target} %*" in text
+    # A local virtual environment first, then the py launcher, then PATH.
+    order = [text.index(".venv\\Scripts\\python.exe"),
+             text.index("py -3 --version"),
+             text.index("python --version")]
+    assert order == sorted(order)
+    # And it explains the fix rather than only failing.
+    assert "App execution aliases" in text
+    assert "python.org" in text
+    assert 'cd /d "%~dp0"' in text          # runs from its own folder

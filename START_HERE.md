@@ -57,6 +57,35 @@ Both flags can be given together, and both just set the corresponding
 environment variable, so `EIS_RESULTS_ROOT=... python run_dashboard.py` works
 equally well.
 
+## "Python konnte nicht gefunden werden" / "Python was not found"
+
+Windows ships a placeholder at `python` that opens the Microsoft Store instead
+of running anything. Two ways past it.
+
+**Use the supplied launchers** — they try `.venv`, then the `py` launcher, then
+`python`, and say what to do if none works:
+
+```powershell
+run_dashboard.cmd --open
+run_evaluation.cmd --all --stage-local
+```
+
+**Or fix the machine**, which is worth doing once:
+
+1. Install Python from python.org with **"Add python.exe to PATH"** ticked; or
+2. Settings → Apps → Advanced app settings → **App execution aliases** → switch
+   off `python.exe` and `python3.exe`; or
+3. Use the `py` launcher instead: `py -3 run_dashboard.py --open`.
+
+If a virtual environment exists at `.venv\` in this folder, the `.cmd`
+launchers use it in preference to anything on PATH — which is also how to give
+colleagues a fixed set of package versions:
+
+```powershell
+py -3 -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
 ## Using it from VS Code
 
 Open the folder that contains `run_dashboard.py`, `app/` and `eis/` as the

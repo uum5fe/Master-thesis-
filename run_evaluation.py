@@ -60,6 +60,14 @@ def main(argv=None) -> int:
                         "its own and never reads them")
     p.add_argument("--stop-after", choices=["bronze", "silver", "gold"],
                    default="gold")
+    p.add_argument("--stage-local", action="store_true",
+                   help="copy the cards to local disk before processing. "
+                        "Strongly advised when the recordings live on a "
+                        "network share: the reader memory-maps each card and "
+                        "bronze walks it repeatedly, so over SMB every page "
+                        "fault is a network round trip")
+    p.add_argument("--keep-staged", action="store_true",
+                   help="do not delete the local copies afterwards")
     p.add_argument("--dry-run", action="store_true",
                    help="print the command that would run, and stop")
     a = p.parse_args(argv)
@@ -71,7 +79,7 @@ def main(argv=None) -> int:
     os.environ.setdefault("EIS_ALLOW_INLINE_PIPELINE", "1")
 
     from app.data.sources import FamosSource, _condition_sort_key
-    from app.services import runner
+    from app.services import runner, staging
     from app.settings import SETTINGS
 
     if a.self_test:
@@ -118,6 +126,15 @@ def main(argv=None) -> int:
     for note in runner.warnings_for(SETTINGS):
         print(f"\nnote: {note}")
 
+    remote = [r for r in refs if staging.is_network_path(r.path)]
+    if remote and not a.stage_local:
+        total = sum(staging.staged_size_mb(r) for r in remote) / 1024
+        print(f"\nnote: {len(remote)} condition(s) sit on a network share "
+              f"({total:.1f} GB). The reader memory-maps each card and bronze "
+              f"walks it repeatedly, so over SMB this is far slower than local "
+              f"disk and a network hiccup fails the run. Pass --stage-local to "
+              f"copy them down first.")
+
     failures = 0
     for index, ref in enumerate(refs, 1):
         out = runner.output_dir(ref, SETTINGS)
@@ -140,15 +157,25 @@ def main(argv=None) -> int:
             continue
 
         started = time.time()
+        source = ref
         try:
+            if a.stage_local:
+                print(f"  staging {staging.staged_size_mb(ref):.0f} MB to "
+                      f"local disk first")
+                source = staging.stage(
+                    ref, SETTINGS.stage_dir or None,
+                    lambda done, total, message="": print(f"    {message}"))
             runner.run_famos(
                 lambda done, total, message="": print(f"  {message}"),
-                ref, settings=SETTINGS, equal_areas=a.equal_areas,
+                source, settings=SETTINGS, equal_areas=a.equal_areas,
                 no_png=a.no_png, stop_after=a.stop_after)
         except Exception as exc:
             print(f"  FAILED: {exc}")
             failures += 1
             continue
+        finally:
+            if a.stage_local and not a.keep_staged:
+                staging.clear(ref, SETTINGS.stage_dir or None)
         print(f"  done in {time.time() - started:.0f} s -> {out}")
 
     if not a.dry_run:

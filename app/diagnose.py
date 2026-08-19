@@ -18,6 +18,7 @@ from pathlib import Path
 
 from app.data.loaders import detect_layout
 from app.data.sources import Catalog, famos_patterns
+from app.services.staging import is_network_path
 from app.settings import DOTENV_LOADED, SETTINGS, Settings
 
 TICK, CROSS, WARN, INFO = "[ok]", "[--]", "[!!]", "  ->"
@@ -87,6 +88,15 @@ def _famos_section(out: list[str], settings: Settings) -> None:
             continue
 
         out.append(f"   {TICK} {len(files)} .DAT file(s) found")
+        if is_network_path(root):
+            size = sum(f.stat().st_size for f in files) / 1e9
+            out.append(f"   {WARN} this is a network share ({size:.1f} GB here)")
+            out.append(f"{INFO} the reader memory-maps each card and bronze "
+                       "walks it repeatedly, so every page fault is an SMB "
+                       "round trip — expect it to be far slower than local "
+                       "disk, and to fail on a network hiccup")
+            out.append(f"{INFO} copy the cards to local disk first: "
+                       "run_evaluation.py --stage-local")
         matched, unmatched = [], []
         for path in files:
             for pattern in patterns:

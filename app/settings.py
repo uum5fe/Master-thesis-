@@ -117,6 +117,10 @@ class Settings:
     #: Databricks.
     pipeline_dir: str = field(default_factory=lambda: _env("EIS_PIPELINE_DIR"))
 
+    #: Where recordings are copied to before processing, when they live on a
+    #: network share. Empty means a folder under the system temp directory.
+    stage_dir: str = field(default_factory=lambda: _env("EIS_STAGE_DIR"))
+
     # -- plates -------------------------------------------------------------
     default_plate: str = field(default_factory=lambda: _env("EIS_DEFAULT_PLATE"))
 

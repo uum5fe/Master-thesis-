@@ -260,3 +260,24 @@ def test_example_env_documents_every_setting_the_app_reads():
                  "EIS_PLATE_SPEC_DIR", "EIS_ALLOW_INLINE_PIPELINE",
                  "EIS_FAMOS_REGEX"):
         assert name in text, f"{name} is not mentioned in .env.example"
+
+
+def test_dotenv_preserves_a_unc_network_path(tmp_path, monkeypatch):
+    r"""\\server\share paths must survive verbatim - leading backslashes and all."""
+    from app import settings
+    unc = (r"\\bosch.com\DfsRB\DfsDE\LOC\Fe\ILM\A_ILM_DSETD\Gruppenablage"
+           r"\EAT3\Charan\Lokale_EIS\Daten\2611976_16_07")
+    env = tmp_path / ".env"
+    env.write_text(f"EIS_FAMOS_ROOT={unc}\n", encoding="utf-8")
+    monkeypatch.delenv("EIS_FAMOS_ROOT", raising=False)
+    settings.load_dotenv(env)
+    assert os.environ["EIS_FAMOS_ROOT"] == unc
+    assert os.environ["EIS_FAMOS_ROOT"].startswith("\\\\")
+
+
+def test_a_unc_path_is_not_split_into_several_roots(monkeypatch):
+    """os.pathsep is ';' on Windows, so a UNC path is one root, not many."""
+    from app import settings
+    unc = r"\\bosch.com\DfsRB\Charan\Lokale_EIS\Daten"
+    monkeypatch.setenv("EIS_FAMOS_ROOT", unc)
+    assert settings.Settings().famos_roots == [unc]

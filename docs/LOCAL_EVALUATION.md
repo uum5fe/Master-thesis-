@@ -92,6 +92,43 @@ starting rather than after ten minutes of work.
 Expect minutes per condition: bronze reads every sample of every card. Silver
 and gold then re-run from `bronze/` quickly.
 
+### Recordings on a network share
+
+A UNC path works as it is written, in `.env` and on the command line:
+
+```ini
+EIS_FAMOS_ROOT=\\bosch.com\DfsRB\DfsDE\LOC\Fe\ILM\A_ILM_DSETD\Gruppenablage\EAT3\Charan\Lokale_EIS\Daten\2611976_16_07
+```
+
+No quoting, no doubled backslashes, and it is not split on the `;` that
+separates several roots. The share must already be reachable in Explorer —
+Python does not authenticate; if opening it prompts for credentials, do that
+once first, or map it to a drive letter.
+
+**Copy the cards down before processing them.** `eis_local.FamosFile` opens
+each recording with `np.memmap`, and bronze then walks that array repeatedly,
+once per frequency step per channel. On local disk the operating system caches
+the pages and nothing is read twice; over SMB every page fault is a network
+round trip, so the same run takes far longer and an ordinary network hiccup
+surfaces as an I/O error partway through rather than as a retry.
+
+```powershell
+python run_evaluation.py --all --stage-local
+```
+
+That copies each condition's cards to local disk, runs, and deletes the copies
+afterwards (`--keep-staged` to keep them). The copy is resumable: a file
+already present at the right size is not fetched again, so an interrupted run
+does not start from nothing. `EIS_STAGE_DIR` chooses where they land; the
+default is a folder under the system temp directory.
+
+Without `--stage-local` the run still works — `run_evaluation.py` and
+`run_dashboard.py --check` both say how much data is on the share and suggest
+staging rather than silently taking hours.
+
+Reading finished *results* over the share is fine and needs no staging: those
+are a few megabytes of CSV, read once.
+
 ### From inside the dashboard
 
 With `EIS_ALLOW_INLINE_PIPELINE=1` in `.env`, selecting a raw recording offers

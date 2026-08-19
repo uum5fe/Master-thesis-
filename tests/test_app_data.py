@@ -7,6 +7,7 @@ a column name in either pipeline fails here rather than in the browser.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -272,3 +273,38 @@ def test_well_formed_csv_still_reads_normally(tmp_path):
     frame = loaders._read_table(path)
     assert frame["a"].tolist() == [1, 2]
     assert frame["b"].tolist() == ["x", "y"]
+
+
+def test_case_insensitive_file_systems_do_not_double_count_cards(tmp_path, monkeypatch):
+    """Windows matches *.DAT and *.dat identically; each card must count once.
+
+    The symptom is a plate that reports twice as many card files as exist, and
+    a staging step that copies every one of them twice.
+    """
+    real = [tmp_path / f"Leepa_2611976_Current_45A_Test_01_Karte_{c}.DAT"
+            for c in range(1, 6)]
+    for path in real:
+        path.touch()
+
+    original = Path.rglob
+
+    def case_insensitive_rglob(self, pattern):
+        # Stand in for Windows: both spellings return the same five files.
+        if pattern.lower() == "*.dat":
+            return iter(real)
+        return original(self, pattern)
+
+    monkeypatch.setattr(Path, "rglob", case_insensitive_rglob)
+    refs = FamosSource([tmp_path]).scan()
+
+    assert len(refs) == 1
+    assert len(refs[0].files) == 5
+    assert len(set(refs[0].files)) == 5
+
+
+def test_a_case_sensitive_file_system_keeps_both_spellings(tmp_path):
+    """On Linux, Karte_1.DAT and karte_1.dat really are two different files."""
+    (tmp_path / "Leepa_2611976_Current_45A_Test_01_Karte_1.DAT").touch()
+    (tmp_path / "Leepa_2611976_Current_45A_Test_01_Karte_2.dat").touch()
+    refs = FamosSource([tmp_path]).scan()
+    assert len(refs[0].files) == 2

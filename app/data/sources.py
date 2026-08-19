@@ -184,8 +184,15 @@ class FamosSource:
         for root in self.roots:
             if not root.is_dir():
                 continue
-            # rglob so a campaign kept in per-condition subfolders still works
-            for path in sorted(root.rglob("*.DAT")) + sorted(root.rglob("*.dat")):
+            # rglob so a campaign kept in per-condition subfolders still works.
+            # Both spellings are searched because a case-sensitive file system
+            # distinguishes them - but Windows does not, where the two patterns
+            # return the same files and would otherwise count every card twice.
+            # Keying on the path string dedupes there and keeps genuinely
+            # different files here.
+            both = list(root.rglob("*.DAT")) + list(root.rglob("*.dat"))
+            for path in sorted(dict.fromkeys(str(p) for p in both)):
+                path = Path(path)
                 for pattern in patterns:
                     m = pattern.search(path.name)
                     if m:

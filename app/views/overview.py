@@ -11,7 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pandas as pd
-from dash import Input, Output, State, dcc, html
+from dash import Input, Output, State, dcc, html, no_update
 
 from app.services import runner, store
 from app.services.figures import empty_figure, plate_heatmap
@@ -152,22 +152,27 @@ def register(app):
 
     @app.callback(Output("ov-run-status", "children"),
                   Output("ov-run-poll", "disabled", allow_duplicate=True),
+                  Output("refresh-token", "data", allow_duplicate=True),
+                  Output("sel-format", "value", allow_duplicate=True),
                   Input("ov-run-poll", "n_intervals"), State("ov-run-job", "data"),
+                  State("refresh-token", "data"),
                   prevent_initial_call=True)
-    def _watch(_n, job_id):
+    def _watch(_n, job_id, token):
         job = store.JOBS.get(job_id or "")
         if job is None:
-            return "", True
+            return "", True, no_update, no_update
         if job.state == "running":
             detail = f" — {job.message}" if job.message else ""
-            return ui.note(job.status_text() + detail), False
+            return ui.note(job.status_text() + detail), False, no_update, no_update
         if job.state == "failed":
-            return ui.warnings_block([job.error], "Pipeline run failed"), True
-        store.bump_generation()
-        return ui.note(
-            f"{job.status_text()}. Results are in {job.result}; press "
-            f"Refresh sources and switch the format selector to processed "
-            f"results.", "good"), True
+            return (ui.warnings_block([job.error], "Pipeline run failed"), True,
+                    no_update, no_update)
+        # A finished run should not need the reader to press Refresh and change
+        # the format selector to discover its own results: rescan, and switch
+        # the picker to the processed output that now exists.
+        return (ui.note(f"{job.status_text()}. Results are in {job.result}.",
+                        "good"),
+                True, store.bump_generation(), "results")
 
 
 def _class_figure(run):

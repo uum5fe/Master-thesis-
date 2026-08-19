@@ -12,4 +12,9 @@ plotly>=5.18
 pyarrow>=12.0                  # Parquet output; without it the pipeline writes CSV
 databricks-sql-connector>=3.0  # datago source; not needed for file-system results
 gunicorn>=21.0                 # production server for the Dash app
+python-dotenv>=1.0             # NOT used by the app - app/settings.py reads
+                               # .env itself, deliberately, so that a flag beats
+                               # the environment beats the file and Windows
+                               # paths need no quoting. Installing it only stops
+                               # VS Code advising you to.
 pytest>=7.0                    # test suite

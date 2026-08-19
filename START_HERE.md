@@ -111,13 +111,28 @@ needed: it puts the project root on the import path itself.
 If you have already edited `app/app.py`, restore it from this archive rather
 than trying to repair it.
 
-### "Terminal environment injection is disabled"
+### VS Code's `.env` tips
 
-A VS Code notification, not an error — and it means VS Code has *found* your
-`.env`, so the file is where it should be. Dismiss it: the application reads
-`.env` itself and does not depend on VS Code or the shell putting anything into
-the environment. The setting it offers is already enabled in `.vscode/settings.json`
-for consistency, so the prompt should not return.
+Two of these go round in a circle, and neither affects the application:
+
+* *"An environment file is configured but terminal environment injection is
+  disabled"* — appears when the injection setting is off.
+* *"There are .env files present. Install python-dotenv to use them"* —
+  appears when it is on and `python-dotenv` is not installed.
+
+Both mean VS Code has **found** your `.env`, so the file is in the right place.
+The application reads it itself, in `app/settings.py`, and depends on nothing
+from the editor or the shell. To stop the tips for good:
+
+```powershell
+pip install python-dotenv
+```
+
+It is in `requirements.txt` as optional and the application never imports it.
+Its own reader is deliberate: a command-line flag beats the environment beats
+the file, and a Windows path goes in unquoted. If VS Code does inject the same
+values into a terminal, nothing changes — they are the same values, and the
+application's reader only fills in what is unset.
 
 To confirm the file is actually being read, ask the application rather than the
 editor:

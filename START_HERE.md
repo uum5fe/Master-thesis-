@@ -150,28 +150,38 @@ over `.env`:
 python run_dashboard.py --famos "D:\some other campaign" --open
 ```
 
-## Viewing raw .DAT
+## Processing raw .DAT into results
 
-Pointing at FAMOS recordings lists them; it does not produce spectra, because
-bronze/silver/gold has to run first. To let the app do that itself, add to
-`.env`:
+The pipeline is bundled in `local_eis/` — the same bronze/silver/gold modules
+that ran on Databricks. Nothing about the evaluation needs a cluster.
 
-```ini
-EIS_ALLOW_INLINE_PIPELINE=1
-EIS_CURR_CAL=C:\Users\uum5fe\OneDrive - Bosch Group\Local_Eis\cal\curr.csv
-EIS_TEMP_CAL=C:\Users\uum5fe\OneDrive - Bosch Group\Local_Eis\cal\temp.csv
-EIS_SCRATCH_RESULTS=C:\Users\uum5fe\Local_Eis_results
+```powershell
+python run_evaluation.py --list           # what recordings did it find?
+python run_evaluation.py --all            # process them
+python run_dashboard.py --open            # look at the results
 ```
 
-Then the Overview tab offers *Run pipeline on this selection*, which runs as a
-background job with progress. The shunt calibration is not optional: it is the
-only absolute scale in the chain once the potentiostat is gone, and without it
-the impedances come out in shunt volts per amp rather than in ohms. The app
-says so rather than producing numbers with the wrong units.
+For that you need, in `.env`:
 
-Results land in `EIS_SCRATCH_RESULTS`, which is automatically also a results
-root — press *Refresh sources* and switch the format selector to processed
-results.
+```ini
+EIS_FAMOS_ROOT=C:\Users\uum5fe\OneDrive - Bosch Group\Local_Eis\2611976_16_07
+EIS_RESULTS_ROOT=C:\Users\uum5fe\OneDrive - Bosch Group\Local_Eis\results
+EIS_CURR_CAL=C:\Users\uum5fe\OneDrive - Bosch Group\Local_Eis\cal\curr.csv
+EIS_TEMP_CAL=C:\Users\uum5fe\OneDrive - Bosch Group\Local_Eis\cal\temp.csv
+```
+
+`curr.csv` is 72 lines of `c0;c1`, `temp.csv` is 4 lines of `c0;c1`. The shunt
+calibration is not optional: it is the only absolute scale left in the chain
+once the potentiostat is gone, and without it every impedance is in shunt volts
+per amp rather than in ohms. `run_evaluation.py` refuses to start rather than
+producing numbers with the wrong units.
+
+Results are written to `<results root>\<order id>\<condition>\`, which is
+exactly where the dashboard looks — no copying step. Allow minutes per
+condition; bronze reads every sample of every card.
+
+To run it from inside the dashboard instead, add `EIS_ALLOW_INLINE_PIPELINE=1`
+and use *Run pipeline on this selection* on the Overview tab.
 
 ## Check the plate geometry before trusting any map
 

@@ -8,3 +8,4 @@ venv/
 
 # local settings, never committed
 .env
+local_eis/__pycache__/

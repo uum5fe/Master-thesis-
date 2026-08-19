@@ -8,6 +8,8 @@ could not be fitted - and all of them are invisible on a pretty heat map.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pandas as pd
 from dash import Input, Output, State, dcc, html
 
@@ -215,30 +217,44 @@ def _famos_body(selection):
     if ref is None:
         return ui.note("selection no longer present; press Refresh")
     problems = runner.preflight(ref, SETTINGS)
-    files = pd.DataFrame({"file": [f.rsplit("/", 1)[-1] for f in ref.files],
+    notes = runner.warnings_for(SETTINGS)
+    files = pd.DataFrame({"file": [Path(f).name for f in ref.files],
                           "path": list(ref.files)})
+    destination = runner.output_dir(ref, SETTINGS)
+    command = runner.build_command(ref, destination, SETTINGS)
+
     return html.Div([
         ui.panel([
             html.Div("Raw FAMOS recordings",
                      style={"fontWeight": 650, "marginBottom": "6px"}),
             ui.note("These are recordings, not results. Bronze/silver/gold has "
-                    "to run over them before there is a spectrum to plot. That "
-                    "is minutes of CPU over gigabytes, so it runs as a "
-                    "background job — and only where the deployment is sized "
-                    "for it."),
-            ui.table(files, "ov-famos-files", height="220px"),
+                    "to run over them before there is a spectrum to plot — "
+                    "minutes of CPU over gigabytes — so it runs as a "
+                    "background job in its own process."),
+            ui.table(files, "ov-famos-files", height="200px"),
+            ui.kv_table([
+                ("pipeline", str(runner.pipeline_dir(SETTINGS))),
+                ("writes to", str(destination)),
+            ]),
         ]),
-        ui.warnings_block(problems, "Cannot run here") if problems else
+        ui.warnings_block(problems, "Cannot run") if problems else
         ui.panel([
             html.Button("Run pipeline on this selection", id="ov-run-pipeline",
                         n_clicks=0,
                         style={"padding": "8px 14px", "border": "none",
                                "borderRadius": "6px", "cursor": "pointer",
                                "background": ui.COLOURS["accent"], "color": "white"}),
+            ui.note("Equivalent command line, if you would rather run it "
+                    "outside the app:", "muted"),
+            html.Pre(" ".join(command[1:]),
+                     style={"fontSize": "10.5px", "whiteSpace": "pre-wrap",
+                            "background": ui.COLOURS["bg"], "padding": "8px",
+                            "borderRadius": "5px", "margin": "4px 0 0 0"}),
             html.Div(id="ov-run-status", style={"marginTop": "10px"}),
             dcc.Interval(id="ov-run-poll", interval=2000, disabled=True),
             dcc.Store(id="ov-run-job"),
         ]),
+        ui.warnings_block(notes, "Before you start") if notes else html.Div(),
     ])
 
 

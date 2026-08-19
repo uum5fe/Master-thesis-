@@ -53,43 +53,58 @@ scale left in the chain once the potentiostat is gone. Without it the numbers
 come out in shunt volts per amp rather than in ohms, and every map is wrong by
 an unknown factor.
 
-## Running it on Windows
+## Running it
 
-`Local_EIS_fixed` is pure Python — numpy, scipy, pandas, matplotlib, plotly.
-The only Databricks-specific code was the notebook runner, and the `import
-core` in `bronze.py` and `gold.py` is already inside a `try/except`.
+The pipeline is bundled in `local_eis/` — the same modules that ran on
+Databricks, byte for byte, with only the notebook runner left behind. It is
+driven by `run_evaluation.py`, which reads the paths from `.env`:
 
 ```powershell
-pip install numpy scipy pandas matplotlib plotly
-
-cd C:\path\to\Local_EIS_fixed
-
-python main.py ^
-    --dat      "C:\Users\uum5fe\OneDrive - Bosch Group\Local_Eis\2611976_16_07" ^
-    --curr-cal "C:\Users\uum5fe\OneDrive - Bosch Group\Local_Eis\cal\curr.csv" ^
-    --temp-cal "C:\Users\uum5fe\OneDrive - Bosch Group\Local_Eis\cal\temp.csv" ^
-    --leepa 2611976 ^
-    --condition 45A ^
-    --out      "C:\Users\uum5fe\OneDrive - Bosch Group\Local_Eis\results\2611976\45A"
+python run_evaluation.py --list          # what recordings are there?
+python run_evaluation.py --all           # process every condition found
+python run_evaluation.py --condition 45A # or just one
+python run_evaluation.py --self-test     # check the install, no data needed
 ```
 
-Point `--out` straight at `<results root>\<order>\<condition>` and the output
-lands where the viewer looks. Repeat per condition, changing `--condition` and
-the last folder of `--out`.
+Output goes straight to `<EIS_RESULTS_ROOT>\<order id>\<condition>`, which is
+where the dashboard looks, so there is no copying step afterwards:
 
-Useful flags: `--self-test` checks the install with no data at all;
-`--no-png` skips the matplotlib figures, which the viewer does not read anyway;
-`--stop-after silver` skips the DRT and spatial inference when only spectra are
-wanted; `--equal-areas` is the deliberate simplification, recorded in the
-manifest whenever it is on.
+```powershell
+python run_dashboard.py --open
+```
 
-**Install matplotlib even if you pass `--no-png`** — `gold.py` imports it at
-module level in places. Without it the run completes bronze, silver and gold
-and then fails while writing figures, leaving `gold_manifest.json` unwritten;
-the viewer still works but the Overview statistics are missing.
+Two commands, start to finish. Verified end to end: a synthetic five-card set
+(145 MB) processed in 164 s, producing the full gold layer — 70/72 segments
+measured, `gold_manifest.json`, every map — and read straight back by the
+viewer.
 
-Expect minutes per condition. Bronze is the slow part because it reads every
-sample of every card; silver and gold then re-run from `bronze/` quickly.
+Useful flags: `--dry-run` prints the exact command without running it;
+`--equal-areas` is the deliberate simplification, recorded in the manifest;
+`--no-png` skips the pipeline's own figures, which the viewer never reads;
+`--stop-after silver` skips the DRT and spatial inference.
+
+**Install matplotlib even with `--no-png`** — `gold.py` imports it at module
+level. Without it the run completes bronze, silver and gold and then fails
+while writing figures, leaving `gold_manifest.json` unwritten; the maps still
+work but the Overview statistics are missing. `run_evaluation.py` warns before
+starting rather than after ten minutes of work.
+
+Expect minutes per condition: bronze reads every sample of every card. Silver
+and gold then re-run from `bronze/` quickly.
+
+### From inside the dashboard
+
+With `EIS_ALLOW_INLINE_PIPELINE=1` in `.env`, selecting a raw recording offers
+*Run pipeline on this selection* on the Overview tab. It runs the same command
+as a background job in its own process, streaming the pipeline's own log as
+progress, and shows the equivalent command line so it can be reproduced outside
+the app.
+
+### Using your own copy of the pipeline
+
+Point `EIS_PIPELINE_DIR` at it. The bundled copy is used when that is unset, so
+a newer pipeline from Databricks is either a straight file replacement into
+`local_eis/` or one line in `.env`.
 
 ## Two pipelines, one viewer
 

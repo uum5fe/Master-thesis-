@@ -109,6 +109,13 @@ class Settings:
     # -- calibration --------------------------------------------------------
     curr_cal: str = field(default_factory=lambda: _env("EIS_CURR_CAL"))
     temp_cal: str = field(default_factory=lambda: _env("EIS_TEMP_CAL"))
+    areas_file: str = field(default_factory=lambda: _env("EIS_AREAS_FILE"))
+
+    # -- the processing pipeline --------------------------------------------
+    #: Folder holding main.py, bronze.py, silver.py and gold.py. Empty means
+    #: the copy bundled in this project, which is the same code that ran on
+    #: Databricks.
+    pipeline_dir: str = field(default_factory=lambda: _env("EIS_PIPELINE_DIR"))
 
     # -- plates -------------------------------------------------------------
     default_plate: str = field(default_factory=lambda: _env("EIS_DEFAULT_PLATE"))
@@ -148,6 +155,8 @@ class Settings:
             ("FAMOS roots", ", ".join(self.famos_roots) or "(none set)"),
             ("datago", self.datago_metadata_table or "(not configured)"),
             ("SQL warehouse", self.warehouse_id or "(not configured)"),
+            ("Pipeline", self.pipeline_dir or "(bundled local_eis/)"),
+            ("Calibration", self.curr_cal or "(not set)"),
             ("Scratch results", self.scratch_results_root),
             ("Inline pipeline", "enabled" if self.allow_inline_pipeline else "disabled"),
             (".env file", DOTENV_LOADED or "(none found)"),

@@ -272,8 +272,14 @@ it never re-derives a spectrum of its own.
 
 ```bash
 pip install -r requirements.txt
-python run_dashboard.py --results /path/to/results --open
+
+python run_evaluation.py --all     # raw .DAT -> gold/silver results
+python run_dashboard.py --open     # look at them
 ```
+
+Both read their paths from one `.env`; see `.env.example`. The processing
+pipeline is bundled in `local_eis/` — the same modules that ran on Databricks —
+so nothing about the evaluation needs a cluster.
 
 `run_dashboard.py` prints the link (`http://127.0.0.1:8050`) and a count of the
 runs it discovered before the server starts, so an empty dropdown is diagnosable
@@ -328,9 +334,11 @@ app/
   data/            canonical run model, loaders, source discovery
   services/        figures, ECM fitting, pipeline jobs, caching
   views/           one module per tab
+local_eis/         the bronze/silver/gold pipeline, as it ran on Databricks
 app.yaml           Databricks App manifest
 run_dashboard.py   start the dashboard (prints the link)
-run_pipeline.py    pipeline CLI
+run_evaluation.py  process raw .DAT into results the dashboard reads
+run_pipeline.py    the packaged eis/ pipeline CLI
 tests/             synthetic generator + tests for pipeline and frontend
 config/example.yaml
 docs/EIS_PIPELINE_DEVELOPMENT_PLAN.md   three-tier development plan

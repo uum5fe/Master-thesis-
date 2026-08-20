@@ -282,8 +282,29 @@ eis/
 run_pipeline.py    CLI
 tests/             synthetic generator + 33 tests
 config/example.yaml
-docs/EIS_PIPELINE_DEVELOPMENT_PLAN.md   three-tier development plan
+
+databricks/local_eis/   the pipeline that runs in the Databricks workspace:
+                        bronze/silver/gold on FAMOS, the CSV evaluation path,
+                        both plate maps, and the runner notebook
+
+docs/EIS_PIPELINE_DEVELOPMENT_PLAN.md    three-tier development plan
+docs/GEN2_PLATE_AND_CSV_PIPELINE.md      the gen2 plate and the CSV path
 ```
 
 Notebooks contain no algorithms: every numerical step is an importable, tested
 module.
+
+## Two plates, two source formats
+
+The Databricks pipeline covers both hardware revisions of the R2-D2 measuring
+plate and both measurement file formats. Neither is a default you can ignore:
+
+| | |
+| --- | --- |
+| **Plate** | `gen1` = green / Kashyyyk, `gen2` = blue / Naboo. Same 45×20 pad grid and 72 segments; segments 37…72 are cut differently, so their areas — and those of the interior segments that gave pad rows to them — differ. Selecting the wrong one does not fail, it draws the right numbers on the wrong squares. |
+| **Source** | `famos` = five free-running cards, which need the measured inter-card synchronisation. `csv` = one logger with one clock, where that stage is not merely unnecessary but undefined; it is a separate pipeline sharing only the geometry and the Abgleich. |
+
+See [`docs/GEN2_PLATE_AND_CSV_PIPELINE.md`](docs/GEN2_PLATE_AND_CSV_PIPELINE.md)
+for the gen2 reconstruction and its evidence, what the Abgleich files say, the
+−11°-at-4.5 kHz measuring-chain roll-off that has never been corrected, and
+what the CSV path does instead of synchronisation.

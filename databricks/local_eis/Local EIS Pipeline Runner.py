@@ -112,6 +112,12 @@ except Exception:
 #                   route is a separate pipeline (csv_pipeline.py), not a
 #                   second reader in front of the same one.
 #
+# For the R2-D2 logger, point 'CSV file / folder' at the SWEEP FOLDER -- the
+# one holding metadata.csv and p1.csv, p2.csv, ...  Each point file carries a
+# single frequency, so the spectrum only exists once they are read together;
+# pointing at one file gives you that one frequency's plate maps and nothing
+# to fit.
+#
 # There is no FAMOS recording of the gen2 plate yet, so "gen2 + famos" is
 # rejected below rather than silently producing an empty run.
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -126,7 +132,8 @@ try:
     dbutils.widgets.text('csv_path', '', 'CSV file / folder (csv only)')
     dbutils.widgets.dropdown(
         'csv_dialect', 'auto',
-        ['auto', 'records', 'wide_time', 'long_time', 'freq', 'gamry'],
+        ['auto', 'r2d2', 'r2d2_sweep', 'records', 'wide_time', 'long_time',
+         'freq', 'gamry'],
         'CSV layout (csv only)')
     dbutils.widgets.text('csv_tones', '', 'CSV tones, comma separated (blank = detect)')
     dbutils.widgets.dropdown('leepa_id', _default, AVAILABLE_ORDERS, 'Order ID (Leepa)')

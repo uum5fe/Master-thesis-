@@ -150,6 +150,82 @@ def make_sweep_csv(path: Path, segments, tones=None, seed=11):
     return path, tones
 
 
+def make_r2d2_sweep(folder: Path, segments, tones=None, fs=11001.1026,
+                    scan_step_us=None, dur_s=0.9, seed=23):
+    """A sweep in the R2-D2 logger's own format: metadata.csv + p<k>.csv.
+
+    Built the way the hardware builds it, which is the point of the test:
+
+      * one point file per frequency;
+      * 80 channels sampled one after another inside each row, each carrying
+        the phase the analogue waveform actually had at ITS instant;
+      * s columns already a current density (the logger applies the Abgleich),
+        temps already in degC;
+      * uc1..uc4 as two differential pairs around a 0.61 V cell.
+
+    Tones above fs/2 are written as the hardware would record them -- folded.
+    Nothing special is done to make the alias: sampling each channel at its
+    own instant and printing the value produces it, exactly as the rig does.
+    """
+    folder.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(seed)
+    tones = list(tones if tones is not None
+                 else [10.0, 40.0, 150.0, 600.0, 2500.0, 9000.0])
+    cols = ([f"s{s}" for s in segments] + ["uc1", "uc2", "uc3", "uc4"]
+            + [f"temp{i}" for i in range(1, 5)])
+    # The real logger spreads its 80 channels across 96 % of the sample
+    # period.  Keep that invariant rather than the 1.1 us step, because it is
+    # the SPAN that gives the scan its leverage on the analogue frequency.
+    if scan_step_us is None:
+        scan_step_us = 0.96e6 / fs / max(len(cols) - 1, 1)
+    shifts = np.arange(len(cols)) * scan_step_us          # microseconds
+
+    (folder / "metadata.csv").write_text(
+        "R2-D2 Local EIS Measurements\r\n"
+        "Date: 20.04.2026 10:21\r\n"
+        "Software Version: V2.5\r\n"
+        "Coefficients: TestPlate\r\n"
+        "Leepa: FC0000000-00\r\n"
+        "Segment 1: Cathode inlet\r\n")
+
+    j_dc = {s: 1.8 + 0.004 * s for s in segments}
+    u_dc = 0.61
+    for k, f in enumerate(tones, start=1):
+        n = int(fs * dur_s)
+        row_t = np.arange(n) / fs
+        U_amp = 4e-4
+        lines = ["\t".join(["timestamp"] + cols),
+                 "\t".join(["timeshifts"] + [f"{v:.6f}" for v in shifts])]
+        chan = np.empty((n, len(cols)))
+        for c, name in enumerate(cols):
+            tt = row_t + shifts[c] * 1e-6          # this channel's instants
+            if name.startswith("temp"):
+                chan[:, c] = 60.0 + 4.0 * int(name[-1]) + rng.normal(0, 0.03, n)
+                continue
+            if name.startswith("uc"):
+                # uc1/uc3 sit at the anode reference, uc2/uc4 at the cathode;
+                # the DIFFERENCE is the cell voltage, so each half carries
+                # half the modulation.
+                base = 0.0 if name in ("uc1", "uc3") else u_dc
+                sign = -0.5 if name in ("uc1", "uc3") else 0.5
+                chan[:, c] = base + sign * U_amp * np.cos(2 * np.pi * f * tt) \
+                    + rng.normal(0, 2e-6, n)
+                continue
+            s = int(name[1:])
+            Z = z_truth(np.array([f]), truth(s))[0]
+            amp = U_amp / abs(Z)
+            chan[:, c] = (j_dc[s]
+                          + amp * np.cos(2 * np.pi * f * tt - np.angle(Z))
+                          + rng.normal(0, 2e-5, n))
+        for i in range(n):
+            us = 429062 + int(round(i * 1e6 / fs))
+            ss, us = 11 + us // 1_000_000, us % 1_000_000
+            lines.append(f"2026.04.20 10:21:{ss:02d},{us:06d}\t"
+                         + "\t".join(f"{v:.6f}" for v in chan[i]))
+        (folder / f"p{k}.csv").write_text("\n".join(lines) + "\n")
+    return folder, tones
+
+
 def make_freq_csv(path: Path, segments, unit="mohm_cm2"):
     k = 1000.0 if unit == "mohm_cm2" else 1.0
     f = np.geomspace(0.1, 5000.0, 40)
@@ -173,6 +249,13 @@ def _cfg(td: Path, csv_path: Path, plate: str, out: str):
         csv_tones=tuple(TONES.tolist()),
         f_min_hz=0.2, f_max_hz=5000.0,
         write_png=False, write_html=False, verbose=False)
+
+
+class _Log:
+    """Quiet stand-in for the pipeline logger, for the direct-call checks."""
+    def info(self, *a, **k): pass
+    def warning(self, *a, **k): pass
+    def debug(self, *a, **k): pass
 
 
 def _report(name, got, want, tol, unit=""):
@@ -294,7 +377,117 @@ def main() -> int:
                              rows[s]["R_ohmic_mohm_cm2"],
                              1000 * truth(s)["Rs"], 0.25, " mΩ·cm²")
 
-        # --- 7. the plate selection must change the areas -------------------
+        # --- 7. the R2-D2 logger format -------------------------------------
+        # The real thing: one file per frequency, a channel scan inside every
+        # row, and one tone deliberately placed above fs/2 so the alias path
+        # is exercised rather than assumed.
+        print("\n  R2-D2 logger sweep")
+        segs3 = [1, 9, 20, 37, 49, 72]
+        fold, sw = make_r2d2_sweep(td / "r2d2", segs3)
+        cfg = _cfg(td, fold, "gen1", "out_r2d2").replace(
+            csv_tones=(), f_min_hz=1.0, f_max_hz=5000.0,
+            min_points_per_spectrum=4)
+        man = csv_pipeline.run_csv(cfg)
+        rep = man.get("r2d2", {})
+        ok = man["schedule"]["mode"] == "r2d2_sweep" and rep.get("n_failed") == 0
+        print(f"    {len(rep.get('points', []))} point files read, "
+              f"{rep.get('n_failed')} failed              "
+              f"{'PASS' if ok else 'FAIL'}")
+        fails += not ok
+
+        got = {round(p["f_analogue_hz"], 1) for p in rep["points"] if p["ok"]}
+        matched = sum(1 for f in sw
+                      if any(abs(g - f) < 0.02 * f for g in got))
+        ok = matched == len(sw)
+        print(f"    {matched}/{len(sw)} analogue frequencies recovered "
+              f"(one above fs/2)   {'PASS' if ok else 'FAIL'}")
+        if not ok:
+            print(f"      wanted {sw}\n      got    {sorted(got)}")
+        fails += not ok
+
+        under = [p for p in rep["points"] if p.get("undersampled")]
+        ok = len(under) == sum(1 for f in sw if f > 0.5 * 11001.1026)
+        print(f"    undersampled points flagged: {len(under)}"
+              f"                    {'PASS' if ok else 'FAIL'}")
+        fails += not ok
+
+        rows = _read_ecm(td / "out_r2d2")
+        for s in (1, 72):
+            if str(rows.get(s, {}).get("ok")) not in ("True", "1.0"):
+                print(f"    segment {s} ECM did not converge: "
+                      f"{rows.get(s, {}).get('reason', 'missing')}   FAIL")
+                fails += 1
+                continue
+            fails += _report(f"segment {s} R_ohmic",
+                             rows[s]["R_ohmic_mohm_cm2"],
+                             1000 * truth(s)["Rs"], 0.20, " mΩ·cm²")
+
+        # The scan skew is the whole point of the format: check that ignoring
+        # it would be visibly wrong at the top of the band.
+        import csv_source as _cs
+        pts = _cs.read_r2d2_sweep(fold)
+        span = max(pts[0].timeshifts.values()) - min(pts[0].timeshifts.values())
+        worst = 360.0 * max(sw) * span
+        print(f"    scan span {1e6*span:.1f} us = {worst:.0f}° at {max(sw):.0f} Hz"
+              f"   (why the deskew is not optional)")
+
+        # --- 8. the real fixture --------------------------------------------
+        # Synthetic data proves the algebra; it does not prove the parser
+        # against the hardware's own output, which is where dialects bite.
+        fx = Path(__file__).with_name("fixtures") / "r2d2_sample"
+        if (fx / "p1.csv").exists():
+            print("\n  real fixture (2500 rows of a real p1.csv)")
+            import csv_source as _cs
+            ok = _cs.detect_dialect(fx) == "r2d2_sweep"
+            pts = _cs.read_r2d2_sweep(fx)
+            m0 = pts[0]
+            s0 = m0.summary()
+            checks = [
+                ("dialect detected as a sweep", ok),
+                ("80 channels", s0["n_channels"] == 80),
+                ("72 segments", len(m0.segments) == 72),
+                ("scan spans ~96 % of a sample",
+                 0.9 < s0["scan_fraction_of_sample"] < 1.0),
+                ("s columns read as A/cm2", m0.seg_unit == "A/cm2"),
+                ("temps read as degC", m0.temp_unit == "degC"),
+                ("coefficient set recorded",
+                 m0.meta["metadata"].get("coefficients") == "Coruscant"),
+                ("four uc taps", sorted(m0.aux) == ["uc1", "uc2", "uc3", "uc4"]),
+            ]
+            for label, good in checks:
+                print(f"    {label:38s}"
+                      f"                {'PASS' if good else 'FAIL'}")
+                fails += not good
+
+            res = csv_pipeline.r2d2_point(
+                m0, _cfg(td, fx, "gen1", "out_fx").replace(
+                    f_min_hz=50.0, f_max_hz=5000.0), _Log())
+            z = res["zone"]
+            good = (res["ok"] and abs(res["f_alias_hz"] - 923.1) < 2.0
+                    and z["undersampled"] and z["zone"] == 1
+                    and z["R"] > 0.7 and z["R_baseband"] < 0.3)
+            print(f"    alias {res.get('f_alias_hz', float('nan')):.1f} Hz -> "
+                  f"analogue {res.get('f_hz', float('nan')):.0f} Hz, zone "
+                  f"{z['zone']}, R {z['R']:.2f} vs {z['R_baseband']:.2f}"
+                  f"   {'PASS' if good else 'FAIL'}")
+            fails += not good
+
+            # A record with no excitation must be refused, not analysed
+            # against the 999 Hz instrument artefact that lives in it.
+            head = m0.u_seg["1"].size
+            m_quiet = _cs.read_r2d2(fx / "p1.csv")
+            for k in list(m_quiet.u_seg):
+                m_quiet.u_seg[k] = m_quiet.u_seg[k] * 0 + 1.9 \
+                    + np.random.default_rng(0).normal(0, 1e-3, head)
+            q = csv_pipeline.r2d2_point(m_quiet, _cfg(td, fx, "gen1", "o2"), _Log())
+            good = not q.get("ok") and "no excitation" in q.get("reason", "")
+            print(f"    a record with no excitation is refused"
+                  f"                {'PASS' if good else 'FAIL'}")
+            fails += not good
+        else:
+            print("\n  real fixture: not present, skipped")
+
+        # --- 9. the plate selection must change the areas -------------------
         print("\n  plate selection")
         a1 = geom.areas("gen1")
         a2 = geom.areas("gen2")

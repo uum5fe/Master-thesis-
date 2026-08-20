@@ -292,6 +292,396 @@ def _detect_sweep_windows(t, y, fs, uniform, f_lo, f_hi, cfg):
 
 
 # ===========================================================================
+# 1b. The R2-D2 logger: one file per frequency, one scan per row
+# ===========================================================================
+# A point file gives 80 channels sampled one after the other inside each row,
+# with the acquisition instant of every channel printed in the `timeshifts`
+# header row.  Two things follow, and the second is the one that bites.
+#
+# 1. THE ROWS ARE NOT SIMULTANEOUS SAMPLES.  Segment 1 is taken at 0 us and
+#    the cell-voltage taps at 79-82 us.  The impedance is the ratio of those
+#    two channels, so 80 us of skew sits directly in it: 29 degrees at 1 kHz,
+#    a full quadrant near the top of the band.  Correcting it needs no fit --
+#    the delays are printed in the file.  `deskew` applies them.
+#
+# 2. THE SCAN IS ALSO A MEASUREMENT OF THE EXCITATION FREQUENCY, and it does
+#    not have to agree with the tone the record appears to contain.  Across
+#    one row the 80 channels sample the analogue waveform at 1.1 us intervals,
+#    so the phase difference between channel k and channel 0 is
+#    2*pi*f_analogue*tau_k -- at the TRUE frequency of the signal, whatever
+#    the row-rate DFT reports.  Compare the two and undersampling becomes
+#    visible instead of invisible.
+#
+#    On the delivered p1.csv the record contains a clean tone at 923.08 Hz
+#    against fs = 11001.10 Hz.  Taken at face value, 923 Hz would rotate the
+#    phase by 0.33 deg/us and produce 29 degrees across the 87 us scan.  The
+#    measured rotation is ~307 degrees, an order of magnitude more, and
+#    de-skewing at 923 Hz leaves the 72 segment phasors scattered (resultant
+#    R = 0.14, i.e. no common phase at all) while de-skewing at fs - 923 Hz
+#    collapses them (R = 0.84).  The analogue tone is near 10 kHz; the 923 Hz
+#    in the record is its alias, folded by a sampler running at 11 kHz with
+#    nothing in front of it that stops 10 kHz.
+#
+#    That is a property of the rig, not of this code, and it is reported
+#    rather than silently worked around: `nyquist_zone` returns the frequency
+#    the scan implies, the resultant at each candidate, and a verdict.  Supply
+#    the sweep's own frequency list through `cfg.csv_tones` and it is used and
+#    checked instead of inferred -- the scan resolves f only to about
+#    1/scan_span = 11 kHz, which is the same ambiguity as the aliasing itself,
+#    so it can identify the Nyquist zone but not replace knowing it.
+
+
+def deskew(A: complex, tau: float, freq: float, conjugated: bool = False
+           ) -> complex:
+    """Move one channel's phasor back to the row's nominal instant.
+
+    A channel sampled tau seconds late carries an extra phase +w*tau, so the
+    correction is a multiplication by exp(-j w tau).  `freq` must be the
+    ANALOGUE frequency: for an undersampled point that is the true tone, not
+    the alias the DFT sees.
+
+    When the point is undersampled into an odd Nyquist zone the alias is also
+    conjugated -- sampling f = fs - f_a produces cos(w_a t - phi) rather than
+    cos(w_a t + phi) -- so the measured phasor is conj(A_true)*exp(-j w tau)
+    and recovering A_true takes a conjugation as well.
+    """
+    if conjugated:
+        return np.conj(A) * np.exp(-1j * 2 * np.pi * freq * tau)
+    return A * np.exp(-1j * 2 * np.pi * freq * tau)
+
+
+def nyquist_zone(phasors: np.ndarray, taus: np.ndarray, f_alias: float,
+                 fs: float, max_zone: int = 4) -> dict:
+    """Which analogue frequency does the channel scan say this point was at?
+
+    All segments of one plate answer the same imposed current, so once the
+    scan skew is removed their phasors must share a phase to within the real
+    spread of the local impedance.  The resultant length
+
+        R(f) = | sum_k  u_k exp(-j 2 pi f tau_k) | / N ,   u_k = A_k/|A_k|
+
+    is therefore a direct score for a candidate analogue frequency.  Every
+    candidate consistent with the observed alias is tried -- f_alias itself,
+    then m*fs +- f_alias with the conjugation each zone implies -- and the
+    best is returned with the runner-up, because the scan spans less than one
+    sample period and so resolves f only to about fs.  That is enough to tell
+    a baseband point from an undersampled one; it is not enough to pick
+    between neighbouring zones on its own.
+    """
+    u = phasors / np.maximum(np.abs(phasors), 1e-300)
+
+    def score(f, conj_):
+        v = np.conj(u) if conj_ else u
+        return float(abs(np.sum(v * np.exp(-1j * 2 * np.pi * f * taus))) / u.size)
+
+    cands = [(float(f_alias), False, 0)]
+    for m in range(1, max_zone + 1):
+        cands.append((m * fs - f_alias, True, m))     # odd zone: conjugated
+        cands.append((m * fs + f_alias, False, m))    # even zone: not
+    scored = sorted(((score(f, c), f, c, m) for f, c, m in cands),
+                    reverse=True)
+    best_R, best_f, best_c, best_m = scored[0]
+    base_R = score(float(f_alias), False)
+
+    return {
+        "f_alias_hz": float(f_alias),
+        "f_analogue_hz": best_f,
+        "conjugated": bool(best_c),
+        "zone": int(best_m),
+        "R": best_R,
+        "R_baseband": base_R,
+        "runner_up_hz": scored[1][1] if len(scored) > 1 else float("nan"),
+        "runner_up_R": scored[1][0] if len(scored) > 1 else float("nan"),
+        "undersampled": bool(best_m > 0 and best_R > base_R + 0.15),
+        "candidates": [{"f_hz": round(f, 4), "zone": m, "conjugated": c,
+                        "R": round(r, 4)} for r, f, c, m in scored[:5]],
+    }
+
+
+def r2d2_point(m, cfg, log, f_true: float | None = None) -> dict:
+    """One point file -> one frequency and one phasor per channel.
+
+    Every channel is fitted separately at the alias frequency and then moved
+    back to the row instant with its own printed delay.  The cell voltage is
+    formed as a DIFFERENCE OF PHASORS afterwards, never as a difference of
+    samples: uc1 and uc2 are themselves 1.1 us apart, and subtracting them
+    row-wise would bake that into the reference before anything could remove
+    it.
+    """
+    t = m.t
+    fs = m.fs_nominal
+    n = t.size
+
+    seg_keys = m.segments
+    aux_keys = sorted(m.aux)
+
+    # THE TONE IS FOUND ON THE SEGMENTS, NOT ON ONE CHANNEL.
+    # The obvious choice -- peak-pick the loudest cell-voltage tap -- is
+    # fragile, and the delivered file shows why: uc1 carries a 3488 Hz
+    # component larger than the excitation at 923 Hz, and on a short record
+    # the picker locks onto it.  The excitation is the one thing that drives
+    # all 72 segments coherently, so averaging the amplitude spectra over the
+    # segments reinforces it and averages down anything that is not common.
+    # On the delivered file that turns a wrong answer into the right one and
+    # costs one FFT per channel.
+    f_lo = max(cfg.f_min_hz, 3.0 / max(t[-1] - t[0], 1e-9))
+    f_hi = min(cfg.f_max_hz, 0.45 * fs)
+
+    n_fft = t.size
+    win = np.hanning(n_fft)
+    wsum = float(np.sum(win))
+    acc = None
+    for k in seg_keys:
+        y = m.u_seg[k]
+        Y = np.abs(np.fft.rfft((y - y.mean()) * win)) * 2.0 / wsum
+        acc = Y / max(float(np.std(y)), 1e-30) if acc is None \
+            else acc + Y / max(float(np.std(y)), 1e-30)
+    if acc is None:
+        return {"ok": False, "reason": "no segment channels"}
+    mean_spec = acc / len(seg_keys)
+
+    fgrid = np.fft.rfftfreq(n_fft, d=1.0 / fs)
+    band = (fgrid >= f_lo) & (fgrid <= f_hi)
+    if band.sum() < 8:
+        return {"ok": False, "reason": f"band {f_lo:.3g}..{f_hi:.3g} Hz holds "
+                                       f"fewer than 8 bins"}
+    f0 = float(fgrid[band][int(np.argmax(mean_spec[band]))])
+
+    # IS THERE AN EXCITATION AT ALL?  A point file can be all lead-in -- the
+    # delivered one carries 0.25 s of it -- and a persistent instrument
+    # artefact sits at 999 Hz at about 6x the noise floor.  The excitation is
+    # 380x.  Refusing a point with nothing in it is better than reporting an
+    # impedance measured against a switching artefact.
+    peak_ratio = float(np.max(mean_spec[band]) / (np.median(mean_spec[band]) + 1e-30))
+    if peak_ratio < 10.0:
+        return {"ok": False,
+                "reason": f"no excitation: the strongest common tone in the "
+                          f"segments is only {peak_ratio:.1f}x the noise "
+                          f"floor ({f0:.1f} Hz). A point file that is all "
+                          f"lead-in looks like this."}
+
+    # The phase reference is still a cell-voltage tap -- the impedance is
+    # measured against the cell, not against another segment.
+    ref_key = max(aux_keys, key=lambda k: float(np.std(m.aux[k]))) if aux_keys \
+        else max(seg_keys, key=lambda k: float(np.std(m.u_seg[k])))
+    ref = m.aux[ref_key] if ref_key in m.aux else m.u_seg[ref_key]
+
+    f_alias, _A, _r, _snr = utils.fit4(ref, fs, f0)
+    if not (0.98 * f0 <= f_alias <= 1.02 * f0):
+        f_alias = f0            # the refit ran off to a neighbouring feature
+
+    # THE POINT FILE IS A BURST, NOT A CONTINUOUS RECORDING.
+    # The delivered p1.csv runs 1.765 s and the excitation is only present
+    # from 0.25 s to 1.35 s -- a quarter of a second of lead-in, four tenths
+    # of lead-out, and in both of them a persistent 999 Hz artefact that is
+    # 6x the noise floor while the excitation is 380x.  Fitting the whole
+    # record inflates the residual, and therefore sigma, by the silent
+    # fraction; worse, a file cut inside the lead-in would be "analysed"
+    # against the artefact.  So find the burst first.  `eis_local` already
+    # locates a dwell from a demodulated envelope and then shrinks it while
+    # the SNR improves -- the same job on the same kind of signal, so it is
+    # reused rather than rewritten.
+    #
+    # The envelope is taken on the COMPOSITE of all segments, normalised
+    # channel by channel: the excitation is the one thing common to all 72,
+    # so the composite has ~sqrt(72) times the SNR of any single channel and
+    # the burst edges are unambiguous in it.
+    comp = np.zeros(t.size)
+    for k in seg_keys:
+        y = m.u_seg[k]
+        comp += (y - y.mean()) / max(float(np.std(y)), 1e-30)
+    comp /= len(seg_keys)
+
+    i0, i1 = 0, t.size
+    try:
+        import eis_local
+        env, wlen = eis_local.demod_envelope(comp, fs, f_alias)
+        # Compare the peak against a LOW PERCENTILE, not the median: on the
+        # delivered file the burst is 62 % of the record, so the median of
+        # the envelope sits inside the burst and a median test would conclude
+        # there is nothing to window to.
+        floor = float(np.percentile(env, 10)) if env.size > 4 else 0.0
+        if env.size > 4 and float(np.max(env)) > 3.0 * floor:
+            centre = int(np.argmax(env)) + wlen // 2
+            i0, i1 = eis_local.dwell_window(comp, fs, f_alias, centre)
+            i0, i1 = eis_local.polish_window(comp, fs, f_alias, i0, i1)
+    except Exception:                                # noqa: BLE001
+        i0, i1 = 0, t.size
+    if (i1 - i0) < max(32, cfg.min_cycles_per_dwell * fs / max(f_alias, 1e-9)):
+        i0, i1 = 0, t.size                           # burst not found; use all
+    burst = {"i0": int(i0), "i1": int(i1),
+             "found": bool(i1 - i0 < t.size),
+             "peak_over_floor": round(peak_ratio, 1),
+             "fraction": round((i1 - i0) / t.size, 4),
+             "t0_s": round(float(t[i0]), 4),
+             "t1_s": round(float(t[min(i1, t.size) - 1]), 4)}
+
+    # Re-estimate the frequency inside the burst, where it is not diluted by
+    # the silent stretches.
+    f_b, _A, _r, _snr = utils.fit4(comp[i0:i1], fs, f_alias)
+    if 0.98 * f_alias <= f_b <= 1.02 * f_alias:
+        f_alias = f_b
+
+    A_raw, r_rms, taus = {}, {}, {}
+    for key, arr in list(m.u_seg.items()) + [(k, m.aux[k]) for k in aux_keys]:
+        col = f"s{key}" if key in m.u_seg else key
+        a, rr, _s = utils.fit3(arr[i0:i1], fs, f_alias)
+        A_raw[key], r_rms[key] = a, rr
+        taus[key] = m.timeshifts.get(col, 0.0)
+
+    seg_A = np.array([A_raw[k] for k in seg_keys])
+    seg_tau = np.array([taus[k] for k in seg_keys])
+    zone = nyquist_zone(seg_A, seg_tau, f_alias, fs)
+
+    if f_true is not None:
+        # An operator-supplied frequency wins, but it is checked: if the scan
+        # disagrees, the list and the file are not describing the same point.
+        f_ana = float(f_true)
+        k = int(round(f_ana / fs))
+        conj_ = bool(k > 0 and (f_ana < k * fs))
+        zone["f_given_hz"] = f_ana
+        zone["agrees_with_scan"] = bool(
+            abs(f_ana - zone["f_analogue_hz"]) < 0.25 * fs)
+    else:
+        f_ana = zone["f_analogue_hz"]
+        conj_ = zone["conjugated"]
+
+    A = {k: deskew(A_raw[k], taus[k], f_ana, conj_) for k in A_raw}
+
+    # Cell voltage: uc1,uc3 sit near 0 V and uc2,uc4 near the cell potential,
+    # so (uc2-uc1) and (uc4-uc3) are two independent measurements of the same
+    # cell.  Both are kept: their disagreement is a lead-placement diagnostic
+    # that no single-tap reading can show.
+    pairs = []
+    for lo, hi in (("uc1", "uc2"), ("uc3", "uc4")):
+        if lo in A and hi in A:
+            pairs.append(A[hi] - A[lo])
+    if not pairs:
+        pairs = [A[k] for k in aux_keys[:1]] or [None]
+    if pairs[0] is None:
+        return {"ok": False, "reason": "no cell-voltage channel"}
+    U = np.mean(pairs, axis=0)
+
+    spread = (abs(abs(pairs[1]) / abs(pairs[0]) - 1.0)
+              if len(pairs) == 2 and abs(pairs[0]) > 0 else 0.0)
+
+    return {"ok": True, "f_hz": f_ana, "f_alias_hz": f_alias, "fs_hz": fs,
+            "n": int(i1 - i0), "n_rows": n, "burst": burst,
+            "U": U, "A": A, "r_rms": r_rms, "zone": zone,
+            "uc_pair_spread": float(spread), "ref_channel": ref_key,
+            "conjugated": conj_}
+
+
+def r2d2_sweep_spectra(points: list, cfg, log) -> tuple[dict, dict]:
+    """Assemble the per-segment spectra from a folder of point files."""
+    tones = list(cfg.csv_tones) if cfg.csv_tones else []
+    if tones and len(tones) != len(points):
+        log.warning(f"  csv_tones has {len(tones)} entries for "
+                    f"{len(points)} point files; the list is used in file "
+                    f"order and the extra entries are ignored.")
+
+    per_seg: dict[str, list] = {}
+    report = {"points": [], "n_undersampled": 0, "n_failed": 0}
+
+    for i, m in enumerate(points):
+        f_given = tones[i] if i < len(tones) else None
+        res = r2d2_point(m, cfg, log, f_true=f_given)
+        name = m.meta.get("point", f"p{i+1}")
+        if not res.get("ok"):
+            log.warning(f"  {name}: {res.get('reason')}")
+            report["n_failed"] += 1
+            report["points"].append({"point": name, "ok": False,
+                                     "reason": res.get("reason")})
+            continue
+
+        z = res["zone"]
+        if z["undersampled"] and f_given is None:
+            report["n_undersampled"] += 1
+        log.info(f"  {name}: alias {res['f_alias_hz']:9.3f} Hz -> analogue "
+                 f"{res['f_hz']:10.3f} Hz  (zone {z['zone']}, R={z['R']:.3f} "
+                 f"vs baseband {z['R_baseband']:.3f})"
+                 + ("  UNDERSAMPLED" if z["undersampled"] else ""))
+
+        U = res["U"]
+        f = res["f_hz"]
+        for seg in m.segments:
+            a = res["A"][seg]
+            if a == 0 or not np.isfinite(abs(a)):
+                continue
+            # m.seg_unit == "A/cm2": the logger already applied the Abgleich,
+            # so the ratio is directly an area-specific impedance and K must
+            # NOT be applied again.
+            Z = U / a
+            n = res["n"]
+            sig = float(np.hypot(
+                np.sqrt(2.0 / n) * res["r_rms"].get("uc2", 0.0) / max(abs(U), 1e-30),
+                np.sqrt(2.0 / n) * res["r_rms"][seg] / max(abs(a), 1e-30)))
+            per_seg.setdefault(seg, []).append((f, Z, sig, n))
+
+        report["points"].append({
+            "point": name, "ok": True, "f_alias_hz": round(res["f_alias_hz"], 4),
+            "f_analogue_hz": round(res["f_hz"], 4), "zone": z["zone"],
+            "R": round(z["R"], 4), "R_baseband": round(z["R_baseband"], 4),
+            "undersampled": z["undersampled"],
+            "uc_pair_spread": round(res["uc_pair_spread"], 4),
+            "n_samples": res["n"], "fs_hz": round(res["fs_hz"], 4)})
+
+    # DC operating point and plate temperature, from the first point file --
+    # the sweep is one steady state, so one file is enough and averaging over
+    # all of them would hide a drift rather than show it.
+    m0 = points[0]
+    j_dc = {k: float(np.mean(v)) for k, v in m0.u_seg.items()}
+    T_seg: dict[str, float] = {}
+    if m0.temps and m0.temp_unit == "degC":
+        import r2d2_geometry as _g
+        sensor_T = {k: float(np.mean(v)) for k, v in m0.temps.items()}
+        T_seg = _g.segment_temperatures(sensor_T)
+        report["temps_C"] = {k: round(v, 3) for k, v in sensor_T.items()}
+    areas0 = utils.segment_areas(cfg)
+    report["dc"] = {
+        "j_median_A_cm2": round(float(np.median(list(j_dc.values()))), 4),
+        "j_min_A_cm2": round(float(min(j_dc.values())), 4),
+        "j_max_A_cm2": round(float(max(j_dc.values())), 4),
+        "I_closure_A": round(float(sum(j_dc[k] * areas0[k]
+                                       for k in j_dc if k in areas0)), 2),
+        "note": "sum(j*A) over the measured segments, on the selected plate",
+    }
+    spreads = [p["uc_pair_spread"] for p in report["points"]
+               if p.get("ok") and p.get("uc_pair_spread") is not None]
+    if spreads and max(spreads) > 0.10:
+        report["uc_pair_warning"] = round(float(max(spreads)), 4)
+        log.warning(
+            f"  UC    : the two cell-voltage pairs (uc2-uc1 and uc4-uc3) "
+            f"disagree by up to {100*max(spreads):.0f} % in amplitude. They "
+            f"measure the same cell, so this is a lead-placement or contact "
+            f"difference, and it sets a floor on how well any single "
+            f"reference defines Z. Their mean is used.")
+
+    spectra: dict[str, SegmentSpectrum] = {}
+    for seg, rows in per_seg.items():
+        rows.sort(key=lambda r: r[0])
+        f = np.array([r[0] for r in rows])
+        Z = np.array([r[1] for r in rows])
+        s = np.array([r[2] for r in rows])
+        nn = np.array([r[3] for r in rows])
+        flags = ["seg_unit=A/cm2", "timeshift_deskew"]
+        if any(p.get("undersampled") for p in report["points"] if p.get("ok")):
+            flags.append("contains_undersampled_points")
+        # The plate answers one imposed current, so a global sign flip is
+        # possible; decide it on the lowest decade where |Z| is largest and a
+        # residual delay cannot rotate the point.
+        lo = f <= max(f.min() * 10, np.median(f))
+        if lo.sum() >= 1 and np.nansum(np.real(Z[lo]) / np.maximum(s[lo], 1e-9)) < 0:
+            Z = -Z
+            flags.append("polarity_flipped")
+        spectra[seg] = SegmentSpectrum(
+            seg, f, Z, s, 20 * np.log10(1.0 / np.maximum(s, 1e-12)), nn, flags,
+            T_C=float(T_seg.get(seg, np.nan)), K=float("nan"),
+            j_dc=float(j_dc.get(seg, np.nan)))
+    return spectra, report
+
+
+# ===========================================================================
 # 2. Impedance
 # ===========================================================================
 
@@ -824,6 +1214,31 @@ def write_outputs(spectra, ecm, agg, cfg, log, extra: dict) -> dict:
                                     f"({len(vals)} segments, CSV source)")
             maps[param] = str(p)
 
+        # A sweep too short to fit anything still says something: |Z| and the
+        # phase at the one measured frequency are a plate map in their own
+        # right, and they are what a single point file is for.
+        n_f = int(np.median([sp.freq.size for sp in spectra.values()])) \
+            if spectra else 0
+        if n_f < 6 and spectra:
+            f_ref = float(np.median([sp.freq[0] for sp in spectra.values()]))
+            zmag = {s: 1000 * float(np.abs(sp.Z[0])) for s, sp in spectra.items()}
+            zphi = {s: float(np.degrees(np.angle(sp.Z[0])))
+                    for s, sp in spectra.items()}
+            for nm, val, unit in (("Z_mag", zmag, "mΩ·cm²"),
+                                  ("Z_phase", zphi, "°")):
+                p = geom.plot_map(out / f"map_{nm}_{f_ref:.0f}Hz.png", val,
+                                  label=f"|Z|  [{unit}]" if nm == "Z_mag"
+                                        else f"arg Z  [{unit}]",
+                                  title=f"{geom.ACTIVE_PLATE.title} — {nm} at "
+                                        f"{f_ref:.1f} Hz ({len(val)} segments)")
+                maps[f"{nm}_at_f"] = str(p)
+            jdc = {s: sp.j_dc for s, sp in spectra.items()
+                   if np.isfinite(sp.j_dc)}
+            if len(jdc) > 3:
+                maps["j_dc"] = str(geom.plot_map(
+                    out / "map_j_dc.png", jdc, label="j  [A/cm²]",
+                    title=f"{geom.ACTIVE_PLATE.title} — DC current density"))
+
         # Nyquist, all segments plus the cell aggregate
         fig, ax = plt.subplots(figsize=(7.5, 6.5))
         for seg in sorted(spectra, key=int):
@@ -878,7 +1293,50 @@ def run_csv(cfg, stop_after: str = "gold") -> dict:
         raise ValueError("cfg.csv_path is not set; the CSV path needs a file "
                          "or a folder to read.")
 
-    m = csv_source.read(cfg.csv_path, cfg.csv_dialect)
+    dialect = (csv_source.detect_dialect(cfg.csv_path)
+               if cfg.csv_dialect in ("auto", "", None) else cfg.csv_dialect)
+
+    # ---- the R2-D2 logger: a folder of one-frequency point files ----------
+    if dialect in ("r2d2", "r2d2_sweep"):
+        points = (csv_source.read_r2d2_sweep(cfg.csv_path)
+                  if dialect == "r2d2_sweep"
+                  else [csv_source.read_r2d2(cfg.csv_path)])
+        md = points[0].meta.get("metadata", {})
+        log.info(f"  read  : R2-D2 logger, {len(points)} frequency point(s), "
+                 f"{len(points[0].segments)} segments")
+        if md:
+            log.info("  file  : " + ", ".join(
+                f"{k}={v}" for k, v in md.items() if k != "notes"))
+            if md.get("coefficients"):
+                log.info(f"  cal   : the logger already applied coefficient "
+                         f"set '{md['coefficients']}' — the s columns are a "
+                         f"current density and curr.csv is NOT applied again")
+        sp0 = points[0].summary()
+        log.info(f"  scan  : {sp0.get('n_channels', '?')} channels over "
+                 f"{sp0.get('scan_span_us', '?')} us "
+                 f"({100*sp0.get('scan_fraction_of_sample', 0):.0f} % of a "
+                 f"{1e6/sp0['fs_hz']:.2f} us sample period), step "
+                 f"{sp0.get('scan_step_us', '?')} us")
+
+        spectra, r2d2_report = r2d2_sweep_spectra(points, cfg, log)
+        if r2d2_report["n_undersampled"]:
+            log.warning(
+                f"  ALIAS : {r2d2_report['n_undersampled']} of "
+                f"{len(points)} points are undersampled — the tone in the "
+                f"record is a fold of a higher analogue frequency. The "
+                f"channel scan measures the true one and it has been used, "
+                f"but the scan resolves f only to about fs, so pass the "
+                f"sweep's own frequency list in cfg.csv_tones to remove the "
+                f"inference.")
+        return _finish_csv(spectra, {"mode": "r2d2_sweep",
+                                     "tones": sorted({round(p["f_analogue_hz"], 4)
+                                                      for p in r2d2_report["points"]
+                                                      if p.get("ok")}),
+                                     "windows": []},
+                           points[0], cfg, log, t0, stop_after,
+                           extra={"r2d2": r2d2_report, "metadata": md})
+
+    m = csv_source.read(cfg.csv_path, dialect)
     log.info(f"  read  : {m.dialect} / {m.kind}, "
              f"{len(m.segments)} segments")
     for k, v in m.summary().items():
@@ -928,12 +1386,35 @@ def run_csv(cfg, stop_after: str = "gold") -> dict:
                  if sched["tones"] else "  tones : none")
         spectra = segment_spectra(m, sched, cal, T_seg, cfg, log)
 
+    return _finish_csv(spectra, sched, m, cfg, log, t0, stop_after)
+
+
+def _finish_csv(spectra, sched, m, cfg, log, t0, stop_after, extra=None):
+    """Validation, ECM, aggregation and output — shared by every CSV route.
+
+    Everything above this point differs between a generic time-domain file, a
+    ready-made spectrum and an R2-D2 sweep.  Everything below it is the same
+    physics on the same data structure, so it lives in one place.
+    """
+    import r2d2_geometry as geom
+
     spectra = {k: v for k, v in spectra.items()
-               if k not in cfg.exclude_segments and v.freq.size >= 3}
-    log.info(f"  Z     : {len(spectra)} segments with a spectrum")
+               if k not in cfg.exclude_segments and v.freq.size >= 1}
+    n_f = int(np.median([sp.freq.size for sp in spectra.values()])) if spectra else 0
+    log.info(f"  Z     : {len(spectra)} segments, {n_f} frequencies each")
+    if spectra and n_f < 6:
+        # Not an error: a single point file is a legitimate thing to look at,
+        # and the per-frequency table and maps below are exactly what it is
+        # good for.  But say plainly which stages cannot run, rather than
+        # reporting zero segments and letting it look like a read failure.
+        log.warning(
+            f"  {n_f} frequency point(s) per segment. lin-KK needs 6 and an "
+            f"ECM needs at least 5, so those stages are skipped; the "
+            f"per-frequency table and the |Z| maps are still written. Point "
+            f"cfg.csv_path at the whole sweep folder to get spectra.")
     if stop_after == "bronze":
         return {"stage": "bronze", "n_segments": len(spectra),
-                "schedule": sched}
+                "schedule": sched, **(extra or {})}
 
     # --- validation --------------------------------------------------------
     kk = {seg: validate(sp, cfg) for seg, sp in spectra.items()}
@@ -941,7 +1422,8 @@ def run_csv(cfg, stop_after: str = "gold") -> dict:
     log.info(f"  KK    : {n_kk}/{len(kk)} segments inside "
              f"{100*cfg.kk_tol:.0f} % residual")
     if stop_after == "silver":
-        return {"stage": "silver", "n_segments": len(spectra), "kk": kk}
+        return {"stage": "silver", "n_segments": len(spectra), "kk": kk,
+                **(extra or {})}
 
     # --- ECM + aggregate ---------------------------------------------------
     ecm = {}
@@ -964,7 +1446,8 @@ def run_csv(cfg, stop_after: str = "gold") -> dict:
                "reader": m.summary(),
                "kk_pass": n_kk, "kk_total": len(kk),
                "cell_aggregate": agg[2],
-               "elapsed_s": round(time.time() - t0, 2)})
+               "elapsed_s": round(time.time() - t0, 2),
+               **(extra or {})})
     utils.banner("DONE", log)
     log.info(f"  {time.time()-t0:.1f} s -> {cfg.out_dir}")
     return manifest

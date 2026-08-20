@@ -16,7 +16,7 @@ Full write-up of the gen2 plate and the CSV path:
 | `r2d2_geometry.py` | **both plate maps**, `use_plate("gen1"\|"gen2")` |
 | `bronze.py` `silver.py` `gold.py` | the FAMOS path |
 | `eis_local.py` `utils.py` `eis_measurement_model.py` `eis_validation.py` | shared estimators, KK, measurement model |
-| `csv_source.py` | CSV reader, five layouts, dialect auto-detection |
+| `csv_source.py` | CSV reader, seven layouts incl. the R2-D2 logger, dialect auto-detection |
 | `csv_pipeline.py` | the CSV evaluation path |
 | `gamry_dta.py` | Gamry `.DTA` reader; builds the chain-response gain file |
 | `abgleich.py` | reads the raw `Step*_<T>Grad.csv` bench files; refits and verifies `curr.csv`/`temp.csv` |
@@ -37,6 +37,38 @@ has one clock and therefore must *not* run it. They are two pipelines sharing
 the geometry and the Abgleich, not two readers in front of one.
 
 `gen2 + famos` is rejected: there is no FAMOS recording of the blue plate.
+
+## The R2-D2 logger format
+
+Point **CSV file / folder** at the sweep folder — the one holding
+`metadata.csv` and `p1.csv, p2.csv, …`. Each point file is one frequency, so
+the spectrum only exists once they are read together.
+
+Two things about this format that are easy to miss and expensive to miss:
+
+- The second header row, `timeshifts`, is the acquisition instant of each
+  column **inside one row, in microseconds**. The logger scans 80 channels
+  across 96 % of a sample period, so segment 1 (0 µs) and the cell-voltage taps
+  (79–82 µs) are 80 µs apart — 29° at 1 kHz, and it is the *ratio* of those two
+  channels that is the impedance. The delays are printed, so the correction is
+  exact and needs no fit; it is applied automatically.
+- The `s` columns are already a current density in A/cm² and the temperatures
+  already in °C: the logger applies the coefficient set named in
+  `metadata.csv`. `curr.csv` is deliberately **not** applied again.
+
+A point file is a **burst**: the delivered one has 0.25 s of lead-in and 0.4 s
+of lead-out with no excitation, and a persistent ~999 Hz artefact living in
+them. The pipeline finds the tone on the segment-averaged spectrum (not on one
+channel — `uc1` carries a larger 3488 Hz component), windows to the burst, and
+refuses a record whose strongest common tone is under 10× the noise floor
+rather than reporting an impedance measured against an artefact.
+
+It also compares the tone in the record against the phase ramp the
+channel scan measures, and reports a point whose analogue frequency is above
+Nyquist. On the delivered `p1.csv` the record shows 923 Hz at fs = 11 001 Hz
+while the scan says ~10 kHz: that point is an alias. Pass the sweep's own
+frequency list in `cfg.csv_tones` (file order) to replace the inference with a
+cross-check.
 
 ## Quick checks
 

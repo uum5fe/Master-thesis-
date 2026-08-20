@@ -114,7 +114,8 @@ _ZMOD_COL = re.compile(r"^(z_?mod|z_?mag|abs_?z|\|z\|)$", re.I)
 _ZPHZ_COL = re.compile(r"^(z_?ph[zs]?|phase|phi|phase_deg)$", re.I)
 _SEGID_COL = re.compile(r"^(seg(ment)?(_?id|_?no|_?nr)?|channel|kanal)$", re.I)
 
-DIALECTS = ("records", "wide_time", "long_time", "freq", "gamry")
+DIALECTS = ("r2d2", "r2d2_sweep", "records", "wide_time", "long_time",
+            "freq", "gamry")
 
 
 # --------------------------------------------------------------------------
@@ -133,8 +134,25 @@ class CsvMeasurement:
     # --- time domain -------------------------------------------------------
     t: np.ndarray | None = None                 # seconds, as recorded
     u_cell: np.ndarray | None = None            # V
-    u_seg: dict[str, np.ndarray] = field(default_factory=dict)   # V per segment
-    temps: dict[str, np.ndarray] = field(default_factory=dict)   # sensor volts
+    u_seg: dict[str, np.ndarray] = field(default_factory=dict)   # per segment
+    temps: dict[str, np.ndarray] = field(default_factory=dict)   # sensor volts or degC
+
+    # Channels that are neither a segment nor a temperature -- on the R2-D2
+    # logger these are uc1..uc4, the four cell-voltage taps, kept raw because
+    # each has its own acquisition instant and the differences have to be
+    # formed AFTER de-skewing, not before.
+    aux: dict[str, np.ndarray] = field(default_factory=dict)
+
+    # Acquisition instant of each column relative to the row timestamp, in
+    # SECONDS.  A scanning multiplexer samples the 80 channels one after the
+    # other inside a single row, so "the same row" is not the same instant.
+    timeshifts: dict[str, float] = field(default_factory=dict)
+
+    # What the segment columns hold.  "V" is a raw shunt voltage that still
+    # needs the Abgleich; "A/cm2" is a current density the logger has already
+    # calibrated, in which case applying K again would be a second division.
+    seg_unit: str = "V"
+    temp_unit: str = "V"
 
     # --- frequency domain --------------------------------------------------
     # segment -> (freq_hz, Z).  Units are carried in `z_unit`, never guessed
@@ -157,14 +175,27 @@ class CsvMeasurement:
 
     @property
     def fs_nominal(self) -> float:
-        """Median sampling rate.  Median, not mean: one long gap in the
-        record must not move the number that every frequency is judged
-        against."""
+        """The sampling rate.
+
+        For a uniform record, taken from the whole span: the R2-D2 logger
+        prints its timestamps to a microsecond, so the individual intervals
+        are quantised (90 or 91 us against a true 90.9) and the median of
+        them is wrong by 0.11 %.  Over the whole record that quantisation
+        averages out. For a non-uniform record the median is the right
+        "nominal" rate, since one long gap must not move the number every
+        frequency is judged against.
+        """
         if self.t is None or self.t.size < 2:
             return float("nan")
         dt = np.diff(self.t)
         dt = dt[dt > 0]
-        return float(1.0 / np.median(dt)) if dt.size else float("nan")
+        if not dt.size:
+            return float("nan")
+        med = float(np.median(dt))
+        mad = float(np.median(np.abs(dt - med))) * 1.4826
+        if med > 0 and mad / med < 1e-3:
+            return float((self.t.size - 1) / (self.t[-1] - self.t[0]))
+        return float(1.0 / med)
 
     @property
     def duration_s(self) -> float:
@@ -179,8 +210,12 @@ class CsvMeasurement:
             d.update(n_samples=self.n_samples,
                      fs_nominal_hz=round(self.fs_nominal, 4),
                      duration_s=round(self.duration_s, 4),
-                     has_u_cell=self.u_cell is not None,
-                     n_temp_sensors=len(self.temps))
+                     has_u_cell=self.u_cell is not None or bool(self.aux),
+                     n_temp_sensors=len(self.temps),
+                     seg_unit=self.seg_unit, temp_unit=self.temp_unit)
+            if self.timeshifts:
+                v = np.array(list(self.timeshifts.values()))
+                d["scan_span_us"] = round(1e6 * (v.max() - v.min()), 4)
             d.update(regularity(self.t))
         else:
             n = [len(v[0]) for v in self.spectra.values()]
@@ -390,16 +425,27 @@ def detect_dialect(path) -> str:
     if p.is_dir():
         if any(p.glob("*.DTA")) or (p / "bode").is_dir():
             return "gamry"
-        cands = sorted(p.glob("*.csv"))
+        cands = r2d2_point_files(p)
         if not cands:
             raise ValueError(f"{p}: no .csv and no .DTA files")
+        # A folder of R2-D2 point files is one sweep, not several unrelated
+        # measurements: each file holds a single frequency and the spectrum
+        # only exists once they are read together.
+        if detect_dialect(cands[0]) == "r2d2":
+            return "r2d2_sweep"
         return detect_dialect(cands[0])
     if p.suffix.lower() == ".dta":
         return "gamry"
 
-    lines = _sniff(p)
+    lines = _sniff(p, 4)
     if not lines:
         raise ValueError(f"{p}: empty file")
+    if (lines[0].split("\t")[0].strip().lower() == "timestamp"
+            and len(lines) > 1
+            and lines[1].split("\t")[0].strip().lower() == "timeshifts"):
+        return "r2d2"
+
+    lines = _sniff(p)
 
     # records: "s12:" plus "u_s=...V"
     hits = sum(1 for ln in lines if _REC_SEG.search(ln) and _REC_U.search(ln))
@@ -673,6 +719,209 @@ def read_freq(path, z_unit: str = "auto") -> CsvMeasurement:
                           z_unit=unit, meta=meta)
 
 
+# --------------------------------------------------------------------------
+# The R2-D2 logger  ("R2-D2 Local EIS Measurements", software V2.5)
+# --------------------------------------------------------------------------
+# One folder per sweep:
+#
+#     metadata.csv        free-text header: date, software version, which
+#                         Abgleich coefficient set was applied, the Leepa,
+#                         and notes such as "Segment 1: Cathode inlet"
+#     p1.csv, p2.csv ...  ONE FILE PER FREQUENCY POINT
+#
+# Each point file is tab-separated with two header rows:
+#
+#     timestamp   s1 ... s72   uc1 uc2 uc3 uc4   temp1 ... temp4
+#     timeshifts  0.000000  1.100125  ...  86.897984
+#     2026.04.20 10:21:11,429062   1.936579  ...
+#
+# THE SECOND ROW IS THE IMPORTANT ONE, AND IT IS EASY TO SKIP PAST.
+# `timeshifts` is the acquisition instant of each column inside one row, in
+# MICROSECONDS.  On the delivered file the 80 channels are 1.1 us apart and
+# span 86.898 us against a 90.9 us sample period -- i.e. the logger is a
+# scanning multiplexer that walks the whole plate once per row and only just
+# finishes before the next one starts.
+#
+# The consequence is not subtle.  Segment 1 is sampled at 0 us and the
+# cell-voltage taps at 79-82 us, so the two channels whose RATIO is the
+# impedance are 80 us apart.  At 1 kHz that is 29 degrees; at the top of this
+# rig's band it is more than a full quadrant.  Nothing in the file warns you:
+# read the rows as simultaneous samples and every phase is wrong by an amount
+# that grows with frequency, which is exactly the signature of an electro-
+# chemical process and will be interpreted as one.
+#
+# Two more properties of the format, both established from the delivered file
+# rather than assumed:
+#
+#   * The s columns are a current DENSITY in A/cm^2, not a shunt voltage.
+#     They span 1.8x across the plate while the segment areas span 12.5x, and
+#     corr(s, area) is +0.25 -- a current would have to track the area at
+#     +0.95.  The logger has already applied the coefficient set named in
+#     metadata.csv, which is also why temp1..temp4 arrive in degC and not in
+#     volts.  Applying the Abgleich again would divide by K twice.
+#
+#   * uc1..uc4 are two differential cell-voltage pairs: uc1, uc3 sit near 0 V
+#     and uc2, uc4 near +0.59 V, so U = (uc2-uc1) and (uc4-uc3) are two
+#     independent measurements of the same 0.61 V cell.  They are kept raw
+#     here and differenced in the phasor domain, because uc1 and uc2 are
+#     themselves 1.1 us apart.
+
+_R2D2_TS_FMT = re.compile(
+    r"^(\d{4})\.(\d{2})\.(\d{2})[ T](\d{2}):(\d{2}):(\d{2})[.,](\d+)$")
+
+
+def _r2d2_seconds(stamps: list[str]) -> np.ndarray:
+    """Seconds from the first row, from `YYYY.MM.DD HH:MM:SS,ffffff`.
+
+    Parsed arithmetically rather than through datetime: 19 417 strptime calls
+    per point file, times a sweep's worth of files, is minutes of wall clock
+    for a format that is fixed-width.
+    """
+    out = np.empty(len(stamps))
+    t0 = None
+    for i, s in enumerate(stamps):
+        m = _R2D2_TS_FMT.match(s.strip())
+        if not m:
+            raise ValueError(f"unparseable timestamp {s!r}")
+        y, mo, d, hh, mm, ss, frac = m.groups()
+        sec = (int(d) * 86400.0 + int(hh) * 3600.0 + int(mm) * 60.0 + int(ss)
+               + float("0." + frac))
+        if t0 is None:
+            t0 = sec
+        out[i] = sec - t0
+    return out
+
+
+def read_r2d2(path, meta_extra: dict | None = None) -> CsvMeasurement:
+    """One R2-D2 point file: `<name>.csv` with the `timeshifts` header row."""
+    path = Path(path)
+    text = path.read_text(encoding="utf-8-sig", errors="replace")
+    lines = text.splitlines()
+    if len(lines) < 4:
+        raise ValueError(f"{path.name}: too short to be an R2-D2 point file")
+
+    header = [h.strip() for h in lines[0].split("\t")]
+    second = [h.strip() for h in lines[1].split("\t")]
+    if not header or header[0].lower() != "timestamp":
+        raise ValueError(f"{path.name}: first column is {header[:1]}, "
+                         f"expected 'timestamp'")
+    if second[0].lower() != "timeshifts":
+        raise ValueError(
+            f"{path.name}: second row starts with {second[0]!r}, expected "
+            f"'timeshifts'. Without the per-channel acquisition instants the "
+            f"segment and the cell voltage cannot be brought onto a common "
+            f"time base and no phase in the result would be trustworthy.")
+
+    cols = header[1:]
+    shifts_us = [float(v) for v in second[1:]]
+    if len(shifts_us) != len(cols):
+        raise ValueError(f"{path.name}: {len(cols)} channels but "
+                         f"{len(shifts_us)} timeshifts")
+
+    body = [ln for ln in lines[2:] if ln.strip()]
+    stamps = [ln.split("\t", 1)[0] for ln in body]
+    data = np.array([[float(v) for v in ln.split("\t")[1:]] for ln in body])
+    if data.shape[1] != len(cols):
+        raise ValueError(f"{path.name}: {data.shape[1]} data columns against "
+                         f"{len(cols)} header names")
+
+    t = _r2d2_seconds(stamps)
+
+    u_seg, temps, aux, tshift = {}, {}, {}, {}
+    for j, name in enumerate(cols):
+        tshift[name] = shifts_us[j] * 1e-6
+        m = _SEG_COL.match(name)
+        if m:
+            u_seg[str(int(m.group(1)))] = data[:, j]
+            continue
+        mt = _TEMP_COL.match(name)
+        if mt:
+            temps[f"temp{int(mt.group(2))}"] = data[:, j]
+            continue
+        aux[name] = data[:, j]
+
+    # temperature unit: the logger writes degC once the coefficients are
+    # applied.  40..120 degC cannot be a sensor voltage (those are ~2.3-4.5 V)
+    # and 2.3-4.5 cannot be a plate temperature, so the two are separable
+    # without being told.
+    tmed = float(np.median([np.median(v) for v in temps.values()])) if temps else np.nan
+    temp_unit = "degC" if np.isfinite(tmed) and tmed > 15.0 else "V"
+
+    meta = {
+        "n_channels": len(cols),
+        "fs_hz": round((len(t) - 1) / (t[-1] - t[0]), 6) if len(t) > 1 else float("nan"),
+        "scan_span_us": round(max(shifts_us) - min(shifts_us), 4),
+        "scan_step_us": round(float(np.median(np.diff(sorted(shifts_us)))), 4),
+        "n_uc_channels": len(aux),
+        "point": path.stem,
+    }
+    if meta_extra:
+        meta.update(meta_extra)
+    # The scan must fit inside one row; if it does not, the units are not
+    # microseconds and every de-skew below would be wrong by that factor.
+    if np.isfinite(meta["fs_hz"]) and meta["fs_hz"] > 0:
+        meta["scan_fraction_of_sample"] = round(
+            meta["scan_span_us"] * 1e-6 * meta["fs_hz"], 4)
+
+    return CsvMeasurement(
+        "time", "r2d2", str(path), t=t, u_cell=None, u_seg=u_seg,
+        temps=temps, aux=aux, timeshifts=tshift,
+        seg_unit="A/cm2", temp_unit=temp_unit, meta=meta)
+
+
+def read_r2d2_metadata(folder) -> dict:
+    """The free-text `metadata.csv` sidecar, as key/value where it looks it."""
+    p = Path(folder) / "metadata.csv"
+    if not p.exists():
+        return {}
+    out: dict = {"notes": []}
+    for line in p.read_text(encoding="utf-8-sig", errors="replace").splitlines():
+        line = line.strip().rstrip(",;\t")
+        if not line:
+            continue
+        if ":" in line:
+            k, v = line.split(":", 1)
+            k, v = k.strip(), v.strip()
+            if k.lower() in ("date", "software version", "coefficients",
+                             "leepa", "operator", "cell", "stack"):
+                out[k.lower().replace(" ", "_")] = v
+                continue
+        out["notes"].append(line)
+    return out
+
+
+def r2d2_point_files(folder) -> list[Path]:
+    """The point files of a sweep, in acquisition order.
+
+    Sorted by the trailing number so p2 comes before p10, and metadata.csv is
+    excluded.  Order is the sweep order, which is usually high frequency
+    first -- do not assume it is ascending in frequency.
+    """
+    folder = Path(folder)
+    files = [p for p in folder.glob("*.csv") if p.name.lower() != "metadata.csv"]
+
+    def key(p: Path):
+        m = re.search(r"(\d+)\s*$", p.stem)
+        return (0, int(m.group(1))) if m else (1, 0), p.stem
+    return sorted(files, key=key)
+
+
+def read_r2d2_sweep(folder) -> list[CsvMeasurement]:
+    """Every point file of one sweep, each carrying the shared metadata."""
+    folder = Path(folder)
+    meta = read_r2d2_metadata(folder)
+    files = r2d2_point_files(folder)
+    if not files:
+        raise ValueError(f"{folder}: no point files (expected p1.csv, p2.csv, ...)")
+    out = []
+    for p in files:
+        try:
+            out.append(read_r2d2(p, meta_extra={"metadata": meta}))
+        except ValueError as exc:
+            raise ValueError(f"{p.name}: {exc}") from exc
+    return out
+
+
 def read_gamry(path, area_cm2: float | None = None) -> CsvMeasurement:
     """A folder of per-segment Gamry .DTA sweeps, or one file."""
     import gamry_dta
@@ -694,6 +943,8 @@ def read_gamry(path, area_cm2: float | None = None) -> CsvMeasurement:
 
 
 _READERS = {
+    "r2d2": read_r2d2,
+    "r2d2_sweep": read_r2d2_sweep,
     "records": read_records,
     "wide_time": read_wide_time,
     "long_time": read_long_time,

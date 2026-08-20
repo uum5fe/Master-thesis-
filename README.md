@@ -306,5 +306,6 @@ plate and both measurement file formats. Neither is a default you can ignore:
 
 See [`docs/GEN2_PLATE_AND_CSV_PIPELINE.md`](docs/GEN2_PLATE_AND_CSV_PIPELINE.md)
 for the gen2 reconstruction and its evidence, what the Abgleich files say, the
-−11°-at-4.5 kHz measuring-chain roll-off that has never been corrected, and
-what the CSV path does instead of synchronisation.
+−11°-at-4.5 kHz measuring-chain roll-off that has never been corrected, the
+R2-D2 logger format and its per-row channel scan, and what the CSV path does
+instead of synchronisation.

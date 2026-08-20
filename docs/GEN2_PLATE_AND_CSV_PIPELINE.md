@@ -267,6 +267,7 @@ load bank drives both rigs.
 
 | dialect | shape |
 | --- | --- |
+| `r2d2` / `r2d2_sweep` | **the real logger format** — see §5 |
 | `records` | `[t=1.23s;] s12: temp1=4.3V;…; i_s=0.5A;u_s=1.15V;` — the same syntax the Abgleich Step files use |
 | `wide_time` | `time_s, u_cell, s1…s72 [, temp1…temp4]`, one row per instant |
 | `long_time` | tidy `time_s, segment, u_s [, u_cell]` |
@@ -330,7 +331,188 @@ convention.
 
 ---
 
-## 5. Using it
+## 5. The R2-D2 logger format
+
+A real sweep (`metadata.csv` + `p1.csv`, software V2.5, 20.04.2026) settled the
+open item from §6 of the first pass. The format is now supported directly as
+the `r2d2` / `r2d2_sweep` dialects.
+
+### 5.1 Layout
+
+```
+<sweep folder>/
+    metadata.csv          date, software version, which Abgleich coefficient
+                          set was applied, the Leepa, and notes
+    p1.csv, p2.csv, ...   ONE FILE PER FREQUENCY POINT
+```
+
+Each point file is tab-separated with **two** header rows:
+
+```
+timestamp    s1 ... s72   uc1 uc2 uc3 uc4   temp1 ... temp4
+timeshifts   0.000000  1.100125  2.200017  ...  86.897984
+2026.04.20 10:21:11,429062    1.936579   1.981619   ...
+```
+
+Measured on the delivered `p1.csv`: 80 channels, 19 417 rows, fs = 11 001.10 Hz,
+1.765 s.
+
+### 5.2 The `timeshifts` row is the whole game
+
+`timeshifts` is the acquisition instant of each column **inside one row, in
+microseconds**. The channels are 1.1 µs apart and span 86.898 µs against a
+90.90 µs sample period — 96 % of it. The logger is a scanning multiplexer that
+walks the whole plate once per row and only just finishes before the next one
+starts.
+
+Segment 1 is sampled at 0 µs; the cell-voltage taps at 79–82 µs. The impedance
+is the *ratio* of those two channels, so **80 µs of skew sits directly in it**
+— 29° at 1 kHz, more than a quadrant near the top of this rig's band. Nothing
+in the file warns you. Read the rows as simultaneous samples and every phase
+is wrong by an amount that grows with frequency, which is precisely the
+signature of an electrochemical process and will be read as one.
+
+Correcting it needs no fit at all: the delays are printed. `deskew()` applies
+them, and `uc2 − uc1` is formed **in the phasor domain afterwards**, never as a
+row-wise subtraction — uc1 and uc2 are themselves 1.1 µs apart.
+
+### 5.3 What the columns hold — established, not assumed
+
+**`s1…s72` are a current density in A/cm², not a shunt voltage.** They span
+1.8× across the plate while the gen1 segment areas span 12.5×, and
+`corr(s, area) = +0.25`; a *current* would have to track the area at ≈ +0.95.
+The logger has already applied the coefficient set named in `metadata.csv`
+(`Coefficients: Coruscant` on this delivery), which is also why `temp1…temp4`
+arrive in °C rather than volts. **Applying `curr.csv` again would divide by K
+twice** — the pipeline logs that it is skipping it and why.
+
+**`uc1…uc4` are two differential pairs.** uc1 and uc3 sit near 0 V, uc2 and
+uc4 near +0.59 V, so `uc2 − uc1` and `uc4 − uc3` are two independent readings of
+the same 0.61 V cell. Both are computed; their mean is used and their
+disagreement is reported. On `p1.csv` they differ by **28 %** in amplitude,
+which is a lead-placement or contact difference and sets a floor on how well
+any single reference defines Z.
+
+Sanity check on the whole chain, gen1 areas: j = 1.37…2.46 A/cm² (median 2.03),
+Σ j·A = **615.9 A** at U = 0.61 V. The DC map falls smoothly from ~2.3 A/cm²
+at the inlet to ~1.4 A/cm² at the outlet — reactant depletion down the channel,
+which is what the plate is for.
+
+### 5.4 A point file is a burst, not a continuous recording
+
+The delivered `p1.csv` runs 1.765 s. The excitation is only present from
+≈ 0.25 s to ≈ 1.35 s. Before and after there is a persistent instrument
+artefact near **999 Hz** sitting at about 6× the noise floor, while the
+excitation runs at **380×**.
+
+This matters more than it looks:
+
+- Fitting the whole record inflates the residual — and therefore σ — by the
+  silent fraction, for no gain in the numerator.
+- Worse, a naive peak-pick on a *truncated* file locks onto the 999 Hz
+  artefact and reports an impedance measured against it. Trimming the first
+  1200 rows of the delivered file and analysing them gives a confident, wrong
+  answer at 1000 Hz. That is not hypothetical: it is what the first version of
+  this reader did, and it is why the fixture in
+  `databricks/local_eis/fixtures/r2d2_sample/` is cut from *inside* the burst.
+
+So the pipeline does two things before fitting anything:
+
+1. **Finds the tone on the segments, not on one channel.** `uc1` carries a
+   3488 Hz component larger than the excitation; the excitation is the one
+   thing that drives all 72 segments coherently, so the segment-averaged
+   amplitude spectrum reinforces it and averages down everything else.
+2. **Windows to the burst.** `eis_local.demod_envelope` / `dwell_window` /
+   `polish_window` already do this for the FAMOS sweeps — same job, same kind
+   of signal — applied here to the normalised composite of all 72 segments,
+   which has ≈ √72 times the SNR of any one channel. The peak is compared
+   against the 10th percentile of the envelope rather than the median,
+   because on this file the burst is 62 % of the record and a median test
+   would conclude there was nothing to window to.
+
+A record whose strongest common segment tone is under 10× the noise floor is
+**refused with a reason** rather than analysed. A point file that is all
+lead-in looks exactly like that.
+
+### 5.5 The finding: the top of the sweep is undersampled
+
+`p1.csv` contains a clean tone at **923.08 Hz** against fs = 11 001.10 Hz. Taken
+at face value that is an ordinary EIS point. It is not.
+
+Across one row the 80 channels sample the analogue waveform at 1.1 µs
+intervals, so the phase difference between channel *k* and channel 0 is
+`2π·f_analogue·τ_k` — **at the true frequency of the signal, whatever the
+row-rate DFT reports**. A 923 Hz tone rotates the phase by 0.33 °/µs and would
+produce 29° across the 87 µs scan. The measured rotation is ≈ 307°, an order of
+magnitude more.
+
+Scoring candidates by how well the 72 segment phasors collapse onto a common
+phase after de-skewing (they must: one plate, one imposed current):
+
+| de-skew at | resultant R |
+| --- | --- |
+| 923.08 Hz (the tone in the record) | **0.14** — no common phase at all |
+| fs − 923.08 = 10 078.02 Hz, conjugated | **0.84** |
+| fs + 923.08 = 11 924.19 Hz, its own sign convention | rejected |
+
+So the analogue tone is near 10 kHz and the 923 Hz in the record is its alias,
+folded by a sampler running at 11 kHz with nothing in front of it that stops
+10 kHz. Consistent with `p1` being the *first* point of a sweep that starts
+high — and with the Gamry chain response (§3), which is still at |H| = 0.94 at
+10 kHz and passes the signal happily.
+
+This is a property of the rig, not of the evaluation, and it is **reported
+rather than silently worked around**. `nyquist_zone()` returns the frequency
+the scan implies, the resultant at every candidate, and a verdict; the run log
+says `UNDERSAMPLED` and the manifest records it per point.
+
+**The limit of what the scan can do.** It resolves f only to about
+1/scan_span ≈ 11 kHz — the same ambiguity as the aliasing itself. It can tell a
+baseband point from an undersampled one, and it picks the zone here because the
+conjugation parity breaks the tie, but it cannot replace *knowing* the
+frequency. Pass the sweep's own frequency list in `cfg.csv_tones` (file order)
+and it is used and cross-checked instead of inferred.
+
+### 5.6 A single point file is still useful
+
+One file is one frequency, so there is no spectrum to fit — lin-KK needs 6
+points and the ECM 5. Rather than reporting zero segments, the pipeline says so
+plainly and still writes the per-frequency table plus plate maps of |Z|, arg Z
+and the DC current density at that frequency. Point `cfg.csv_path` at the whole
+sweep folder to get spectra.
+
+### 5.7 Verified
+
+`test_csv_pipeline.py` builds a synthetic sweep in this exact format — one file
+per frequency, a channel scan inside every row, one tone deliberately placed
+above fs/2 so the alias path is exercised rather than assumed:
+
+```
+  R2-D2 logger sweep
+    6 point files read, 0 failed                                  PASS
+    6/6 analogue frequencies recovered (one above fs/2)           PASS
+    undersampled points flagged: 1                                PASS
+    segment 1 R_ohmic    70.5962 mΩ·cm²  (true 70.6000,  0.01 %)  PASS
+    segment 72 R_ohmic  113.1790 mΩ·cm²  (true 113.2000, 0.02 %)  PASS
+    scan span 87.3 us = 283° at 9000 Hz  (why the deskew is not optional)
+```
+
+Against the real fixture — 2500 rows of the delivered `p1.csv`, cut from
+inside the burst:
+
+```
+  real fixture (2500 rows of a real p1.csv)
+    dialect detected as a sweep / 80 channels / 72 segments        PASS
+    scan spans ~96 % of a sample                                   PASS
+    s columns read as A/cm2, temps as degC                         PASS
+    coefficient set recorded, four uc taps                         PASS
+    alias 923.1 Hz -> analogue 10078 Hz, zone 1, R 0.84 vs 0.14    PASS
+    a record with no excitation is refused                         PASS
+```
+
+---
+
+## 6. Using it
 
 In the runner notebook the two new dropdowns are **Plate generation**
 (`gen1`/`gen2`) and **Measurement file format** (`famos`/`csv`), with
@@ -363,13 +545,26 @@ python abgleich.py /path/to/Abgleichdaten/Naboo \
 
 ---
 
-## 6. Open item
+## 7. Open items
 
-**No real CSV measurement file has been seen.** The reader covers the five
-layouts above and auto-detects between them, and each is verified against
-synthetic data built from the measurement equation — but a real file may use a
-sixth layout, or one of these with a dialect quirk. If detection fails it
-raises with the header attached and lists what it expected, which is the
-failure mode to want; adding a sixth layout means adding one reader in
-`csv_source.py` and changing nothing else. Send one real file and the
-dialect can be pinned instead of sniffed.
+1. **The sweep's frequency list.** The channel scan identifies the Nyquist
+   zone but resolves f only to about fs (§5.4). The rig commands the
+   frequencies, so it knows them exactly — pass them in `cfg.csv_tones`, in
+   file order, and the inference is replaced by a cross-check.
+
+2. **Undersampling at the top of the sweep** (§5.4) is a measurement-setup
+   question, not an evaluation one. Either the sampler runs faster than twice
+   the highest tone, or an anti-alias filter goes in front of it, or the top
+   points are treated as deliberate coherent undersampling with their
+   frequencies declared. The pipeline handles the third case and flags the
+   first two; it cannot make an aliased point unambiguous on its own.
+
+3. **The two cell-voltage pairs disagree by 28 %** on the delivered file
+   (§5.3). Both are used and the spread is reported, but it is worth tracing
+   to the leads: it is a floor on the accuracy of every Z on that plate.
+
+4. **`Coefficients: Coruscant`** names a third coefficient set, alongside
+   Kashyyyk (gen1) and Naboo (gen2). Which physical plate that Leepa
+   (`FC2600265-02`) carries decides which geometry the run should select, and
+   the file does not say. The plate dropdown is explicit for exactly this
+   reason.

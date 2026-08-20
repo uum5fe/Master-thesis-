@@ -11,27 +11,57 @@ dbutils.library.restartPython()
 # Selects measurement by Order ID (Leepa) from datago, runs the full
 # pipeline, and displays Nyquist + heatmap results inline.
 #
-# Modules: config.py, utils.py, bronze.py, silver.py, gold.py
-# Location: /Users/uum5fe@bosch.com/Dat files/Loacal_Eis_/Local_EIS
+# Modules: config.py, utils.py, bronze.py, silver.py, gold.py, csv_source.py,
+#          csv_pipeline.py, gamry_dta.py, abgleich.py, r2d2_geometry.py
 # ═══════════════════════════════════════════════════════════════════════════════
 import sys
 from pathlib import Path
 
-# ─── Wire up the Local_EIS module directory ───
-_PIPELINE_DIR = '/Workspace/Users/uum5fe@bosch.com/Local_EIS_fixed/Local_EIS_fixed'
+# ─── Find the module directory: the folder this notebook sits in ───
+# Hard-coding a workspace path means the notebook only runs for whoever
+# uploaded it, and breaks silently when the folder is renamed.  The modules
+# are always beside the notebook, so ask Databricks where the notebook is and
+# work from there.  `_PIPELINE_DIR_OVERRIDE` is the escape hatch for the case
+# where they are deliberately kept somewhere else.
+_PIPELINE_DIR_OVERRIDE = ''      # e.g. '/Workspace/Users/you@bosch.com/Local_EIS_pipeline'
+
+
+def _find_pipeline_dir():
+    if _PIPELINE_DIR_OVERRIDE:
+        return _PIPELINE_DIR_OVERRIDE
+    try:
+        nb = (dbutils.notebook.entry_point.getDbutils().notebook()
+              .getContext().notebookPath().get())
+        cand = '/Workspace' + str(Path(nb).parent)
+        if (Path(cand) / 'config.py').exists():
+            return cand
+    except Exception:
+        pass
+    # Repos, a local checkout, or anything else: fall back to the cwd and to
+    # the historical location, and say which one was used.
+    for cand in (str(Path.cwd()),
+                 '/Workspace/Users/uum5fe@bosch.com/Local_EIS_pipeline',
+                 '/Workspace/Users/uum5fe@bosch.com/Local_EIS_fixed/Local_EIS_fixed'):
+        if (Path(cand) / 'config.py').exists():
+            return cand
+    raise FileNotFoundError(
+        "cannot find the pipeline modules. config.py should sit in the same "
+        "folder as this notebook; if it does not, set "
+        "_PIPELINE_DIR_OVERRIDE at the top of this cell.")
+
+
+_PIPELINE_DIR = _find_pipeline_dir()
 if _PIPELINE_DIR not in sys.path:
     sys.path.insert(0, _PIPELINE_DIR)
 
 # ─── Shim the missing 'core' package ───
-# bronze.py does `import core` to put the core dir on sys.path.
-# The core/ subdirectory doesn't exist; the modules it provides
-# (r2d2_geometry, eis_local) live in the parent 'Dat files' folder.
+# bronze.py, silver.py and gold.py do `import core` to put a core directory on
+# sys.path.  There is no core/ subdirectory; the modules it was meant to
+# provide (r2d2_geometry, eis_local) sit alongside them, so point the shim at
+# the pipeline directory itself.
 import types
-_CORE_DIR = '/Workspace/Users/uum5fe@bosch.com'
-if _CORE_DIR not in sys.path:
-    sys.path.insert(0, _CORE_DIR)
 _core_mod = types.ModuleType('core')
-_core_mod.__path__ = [_CORE_DIR]
+_core_mod.__path__ = [_PIPELINE_DIR]
 sys.modules['core'] = _core_mod
 
 import importlib

@@ -4,6 +4,7 @@
     python run_dashboard.py
     python run_dashboard.py --results /path/to/results --open
     python run_dashboard.py --famos /path/to/Famos --port 8060
+    python run_dashboard.py --csv /path/to/csv_files --open
 
 Run this file from anywhere; it puts the project root on the import path
 itself, so `python run_dashboard.py` and `python /full/path/run_dashboard.py`
@@ -48,6 +49,7 @@ def write_env_file(args, force: bool = False) -> int:
     # usable as written rather than needing an edit before the first run.
     supplied = {
         "EIS_FAMOS_ROOT": args.famos,
+        "EIS_CSV_ROOT": args.csv,
         "EIS_RESULTS_ROOT": args.results,
         "EIS_PLATE_SPEC_DIR": args.plate_specs,
     }
@@ -75,6 +77,7 @@ def write_env_file(args, force: bool = False) -> int:
     else:
         print("  Open it and set at least one of:")
         print("    EIS_FAMOS_ROOT    folder of raw .DAT recordings")
+        print("    EIS_CSV_ROOT      folder of raw R2-D2 CSV sweep folders")
         print("    EIS_RESULTS_ROOT  folder of finished results")
     print("\n  Then:  python run_dashboard.py --check")
     return 0
@@ -91,6 +94,10 @@ def main(argv=None) -> int:
     p.add_argument("--famos", metavar="DIR",
                    help="folder of raw FAMOS .DAT recordings "
                         "(sets EIS_FAMOS_ROOT)")
+    p.add_argument("--csv", metavar="DIR",
+                   help="folder holding R2-D2 CSV sweep folders, each of them "
+                        "metadata.csv plus p1.csv, p2.csv, ... "
+                        "(sets EIS_CSV_ROOT)")
     p.add_argument("--plate-specs", metavar="DIR",
                    help="extra folder of plate generation specs "
                         "(sets EIS_PLATE_SPEC_DIR)")
@@ -123,6 +130,7 @@ def main(argv=None) -> int:
     # are set before app.settings is imported - Settings reads os.environ once.
     for value, name in ((a.results, "EIS_RESULTS_ROOT"),
                         (a.famos, "EIS_FAMOS_ROOT"),
+                        (a.csv, "EIS_CSV_ROOT"),
                         (a.plate_specs, "EIS_PLATE_SPEC_DIR")):
         if value:
             path = Path(value).expanduser()

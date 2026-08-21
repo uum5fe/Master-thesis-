@@ -125,8 +125,85 @@ def _famos_section(out: list[str], settings: Settings) -> None:
     out.append("")
 
 
+def _csv_section(out: list[str], settings: Settings) -> None:
+    """R2-D2 CSV sweeps.
+
+    This is the only source whose unit of selection is a FOLDER rather than a
+    file: a sweep is metadata.csv plus p1.csv, p2.csv, ... in one directory.
+    Either the parent or the sweep folder itself works as a root, since the
+    search is recursive -- what does NOT work is a folder of point files with
+    no metadata.csv, and that is indistinguishable from "no data" unless it is
+    said out loud.  So the check reports what it saw at each level, down to the
+    cell and the point count, rather than a bare verdict.
+    """
+    out.append("3. RAW R2-D2 CSV SWEEPS  (EIS_CSV_ROOT)")
+    if not settings.csv_roots:
+        out.append(f"   {CROSS} not set — skipping. Set EIS_CSV_ROOT to view "
+                   "CSV sweeps (this is how the Gen 2 plate is measured; "
+                   "there is no FAMOS recording for it).")
+        out.append(f"{INFO} the FAMOS and results roots are still searched, so "
+                   "a sweep sitting beside them is found without this — a "
+                   "sweep kept in its own folder is not")
+        out.append("")
+        return
+
+    for raw in settings.csv_roots:
+        root = Path(raw)
+        out.append(f"   folder: {root}")
+        if not root.exists():
+            out.append(f"   {CROSS} does not exist")
+            out.append(f"{INFO} check for a typo, and that you are signed in "
+                       "to the share")
+            continue
+        if not root.is_dir():
+            out.append(f"   {CROSS} that is a file, not a folder")
+            continue
+
+        meta = sorted(root.rglob("metadata.csv"))
+        if not meta:
+            out.append(f"   {CROSS} no metadata.csv anywhere under it, so no "
+                       "sweep folder was recognised")
+            subdirs = [d.name for d in root.iterdir() if d.is_dir()][:8]
+            loose = [f.name for f in root.glob("p*.csv")][:4]
+            if loose:
+                out.append(f"   {WARN} there are point files ({', '.join(loose)}) "
+                           "directly in this folder but no metadata.csv beside "
+                           "them")
+                out.append(f"{INFO} a sweep needs its metadata.csv: that is "
+                           "where the cell (Leepa:) and the coefficient set "
+                           "come from, and without it these point files "
+                           "cannot be grouped into a run")
+                out.append(f"{INFO} copy metadata.csv in beside them, or point "
+                           "EIS_CSV_ROOT at the folder the sweep was copied "
+                           "from")
+            elif subdirs:
+                out.append(f"{INFO} subfolders here: {', '.join(subdirs)}")
+            continue
+
+        out.append(f"   {TICK} {len(meta)} sweep folder(s) found")
+        if is_network_path(root):
+            out.append(f"   {WARN} this is a network share — the first read of "
+                       "a sweep will be slow, but each point file is read once, "
+                       "so this is far less painful than FAMOS over SMB")
+        for m in meta[:10]:
+            folder = m.parent
+            points = sorted(folder.glob("p*.csv"))
+            cell = "?"
+            for line in m.read_text(errors="ignore").splitlines():
+                if line.lower().startswith("leepa"):
+                    cell = line.split(":", 1)[-1].strip() or "?"
+                    break
+            mark = TICK if points else CROSS
+            out.append(f"        {mark} {folder.name}: cell {cell}, "
+                       f"{len(points)} frequency point(s)")
+            if not points:
+                out.append(f"{INFO} metadata.csv with no p*.csv beside it is "
+                           "not a usable sweep")
+    out.append("")
+
+
 def _results_section(out: list[str], settings: Settings) -> None:
-    out.append("3. PROCESSED RESULTS  (EIS_RESULTS_ROOT)")
+    out.append("4. PROCESSED RESULTS  (EIS_RESULTS_ROOT)")
     roots = [r for r in settings.resolved_results_roots()]
     if not settings.results_roots:
         out.append(f"   {CROSS} not set — skipping. Set EIS_RESULTS_ROOT to view "
@@ -184,7 +261,7 @@ def _results_section(out: list[str], settings: Settings) -> None:
 
 
 def _summary(out: list[str], settings: Settings) -> None:
-    out.append("4. WHAT THE APP WILL SHOW")
+    out.append("5. WHAT THE APP WILL SHOW")
     catalog = Catalog(settings).refresh()
     if not catalog.runs:
         out.append(f"   {CROSS} nothing — every dropdown will be empty")
@@ -208,6 +285,7 @@ def report(settings: Settings = SETTINGS) -> str:
     out = ["", "=" * 68, "  Local EIS Viewer — configuration check", "=" * 68, ""]
     _env_section(out)
     _famos_section(out, settings)
+    _csv_section(out, settings)
     _results_section(out, settings)
     _summary(out, settings)
     out.append("=" * 68)

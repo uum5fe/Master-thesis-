@@ -189,6 +189,7 @@ Otherwise open the created file in VS Code and set the paths by hand:
 
 ```ini
 EIS_FAMOS_ROOT=C:\Users\uum5fe\OneDrive - Bosch Group\Local_Eis\2611976_16_07
+EIS_CSV_ROOT=\\bosch.com\DfsRB\DfsDE\LOC\Fe\ILM\A_ILM_DSETD\Gruppenablage\EAT3\Charan\Lokale_EIS\csv_files
 EIS_RESULTS_ROOT=C:\Users\uum5fe\OneDrive - Bosch Group\Local_Eis\results
 ```
 
@@ -200,6 +201,7 @@ so there is no doubt about which file is in force.
 | What you want to change | Variable |
 | --- | --- |
 | Folder of raw FAMOS `.DAT` | `EIS_FAMOS_ROOT` |
+| Folder of raw R2-D2 **CSV sweeps** (the Gen 2 path) | `EIS_CSV_ROOT` |
 | Folder of processed results (CSV/Parquet) | `EIS_RESULTS_ROOT` |
 | A different `.DAT` naming convention | `EIS_FAMOS_REGEX` |
 | Shunt / temperature calibration | `EIS_CURR_CAL`, `EIS_TEMP_CAL` |
@@ -218,6 +220,82 @@ over `.env`:
 ```powershell
 python run_dashboard.py --famos "D:\some other campaign" --open
 ```
+
+## The Gen 2 plate and the CSV sweeps
+
+There is **no FAMOS recording for the Gen 2 plate** — it is measured with the
+R2-D2 CSV logger instead. Those sweeps are found through their own variable:
+
+```ini
+EIS_CSV_ROOT=\\bosch.com\DfsRB\DfsDE\LOC\Fe\ILM\A_ILM_DSETD\Gruppenablage\EAT3\Charan\Lokale_EIS\csv_files
+```
+
+or as a one-off flag:
+
+```powershell
+python run_dashboard.py --csv "\\bosch.com\...\Lokale_EIS\csv_files" --open
+```
+
+Point it at the folder that **holds the sweep folders**, not into one of them.
+The search is recursive, so either works, but the parent gives you every sweep
+at once:
+
+```
+csv_files\
+    <sweep folder>\
+        metadata.csv        <- the cell (Leepa:) and the coefficient set
+        p1.csv, p2.csv, ... <- one file per frequency
+    <another sweep>\
+        ...
+```
+
+One sweep folder = one selectable run. It is listed under the cell named in
+`metadata.csv`, not under the folder name, and the folder name becomes the
+condition. **`metadata.csv` is required** — a folder of `p*.csv` without it is
+not a run, because there is nothing to identify the cell with.
+
+If nothing appears, ask the app rather than guessing:
+
+```powershell
+python run_dashboard.py --check
+```
+
+Section 3 of that report walks every sweep folder it found and prints the cell
+and the number of frequency points in each, or says exactly what is missing.
+
+## Seeing the raw signals (the Signals tab)
+
+Same script — `python run_dashboard.py` — then the **Signals** tab. There is no
+separate script for it.
+
+It reads raw samples, so it only has something to draw when a **raw** run is
+selected. If the tab is empty, check these in order:
+
+1. **File format** in the left column must be `Raw recording — FAMOS .DAT`
+   or `Raw sweep — R2-D2 CSV logger folder`. A finished pipeline result no
+   longer contains the samples, so with `Pipeline results` selected the tab
+   correctly says there is nothing to draw.
+2. **A run must be selected** below it. If the run dropdown is empty, the data
+   was never found — run `python run_dashboard.py --check` and read sections 2
+   and 3.
+3. **A segment and a frequency step** must both be picked. The step list is
+   the dwells the pipeline actually located and kept, so it is empty if no
+   dwell in the recording passed the SNR gate.
+
+What the four panels show:
+
+| Panel | What it is |
+| --- | --- |
+| 1 · the recording | Envelope of the whole record, with each located dwell shaded. Gaps are settling time, not lost data. |
+| 2 · one dwell | Raw samples with the fitted sine through them. If the samples wander off the curve, the window is wrong or the step was not stationary. |
+| 3 · are they simultaneous? | Calibrated voltage and current normalised and overlaid, with the offset in µs. Any horizontal shift is acquisition skew and goes straight into the impedance phase. |
+| 4 · every tone | One row per dwell: frequency, amplitude, cycles, SNR. |
+
+For FAMOS, each segment is paired with the cell-voltage copy on **its own
+card** — the five cards free-run, so pairing across cards would put the whole
+inter-card offset into the phase. For CSV there is one clock and no such
+problem, so panel 3 instead shows the printed channel-scan offset as the phase
+it costs **at the analogue frequency**.
 
 ## Calibration campaigns (no order id needed)
 

@@ -281,3 +281,40 @@ def test_the_dwells_are_found_where_they_were_written(cards):
         # and the window sits inside the dwell that was written, not across it
         a, b = k * (seg_s + gap_s), k * (seg_s + gap_s) + seg_s
         assert a <= s["start"] / fs < s["stop"] / fs <= b
+
+
+# ---------------------------------------------------------------------------
+# finding the sweeps in the first place
+# ---------------------------------------------------------------------------
+
+
+def test_the_check_reports_each_sweep_it_found(sweep, monkeypatch):
+    """`--check` has to answer "why is the Signals tab empty?".
+
+    An unset EIS_CSV_ROOT and a wrongly-shaped folder both present as no data,
+    and the app cannot tell them apart at the point the user notices.  The
+    report names the cell and the point count per sweep so that "nothing is
+    showing" becomes a fact about the configuration.
+    """
+    from app.settings import Settings
+    from app.diagnose import report
+
+    monkeypatch.setenv("EIS_SKIP_DOTENV", "1")
+    settings = Settings(csv_roots=[str(sweep.parent)])
+    text = report(settings)
+
+    body = text[text.index("RAW R2-D2 CSV SWEEPS"):]
+    assert "1 sweep folder(s) found" in body
+    assert "FC0000000-00" in body        # the cell, read from metadata.csv
+    assert "2 frequency point(s)" in body
+
+
+def test_the_check_says_so_when_the_root_is_unset(monkeypatch):
+    from app.settings import Settings
+    from app.diagnose import report
+
+    monkeypatch.setenv("EIS_SKIP_DOTENV", "1")
+    text = report(Settings(csv_roots=[], famos_roots=[], results_roots=[]))
+    body = text[text.index("RAW R2-D2 CSV SWEEPS"):]
+    assert "EIS_CSV_ROOT" in body
+    assert "not set" in body

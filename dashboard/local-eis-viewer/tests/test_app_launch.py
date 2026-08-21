@@ -290,6 +290,7 @@ def test_a_unc_path_is_not_split_into_several_roots(monkeypatch):
 class _InitArgs:
     def __init__(self, **kwargs):
         self.famos = kwargs.get("famos")
+        self.csv = kwargs.get("csv")
         self.results = kwargs.get("results")
         self.plate_specs = kwargs.get("plate_specs")
 
@@ -454,3 +455,23 @@ def test_windows_launcher_tries_the_interpreters_that_work(script, target):
     assert "App execution aliases" in text
     assert "python.org" in text
     assert 'cd /d "%~dp0"' in text          # runs from its own folder
+
+
+def test_init_writes_the_csv_root_it_was_given(tmp_path, monkeypatch):
+    """The CSV sweeps are the Gen 2 path, so the flag has to reach the file.
+
+    There is no FAMOS recording for the Gen 2 plate: if EIS_CSV_ROOT never
+    lands in .env, the Gen 2 measurements are simply invisible and the app
+    looks empty rather than misconfigured.
+    """
+    monkeypatch.setattr(run_dashboard, "ROOT", tmp_path)
+    (tmp_path / ".env.example").write_text(
+        "EIS_FAMOS_ROOT=C:\\placeholder\n"
+        "EIS_CSV_ROOT=C:\\placeholder\n", encoding="utf-8")
+    share = r"\\bosch.com\DfsRB\Gruppenablage\EAT3\Charan\Lokale_EIS\csv_files"
+    run_dashboard.write_env_file(_InitArgs(csv=share))
+    written = (tmp_path / ".env").read_text(encoding="utf-8")
+    assert f"EIS_CSV_ROOT={share}" in written
+    # and it is live, not commented out as an example
+    assert not any(l.strip().startswith("#") and "EIS_CSV_ROOT" in l
+                   for l in written.splitlines())

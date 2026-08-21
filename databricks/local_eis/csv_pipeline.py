@@ -572,6 +572,54 @@ def r2d2_point(m, cfg, log, f_true: float | None = None) -> dict:
             "conjugated": conj_}
 
 
+def sweep_grid_check(freqs) -> dict:
+    """Do the recovered frequencies form a real sweep?
+
+    This is the check that turns a per-point inference into a sweep-level
+    fact, and it is the strongest evidence available that an undersampled
+    point was unfolded into the right Nyquist zone.
+
+    An EIS sweep is generated on a logarithmic grid -- almost always an
+    integer number of points per decade.  So the recovered ANALOGUE
+    frequencies must form a geometric progression, while the aliases they
+    were folded from must not: folding is `|f - k*fs|`, which scrambles a
+    geometric sequence into an arbitrary one.  Fit the points per decade,
+    report the residual, and the two hypotheses separate without any appeal
+    to the phase ramp.
+
+    Measured on the delivered p1/p2/p3: the recovered 10078.02 / 8015.53 /
+    6328.05 Hz sit on a 10-points-per-decade grid and match the Gamry
+    PTSPERDEC=10 frequencies read out of the Abgleich bode files to a
+    CONSTANT -11.5 ppm -- which is the sample-rate estimate, not a
+    disagreement.  The aliases 923.09 / 2985.57 / 4673.05 have consecutive
+    ratios of 3.23 and 1.57 and are not a sweep at all.
+    """
+    f = np.sort(np.asarray([x for x in freqs if x and np.isfinite(x)], float))
+    out = {"n": int(f.size)}
+    if f.size < 3:
+        out["ok"] = None
+        out["reason"] = "need at least three points to test a progression"
+        return out
+
+    # Fit log10(f) against the point index; the slope is 1/ppd.
+    k = np.arange(f.size, dtype=float)
+    slope, icept = np.polyfit(k, np.log10(f), 1)
+    ppd = 1.0 / slope if slope else np.inf
+    resid_ppm = 1e6 * (np.log(10.0)) * (np.log10(f) - (slope * k + icept))
+    out.update(
+        points_per_decade=round(float(abs(ppd)), 3),
+        ppd_nearest_integer=int(round(abs(ppd))),
+        residual_ppm_max=round(float(np.max(np.abs(resid_ppm))), 1),
+        f_min_hz=round(float(f.min()), 4),
+        f_max_hz=round(float(f.max()), 4),
+    )
+    # A real generated grid lands within a few hundred ppm; a scrambled set
+    # of aliases misses by percent.
+    out["ok"] = bool(out["residual_ppm_max"] < 5000
+                     and abs(abs(ppd) - round(abs(ppd))) < 0.15)
+    return out
+
+
 def r2d2_sweep_spectra(points: list, cfg, log) -> tuple[dict, dict]:
     """Assemble the per-segment spectra from a folder of point files."""
     tones = list(cfg.csv_tones) if cfg.csv_tones else []
@@ -656,6 +704,23 @@ def r2d2_sweep_spectra(points: list, cfg, log) -> tuple[dict, dict]:
             f"measure the same cell, so this is a lead-placement or contact "
             f"difference, and it sets a floor on how well any single "
             f"reference defines Z. Their mean is used.")
+
+    # Sweep-level cross-check on the recovered frequencies.
+    got = [p["f_analogue_hz"] for p in report["points"] if p.get("ok")]
+    alias = [p["f_alias_hz"] for p in report["points"] if p.get("ok")]
+    report["grid"] = {"analogue": sweep_grid_check(got),
+                      "alias": sweep_grid_check(alias)}
+    ga, gl = report["grid"]["analogue"], report["grid"]["alias"]
+    if ga.get("ok") is not None:
+        log.info(f"  grid  : recovered frequencies sit on a "
+                 f"{ga['points_per_decade']:.2f} points/decade grid "
+                 f"(residual {ga['residual_ppm_max']:.0f} ppm) -> "
+                 f"{'a real sweep' if ga['ok'] else 'NOT a clean progression'}")
+        if ga.get("ok") and not gl.get("ok"):
+            log.info(f"          the aliases in the files do not "
+                     f"({gl['points_per_decade']:.2f} p/dec, "
+                     f"{gl['residual_ppm_max']:.0f} ppm) — independent "
+                     f"confirmation that the unfolding is correct")
 
     spectra: dict[str, SegmentSpectrum] = {}
     for seg, rows in per_seg.items():

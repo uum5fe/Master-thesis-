@@ -1,0 +1,66 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Local EIS Viewer (dashboard)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/run_dashboard.py",
+      "args": [
+        "--results",
+        "${input:resultsRoot}",
+        "--open"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "Check configuration (why is it empty?)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/run_dashboard.py",
+      "args": [
+        "--check"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Local EIS Viewer (no data, just start it)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/run_dashboard.py",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Check plate geometry",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "app.plates.registry",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Run tests",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pytest",
+      "args": [
+        "tests",
+        "-q"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    }
+  ],
+  "inputs": [
+    {
+      "id": "resultsRoot",
+      "type": "promptString",
+      "description": "Folder of finished results: <DIR>/<order id>/<condition>/{gold,silver}/",
+      "default": "C:\\Users\\me\\eis_results"
+    }
+  ]
+}

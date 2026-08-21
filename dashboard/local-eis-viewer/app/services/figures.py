@@ -93,7 +93,10 @@ def plate_heatmap(
     fig = go.Figure()
 
     for name in order:
-        x0, y0, x1, y1 = geom.bounds_mm(name)
+        # The true outline, not the bounding box: 40 of the 72 Gen 1 segments
+        # are staircases, and drawing their boxes would overlap the
+        # neighbours and colour pads that belong to someone else.
+        xs, ys = geom.outline_mm(name)
         value = values.get(name, float("nan"))
         cls = classes.get(name, "measured")
         if name in geom.known_bad and name not in classes:
@@ -118,14 +121,14 @@ def plate_heatmap(
             text.append(f"known fault: {geom.known_bad[name]}")
 
         fig.add_trace(go.Scatter(
-            x=[x0, x1, x1, x0, x0], y=[y0, y0, y1, y1, y0],
+            x=xs, y=ys,
             fill="toself", mode="lines",
             line=dict(color="rgba(60,60,60,0.65)", width=1),
             fillcolor=colour,
             opacity=CLASS_OPACITY.get(cls, 0.9),
             fillpattern=dict(shape=CLASS_PATTERN.get(cls) or "",
                              fgcolor="rgba(40,40,40,0.55)", size=6),
-            name=str(name), customdata=[name] * 5,
+            name=str(name), customdata=[name] * len(xs),
             hoveron="fills",
             hovertemplate="<br>".join(text) + "<extra></extra>",
             showlegend=False,
@@ -134,7 +137,10 @@ def plate_heatmap(
     if show_labels:
         cx, cy, labels = [], [], []
         for name in order:
-            x, y = geom.centroid_mm(name)
+            # label_point, not centroid: a concave segment need not contain
+            # its own centroid, and a number drawn on the neighbour's tile is
+            # worse than no number at all.
+            x, y = geom.label_point_mm(name)
             cx.append(x); cy.append(y); labels.append(name)
         fig.add_trace(go.Scatter(
             x=cx, y=cy, mode="text", text=labels,

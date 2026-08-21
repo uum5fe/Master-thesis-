@@ -18,8 +18,8 @@
     90.75
   ],
   "known_bad": {},
-  "verified": true,
-  "notes": "Reconstructed from Coordinates(blue).pdf by reading the 72 printed label pads off the drawing's own mm ticks (x=(col-0.5)*5.60, y=(row-0.5)*6.05) - the same method reproduces the Gen-1 map exactly from the green drawing, so it was validated before being applied here. Segments 1..36 keep their columns; 37..72 are re-cut and interleaved into the wide strips along the top and bottom edges, so 49/51/55/57 sit on row 1 and 52/54/58/60 on row 20. The label set is exactly mirror-symmetric about the plate centre under (col,row)->(46-col,21-row) - all 18 pairs check - and that symmetry, plus label containment, plus exact tiling of 45x20 pads, leaves one reading. Segment counts per strip left to right are 4,6,6,4,2,6,6,4,6,6,2,4,6,6,4: themselves mirror-symmetric, summing to 72, covering 900 pads. CONSEQUENCE: segments 9-16 and 21-28 are 6.776 cm2 here against 8.470 cm2 on Gen 1, because those strips each gave two pad rows to a new edge segment. Never carry an area across generations. Residual uncertainty: the exact pad-row boundary inside strips carrying more than four segments is constrained by the labels to within one pad row. Verify once against the KiCad board file to remove it.",
+  "verified": false,
+  "notes": "UNVERIFIED LAYOUT -- every segment here is described as a rectangle, and on this hardware that is known to be the wrong shape. The Gen 1 plate was modelled the same way, from the same kind of evidence (a drawing, the printed label pads, and an exact tiling of the 45x20 pad grid), and when the plant's own get_900_matrix pad map arrived it disagreed with 60 of the 72 areas -- one segment by more than a factor of two. 40 of the Gen 1 segments turned out to be staircases where they meet the rounded corners of the plate. There is no reason to expect Gen 2 to be different, so the areas in this file should be treated as provisional and the plate map drawn from it as indicative. Testing whether Gen 2 is merely a renumbering of Gen 1 fails: matching these rectangles onto the Gen 1 pad map is not a bijection, and the best overlaps run as low as 44 %, so the correspondence cannot be recovered this way either. TO FIX: supply the get_900_matrix output for the Gen 2 plate as a 'pad_matrix' key (20 rows of 45 segment numbers), exactly as the Gen 1 spec now carries, and delete the 'strips'/'bands'/'numbering' keys. Nothing else needs to change. Until then the KiCad board file remains the other way to settle it, and the edge segments are the part in doubt -- the column strips are certain to within one pad row.",
   "segments": [
     {
       "name": "1",
@@ -525,5 +525,6 @@
       "row0": 16,
       "row1": 20
     }
-  ]
+  ],
+  "verification_note": "RECONSTRUCTION, not the plant's pad map. Needs the get_900_matrix output for the Gen 2 plate to become authoritative."
 }

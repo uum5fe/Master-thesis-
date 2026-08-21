@@ -158,23 +158,71 @@ TEMP_SENSOR_X_MM = {"temp1": 0.0, "temp2": 84.0, "temp3": 168.0, "temp4": 252.0}
 
 @dataclass(frozen=True)
 class Segment:
+    """One measured segment: the set of pads wired to it.
+
+    A segment is NOT necessarily a rectangle.  On the gen1 plate the segments
+    along the edges are staircases -- segment 37 covers three pads of row 1,
+    two of row 2 and one of row 3 -- and an earlier version of this module,
+    which assumed rectangles, got 60 of the 72 areas wrong, some by more than
+    a factor of two.  The pad set is therefore the primitive, and `col0`,
+    `row1`, `x0_mm` and friends are the BOUNDING BOX of that set, kept because
+    plotting and cropping want it.  They do not describe the shape.
+    """
+
     number: int
-    col0: int            # 1-based inclusive pad column span
-    col1: int
-    row0: int            # 1-based inclusive pad row span
-    row1: int
+    pads: tuple[tuple[int, int], ...]     # (col, row), 1-based, sorted
+
+    # -- construction -------------------------------------------------------
+
+    @classmethod
+    def from_rect(cls, number: int, col0: int, col1: int,
+                  row0: int, row1: int) -> "Segment":
+        return cls(number, tuple((c, r)
+                                 for c in range(col0, col1 + 1)
+                                 for r in range(row0, row1 + 1)))
+
+    @classmethod
+    def from_pads(cls, number: int, pads) -> "Segment":
+        return cls(number, tuple(sorted((int(c), int(r)) for c, r in pads)))
 
     @property
     def name(self) -> str:
         return str(self.number)
 
+    # -- size ---------------------------------------------------------------
+
     @property
     def n_pads(self) -> int:
-        return (self.col1 - self.col0 + 1) * (self.row1 - self.row0 + 1)
+        return len(self.pads)
 
     @property
     def area_cm2(self) -> float:
         return self.n_pads * PAD_AREA_CM2
+
+    # -- bounding box, in pad indices ---------------------------------------
+
+    @property
+    def col0(self) -> int:
+        return min(c for c, _r in self.pads)
+
+    @property
+    def col1(self) -> int:
+        return max(c for c, _r in self.pads)
+
+    @property
+    def row0(self) -> int:
+        return min(r for _c, r in self.pads)
+
+    @property
+    def row1(self) -> int:
+        return max(r for _c, r in self.pads)
+
+    @property
+    def is_rectangle(self) -> bool:
+        return self.n_pads == ((self.col1 - self.col0 + 1)
+                               * (self.row1 - self.row0 + 1))
+
+    # -- bounding box, in mm ------------------------------------------------
 
     @property
     def x0_mm(self) -> float:
@@ -193,14 +241,6 @@ class Segment:
         return self.row1 * PAD_H_MM
 
     @property
-    def cx_mm(self) -> float:
-        return 0.5 * (self.x0_mm + self.x1_mm)
-
-    @property
-    def cy_mm(self) -> float:
-        return 0.5 * (self.y0_mm + self.y1_mm)
-
-    @property
     def w_mm(self) -> float:
         return self.x1_mm - self.x0_mm
 
@@ -208,74 +248,121 @@ class Segment:
     def h_mm(self) -> float:
         return self.y1_mm - self.y0_mm
 
+    # -- centroid -----------------------------------------------------------
+    # The mean of the pad centres, not the middle of the bounding box.  For a
+    # rectangle the two agree; for a staircase they do not, and it is the
+    # centroid that belongs in a spatial fit or a distance-to-inlet.
+
+    @property
+    def cx_mm(self) -> float:
+        return PAD_W_MM * (sum(c for c, _r in self.pads) / self.n_pads - 0.5)
+
+    @property
+    def cy_mm(self) -> float:
+        return PAD_H_MM * (sum(r for _c, r in self.pads) / self.n_pads - 0.5)
+
+    # -- drawing ------------------------------------------------------------
+
+    @property
+    def runs(self) -> tuple[tuple[int, int, int], ...]:
+        """The pad set as maximal horizontal runs (row, col_from, col_to).
+
+        Drawing these draws the true outline with a handful of rectangles
+        instead of one per pad, and they round-trip through JSON.
+        """
+        by_row: dict[int, list[int]] = {}
+        for c, r in self.pads:
+            by_row.setdefault(r, []).append(c)
+        out: list[tuple[int, int, int]] = []
+        for r in sorted(by_row):
+            cols = sorted(by_row[r])
+            start = prev = cols[0]
+            for c in cols[1:]:
+                if c == prev + 1:
+                    prev = c
+                    continue
+                out.append((r, start, prev))
+                start = prev = c
+            out.append((r, start, prev))
+        return tuple(out)
+
 
 # ===========================================================================
 # GEN 1  --  "green" / Kashyyyk
 # ===========================================================================
-# Vertical strips, given as pad-column spans (1-based, inclusive).
-# "wide" strips hold 4 segments, "narrow" strips hold 6.
-STRIPS: list[tuple[int, int, str]] = [
-    (1, 1, "narrow"),
-    (2, 4, "wide"),
-    (5, 6, "narrow"),
-    (7, 9, "wide"),
-    (10, 10, "narrow"),
-    (11, 15, "wide"),
-    (16, 20, "wide"),
-    (21, 25, "wide"),
-    (26, 30, "wide"),
-    (31, 35, "wide"),
-    (36, 36, "narrow"),
-    (37, 39, "wide"),
-    (40, 41, "narrow"),
-    (42, 44, "wide"),
-    (45, 45, "narrow"),
-]
+# THE AUTHORITATIVE MAP: which segment every one of the 900 pads belongs to.
+#
+# This is the output of the plant's own `get_900_matrix`, transcribed as it is
+# printed: 20 rows of 45 columns, row 1 first, column 1 leftmost -- the same
+# orientation the rest of this module uses, so matrix[r-1][c-1] is the segment
+# owning pad (col=c, row=r).
+#
+# It replaces a reconstruction that described the plate as 15 vertical strips
+# cut into rectangular bands.  That model tiled the grid and reproduced the
+# printed label pads, which is why it survived, but it was still wrong: the
+# real segments are staircases wherever they meet the rounded corners of the
+# plate.  60 of the 72 areas disagreed with this map, segment 1 by more than a
+# factor of two (15 pads assumed, 7 actual).  Nothing is inferred here any
+# more -- the areas, the centroids and the map are all read off these numbers.
+_GEN1_MATRIX_TEXT = """
+    37 37 37 43 43 43 43  5 49 49 49 49  9  9  9 13 13 13 13 13 17 17 17 17 17 21 21 21 21 21 25 25 25 55 55 55 55 29 61 61 61 61 67 67 67
+    37 37  1  1 43 43  5  5  5 49 49  9  9  9  9 13 13 13 13 13 17 17 17 17 17 21 21 21 21 21 25 25 25 25 55 55 29 29 29 61 61 33 33 33 67
+    37  1  1  1 44 44  5  5  5 50 50  9  9  9  9 13 13 13 13 13 17 17 17 17 17 21 21 21 21 21 25 25 25 25 56 56 29 29 29 62 62 33 33 33 67
+    38  1  1 44 44 44  5  5 50 50 50  9  9  9  9 13 13 13 13 13 17 17 17 17 17 21 21 21 21 21 25 25 25 25 56 56 56 29 29 62 62 62 33 33 68
+    38 38 44 44 44 44  5  5 50 50 50  9  9  9  9 13 13 13 13 13 17 17 17 17 17 21 21 21 21 21 25 25 25 25 56 56 56 29 29 62 62 62 62 68 68
+    38  2  2 44 44 44  6  6 50 50 50 10 10 10 10 14 14 14 14 14 18 18 18 18 18 22 22 22 22 22 26 26 26 26 56 56 56 30 30 62 62 62 34 34 68
+    39  2  2 44 44  6  6  6  6 50 50 10 10 10 10 14 14 14 14 14 18 18 18 18 18 22 22 22 22 22 26 26 26 26 56 56 30 30 30 30 62 62 34 34 69
+    39  2  2 45 45 45  6  6 51 51 51 10 10 10 10 14 14 14 14 14 18 18 18 18 18 22 22 22 22 22 26 26 26 26 57 57 57 30 30 63 63 63 34 34 69
+    39  2  2 45 45 45  6  6 51 51 51 10 10 10 10 14 14 14 14 14 18 18 18 18 18 22 22 22 22 22 26 26 26 26 57 57 57 30 30 63 63 63 34 34 69
+    39  2  2 45 45 45  6  6 51 51 51 10 10 10 10 14 14 14 14 14 18 18 18 18 18 22 22 22 22 22 26 26 26 26 57 57 57 30 30 63 63 63 34 34 69
+    40  3  3 46 46 46  7  7 52 52 52 11 11 11 11 15 15 15 15 15 19 19 19 19 19 23 23 23 23 23 27 27 27 27 58 58 58 31 31 64 64 64 35 35 70
+    40  3  3 46 46 46  7  7 52 52 52 11 11 11 11 15 15 15 15 15 19 19 19 19 19 23 23 23 23 23 27 27 27 27 58 58 58 31 31 64 64 64 35 35 70
+    40  3  3 46 46 46  7  7 52 52 52 11 11 11 11 15 15 15 15 15 19 19 19 19 19 23 23 23 23 23 27 27 27 27 58 58 58 31 31 64 64 64 35 35 70
+    40  3  3 47 47  7  7  7  7 53 53 11 11 11 11 15 15 15 15 15 19 19 19 19 19 23 23 23 23 23 27 27 27 27 59 59 31 31 31 31 65 65 35 35 70
+    41  3  3 47 47 47  7  7 53 53 53 11 11 11 11 15 15 15 15 15 19 19 19 19 19 23 23 23 23 23 27 27 27 27 59 59 59 31 31 65 65 65 35 35 71
+    41 41 47 47 47 47  8  8 53 53 53 12 12 12 12 16 16 16 16 16 20 20 20 20 20 24 24 24 24 24 28 28 28 28 59 59 59 32 32 65 65 65 65 71 71
+    41  4  4 47 47 47  8  8 53 53 53 12 12 12 12 16 16 16 16 16 20 20 20 20 20 24 24 24 24 24 28 28 28 28 59 59 59 32 32 65 65 65 36 36 71
+    42  4  4  4 47 47  8  8  8 53 53 12 12 12 12 16 16 16 16 16 20 20 20 20 20 24 24 24 24 24 28 28 28 28 59 59 32 32 32 65 65 36 36 36 72
+    42 42  4  4 48 48  8  8  8 54 54 12 12 12 12 16 16 16 16 16 20 20 20 20 20 24 24 24 24 24 28 28 28 28 60 60 32 32 32 66 66 36 36 72 72
+    42 42 42 48 48 48 48  8 54 54 54 54 12 12 12 16 16 16 16 16 20 20 20 20 20 24 24 24 24 24 28 28 28 60 60 60 60 32 66 66 66 66 72 72 72
+"""
 
-# Pad-row spans (1-based, inclusive) of the segments inside a strip.
-ROWS_WIDE = [(1, 5), (6, 10), (11, 15), (16, 20)]                 # 5,5,5,5
-ROWS_NARROW = [(1, 2), (3, 7), (8, 10), (11, 13), (14, 18), (19, 20)]  # 2,5,3,3,5,2
 
-# Label pads as printed on R2D2_Coordinates_and_Segment_Numbering.pdf page 2.
-_GEN1_WIDE_LABEL_COLS = [3, 8, 13, 18, 23, 28, 33, 38, 43]
-_GEN1_WIDE_LABEL_ROWS = [3, 8, 13, 18]
-_GEN1_NARROW_LABEL_COLS = [1, 5, 10, 36, 41, 45]
-_GEN1_NARROW_LABEL_ROWS = [1, 5, 9, 12, 16, 20]
+def _parse_matrix(text: str) -> list[list[int]]:
+    grid = [[int(v) for v in line.split()]
+            for line in text.strip().splitlines() if line.strip()]
+    if len(grid) != N_ROWS or any(len(r) != N_COLS for r in grid):
+        raise ValueError(f"pad matrix must be {N_ROWS}x{N_COLS}")
+    return grid
+
+
+def _segments_from_matrix(grid: list[list[int]]) -> dict[str, Segment]:
+    pads: dict[int, list[tuple[int, int]]] = {}
+    for r, line in enumerate(grid, start=1):
+        for c, n in enumerate(line, start=1):
+            pads.setdefault(int(n), []).append((c, r))
+    return {str(n): Segment.from_pads(n, ps) for n, ps in sorted(pads.items())}
+
+
+def _label_pads(segs: dict[str, Segment]) -> tuple[dict[str, int], dict[str, int]]:
+    """A pad inside the segment to hang its number on.
+
+    The pad nearest the centroid AND owned by the segment -- on a staircase the
+    centroid itself can fall in a neighbour, so it cannot be used directly.
+    """
+    lcol: dict[str, int] = {}
+    lrow: dict[str, int] = {}
+    for name, seg in segs.items():
+        cx = sum(c for c, _r in seg.pads) / seg.n_pads
+        cy = sum(r for _c, r in seg.pads) / seg.n_pads
+        c, r = min(seg.pads, key=lambda p: (p[0] - cx) ** 2 + (p[1] - cy) ** 2)
+        lcol[name], lrow[name] = c, r
+    return lcol, lrow
 
 
 def _build_gen1() -> tuple[dict[str, Segment], dict[str, int], dict[str, int]]:
-    """Segments 1..36 fill the wide strips, 37..72 the narrow strips.
-
-    Numbering runs top-to-bottom inside a strip, then strips left to right
-    (segment 1 = 2nd strip / top band, segment 5 = 4th strip / top band,
-    segment 37 = 1st strip / top band).  This reproduces every label pad
-    printed on the drawing; see check_against_drawing().
-    """
-    segs: dict[str, Segment] = {}
-
-    wide = [s for s in STRIPS if s[2] == "wide"]
-    narrow = [s for s in STRIPS if s[2] == "narrow"]
-
-    for i, (c0, c1, _) in enumerate(wide):
-        for k, (r0, r1) in enumerate(ROWS_WIDE):
-            n = i * len(ROWS_WIDE) + k + 1              # 1 .. 36
-            segs[str(n)] = Segment(n, c0, c1, r0, r1)
-
-    for i, (c0, c1, _) in enumerate(narrow):
-        for k, (r0, r1) in enumerate(ROWS_NARROW):
-            n = 36 + i * len(ROWS_NARROW) + k + 1       # 37 .. 72
-            segs[str(n)] = Segment(n, c0, c1, r0, r1)
-
-    lcol: dict[str, int] = {}
-    lrow: dict[str, int] = {}
-    for i, c in enumerate(_GEN1_WIDE_LABEL_COLS):
-        for k, r in enumerate(_GEN1_WIDE_LABEL_ROWS):
-            n = i * 4 + k + 1
-            lcol[str(n)], lrow[str(n)] = c, r
-    for i, c in enumerate(_GEN1_NARROW_LABEL_COLS):
-        for k, r in enumerate(_GEN1_NARROW_LABEL_ROWS):
-            n = 36 + i * 6 + k + 1
-            lcol[str(n)], lrow[str(n)] = c, r
+    segs = _segments_from_matrix(_parse_matrix(_GEN1_MATRIX_TEXT))
+    lcol, lrow = _label_pads(segs)
     return segs, lcol, lrow
 
 
@@ -346,7 +433,7 @@ def _build_gen2() -> tuple[dict[str, Segment], dict[str, int], dict[str, int]]:
     segs: dict[str, Segment] = {}
     for c0, c1, bands in _GEN2_STRIPS:
         for r0, r1, n in bands:
-            segs[str(n)] = Segment(n, c0, c1, r0, r1)
+            segs[str(n)] = Segment.from_rect(n, c0, c1, r0, r1)
     lcol = {str(n): cr[0] for n, cr in _GEN2_LABELS.items()}
     lrow = {str(n): cr[1] for n, cr in _GEN2_LABELS.items()}
     return segs, lcol, lrow
@@ -366,6 +453,11 @@ class Plate:
     segments: dict[str, Segment]
     label_col: dict[str, int]
     label_row: dict[str, int]
+    #: True only when the pad map came from the plant's own `get_900_matrix`.
+    #: A layout that merely tiles the grid and matches the printed labels can
+    #: still be wrong -- the gen1 reconstruction did both and had 60 of 72
+    #: areas wrong -- so anything derived from an unverified plate is marked.
+    verified: bool = False
 
     @property
     def title(self) -> str:
@@ -377,11 +469,11 @@ _g2_segs, _g2_lc, _g2_lr = _build_gen2()
 
 PLATES: dict[str, Plate] = {
     "gen1": Plate("gen1", "green", "Kashyyyk",
-                  "R2D2_Coordinates_and_Segment_Numbering.pdf",
-                  _g1_segs, _g1_lc, _g1_lr),
+                  "get_900_matrix (plant pad map)",
+                  _g1_segs, _g1_lc, _g1_lr, verified=True),
     "gen2": Plate("gen2", "blue", "Naboo",
                   "Coordinates(blue).pdf",
-                  _g2_segs, _g2_lc, _g2_lr),
+                  _g2_segs, _g2_lc, _g2_lr, verified=False),
 }
 
 # Everything a user might reasonably type for a plate, mapped to its key.
@@ -534,15 +626,59 @@ def renumbering(src: str = "gen1", dst: str = "gen2") -> dict[str, str]:
     plate does gen1 segment 51 sit?", never to convert a data set.
     """
     a, b = plate(src), plate(dst)
+    owner = {pad: k2 for k2, s2 in b.segments.items() for pad in s2.pads}
     out: dict[str, str] = {}
-    for k, s in a.segments.items():
-        col = int(s.cx_mm // PAD_W_MM) + 1
-        row = int(s.cy_mm // PAD_H_MM) + 1
-        for k2, s2 in b.segments.items():
-            if s2.col0 <= col <= s2.col1 and s2.row0 <= row <= s2.row1:
-                out[k] = k2
-                break
+    for k, seg in a.segments.items():
+        # The dst segment holding the most of this src segment's pads.  A
+        # centroid test would be wrong for a staircase, whose centroid can
+        # land in a neighbour.
+        tally: dict[str, int] = {}
+        for pad in seg.pads:
+            k2 = owner.get(pad)
+            if k2 is not None:
+                tally[k2] = tally.get(k2, 0) + 1
+        if tally:
+            out[k] = max(tally.items(), key=lambda kv: kv[1])[0]
     return out
+
+
+def symmetry_report(plate_name: str | None = None) -> dict:
+    """Does the pad map mirror onto itself, left-right and top-bottom?
+
+    The plate is a symmetric piece of hardware: the corner staircases at the
+    four corners are the same shape, and every interior segment has a partner.
+    That makes symmetry a free, independent check on a transcribed pad map --
+    a single mistyped cell shows up as exactly two regions losing their
+    partner, which no amount of "it tiles the grid" checking would catch.
+
+    This does NOT compare segment NUMBERS, only the partition into shapes:
+    the numbering is deliberately not symmetric.
+    """
+    p = plate(plate_name) if plate_name else ACTIVE_PLATE
+
+    def shapes(flip_c: bool, flip_r: bool) -> set:
+        out = set()
+        for seg in p.segments.values():
+            out.add(frozenset(((N_COLS + 1 - c) if flip_c else c,
+                               (N_ROWS + 1 - r) if flip_r else r)
+                              for c, r in seg.pads))
+        return out
+
+    base = shapes(False, False)
+    lr, tb = shapes(True, False), shapes(False, True)
+    unmatched_lr = sorted(
+        {seg.number for seg in p.segments.values()
+         if frozenset(seg.pads) not in lr})
+    unmatched_tb = sorted(
+        {seg.number for seg in p.segments.values()
+         if frozenset(seg.pads) not in tb})
+    return {
+        "plate": p.key,
+        "left_right": base == lr,
+        "top_bottom": base == tb,
+        "unmatched_left_right": unmatched_lr,
+        "unmatched_top_bottom": unmatched_tb,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -554,11 +690,13 @@ def self_check(verbose: bool = True, plate_name: str | None = None) -> dict:
     p = plate(plate_name) if plate_name else ACTIVE_PLATE
     segments, lcol, lrow = p.segments, p.label_col, p.label_row
 
+    # Count the PADS each segment owns, not its bounding box: 40 of the 72
+    # gen1 segments are staircases, and a bounding-box count would report a
+    # clean tiling for a layout that overlaps badly.
     grid = [[0] * N_COLS for _ in range(N_ROWS)]
     for s in segments.values():
-        for r in range(s.row0 - 1, s.row1):
-            for c in range(s.col0 - 1, s.col1):
-                grid[r][c] += 1
+        for c, r in s.pads:
+            grid[r - 1][c - 1] += 1
 
     covered = sum(1 for row in grid for v in row if v == 1)
     doubled = sum(1 for row in grid for v in row if v > 1)
@@ -575,10 +713,17 @@ def self_check(verbose: bool = True, plate_name: str | None = None) -> dict:
 
     # every printed label pad must lie inside its own segment
     bad_labels = [n for n, s in segments.items()
-                  if not (s.col0 <= lcol[n] <= s.col1
-                          and s.row0 <= lrow[n] <= s.row1)]
+                  if (lcol[n], lrow[n]) not in s.pads]
     if bad_labels:
         problems.append(f"label pad outside segment for {bad_labels}")
+
+    sym = symmetry_report(p.key)
+    warnings = []
+    if not (sym["left_right"] and sym["top_bottom"]):
+        warnings.append(
+            "pad map is not mirror-symmetric; segments without a partner: "
+            f"left-right {sym['unmatched_left_right']}, "
+            f"top-bottom {sym['unmatched_top_bottom']}")
 
     res = {
         "plate": p.key,
@@ -589,6 +734,11 @@ def self_check(verbose: bool = True, plate_name: str | None = None) -> dict:
         "area_sum_cm2": total_area,
         "area_min_cm2": min(s.area_cm2 for s in segments.values()),
         "area_max_cm2": max(s.area_cm2 for s in segments.values()),
+        "n_non_rectangular": sum(1 for s in segments.values()
+                                 if not s.is_rectangle),
+        "verified": p.verified,
+        "symmetric": bool(sym["left_right"] and sym["top_bottom"]),
+        "warnings": warnings,
         "problems": problems,
     }
     if verbose:
@@ -602,6 +752,13 @@ def self_check(verbose: bool = True, plate_name: str | None = None) -> dict:
               f"{res['area_max_cm2']:.4f} cm2  "
               f"(x{res['area_max_cm2']/res['area_min_cm2']:.1f})")
         print(f"label pads      : {'all inside their segment' if not bad_labels else bad_labels}")
+        print(f"shape           : {res['n_non_rectangular']} of "
+              f"{len(segments)} segments are not rectangles")
+        if not p.verified:
+            print("NOTE            : this layout is a RECONSTRUCTION, not the "
+                  "plant's own pad map — areas from it are provisional")
+        for w in warnings:
+            print(f"WARNING         : {w}")
         print("PASS" if not problems else "FAIL: " + "; ".join(problems))
     return res
 
@@ -646,12 +803,32 @@ def plot_map(path="segment_map.png", value: dict[str, float] | None = None,
         s = segments[n]
         v = value.get(n)
         col = "0.85" if v is None else cmap((v - vmin) / (vmax - vmin + 1e-30))
+        # One patch per horizontal pad run, so a staircase segment is drawn as
+        # the shape it is.  Drawing the bounding box instead would overlap its
+        # neighbours and quietly misreport which pads carry which value.
+        for row, c0, c1 in s.runs:
+            ax.add_patch(Rectangle(((c0 - 1) * PAD_W_MM, (row - 1) * PAD_H_MM),
+                                   (c1 - c0 + 1) * PAD_W_MM, PAD_H_MM,
+                                   facecolor=col, edgecolor=col, lw=0.0))
         ax.add_patch(Rectangle((s.x0_mm, s.y0_mm), s.w_mm, s.h_mm,
-                               facecolor=col, edgecolor="w", lw=1.2))
+                               facecolor="none", edgecolor="none"))
         txt = n if v is None else f"{n}\n{v:.3g}"
         ax.text(s.cx_mm, s.cy_mm, txt, ha="center", va="center", fontsize=6.5,
                 color="w" if (v is not None and (v - vmin) /
                               (vmax - vmin + 1e-30) < 0.6) else "k")
+    # Segment boundaries: draw the edge between two pads that belong to
+    # different segments.  This traces every staircase exactly.
+    owner = {}
+    for n, seg in segments.items():
+        for c, r in seg.pads:
+            owner[(c, r)] = n
+    for (c, r), n in owner.items():
+        x0, y0 = (c - 1) * PAD_W_MM, (r - 1) * PAD_H_MM
+        if owner.get((c + 1, r)) != n:
+            ax.plot([x0 + PAD_W_MM] * 2, [y0, y0 + PAD_H_MM], color="w", lw=1.2)
+        if owner.get((c, r + 1)) != n:
+            ax.plot([x0, x0 + PAD_W_MM], [y0 + PAD_H_MM] * 2, color="w", lw=1.2)
+
     for x in TEMP_SENSOR_X_MM.values():
         ax.axvline(x, color="tab:red", ls=":", lw=1)
 

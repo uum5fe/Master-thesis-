@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
 
@@ -47,24 +47,57 @@ class PlateSpecError(ValueError):
 
 @dataclass(frozen=True)
 class PlateSegment:
-    """One segment, as a rectangle on the pad grid.
+    """One segment, as the SET OF PADS wired to it.
 
-    Pad indices are 1-based and inclusive on both ends, which is how the
-    numbering is printed on the plate drawings.
+    Pad indices are 1-based, which is how the numbering is printed on the
+    plate drawings.  A segment is not necessarily a rectangle: on the Gen 1
+    plate 40 of the 72 segments are staircases where they meet the rounded
+    corners, and describing them as rectangles got 60 of the 72 areas wrong.
+    `col0`/`row1` and friends are therefore the BOUNDING BOX of the pad set,
+    which is what cropping and axis limits want; they are not the shape.
     """
 
     name: str
-    col0: int
-    col1: int
-    row0: int
-    row1: int
+    pads: tuple[tuple[int, int], ...]        # (col, row), 1-based, sorted
     card: str | None = None
     channel: str | None = None
     area_override_cm2: float | None = None
 
+    @classmethod
+    def from_rect(cls, name: str, col0: int, col1: int, row0: int, row1: int,
+                  **kw) -> "PlateSegment":
+        return cls(name, tuple((c, r)
+                               for c in range(col0, col1 + 1)
+                               for r in range(row0, row1 + 1)), **kw)
+
+    @classmethod
+    def from_pads(cls, name: str, pads, **kw) -> "PlateSegment":
+        return cls(name, tuple(sorted((int(c), int(r)) for c, r in pads)), **kw)
+
     @property
     def n_pads(self) -> int:
-        return (self.col1 - self.col0 + 1) * (self.row1 - self.row0 + 1)
+        return len(self.pads)
+
+    @property
+    def col0(self) -> int:
+        return min(c for c, _r in self.pads)
+
+    @property
+    def col1(self) -> int:
+        return max(c for c, _r in self.pads)
+
+    @property
+    def row0(self) -> int:
+        return min(r for _c, r in self.pads)
+
+    @property
+    def row1(self) -> int:
+        return max(r for _c, r in self.pads)
+
+    @property
+    def is_rectangle(self) -> bool:
+        return self.n_pads == ((self.col1 - self.col0 + 1)
+                               * (self.row1 - self.row0 + 1))
 
 
 @dataclass(frozen=True)
@@ -132,8 +165,71 @@ class PlateGeometry:
         return s.n_pads * self.pad_area_cm2
 
     def centroid_mm(self, name: str) -> tuple[float, float]:
-        x0, y0, x1, y1 = self.bounds_mm(name)
-        return (0.5 * (x0 + x1), 0.5 * (y0 + y1))
+        """Mean of the pad centres -- not the middle of the bounding box.
+
+        For a rectangle the two agree.  For a staircase they do not, and the
+        bounding-box centre can fall in a neighbouring segment, which would
+        put a label on the wrong tile and a spatial fit at the wrong place.
+        """
+        s = self.segments[name]
+        return (self.pad_w_mm * (sum(c for c, _r in s.pads) / s.n_pads - 0.5),
+                self.pad_h_mm * (sum(r for _c, r in s.pads) / s.n_pads - 0.5))
+
+    def label_point_mm(self, name: str) -> tuple[float, float]:
+        """Where to print the segment's number so it lands on its own tile.
+
+        The centroid is the right place for a spatial fit but the wrong place
+        for a label: a concave segment need not contain its own centroid.  On
+        this plate segment 67 is exactly that case -- its centroid sits on a
+        pad belonging to segment 33 -- so the label snaps to the centre of the
+        pad it owns that is nearest the centroid.
+        """
+        s = self.segments[name]
+        cx = sum(c for c, _r in s.pads) / s.n_pads
+        cy = sum(r for _c, r in s.pads) / s.n_pads
+        c, r = min(s.pads, key=lambda p: (p[0] - cx) ** 2 + (p[1] - cy) ** 2)
+        return ((c - 0.5) * self.pad_w_mm, (r - 0.5) * self.pad_h_mm)
+
+    def outline_mm(self, name: str) -> tuple[list[float], list[float]]:
+        """The true boundary of the segment as a closed polygon path.
+
+        Every unit edge with a pad inside the segment and nothing inside on
+        the other side is a boundary edge; walking those edges gives the
+        outline exactly, staircases included.  Disjoint loops are separated by
+        None, which is how a fill-toself trace draws more than one ring.
+        """
+        pads = set(self.segments[name].pads)
+        w, h = self.pad_w_mm, self.pad_h_mm
+
+        # Directed edges, counter-clockwise around the inside of each pad, so
+        # that the surviving edges already chain head-to-tail.
+        edges: dict[tuple[float, float], tuple[float, float]] = {}
+        for c, r in pads:
+            x0, y0, x1, y1 = (c - 1) * w, (r - 1) * h, c * w, r * h
+            if (c, r - 1) not in pads:
+                edges[(x0, y0)] = (x1, y0)
+            if (c + 1, r) not in pads:
+                edges[(x1, y0)] = (x1, y1)
+            if (c, r + 1) not in pads:
+                edges[(x1, y1)] = (x0, y1)
+            if (c - 1, r) not in pads:
+                edges[(x0, y1)] = (x0, y0)
+
+        xs: list[float] = []
+        ys: list[float] = []
+        while edges:
+            start = next(iter(edges))
+            point = start
+            loop: list[tuple[float, float]] = []
+            while point in edges:
+                loop.append(point)
+                point = edges.pop(point)
+            loop.append(start)
+            if xs:
+                xs.append(None); ys.append(None)
+            xs.extend(p[0] for p in loop)
+            ys.extend(p[1] for p in loop)
+        return xs, ys
 
     def areas(self) -> dict[str, float]:
         return {k: self.area_cm2(k) for k in self.segments}
@@ -166,9 +262,8 @@ class PlateGeometry:
         """
         grid: dict[tuple[int, int], list[str]] = {}
         for name, s in self.segments.items():
-            for c in range(s.col0, s.col1 + 1):
-                for r in range(s.row0, s.row1 + 1):
-                    grid.setdefault((c, r), []).append(name)
+            for pad in s.pads:
+                grid.setdefault(pad, []).append(name)
 
         overlaps = {k: v for k, v in grid.items() if len(v) > 1}
         covered = set(grid)
@@ -227,7 +322,8 @@ def _segments_from_strips(spec: dict) -> dict[str, PlateSegment]:
                 name = str(n)
                 if name in out:
                     raise PlateSpecError(f"segment {name} defined twice")
-                out[name] = PlateSegment(name, int(c0), int(c1), int(r0), int(r1))
+                out[name] = PlateSegment.from_rect(name, int(c0), int(c1),
+                                                  int(r0), int(r1))
                 n += 1
     return out
 
@@ -238,14 +334,42 @@ def _segments_explicit(spec: dict) -> dict[str, PlateSegment]:
         name = str(entry["name"] if "name" in entry else entry["segment"])
         if name in out:
             raise PlateSpecError(f"segment {name} defined twice")
-        out[name] = PlateSegment(
-            name=name,
-            col0=int(entry["col0"]), col1=int(entry["col1"]),
-            row0=int(entry["row0"]), row1=int(entry["row1"]),
-            card=entry.get("card"), channel=entry.get("channel"),
-            area_override_cm2=entry.get("area_cm2"),
-        )
+        kw = dict(card=entry.get("card"), channel=entry.get("channel"),
+                  area_override_cm2=entry.get("area_cm2"))
+        if "pads" in entry:
+            out[name] = PlateSegment.from_pads(name, entry["pads"], **kw)
+        elif "runs" in entry:
+            # (row, col_from, col_to) triples -- compact and exact
+            out[name] = PlateSegment.from_pads(
+                name, ((c, int(row)) for row, c0, c1 in entry["runs"]
+                       for c in range(int(c0), int(c1) + 1)), **kw)
+        else:
+            out[name] = PlateSegment.from_rect(
+                name, int(entry["col0"]), int(entry["col1"]),
+                int(entry["row0"]), int(entry["row1"]), **kw)
     return out
+
+
+def _segments_from_pad_matrix(spec: dict) -> dict[str, PlateSegment]:
+    """The authoritative form: which segment owns each pad, one row per line.
+
+    ``pad_matrix`` is ``n_rows`` lists of ``n_cols`` segment numbers, row 1
+    first and column 1 leftmost.  Nothing is inferred from it -- no strips, no
+    bands, no assumption that a segment is a rectangle -- so a plate given this
+    way cannot be misread the way a generative description can.
+    """
+    grid = spec["pad_matrix"]
+    n_rows, n_cols = int(spec["n_rows"]), int(spec["n_cols"])
+    if len(grid) != n_rows or any(len(row) != n_cols for row in grid):
+        raise PlateSpecError(
+            f"pad_matrix must be {n_rows} rows of {n_cols} columns")
+    pads: dict[str, list[tuple[int, int]]] = {}
+    for r, row in enumerate(grid, start=1):
+        for c, value in enumerate(row, start=1):
+            pads.setdefault(str(value), []).append((c, r))
+    return {name: PlateSegment.from_pads(name, ps)
+            for name, ps in sorted(pads.items(),
+                                   key=lambda kv: (len(kv[0]), kv[0]))}
 
 
 def load_spec(path: str | Path) -> PlateGeometry:
@@ -253,22 +377,25 @@ def load_spec(path: str | Path) -> PlateGeometry:
     path = Path(path)
     spec = json.loads(path.read_text())
 
-    if "segments" in spec:
+    if "pad_matrix" in spec:
+        segments = _segments_from_pad_matrix(spec)
+    elif "segments" in spec:
         segments = _segments_explicit(spec)
     elif "strips" in spec:
         segments = _segments_from_strips(spec)
     else:
-        raise PlateSpecError(f"{path.name}: needs either 'segments' or 'strips'")
+        raise PlateSpecError(
+            f"{path.name}: needs one of 'pad_matrix', 'segments' or 'strips'")
 
     # Per-segment wiring, kept separate from the layout so that a re-wiring
     # does not force the geometry to be re-entered.
     wiring: dict[str, dict] = spec.get("wiring", {})
     if wiring:
         segments = {
-            k: PlateSegment(
-                **{**vars(s),
-                   "card": wiring.get(k, {}).get("card", s.card),
-                   "channel": wiring.get(k, {}).get("channel", s.channel)}
+            k: replace(
+                s,
+                card=wiring.get(k, {}).get("card", s.card),
+                channel=wiring.get(k, {}).get("channel", s.channel),
             )
             for k, s in segments.items()
         }
@@ -292,14 +419,13 @@ def load_spec(path: str | Path) -> PlateGeometry:
     )
 
     for name, s in geom.segments.items():
-        if not (1 <= s.col0 <= s.col1 <= geom.n_cols):
-            raise PlateSpecError(
-                f"{path.name}: segment {name} columns {s.col0}..{s.col1} "
-                f"outside 1..{geom.n_cols}")
-        if not (1 <= s.row0 <= s.row1 <= geom.n_rows):
-            raise PlateSpecError(
-                f"{path.name}: segment {name} rows {s.row0}..{s.row1} "
-                f"outside 1..{geom.n_rows}")
+        if not s.pads:
+            raise PlateSpecError(f"{path.name}: segment {name} has no pads")
+        for c, r in s.pads:
+            if not (1 <= c <= geom.n_cols and 1 <= r <= geom.n_rows):
+                raise PlateSpecError(
+                    f"{path.name}: segment {name} has pad (col {c}, row {r}) "
+                    f"outside the {geom.n_cols}x{geom.n_rows} grid")
     return geom
 
 

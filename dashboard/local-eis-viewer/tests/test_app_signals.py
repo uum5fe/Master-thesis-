@@ -185,3 +185,99 @@ def test_the_scan_offset_is_reported_at_the_analogue_frequency(points):
     above = [p for p in pts if p["name"] == "p2"][0]
     assert f"{above['f_true']:.4g}" in title
     assert f"{above['f_alias']:.4g}" in title
+
+
+# ---------------------------------------------------------------------------
+# the FAMOS side: five free-running cards, and what may be compared with what
+# ---------------------------------------------------------------------------
+
+DWELLS = (500.0, 1000.0, 2000.0)
+
+
+@pytest.fixture(scope="module")
+def cards(tmp_path_factory):
+    """Two cards of a stepped sweep, with a bulk offset between them.
+
+    Card 2 is written a full 3 ms late, which is what a free-running card
+    actually looks like.  That offset is common to everything on card 2, so it
+    cancels in a ratio taken WITHIN card 2 and does not cancel in a ratio taken
+    across cards -- which is the whole reason the tab has to pick a reference.
+    """
+    from datetime import datetime
+    from tests.synthetic import write_famos
+
+    fs, seg_s, gap_s = 10_000.0, 0.5, 0.1
+    rng = np.random.default_rng(3)
+    n = int(fs * len(DWELLS) * (seg_s + gap_s))
+    t = np.arange(n) / fs
+
+    def sweep(delay_s=0.0, amp=1.0):
+        y = np.zeros(n)
+        for k, f in enumerate(DWELLS):
+            a = int(fs * k * (seg_s + gap_s))
+            b = a + int(fs * seg_s)
+            y[a:b] = amp * np.sin(2 * np.pi * f * (t[a:b] - delay_s))
+        return y
+
+    folder = tmp_path_factory.mktemp("famos")
+    files = []
+    for card, (names, lag) in {1: (["1", "2"], 0.0),
+                               2: (["17", "18"], 3e-3)}.items():
+        chans = {}
+        for s in names:
+            chans[s] = 2.0 + 8e-3 * sweep(lag) + rng.normal(0, 2e-6, n)
+        chans[f"UC{card}"] = 0.65 + 4e-3 * sweep(lag) + rng.normal(0, 2e-7, n)
+        chans[f"Temp_{card}"] = 0.62 + rng.normal(0, 1e-5, n)
+        p = folder / f"Leepa_SYNTH_Current_150A_Test_01_Karte_{card}.DAT"
+        write_famos(p, chans, 1.0 / fs, datetime(2026, 4, 20, 10, 21))
+        files.append(str(p))
+    return files
+
+
+def test_each_segment_is_traced_back_to_the_card_that_carries_it(cards):
+    index = signals._segment_index(cards)
+    assert set(index) == {"1", "2", "17", "18"}
+    assert index["1"] == index["2"] == cards[0]
+    assert index["17"] == index["18"] == cards[1]
+
+
+def test_a_segment_is_referenced_to_the_cell_voltage_on_its_own_card(cards):
+    """Pairing across cards would put the inter-card offset into the ratio.
+
+    Card 2 here is 3 ms late.  At the top dwell that is six full periods of
+    phase -- so a segment on card 2 compared against UC1 would produce a
+    confident, entirely fictitious impedance angle.
+    """
+    fam, ref = signals._card_for_segment(cards, "17")
+    assert fam is not None
+    assert ref == "UC2", "segment 17 was referenced to another card's copy"
+    assert "17" in fam.names
+
+    fam1, ref1 = signals._card_for_segment(cards, "1")
+    assert ref1 == "UC1"
+    assert "17" not in fam1.names
+
+
+def test_the_dwells_are_found_where_they_were_written(cards):
+    """Only the dwells the evaluation kept, and each inside its own step.
+
+    The hard end of a dwell splatters, and the detector raises a handful of
+    weak candidates out of that splatter.  Bronze discards them, so the tab
+    must discard them too -- a dropdown entry no impedance came from is worse
+    than no entry at all.
+    """
+    fam, ref = signals._card_for_segment(cards, "1")
+    steps = signals._schedule(fam, ref)
+
+    assert len(steps) == len(DWELLS), \
+        f"expected {len(DWELLS)} dwells, got {[round(s['freq'], 1) for s in steps]}"
+    # offered in the order they were played, so "step 3" means the third one
+    assert [s["start"] for s in steps] == sorted(s["start"] for s in steps)
+
+    seg_s, gap_s, fs = 0.5, 0.1, fam.fs
+    for k, (s, want) in enumerate(zip(steps, DWELLS)):
+        assert abs(s["freq"] - want) / want < 0.02
+        assert s["snr_db"] > 20
+        # and the window sits inside the dwell that was written, not across it
+        a, b = k * (seg_s + gap_s), k * (seg_s + gap_s) + seg_s
+        assert a <= s["start"] / fs < s["stop"] / fs <= b

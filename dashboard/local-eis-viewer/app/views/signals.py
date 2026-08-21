@@ -241,10 +241,22 @@ def _csv_points(ref):
 
 
 def _schedule(fam, ref_name: str) -> list[dict]:
+    """The dwells of the sweep, filtered the way the evaluation filters them.
+
+    `detect_schedule` returns candidates, and the abrupt end of a dwell splatters
+    enough energy to raise a few of them out of nothing.  Bronze keeps only the
+    steps that pass `Step.valid(min_snr_db)` and evaluates those; offering the
+    rejects here would put dwells in the dropdown that no impedance was ever
+    computed from, which is exactly what this tab exists not to do.
+    """
     _pipeline_on_path()
     from eis_local import detect_schedule
+    from config import DEFAULT
+    min_snr = float(getattr(DEFAULT, "min_snr_db", 8.0))
     ref = fam.channel(ref_name)
-    steps = detect_schedule(ref, fam.fs, verbose=False)
+    steps = detect_schedule(ref, fam.fs, min_snr_db=min_snr, verbose=False)
+    steps = [s for s in steps if s.valid(min_snr)]
+    steps.sort(key=lambda s: s.start)
     return [{"freq": float(s.freq), "start": int(s.start), "stop": int(s.stop),
              "amp": float(s.amp), "snr_db": float(s.snr_db)}
             for s in steps][:MAX_DWELLS]

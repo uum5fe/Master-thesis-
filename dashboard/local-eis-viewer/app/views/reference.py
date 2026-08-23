@@ -23,13 +23,14 @@ import plotly.graph_objects as go
 from dash import Input, Output, dcc, html
 
 from app.services import store
-from app.services.figures import TEMPLATE, empty_figure
+from app.services.figures import SERIES_COLOURS, TEMPLATE, empty_figure
 from app.views import common as ui
 
 
 #: One colour per condition, so the same current keeps its colour in both
-#: plots and the reference/local pair can be read as one series.
-_PALETTE = ("#1f6feb", "#c0392b", "#2e9e5b", "#8250df", "#b8860b", "#0f9b9b")
+#: plots and the reference/local pair reads as one series. Taken from the
+#: shared, colour-vision-checked order rather than chosen here.
+_PALETTE = SERIES_COLOURS
 
 
 def _pipeline_on_path() -> None:
@@ -44,8 +45,8 @@ def _pipeline_on_path() -> None:
 def layout():
     return html.Div([
         ui.panel([
-            html.Div("Local EIS, aggregated to the cell, against a whole-cell "
-                     "sweep", style={"fontWeight": 650, "marginBottom": "4px"}),
+            ui.section_title("Local EIS, aggregated to the cell, against a whole-cell "
+                     "sweep"),
             ui.note(
                 "The segments are in parallel across one cell voltage, so "
                 "admittances add: Z_cell = A_cell / Σ(A_s / Z_s). Gamry writes "
@@ -55,13 +56,11 @@ def layout():
             html.Div(id="rf-status", style={"marginTop": "8px"}),
         ]),
         ui.panel([
-            html.Div("Nyquist, per condition",
-                     style={"fontWeight": 650, "marginBottom": "4px"}),
+            ui.section_title("Nyquist, per condition"),
             ui.graph("rf-nyquist"),
         ]),
         ui.panel([
-            html.Div("What the difference looks like",
-                     style={"fontWeight": 650, "marginBottom": "4px"}),
+            ui.section_title("What the difference looks like"),
             ui.note(
                 "A flat magnitude offset is an area or a common shunt error. A "
                 "phase error growing with frequency is uncorrected chain "
@@ -71,8 +70,7 @@ def layout():
             ui.graph("rf-residual"),
         ]),
         ui.panel([
-            html.Div("Per condition", style={"fontWeight": 650,
-                                             "marginBottom": "4px"}),
+            ui.section_title("Per condition"),
             html.Div(id="rf-table"),
         ]),
     ])
@@ -167,8 +165,13 @@ def render(selection):
 
     order = [r["condition"] for r in rows]
 
+    from plotly.subplots import make_subplots
+
     nyq = go.Figure()
-    res = go.Figure()
+    res = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                        vertical_spacing=0.09,
+                        subplot_titles=("magnitude difference",
+                                        "phase difference"))
     for i, cond in enumerate(order):
         d = curves.get(cond)
         if d is None:
@@ -182,26 +185,34 @@ def render(selection):
             x=d["zl"].real, y=-d["zl"].imag, mode="lines+markers",
             name=f"{cond} · local", line=dict(color=colour),
             marker=dict(size=5, symbol="square")))
+        # Per cent and degrees are different quantities. They share the
+        # frequency axis and nothing else, so they get a row each rather than
+        # two scales in one frame, where a crossing would read as a
+        # relationship between them.
         rel = 100 * (np.abs(d["zl"]) / np.abs(d["zr"]) - 1.0)
         res.add_trace(go.Scatter(x=d["f"], y=rel, mode="lines+markers",
-                                 name=f"{cond} · |Z| [%]",
-                                 line=dict(color=colour),
-                                 marker=dict(size=4)))
+                                 name=cond, legendgroup=cond,
+                                 line=dict(color=colour, width=2),
+                                 marker=dict(size=5)), row=1, col=1)
         res.add_trace(go.Scatter(x=d["f"], y=d["dphi"], mode="lines+markers",
-                                 name=f"{cond} · phase [°]",
-                                 line=dict(color=colour, dash="dash"),
-                                 marker=dict(size=4, symbol="square")))
+                                 name=cond, legendgroup=cond, showlegend=False,
+                                 line=dict(color=colour, width=2),
+                                 marker=dict(size=5, symbol="square")),
+                      row=2, col=1)
 
     nyq.update_layout(
         template=TEMPLATE,
         xaxis_title="Z′ [mΩ·cm²]", yaxis_title="−Z″ [mΩ·cm²]",
         yaxis=dict(scaleanchor="x", scaleratio=1),
         title="dotted = whole cell (Gamry) · solid = local, aggregated")
-    res.update_layout(
-        template=TEMPLATE,
-        xaxis_title="f [Hz]", xaxis_type="log",
-        yaxis_title="local − reference",
-        title="magnitude difference [%] and phase difference [°]")
+    res.update_xaxes(type="log", row=1, col=1)
+    res.update_xaxes(type="log", title_text="f [Hz]", row=2, col=1)
+    res.update_yaxes(title_text="local − ref  [%]", row=1, col=1)
+    res.update_yaxes(title_text="local − ref  [°]", row=2, col=1)
+    for row in (1, 2):
+        res.add_hline(y=0, line=dict(color="#b9bfc7", width=1), row=row, col=1)
+    res.update_layout(template=TEMPLATE, height=460,
+                      title="How the two instruments differ")
     notes = [f"{r['condition']}: {r['notes']}" for r in rows
              if r.get("notes")]
     status = ui.note(

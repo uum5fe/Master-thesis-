@@ -103,8 +103,7 @@ def layout():
                     html.Div(id="ecm-params"),
                 ]),
                 ui.panel([
-                    html.Div("Circuit ladder", style={"fontWeight": 650,
-                                                      "marginBottom": "6px"}),
+                    ui.section_title("Circuit ladder"),
                     ui.note("Lower AICc wins. A difference under about 2 means "
                             "the data does not distinguish the two circuits."),
                     html.Div(id="ecm-ladder"),
@@ -113,8 +112,7 @@ def layout():
         ], style={"display": "flex", "gap": "12px", "flexWrap": "wrap"}),
 
         ui.panel([
-            html.Div("Fitted parameter across the plate",
-                     style={"fontWeight": 650, "marginBottom": "6px"}),
+            ui.section_title("Fitted parameter across the plate"),
             html.Div([
                 html.Div(ui.field("Map", dcc.Dropdown(id="ecm-map-param", options=[],
                                                       value=None, clearable=False)),
@@ -129,8 +127,7 @@ def layout():
         ]),
 
         ui.panel([
-            html.Div("Fitted parameters, all segments",
-                     style={"fontWeight": 650, "marginBottom": "6px"}),
+            ui.section_title("Fitted parameters, all segments"),
             html.Div(id="ecm-table"),
         ]),
     ])

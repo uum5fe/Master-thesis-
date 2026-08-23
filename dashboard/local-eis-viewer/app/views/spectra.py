@@ -85,7 +85,7 @@ def layout():
                      style={"flex": "1 1 420px", "minWidth": "380px"}),
         ], style={"display": "flex", "gap": "12px", "flexWrap": "wrap"}),
         ui.panel([
-            html.Div("Selected points", style={"fontWeight": 650, "marginBottom": "6px"}),
+            ui.section_title("Selected points"),
             html.Div(id="sp-table"),
         ]),
     ])

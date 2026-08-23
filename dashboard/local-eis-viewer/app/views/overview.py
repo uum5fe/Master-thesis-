@@ -86,8 +86,7 @@ def register(app):
 
         left = [
             ui.panel([
-                html.Div("Plate-level statistics",
-                         style={"fontWeight": 650, "marginBottom": "8px"}),
+                ui.section_title("Plate-level statistics"),
                 ui.note("From the pipeline's own manifest, in SI units "
                         "(Ω·cm², A/cm²) as the pipeline wrote them. "
                         "A large spread is the signal worth chasing: it means "
@@ -95,7 +94,7 @@ def register(app):
                 ui.table(pd.DataFrame(stats_rows), "ov-stats", height="240px"),
             ]) if stats_rows else html.Div(),
             ui.panel([
-                html.Div("DC closure", style={"fontWeight": 650, "marginBottom": "6px"}),
+                ui.section_title("DC closure"),
                 ui.note("The measured segment currents, extrapolated over the "
                         "unmeasured area, against the load setpoint. This is "
                         "the one end-to-end check on the current calibration."),
@@ -107,8 +106,7 @@ def register(app):
         skew = run.meta.get("skew_table")
         right = [
             ui.panel([
-                html.Div("Acquisition skew per card",
-                         style={"fontWeight": 650, "marginBottom": "6px"}),
+                ui.section_title("Acquisition skew per card"),
                 ui.note("A multiplexed converter samples channel slot p at "
                         "p/(n_ch·fs). Left uncorrected this is tens of degrees "
                         "of phase error at the top of the band, which fans the "
@@ -117,8 +115,7 @@ def register(app):
                 if skew else ui.note("no skew table in this run"),
             ]),
             ui.panel([
-                html.Div("Segment quality", style={"fontWeight": 650,
-                                                   "marginBottom": "6px"}),
+                ui.section_title("Segment quality"),
                 dcc.Graph(figure=_class_figure(run), config=ui.GRAPH_CONFIG),
             ]),
         ]
@@ -230,8 +227,7 @@ def _famos_body(selection):
 
     return html.Div([
         ui.panel([
-            html.Div("Raw FAMOS recordings",
-                     style={"fontWeight": 650, "marginBottom": "6px"}),
+            ui.section_title("Raw FAMOS recordings"),
             ui.note("These are recordings, not results. Bronze/silver/gold has "
                     "to run over them before there is a spectrum to plot — "
                     "minutes of CPU over gigabytes — so it runs as a "
@@ -273,8 +269,7 @@ def _datago_header(selection):
 
 def _datago_body(_selection):
     return ui.panel([
-        html.Div("datago catalogue entry",
-                 style={"fontWeight": 650, "marginBottom": "6px"}),
+        ui.section_title("datago catalogue entry"),
         ui.note("datago lists which orders were measured. To see spectra, "
                 "point the format selector at processed results, or run the "
                 "pipeline over the order's recordings and let the output land "

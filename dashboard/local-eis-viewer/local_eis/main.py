@@ -363,6 +363,11 @@ def self_test() -> int:
     n = gamry_compare._selftest(log)
     log.info(f"  gamry_compare: {'PASS' if not n else str(n) + ' FAILURES'}")
     fails += n
+
+    import plate_conditions
+    n = plate_conditions._selftest(log)
+    log.info(f"  plate_conditions: {'PASS' if not n else str(n) + ' FAILURES'}")
+    fails += n
     log.info(f"\n  {'ALL PASS' if not fails else str(fails) + ' FAILURES'}")
     return int(fails)
 

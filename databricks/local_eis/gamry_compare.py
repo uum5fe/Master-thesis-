@@ -205,10 +205,22 @@ def find_cell_sweeps(root, pattern: str = "*.dta") -> list[CellSweep]:
 BENCH_CHANNELS: dict[str, str] = {
     "I_S": "I [A]",
     "U_S": "U_cell [V]",
+    "n_Cells": "cells",
+    # cathode gas, in and out -- both ends, because the plate sits between them
     "T_Si_C": "T_cath_in [C]",
-    "RH_Si_C_gas": "RH_cath [%]",
-    "RH_Si_A_gas": "RH_an [%]",
-    "p_So_C": "p_cath_out [bar]",
+    "T_So_C": "T_cath_out [C]",
+    "p_Si_C": "p_cath_in [bara]",
+    "p_So_C": "p_cath_out [bara]",
+    "RH_Si_C_gas": "RH_cath_in [%]",
+    "DPT_Si_C": "dew_cath_in [C]",
+    "FN_Si_Air_C": "air_cath [Nl/min]",
+    "FN_Si_Air_C_dry": "air_cath_dry [Nl/min]",
+    # anode and coolant, for context rather than for the fields
+    "T_Si_A": "T_an_in [C]",
+    "T_So_A": "T_an_out [C]",
+    "RH_Si_A_gas": "RH_an_in [%]",
+    "T_Si_CL": "T_cool_in [C]",
+    "T_So_CL": "T_cool_out [C]",
     "R_S_HFR": "bench HFR [ohm]",
 }
 
@@ -224,21 +236,36 @@ class BenchLog:
     series: dict[str, tuple[np.ndarray, np.ndarray]]
 
     def state_at(self, when: datetime, window_s: float = 30.0) -> dict[str, float]:
-        """Bench state over the `window_s` ending at `when`.
+        """Bench state at `when`.
 
-        The median, not the mean, and NaN-aware: several bench channels park at
-        NaN while their instrument is not measuring, and a single NaN would
-        otherwise wipe out the whole reading.
+        Two sampling models, because this log has both.  Fast channels are
+        recorded continuously and are best read as the median over the window
+        ending at `when` -- median, not mean, and NaN-aware, since several
+        channels park at NaN while their instrument is idle.
+
+        Setpoint-like channels are recorded ON CHANGE: `I_S` holds a value for
+        as long as the current is held and has gaps of several minutes.  A
+        window median of those returns NaN precisely when the operating point
+        is stable, which is exactly when it is being asked for -- the current
+        came back missing at every one of the four HFR points until this was
+        fixed.  For those the correct read is a zero-order hold: the last value
+        recorded at or before `when`.
         """
         if self.t0 is None:
             return {}
         t_rel = (when - self.t0).total_seconds()
         out: dict[str, float] = {}
         for key, (t, v) in self.series.items():
-            k = (t >= t_rel - window_s) & (t <= t_rel + 5.0)
-            vals = v[k]
-            vals = vals[np.isfinite(vals)]
-            out[key] = float(np.median(vals)) if vals.size else float("nan")
+            good = np.isfinite(v)
+            k = good & (t >= t_rel - window_s) & (t <= t_rel + 5.0)
+            if k.any():
+                out[key] = float(np.median(v[k]))
+                continue
+            before = good & (t <= t_rel + 5.0)
+            if before.any():
+                out[key] = float(v[before][np.argmax(t[before])])   # held value
+            else:
+                out[key] = float("nan")
         out["t_rel_s"] = t_rel
         return out
 

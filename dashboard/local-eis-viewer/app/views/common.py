@@ -48,6 +48,18 @@ def field(label: str, control, hint: str = "", label_id: str = "",
                     style={"marginBottom": "12px"})
 
 
+def section_title(text: str, subtitle: str = "") -> html.Div:
+    """A panel heading, in one place rather than restyled in every view."""
+    kids = [html.Div(text, style={"fontSize": "13px", "fontWeight": 650,
+                                  "color": COLOURS["text"],
+                                  "letterSpacing": "0.005em"})]
+    if subtitle:
+        kids.append(html.Div(subtitle, style={"fontSize": "11px",
+                                              "color": COLOURS["muted"],
+                                              "marginTop": "2px"}))
+    return html.Div(kids, style={"marginBottom": "8px"})
+
+
 def stat(label: str, value: str, tone: str = "text") -> html.Div:
     return html.Div([
         html.Div(label, style={"fontSize": "11px", "color": COLOURS["muted"],

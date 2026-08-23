@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import numpy as np
 import plotly.graph_objects as go
+import plotly.io as pio
 from plotly.colors import sample_colorscale
 from plotly.subplots import make_subplots
 
@@ -31,7 +32,58 @@ CLASS_PATTERN = {
 }
 CLASS_OPACITY = {"measured": 0.95, "inferred": 0.55, "bad": 0.30}
 
-TEMPLATE = "plotly_white"
+#: Categorical series colours, in FIXED order -- assigned by entity, never
+#: cycled by rank, so a filter that drops a condition does not repaint the
+#: survivors.  This order is not arbitrary: it is the one that passes the
+#: colour-vision check.  The obvious ordering (blue, red, green, ...) puts red
+#: next to green, which for a deuteranope separates by only 7.7 in OKLab -- the
+#: floor band -- and green next to gold fails outright at 5.9 for a
+#: protanope.  Moving gold between blue and red lifts the worst adjacent pair
+#: to 10.9 and every check passes.  Re-run the check before reordering.
+SERIES_COLOURS = ("#1f6feb", "#b8860b", "#c0392b", "#0f9b9b", "#8250df",
+                  "#2e9e5b")
+
+#: One template for every figure, so the charts read as one system rather than
+#: as whatever each view happened to set.  Recessive grid and axes, ink for
+#: text rather than series colour, and room for a title that says what the
+#: reader is looking at.
+TEMPLATE = go.layout.Template(
+    layout=dict(
+        colorway=list(SERIES_COLOURS),
+        font=dict(family="system-ui, -apple-system, 'Segoe UI', Roboto, "
+                         "'Helvetica Neue', sans-serif",
+                  size=12, color="#1f2328"),
+        # x in PAPER coordinates, so 0.0 puts the title outside the plotting
+        # area and the first glyph is clipped. Anchor it to the left margin
+        # instead, where the y axis label already lives.
+        title=dict(font=dict(size=13, color="#1f2328"), x=0.01,
+                   xanchor="left", xref="paper", pad=dict(b=10, l=0)),
+        paper_bgcolor="#ffffff",
+        plot_bgcolor="#ffffff",
+        margin=dict(l=64, r=24, t=44, b=52),
+        xaxis=dict(showgrid=True, gridcolor="#eef0f3", gridwidth=1,
+                   zeroline=False, linecolor="#d7dbe0", ticks="outside",
+                   ticklen=4, tickcolor="#d7dbe0",
+                   title=dict(font=dict(size=12, color="#5b6470"))),
+        yaxis=dict(showgrid=True, gridcolor="#eef0f3", gridwidth=1,
+                   zeroline=False, linecolor="#d7dbe0", ticks="outside",
+                   ticklen=4, tickcolor="#d7dbe0",
+                   title=dict(font=dict(size=12, color="#5b6470"))),
+        legend=dict(bgcolor="rgba(255,255,255,0.85)", borderwidth=0,
+                    font=dict(size=11), orientation="v",
+                    yanchor="top", y=1, xanchor="left", x=1.02),
+        hoverlabel=dict(bgcolor="#ffffff", bordercolor="#d7dbe0",
+                        font=dict(size=11, color="#1f2328")),
+        colorscale=dict(sequential="Viridis"),
+    )
+)
+
+# Registered AND made the default, so a figure built anywhere in the app picks
+# it up without the call site having to remember. Views may still pass
+# template=TEMPLATE explicitly; it is the same object either way.
+pio.templates["localeis"] = TEMPLATE
+pio.templates.default = "localeis"
+
 MISSING_COLOUR = "#d9d9d9"
 
 
@@ -42,6 +94,24 @@ def _colour_for(value, vmin, vmax, colorscale) -> str:
         return sample_colorscale(colorscale, [0.5])[0]
     t = float(np.clip((value - vmin) / (vmax - vmin), 0.0, 1.0))
     return sample_colorscale(colorscale, [t])[0]
+
+
+def _ink_on(colour: str) -> str:
+    """Dark or light text, whichever the fill can actually carry.
+
+    A fixed dark label is unreadable on the dark end of any sequential ramp,
+    and these maps are read by picking a segment number off a tile. Relative
+    luminance per WCAG, with the usual 0.5 split.
+    """
+    try:
+        rgb = [int(v) for v in colour[colour.index("(") + 1:
+                                      colour.index(")")].split(",")[:3]]
+    except (ValueError, IndexError):
+        return "rgba(20,20,20,0.85)"
+    lin = [(c / 255.0) / 12.92 if c / 255.0 <= 0.04045
+           else (((c / 255.0) + 0.055) / 1.055) ** 2.4 for c in rgb]
+    lum = 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2]
+    return "rgba(20,20,20,0.85)" if lum > 0.5 else "rgba(255,255,255,0.95)"
 
 
 def _robust_limits(values, low: float = 2.0, high: float = 98.0):
@@ -135,18 +205,25 @@ def plate_heatmap(
         ))
 
     if show_labels:
-        cx, cy, labels = [], [], []
+        # One trace per ink colour rather than one for all: the label has to be
+        # legible against the tile it sits on, and a single fixed colour cannot
+        # be, at both ends of a sequential ramp.
+        by_ink: dict[str, tuple[list, list, list]] = {}
         for name in order:
             # label_point, not centroid: a concave segment need not contain
             # its own centroid, and a number drawn on the neighbour's tile is
             # worse than no number at all.
             x, y = geom.label_point_mm(name)
+            ink = _ink_on(_colour_for(values.get(name, float("nan")),
+                                      vmin, vmax, colorscale))
+            cx, cy, labels = by_ink.setdefault(ink, ([], [], []))
             cx.append(x); cy.append(y); labels.append(name)
-        fig.add_trace(go.Scatter(
-            x=cx, y=cy, mode="text", text=labels,
-            textfont=dict(size=8, color="rgba(20,20,20,0.75)"),
-            hoverinfo="skip", showlegend=False,
-        ))
+        for ink, (cx, cy, labels) in by_ink.items():
+            fig.add_trace(go.Scatter(
+                x=cx, y=cy, mode="text", text=labels,
+                textfont=dict(size=8, color=ink),
+                hoverinfo="skip", showlegend=False,
+            ))
 
     # Flow channel separators and the gas inlet marker: a map of a fuel cell
     # plate is not readable without knowing which way the gas runs.

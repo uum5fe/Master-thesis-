@@ -73,8 +73,7 @@ def layout():
         ]),
 
         ui.panel([
-            html.Div("1 · The recording, and where the dwells are",
-                     style={"fontWeight": 650, "marginBottom": "4px"}),
+            ui.section_title("1 · The recording, and where the dwells are"),
             ui.note("Envelope of the cell-voltage reference over the whole "
                     "record. Each shaded band is one frequency step as the "
                     "pipeline located it — grown from the demodulated envelope, "
@@ -85,8 +84,7 @@ def layout():
 
         html.Div([
             html.Div([ui.panel([
-                html.Div("2 · One dwell, and the tone taken out of it",
-                         style={"fontWeight": 650, "marginBottom": "4px"}),
+                ui.section_title("2 · One dwell, and the tone taken out of it"),
                 ui.note("Raw samples with the fitted sine on top. The fit is a "
                         "least-squares sine at the known frequency — the "
                         "optimum estimator, and the same one the pipeline uses. "
@@ -95,8 +93,7 @@ def layout():
                 ui.graph("sg-dwell"),
             ])], style={"flex": "1 1 480px", "minWidth": "420px"}),
             html.Div([ui.panel([
-                html.Div("3 · Are the two channels simultaneous?",
-                         style={"fontWeight": 650, "marginBottom": "4px"}),
+                ui.section_title("3 · Are the two channels simultaneous?"),
                 ui.note("Both channels normalised to unit amplitude and drawn "
                         "over a few cycles. Any horizontal shift between them "
                         "is acquisition skew, and it goes straight into the "
@@ -107,8 +104,7 @@ def layout():
         ], style={"display": "flex", "gap": "12px", "flexWrap": "wrap"}),
 
         ui.panel([
-            html.Div("4 · Every tone extracted from this recording",
-                     style={"fontWeight": 650, "marginBottom": "4px"}),
+            ui.section_title("4 · Every tone extracted from this recording"),
             ui.note("One row per dwell. `cycles` under about three means the "
                     "phasor came from a fraction of a period and should not be "
                     "trusted whatever its SNR; `SNR` is the tone against the "

@@ -54,6 +54,15 @@ PARAM_META: dict[str, dict] = {
     "kk_res_pct":  dict(label="Kramers-Kronig residual", unit="%", colorscale="Greys"),
     "snr_med_db":  dict(label="Median SNR", unit="dB", colorscale="Viridis"),
 
+    # -- operating conditions over the plate --------------------------------
+    # Diverging scales would imply a meaningful mid-point; these are gradients
+    # along a flow path, so a sequential scale is the honest one. Humidity gets
+    # a wet-looking scale because saturation is the thing being looked for.
+    "op_temperature": dict(label="Temperature", unit="°C", colorscale="Inferno"),
+    "op_pressure":    dict(label="Pressure", unit="bar(a)", colorscale="Cividis"),
+    "op_humidity":    dict(label="Relative humidity", unit="% RH",
+                           colorscale="YlGnBu"),
+
     # -- calibration campaigns ----------------------------------------------
     "H_at_60C":      dict(label="Shunt sensitivity at 60 °C", unit="V/A",
                           colorscale="Viridis"),

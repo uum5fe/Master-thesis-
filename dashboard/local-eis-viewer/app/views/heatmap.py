@@ -48,14 +48,19 @@ def layout():
             html.Div([
                 ui.panel([ui.graph("hm-dist")]),
                 ui.panel([
+                    # Filled by a callback, so it stays a plain Div; the
+                    # typography is section_title's so it does not read as a
+                    # different kind of heading.
                     html.Div(id="hm-click-title",
-                             style={"fontWeight": 650, "marginBottom": "4px"}),
+                             style={"fontSize": "13px", "fontWeight": 650,
+                                    "color": ui.COLOURS["text"],
+                                    "marginBottom": "8px"}),
                     ui.graph("hm-click-spectrum"),
                 ]),
             ], style={"flex": "2 1 380px", "minWidth": "340px"}),
         ], style={"display": "flex", "gap": "12px", "flexWrap": "wrap"}),
         ui.panel([
-            html.Div("Segment table", style={"fontWeight": 650, "marginBottom": "6px"}),
+            ui.section_title("Segment table"),
             ui.note("Sortable and filterable; the Export button writes the "
                     "current view to CSV."),
             html.Div(id="hm-table"),

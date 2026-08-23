@@ -96,6 +96,17 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--equal-areas", action="store_true",
                    help="treat every segment as A_cell/72 = 4.235 cm2")
     g.add_argument("--gain", help="optional ex-situ chain response")
+    g.add_argument("--gamry", dest="gamry_dir",
+                   help="folder of whole-cell Gamry .DTA sweeps; the 72 "
+                        "segments in parallel are compared against them")
+    g.add_argument("--bench-log", dest="bench_log",
+                   help="ASAM MDF4 bench log, to report the operating point "
+                        "at each reference sweep (default: found in --gamry)")
+    g.add_argument("--exclude", dest="exclude_segments", default=None,
+                   help="comma-separated segments to skip entirely, for a "
+                        "DEMONSTRATED hardware fault. Empty by default: an "
+                        "excluded segment is never measured, so the exclusion "
+                        "can never be disproved")
     g.add_argument("--leepa", default="", help="order id, e.g. 2611976")
     g.add_argument("--condition", default="ALL", help="e.g. 450A")
     g.add_argument("--current", type=float, default=None,
@@ -165,6 +176,13 @@ def config_from_args(a) -> Config:
         kw["equal_areas"] = True
     if a.gain:
         kw["gain_file"] = Path(a.gain)
+    if a.gamry_dir:
+        kw["gamry_dir"] = Path(a.gamry_dir)
+    if a.bench_log:
+        kw["bench_log"] = Path(a.bench_log)
+    if a.exclude_segments is not None:
+        kw["exclude_segments"] = frozenset(
+            x.strip() for x in a.exclude_segments.split(",") if x.strip())
     if a.leepa:
         kw["leepa"] = a.leepa
     if a.condition:
@@ -200,6 +218,17 @@ def config_from_args(a) -> Config:
 
 
 # ---------------------------------------------------------------------------
+
+
+def geom_area(cfg: Config) -> float:
+    """The cell area the comparison must use.
+
+    Read from the geometry actually in force rather than the module constant,
+    so an area override or a different plate generation reaches the whole-cell
+    comparison too.
+    """
+    import r2d2_geometry as geom
+    return float(sum(geom.areas().values()))
 
 
 def run_pipeline(cfg: Config, stop_after: str = "gold") -> dict:
@@ -264,6 +293,25 @@ def run_pipeline(cfg: Config, stop_after: str = "gold") -> dict:
     gold.save(gr, sr, cfg, log)
     manifest["stages"]["gold"] = gr.stats
 
+    # ---- the whole-cell cross-check ---------------------------------------
+    # Last, because it needs the aggregate silver has just written, and
+    # non-fatal, because a missing or unreadable reference must not throw away
+    # a run that is otherwise complete.
+    if cfg.gamry_dir:
+        utils.banner("WHOLE-CELL REFERENCE  --  local aggregate vs Gamry", log)
+        try:
+            import gamry_compare
+            comps = gamry_compare.run(
+                cfg.out_dir, cfg.gamry_dir, geom_area(cfg),
+                out_dir=cfg.out_dir, bench_path=cfg.bench_log,
+                chain_applied=cfg.gain_file is not None, log=log)
+            manifest["stages"]["gamry"] = [c.summary() for c in comps]
+            if cfg.write_png and comps:
+                gamry_compare.plot(
+                    comps, Path(cfg.out_dir) / "gamry_comparison.png")
+        except Exception as exc:                            # noqa: BLE001
+            log.warning(f"  whole-cell comparison skipped: {exc}")
+
     dt = time.time() - t0
     utils.banner("DONE", log)
     log.info(f"  {gr.stats['n_measured']}/{gr.stats['n_total']} segments "
@@ -309,6 +357,11 @@ def self_test() -> int:
     import csv_source
     n = csv_source._selftest(log)
     log.info(f"  csv_source: {'PASS' if not n else str(n) + ' FAILURES'}")
+    fails += n
+
+    import gamry_compare
+    n = gamry_compare._selftest(log)
+    log.info(f"  gamry_compare: {'PASS' if not n else str(n) + ' FAILURES'}")
     fails += n
     log.info(f"\n  {'ALL PASS' if not fails else str(fails) + ' FAILURES'}")
     return int(fails)

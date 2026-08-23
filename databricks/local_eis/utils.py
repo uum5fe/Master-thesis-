@@ -796,24 +796,34 @@ def write_json(path, obj) -> Path:
 
 def write_table(path, rows: list[dict], columns: list[str] | None = None
                 ) -> Path:
-    """Minimal CSV writer -- no pandas dependency in the core path."""
+    """Minimal CSV writer -- no pandas dependency in the core path.
+
+    Quoting goes through the `csv` module rather than a bare ",".join.  Free
+    text reaches these tables -- a fault flag, a note explaining why a value is
+    missing -- and such text contains commas.  Joined naively, the first comma
+    ends the field: at best the note is truncated, at worst every column after
+    it shifts by one and the file still parses, which is the bad kind of wrong.
+    """
+    import csv as _csv
+
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
         path.write_text("")
         return path
     cols = columns or list(rows[0].keys())
-    lines = [",".join(cols)]
-    for r in rows:
-        vals = []
-        for c in cols:
-            v = r.get(c, "")
-            if isinstance(v, float):
-                vals.append(f"{v:.6g}" if np.isfinite(v) else "")
-            else:
-                vals.append(str(v))
-        lines.append(",".join(vals))
-    path.write_text("\n".join(lines) + "\n")
+    with path.open("w", newline="") as fh:
+        w = _csv.writer(fh, lineterminator="\n")
+        w.writerow(cols)
+        for r in rows:
+            vals = []
+            for c in cols:
+                v = r.get(c, "")
+                if isinstance(v, float):
+                    vals.append(f"{v:.6g}" if np.isfinite(v) else "")
+                else:
+                    vals.append(v)
+            w.writerow(vals)
     return path
 
 

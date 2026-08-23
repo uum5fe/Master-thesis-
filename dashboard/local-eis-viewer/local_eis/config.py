@@ -86,14 +86,26 @@ N_CARDS = 5
 CHANNELS_PER_CARD = 16
 NOMINAL_FS_HZ = 10_000.0
 
-# Segments with a known hardware fault.  Kept as a set so the reason travels
-# with the number; anything in here is excluded from measurement but STILL
-# rendered on the map as "inferred", because a hole in a heat map is read by
-# eye as a cold spot.
-KNOWN_BAD_SEGMENTS: dict[str, str] = {
-    "33": "open via / no response above noise in every campaign",
-    "59": "open via / no response above noise in every campaign",
-}
+# Segments with a known hardware fault, as segment -> reason.  Anything listed
+# here is skipped in bronze and drawn on the map as "bad" rather than measured.
+#
+# THIS IS DELIBERATELY EMPTY, and it should stay empty unless a fault has been
+# demonstrated on data that this pipeline produced.
+#
+# It used to contain 33 and 59, with the reason "open via / no response above
+# noise in every campaign".  No measurement in this repository ever established
+# that, and the exclusion made it unfalsifiable: bronze skips an excluded
+# segment BEFORE reading its channel (see bronze.py), so those two were never
+# evaluated, no evidence could ever accumulate against the claim, and gold
+# printed "hardware: open via" from this dict alone.  Every later campaign
+# inherited a verdict that nothing had re-tested.
+#
+# A segment that really has no response does not need to be declared: it
+# arrives as a low SNR, a wide posterior and a fault flag on THAT run, which
+# is a statement about that recording rather than a permanent property of the
+# plate.  That is the honest failure mode, and it is the one the pipeline
+# already implements.
+KNOWN_BAD_SEGMENTS: dict[str, str] = {}
 
 # FAMOS file naming.  Kept as a template so a different campaign is a config
 # change, not a code change.
@@ -163,6 +175,14 @@ class Config:
     temp_cal: Path | None = None     # per-sensor  "Abgleich": c0;c1 x 4
     gain_file: Path | None = None    # ex-situ chain response: seg,f,re,im
     areas_file: Path | None = None   # optional per-segment area override CSV
+
+    # WHOLE-CELL REFERENCE.  A folder of Gamry .DTA sweeps of the same cell at
+    # the same operating points, and optionally the bench MF4 log beside them.
+    # The 72 segments in parallel must reproduce this; it is the one check that
+    # tests the calibration, the geometry, the synchronisation and the chain
+    # response at once, against an instrument that shares none of them.
+    gamry_dir: Path | None = None
+    bench_log: Path | None = None    # ASAM MDF4; defaults to one in gamry_dir
 
     # EQUAL-AREA MODE.  The plate's true segment areas span 0.678..8.470
     # cm^2, a factor of 12.5.  Setting this replaces them all with
@@ -435,6 +455,9 @@ class Config:
     report_steps: bool = False       # print the full per-step table
 
     # ---- derived ----------------------------------------------------------
+    # Segments to skip entirely.  Empty by default: excluding a segment before
+    # its data is seen removes the only evidence that could ever overturn the
+    # exclusion.  Use --exclude for a genuine, current hardware fault.
     exclude_segments: frozenset[str] = field(
         default_factory=lambda: frozenset(KNOWN_BAD_SEGMENTS)
     )
@@ -567,8 +590,21 @@ class Config:
                        help="per-segment Abgleich c0;c1 (REQUIRED: the only "
                             "absolute scale once the potentiostat is gone)")
         g.add_argument("--temp-cal", dest="temp_cal", type=Path)
+        g.add_argument("--gamry", dest="gamry_dir", type=Path,
+                       help="folder of whole-cell Gamry .DTA sweeps to "
+                            "compare the aggregated local result against")
+        g.add_argument("--bench-log", dest="bench_log", type=Path,
+                       help="ASAM MDF4 bench log, to report the operating "
+                            "point at each reference sweep")
         g.add_argument("--gain", dest="gain_file", type=Path,
                        help="ex-situ chain response segment,freq,re,im")
+        g.add_argument("--exclude", dest="exclude_segments", default=None,
+                       type=lambda v: frozenset(
+                           x.strip() for x in v.split(",") if x.strip()),
+                       help="comma-separated segments to skip entirely, for a "
+                            "demonstrated hardware fault. Empty by default: an "
+                            "excluded segment is never measured, so the "
+                            "exclusion can never be disproved")
         g.add_argument("--areas", dest="areas_file", type=Path)
         g.add_argument("--equal-areas", dest="equal_areas",
                        action="store_true",

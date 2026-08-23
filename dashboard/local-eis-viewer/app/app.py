@@ -29,7 +29,8 @@ from app.services import store
 from app.settings import DOTENV_LOADED as SETTINGS_DOTENV
 from app.settings import SETTINGS
 from app.views import common as ui
-from app.views import ecm, heatmap, overview, signals, spectra
+from app.views import (ecm, heatmap, overview, reference, signals,
+                       spectra)
 
 def location_options() -> list[dict]:
     """Where data can come from — as this deployment is actually configured.
@@ -174,6 +175,7 @@ def build_app() -> Dash:
                 dcc.Tab(label="Spectra", value="tab-spectra"),
                 dcc.Tab(label="ECM fitting", value="tab-ecm"),
                 dcc.Tab(label="Signals", value="tab-signals"),
+                dcc.Tab(label="Whole-cell check", value="tab-reference"),
             ]),
             html.Div(id="tab-body", style={"padding": "16px 18px"}),
         ], style={"flex": 1, "height": "100vh", "overflowY": "auto"}),
@@ -182,7 +184,7 @@ def build_app() -> Dash:
               "color": ui.COLOURS["text"], "margin": 0})
 
     register_selection(app)
-    for view in (overview, heatmap, spectra, ecm, signals):
+    for view in (overview, heatmap, spectra, ecm, signals, reference):
         view.register(app)
 
     @app.callback(Output("tab-body", "children"), Input("tabs", "value"))
@@ -193,6 +195,7 @@ def build_app() -> Dash:
             "tab-spectra": spectra.layout,
             "tab-ecm": ecm.layout,
             "tab-signals": signals.layout,
+            "tab-reference": reference.layout,
         }[tab]()
 
     return app

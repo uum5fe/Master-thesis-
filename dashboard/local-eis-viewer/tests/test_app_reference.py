@@ -98,3 +98,110 @@ def test_the_tab_says_what_to_do_when_no_comparison_was_run():
     """An empty tab must name the flag that fills it."""
     assert "--gamry" in reference._HINT
     assert "--bench-log" in reference._HINT
+
+
+# ---------------------------------------------------------------------------
+# finding the comparison for the selected run
+# ---------------------------------------------------------------------------
+#
+# The tests above read the CSVs directly, which left the step that turns a
+# SELECTION into a folder untested -- and that is exactly where the tab
+# crashed in the field, on a RunRef attribute that does not exist. These drive
+# the real callback through a real catalogue so that path cannot rot again.
+
+
+def _results_tree(tmp_path):
+    """A minimal but real results layout: <root>/<id>/<condition>/silver.
+
+    The root is a subdirectory of tmp_path, never tmp_path itself: layout
+    detection claims a folder that merely contains CSVs, so a stray file at
+    the root would be read as one big run and the per-condition folders would
+    never be reached.
+    """
+    run = tmp_path / "results" / "2611976" / "45A"
+    (run / "silver").mkdir(parents=True)
+    (run / "gold").mkdir(parents=True)
+    import pandas as pd
+    pd.DataFrame({"freq_hz": [1.0, 10.0],
+                  "z_re_mohm_cm2": [100.0, 80.0],
+                  "z_im_mohm_cm2": [-10.0, -20.0]}).to_csv(
+        run / "silver" / "cell_aggregate.csv", index=False)
+    pd.DataFrame({"segment": ["1"], "R_ohmic": [0.06]}).to_csv(
+        run / "gold" / "plate_summary.csv", index=False)
+    return run
+
+
+def _catalog_for(tmp_path, monkeypatch):
+    from app.data.sources import Catalog
+    from app.settings import Settings
+    from app.views import reference as ref_view
+
+    catalog = Catalog(Settings(results_roots=[str(tmp_path / "results")],
+                               famos_roots=[], csv_roots=[])).refresh(
+        kinds=("results",))
+    monkeypatch.setattr(ref_view.store, "current_catalog", lambda: catalog)
+    return catalog
+
+
+def test_the_selected_run_resolves_to_its_comparison_folder(tmp_path,
+                                                            monkeypatch):
+    run = _results_tree(tmp_path)
+    catalog = _catalog_for(tmp_path, monkeypatch)
+    assert catalog.runs, "the results tree was not discovered"
+    sel = {"kind": "results", "measurement_id": "2611976", "condition": "45A"}
+
+    # Nothing written yet: no folder, and no exception.
+    assert reference._comparison_dir(sel) is None
+
+    (run / "gamry_comparison.csv").write_text("condition\n45A\n")
+    assert reference._comparison_dir(sel) == run
+
+
+def test_a_campaign_level_comparison_is_found_from_a_condition_run(
+        tmp_path, monkeypatch):
+    """The pipeline may write one comparison for the whole campaign."""
+    run = _results_tree(tmp_path)
+    _catalog_for(tmp_path, monkeypatch)
+    (run.parent / "gamry_comparison.csv").write_text("condition\n45A\n")
+    sel = {"kind": "results", "measurement_id": "2611976", "condition": "45A"}
+    assert reference._comparison_dir(sel) == run.parent
+
+
+def test_the_tab_renders_without_a_comparison_instead_of_raising(
+        tmp_path, monkeypatch, written):
+    """The regression: the callback must survive a run that has no comparison.
+
+    It previously reached for a RunRef field that does not exist, so selecting
+    any run at all raised AttributeError and the tab showed a Dash error
+    instead of the hint telling you which flag to pass.
+    """
+    _results_tree(tmp_path)
+    _catalog_for(tmp_path, monkeypatch)
+    sel = {"kind": "results", "measurement_id": "2611976", "condition": "45A"}
+
+    status, nyq, res, table = reference.render(sel)
+    assert table is None
+    assert not nyq.data and not res.data
+    assert "--gamry" in str(status)
+
+    # And an empty selection is not a crash either.
+    assert reference.render({})[3] is None
+    assert reference.render(None)[3] is None
+
+
+def test_the_tab_draws_the_comparison_that_is_there(tmp_path, monkeypatch,
+                                                    written):
+    """With the files present, both figures and the table come back."""
+    import shutil
+    run = _results_tree(tmp_path)
+    for name in ("gamry_comparison.csv", "gamry_comparison_curves.csv"):
+        shutil.copy(written / name, run / name)
+    _catalog_for(tmp_path, monkeypatch)
+    sel = {"kind": "results", "measurement_id": "2611976", "condition": "45A"}
+
+    _status, nyq, res, table = reference.render(sel)
+    assert table is not None
+    # reference + local for each of the two conditions in the fixture
+    assert len(nyq.data) == 4
+    assert len(res.data) == 4
+    assert "Z′" in nyq.layout.xaxis.title.text

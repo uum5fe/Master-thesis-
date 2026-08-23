@@ -79,17 +79,25 @@ def layout():
 
 
 def _comparison_dir(selection) -> Path | None:
-    """Where the pipeline wrote `gamry_comparison.csv` for this run."""
+    """Where the pipeline wrote `gamry_comparison.csv` for this run.
+
+    `RunRef.path` is the run directory -- the one holding `gold/` and
+    `silver/` -- and the pipeline writes the comparison into `cfg.out_dir`,
+    which is that same directory. A campaign-level run writes it one or two
+    levels up instead, so those are searched too, nearest first.
+    """
     run = store.current_catalog().find(
         selection.get("measurement_id", ""), selection.get("condition", ""),
         selection.get("kind", "results"))
-    if run is None:
+    if run is None or not run.path:
         return None
-    for base in {Path(f).parent for f in run.files} | {Path(run.root)
-                                                       if run.root else Path(".")}:
-        for cand in (base, base.parent, base.parent.parent):
-            if (cand / "gamry_comparison.csv").is_file():
-                return cand
+    base = Path(run.path)
+    for folder in (base, base.parent, base.parent.parent):
+        try:
+            if (folder / "gamry_comparison.csv").is_file():
+                return folder
+        except OSError:
+            continue
     return None
 
 
@@ -132,6 +140,92 @@ _HINT = (
 )
 
 
+# ---------------------------------------------------------------------------
+# rendering
+# ---------------------------------------------------------------------------
+#
+# A module-level function rather than a closure inside `register`, so it can
+# be called directly by a test. The version of this tab that shipped reached
+# for a RunRef field that does not exist; every test passed, because the only
+# code that could raise was unreachable from outside the Dash app.
+
+def render(selection):
+    blank = empty_figure("nothing to compare")
+    if not selection:
+        return ui.note(""), blank, blank, None
+
+    folder = _comparison_dir(selection)
+    if folder is None:
+        return (ui.warnings_block([_HINT], "No reference comparison"),
+                blank, blank, None)
+
+    rows = _read_summary(folder)
+    curves = _read_curves(folder)
+    if not rows or not curves:
+        return (ui.warnings_block([_HINT], "No reference comparison"),
+                blank, blank, None)
+
+    order = [r["condition"] for r in rows]
+
+    nyq = go.Figure()
+    res = go.Figure()
+    for i, cond in enumerate(order):
+        d = curves.get(cond)
+        if d is None:
+            continue
+        colour = _PALETTE[i % len(_PALETTE)]
+        nyq.add_trace(go.Scatter(
+            x=d["zr"].real, y=-d["zr"].imag, mode="lines+markers",
+            name=f"{cond} · whole cell",
+            line=dict(color=colour, dash="dot"), marker=dict(size=4)))
+        nyq.add_trace(go.Scatter(
+            x=d["zl"].real, y=-d["zl"].imag, mode="lines+markers",
+            name=f"{cond} · local", line=dict(color=colour),
+            marker=dict(size=5, symbol="square")))
+        rel = 100 * (np.abs(d["zl"]) / np.abs(d["zr"]) - 1.0)
+        res.add_trace(go.Scatter(x=d["f"], y=rel, mode="lines+markers",
+                                 name=f"{cond} · |Z| [%]",
+                                 line=dict(color=colour),
+                                 marker=dict(size=4)))
+        res.add_trace(go.Scatter(x=d["f"], y=d["dphi"], mode="lines+markers",
+                                 name=f"{cond} · phase [°]",
+                                 line=dict(color=colour, dash="dash"),
+                                 marker=dict(size=4, symbol="square")))
+
+    nyq.update_layout(
+        template=TEMPLATE,
+        xaxis_title="Z′ [mΩ·cm²]", yaxis_title="−Z″ [mΩ·cm²]",
+        yaxis=dict(scaleanchor="x", scaleratio=1),
+        title="dotted = whole cell (Gamry) · solid = local, aggregated")
+    res.update_layout(
+        template=TEMPLATE,
+        xaxis_title="f [Hz]", xaxis_type="log",
+        yaxis_title="local − reference",
+        title="magnitude difference [%] and phase difference [°]")
+    notes = [f"{r['condition']}: {r['notes']}" for r in rows
+             if r.get("notes")]
+    status = ui.note(
+        f"{len(rows)} condition(s) compared · reference folder "
+        f"{folder.name}")
+    if notes:
+        status = html.Div([status,
+                           ui.warnings_block(notes, "Worth knowing")])
+
+    import pandas as pd
+    table = pd.DataFrame([{
+        "condition": r["condition"],
+        "points": r["n_points"],
+        "band [Hz]": f"{float(r['f_lo_hz']):.3g} – {float(r['f_hi_hz']):.4g}",
+        "HFR local": _fmt(r["hfr_local_mohm_cm2"]),
+        "HFR ref": _fmt(r["hfr_ref_mohm_cm2"]),
+        "ΔHFR [%]": _fmt(r["hfr_rel_pct"], 1),
+        "Δ|Z| [%]": _fmt(r["mag_rel_median_pct"], 1),
+        "rms [%]": _fmt(r["rms_rel_pct"], 1),
+        "max Δφ [°]": _fmt(r["phase_diff_max_deg"], 2),
+    } for r in rows])
+    return status, nyq, res, ui.table(table, "rf-summary", height="220px")
+
+
 def register(app):
 
     @app.callback(Output("rf-status", "children"),
@@ -140,81 +234,7 @@ def register(app):
                   Output("rf-table", "children"),
                   Input("selection", "data"))
     def _show(selection):
-        blank = empty_figure("nothing to compare")
-        if not selection:
-            return ui.note(""), blank, blank, None
-
-        folder = _comparison_dir(selection)
-        if folder is None:
-            return (ui.warnings_block([_HINT], "No reference comparison"),
-                    blank, blank, None)
-
-        rows = _read_summary(folder)
-        curves = _read_curves(folder)
-        if not rows or not curves:
-            return (ui.warnings_block([_HINT], "No reference comparison"),
-                    blank, blank, None)
-
-        order = [r["condition"] for r in rows]
-
-        nyq = go.Figure()
-        res = go.Figure()
-        for i, cond in enumerate(order):
-            d = curves.get(cond)
-            if d is None:
-                continue
-            colour = _PALETTE[i % len(_PALETTE)]
-            nyq.add_trace(go.Scatter(
-                x=d["zr"].real, y=-d["zr"].imag, mode="lines+markers",
-                name=f"{cond} · whole cell",
-                line=dict(color=colour, dash="dot"), marker=dict(size=4)))
-            nyq.add_trace(go.Scatter(
-                x=d["zl"].real, y=-d["zl"].imag, mode="lines+markers",
-                name=f"{cond} · local", line=dict(color=colour),
-                marker=dict(size=5, symbol="square")))
-            rel = 100 * (np.abs(d["zl"]) / np.abs(d["zr"]) - 1.0)
-            res.add_trace(go.Scatter(x=d["f"], y=rel, mode="lines+markers",
-                                     name=f"{cond} · |Z| [%]",
-                                     line=dict(color=colour),
-                                     marker=dict(size=4)))
-            res.add_trace(go.Scatter(x=d["f"], y=d["dphi"], mode="lines+markers",
-                                     name=f"{cond} · phase [°]",
-                                     line=dict(color=colour, dash="dash"),
-                                     marker=dict(size=4, symbol="square")))
-
-        nyq.update_layout(
-            template=TEMPLATE,
-            xaxis_title="Z′ [mΩ·cm²]", yaxis_title="−Z″ [mΩ·cm²]",
-            yaxis=dict(scaleanchor="x", scaleratio=1),
-            title="dotted = whole cell (Gamry) · solid = local, aggregated")
-        res.update_layout(
-            template=TEMPLATE,
-            xaxis_title="f [Hz]", xaxis_type="log",
-            yaxis_title="local − reference",
-            title="magnitude difference [%] and phase difference [°]")
-        notes = [f"{r['condition']}: {r['notes']}" for r in rows
-                 if r.get("notes")]
-        status = ui.note(
-            f"{len(rows)} condition(s) compared · reference folder "
-            f"{folder.name}")
-        if notes:
-            status = html.Div([status,
-                               ui.warnings_block(notes, "Worth knowing")])
-
-        import pandas as pd
-        table = pd.DataFrame([{
-            "condition": r["condition"],
-            "points": r["n_points"],
-            "band [Hz]": f"{float(r['f_lo_hz']):.3g} – {float(r['f_hi_hz']):.4g}",
-            "HFR local": _fmt(r["hfr_local_mohm_cm2"]),
-            "HFR ref": _fmt(r["hfr_ref_mohm_cm2"]),
-            "ΔHFR [%]": _fmt(r["hfr_rel_pct"], 1),
-            "Δ|Z| [%]": _fmt(r["mag_rel_median_pct"], 1),
-            "rms [%]": _fmt(r["rms_rel_pct"], 1),
-            "max Δφ [°]": _fmt(r["phase_diff_max_deg"], 2),
-        } for r in rows])
-        return status, nyq, res, ui.table(table, "rf-summary", height="220px")
-
+        return render(selection)
 
 def _fmt(value: str, digits: int = 2) -> str:
     try:

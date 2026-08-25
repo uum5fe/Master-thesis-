@@ -6,8 +6,8 @@ REM Store placeholder, which answers "Python konnte nicht gefunden werden"
 REM instead of running anything. This tries the interpreters that actually
 REM work, in the order that is most likely to be the right one.
 REM
-REM   run_evaluation.cmd --list
-REM   run_evaluation.cmd --all --stage-local
+REM   .\run_evaluation.cmd --list
+REM   .\run_evaluation.cmd --all --stage-local
 setlocal
 cd /d "%~dp0"
 

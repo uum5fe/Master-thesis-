@@ -338,7 +338,7 @@ app/
 local_eis/         the bronze/silver/gold pipeline, as it ran on Databricks
 app.yaml           Databricks App manifest
 run_dashboard.py   start the dashboard (prints the link)
-run_dashboard.cmd  the same on Windows, past the Store placeholder
+run_dashboard.cmd  the same on Windows (PowerShell: .\run_dashboard.cmd)
 run_evaluation.cmd the same for run_evaluation.py
 run_evaluation.py  process raw .DAT into results the dashboard reads
 run_pipeline.py    the packaged eis/ pipeline CLI

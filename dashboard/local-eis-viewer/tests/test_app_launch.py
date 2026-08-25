@@ -446,15 +446,40 @@ def test_windows_launcher_tries_the_interpreters_that_work(script, target):
     """`python` on a fresh Windows PATH is the Microsoft Store placeholder."""
     text = (ROOT / script).read_text(encoding="utf-8")
     assert f"{target} %*" in text
-    # A local virtual environment first, then the py launcher, then PATH.
+    # A local virtual environment first, then the py launcher, then the place
+    # the current python.org installer actually puts things, then PATH. That
+    # third probe matters: the Store placeholder sits EARLIER on PATH than
+    # %LOCALAPPDATA%\Python\bin, so "python" fails on a machine that has a
+    # perfectly good interpreter installed.
     order = [text.index(".venv\\Scripts\\python.exe"),
              text.index("py -3 --version"),
+             text.index("%LOCALAPPDATA%\\Python\\bin\\python.exe"),
              text.index("python --version")]
     assert order == sorted(order)
     # And it explains the fix rather than only failing.
     assert "App execution aliases" in text
     assert "python.org" in text
     assert 'cd /d "%~dp0"' in text          # runs from its own folder
+    # Its own usage lines are written the way PowerShell needs them.
+    assert f".\\{script} " in text
+
+
+def test_the_docs_use_the_powershell_form_for_the_launchers():
+    r"""PowerShell does not run a program from the current directory.
+
+    A bare `run_dashboard.cmd` gives "The term is not recognized...", which
+    reads like a missing file rather than a missing `.\`. Every launcher line
+    in a powershell block has to carry the prefix.
+    """
+    import re
+
+    text = (ROOT / "START_HERE.md").read_text(encoding="utf-8")
+    for block in re.findall(r"```powershell\n(.*?)```", text, re.S):
+        for line in block.splitlines():
+            line = line.strip()
+            if ".cmd" not in line or line.startswith("#"):
+                continue
+            assert line.startswith(".\\"), f"needs a .\\ prefix: {line}"
 
 
 def test_init_writes_the_csv_root_it_was_given(tmp_path, monkeypatch):

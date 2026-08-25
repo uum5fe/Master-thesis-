@@ -6,8 +6,8 @@ REM Store placeholder, which answers "Python konnte nicht gefunden werden"
 REM instead of running anything. This tries the interpreters that actually
 REM work, in the order that is most likely to be the right one.
 REM
-REM   run_dashboard.cmd --open
-REM   run_dashboard.cmd --check
+REM   .\run_dashboard.cmd --open
+REM   .\run_dashboard.cmd --check
 setlocal
 cd /d "%~dp0"
 

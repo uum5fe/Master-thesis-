@@ -63,12 +63,19 @@ Windows ships a placeholder at `python` that opens the Microsoft Store instead
 of running anything. Two ways past it.
 
 **Use the supplied launchers** — they try `.venv`, then the `py` launcher, then
-`python`, and say what to do if none works:
+the Python Install Manager location, then `python`, and say what to do if none
+works:
 
 ```powershell
-run_dashboard.cmd --open
-run_evaluation.cmd --all --stage-local
+.\run_dashboard.cmd --open
+.\run_evaluation.cmd --all --stage-local
 ```
+
+The leading `.\` is not optional in PowerShell. Unlike `cmd.exe`, PowerShell
+does not look in the current directory for a program, so a bare
+`run_dashboard.cmd` gives *"The term is not recognized as the name of a cmdlet,
+function, script file, or operable program"* even while the file is sitting
+right there. `.\` says "this folder".
 
 **You may already have Python** and just not be reaching it. The current
 python.org installer (the Python Install Manager) puts its shims in
@@ -81,8 +88,8 @@ Check, and use it directly:
 & "$env:LOCALAPPDATA\Python\bin\python.exe" run_evaluation.py --list
 ```
 
-The `.cmd` launchers now probe that location too, so `run_evaluation.cmd`
-works without any of this.
+The `.cmd` launchers probe that location too, so `.\run_evaluation.cmd` works
+without any of this.
 
 **Or fix the machine**, which is worth doing once:
 

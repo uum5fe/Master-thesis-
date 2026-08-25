@@ -22,6 +22,16 @@ if %errorlevel%==0 (
     goto :eof
 )
 
+REM The Python Install Manager (python.org's current installer) puts its shims
+REM in %LOCALAPPDATA%\Python\bin. The Microsoft Store placeholder sits earlier
+REM on PATH than that on a normal machine, so "python" answers "konnte nicht
+REM gefunden werden" while a perfectly good interpreter is installed. Probe the
+REM real location before giving up.
+if exist "%LOCALAPPDATA%\Python\bin\python.exe" (
+    "%LOCALAPPDATA%\Python\bin\python.exe" run_dashboard.py %*
+    goto :eof
+)
+
 python --version >nul 2>&1
 if %errorlevel%==0 (
     python run_dashboard.py %*
@@ -35,6 +45,7 @@ echo   "python" on this machine is most likely the Microsoft Store
 echo   placeholder. Any of these fixes it:
 echo.
 echo     1. Install Python from python.org and tick "Add python.exe to PATH".
+echo        (already installed? try %LOCALAPPDATA%\Python\bin\python.exe)
 echo     2. Or turn the placeholder off:
 echo          Settings ^> Apps ^> Advanced app settings ^>
 echo          App execution aliases ^> switch off python.exe and python3.exe

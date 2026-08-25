@@ -70,12 +70,27 @@ run_dashboard.cmd --open
 run_evaluation.cmd --all --stage-local
 ```
 
+**You may already have Python** and just not be reaching it. The current
+python.org installer (the Python Install Manager) puts its shims in
+`%LOCALAPPDATA%\Python\bin`, and the Store placeholder sits *earlier* on PATH
+than that — so `python` fails while a perfectly good interpreter is installed.
+Check, and use it directly:
+
+```powershell
+& "$env:LOCALAPPDATA\Python\bin\python.exe" --version
+& "$env:LOCALAPPDATA\Python\bin\python.exe" run_evaluation.py --list
+```
+
+The `.cmd` launchers now probe that location too, so `run_evaluation.cmd`
+works without any of this.
+
 **Or fix the machine**, which is worth doing once:
 
-1. Install Python from python.org with **"Add python.exe to PATH"** ticked; or
-2. Settings → Apps → Advanced app settings → **App execution aliases** → switch
-   off `python.exe` and `python3.exe`; or
-3. Use the `py` launcher instead: `py -3 run_dashboard.py --open`.
+1. Settings → Apps → Advanced app settings → **App execution aliases** → switch
+   off `python.exe` and `python3.exe`. This is the direct fix: it removes the
+   placeholder that is shadowing your real Python; or
+2. Use the `py` launcher instead: `py -3 run_dashboard.py --open`; or
+3. Re-install from python.org with **"Add python.exe to PATH"** ticked.
 
 If a virtual environment exists at `.venv\` in this folder, the `.cmd`
 launchers use it in preference to anything on PATH — which is also how to give

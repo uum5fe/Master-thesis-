@@ -214,19 +214,72 @@ class BronzeRun:
 # ===========================================================================
 
 
+#: A current setpoint inside a filename: "45A", "450 A", "1.5A". Used only
+#: when no known pattern matched, to find out whether a folder holds one
+#: condition or several before deciding what to do.
+_CURRENT_IN_NAME = re.compile(r"\d+(?:[.,]\d+)?\s*A(?![A-Za-z])")
+
+
 def discover_files(cfg: Config) -> list[Path]:
-    """FAMOS files for this run, sorted so card order is deterministic."""
+    """FAMOS files for THIS RUN, sorted so card order is deterministic.
+
+    Every filename convention is tried before any fallback, because the
+    fallback is dangerous: a campaign folder holds every condition, and
+    "any .DAT in the directory" silently turns a request for 45A into a run
+    over 45A, 60A, 150A and 450A at once -- four times the data, re-read at
+    every stage, over a network share. That is a run that never finishes, and
+    it looks like a hang rather than a mistake.
+
+    So the fallback still filters on the condition, and if it cannot -- if the
+    files that remain describe more than one condition -- this refuses rather
+    than guessing. Reading the wrong data slowly is worse than stopping.
+    """
     d = Path(cfg.dat_dir)
     if not d.exists():
         raise SystemExit(f"bronze: --dat directory does not exist: {d}")
-    pattern = cfg.famos_pattern()
-    files = sorted(d.glob(pattern))
-    if not files:                                # fall back to any .DAT
-        files = sorted(d.glob("*.DAT")) + sorted(d.glob("*.dat"))
-    if not files:
-        raise SystemExit(f"bronze: no FAMOS files in {d} "
-                         f"(pattern {pattern!r})")
-    return files
+
+    patterns = cfg.famos_patterns()
+    files: list[Path] = []
+    for pattern in patterns:
+        files = sorted(d.glob(pattern))
+        if files:
+            return files
+
+    # Nothing matched a known convention. Take what is there, but keep the
+    # condition: the run was asked for one.
+    every = sorted(d.glob("*.DAT")) + sorted(d.glob("*.dat"))
+    if not every:
+        raise SystemExit(
+            f"bronze: no FAMOS files in {d}\n"
+            f"  tried: {', '.join(patterns)}")
+
+    cond = cfg.condition
+    if not cond or cond == "ALL":
+        return every
+
+    wanted = [f for f in every
+              if f"_Current_{cond}_".lower() in f.name.lower()]
+    if wanted:
+        return wanted
+
+    # Still no filter. Before widening, find out what is actually in the
+    # folder: any "<number>A" in a name is a current setpoint, whatever the
+    # convention around it.
+    seen = sorted({m.group(0).upper().replace(" ", "")
+                   for m in (_CURRENT_IN_NAME.search(f.name) for f in every)
+                   if m})
+    if seen == [cond.upper()]:
+        return every                       # one condition, and it is the one
+    raise SystemExit(
+        f"bronze: none of the known filename patterns matched in {d}, and the "
+        f"files there cannot be narrowed to the requested condition.\n"
+        f"  asked for : {cond}\n"
+        f"  folder has: {', '.join(seen) if seen else 'no recognisable condition'}"
+        f"  ({len(every)} .DAT files)\n"
+        f"  tried     : {', '.join(patterns)}\n"
+        f"  Processing all of them would read every condition at once, which "
+        f"is four times the data and does not finish. Point --dat at one "
+        f"condition's files, or set EIS_FAMOS_REGEX for this naming scheme.")
 
 
 def _digest(items) -> str:

@@ -109,7 +109,18 @@ KNOWN_BAD_SEGMENTS: dict[str, str] = {}
 
 # FAMOS file naming.  Kept as a template so a different campaign is a config
 # change, not a code change.
-FAMOS_PATTERN = "Leepa_{leepa}_Current_{cond}_Test_{test}_Karte_*.DAT"
+#: Both naming conventions in use, tried in order.  The dashboard has known
+#: about the RO form for a long time; the pipeline knew only the Leepa one, and
+#: when a name matched neither it fell back to "every .DAT in the folder" --
+#: which on a campaign directory means every CONDITION, so asking for 45A read
+#: 45A, 60A, 150A and 450A, four times the data, at every stage.  A run that
+#: should take minutes never finished.
+FAMOS_PATTERNS = (
+    "Leepa_{leepa}_Current_{cond}_Test_{test}_Karte_*.DAT",
+    "RO{leepa}-*_Current_{cond}_Test_{test}_Karte_*.DAT",
+    "{leepa}_Current_{cond}_Test_{test}_Karte_*.DAT",
+)
+FAMOS_PATTERN = FAMOS_PATTERNS[0]
 FAMOS_TEST_ID = "01"
 
 
@@ -468,11 +479,20 @@ class Config:
         return replace(self, **kw)
 
     def famos_pattern(self, cond: str | None = None) -> str:
-        return FAMOS_PATTERN.format(
-            leepa=self.leepa or "*",
-            cond=cond or (self.condition if self.condition != "ALL" else "*"),
-            test=self.test_id,
-        )
+        """The first pattern, kept for messages and for backward compatibility."""
+        return self.famos_patterns(cond)[0]
+
+    def famos_patterns(self, cond: str | None = None) -> list[str]:
+        """Every filename convention this campaign might use, in order."""
+        return [
+            p.format(
+                leepa=self.leepa or "*",
+                cond=cond or (self.condition
+                              if self.condition != "ALL" else "*"),
+                test=self.test_id,
+            )
+            for p in FAMOS_PATTERNS
+        ]
 
     def preset(self, name: str) -> "Config":
         """Return a copy with a named gate preset applied."""

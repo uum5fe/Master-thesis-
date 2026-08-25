@@ -371,13 +371,22 @@ def register(app):
 
         for i, s in enumerate(data["steps"]):
             selected = (i == step_index)
+            # annotation_text=None does NOT mean "no annotation": Plotly then
+            # draws its placeholder, which is where the "new text" labels came
+            # from. The annotation has to be omitted entirely instead -- and
+            # every dwell gets its frequency, not just the selected one, since
+            # reading off which frequencies were found is the whole job of
+            # this plot.
             fig.add_vrect(
                 x0=s["start"] / data["fs"], x1=s["stop"] / data["fs"],
                 fillcolor="#c0392b" if selected else "#5b6470",
                 opacity=0.30 if selected else 0.10, line_width=0,
-                annotation_text=f"{s['freq']:.3g}" if selected else None,
-                annotation_position="top left",
-                annotation_font_size=11)
+                annotation=dict(
+                    text=f"{s['freq']:.4g}",
+                    font=dict(size=10 if selected else 9,
+                              color="#c0392b" if selected else "#5b6470"),
+                    textangle=-90, yanchor="top"),
+                annotation_position="top left")
 
         fig.update_layout(
             template=TEMPLATE, height=260,

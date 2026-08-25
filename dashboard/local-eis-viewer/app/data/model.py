@@ -54,6 +54,9 @@ PARAM_META: dict[str, dict] = {
     "kk_res_pct":  dict(label="Kramers-Kronig residual", unit="%", colorscale="Greys"),
     "snr_med_db":  dict(label="Median SNR", unit="dB", colorscale="Viridis"),
 
+    "coverage_f_max": dict(label="Highest frequency reached", unit="Hz",
+                           colorscale="Viridis"),
+
     # -- operating conditions over the plate --------------------------------
     # Diverging scales would imply a meaningful mid-point; these are gradients
     # along a flow path, so a sequential scale is the honest one. Humidity gets

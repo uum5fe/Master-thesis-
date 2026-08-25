@@ -228,6 +228,58 @@ class SilverRun:
     dc_closure: dict
     cell_freq: np.ndarray
     Z_cell: np.ndarray
+    #: One row per segment per point: whether it was kept, and if not, which
+    #: gate removed it. This is the evidence for "why does my spectrum stop
+    #: at 400 Hz" and "why is this segment missing".
+    point_ledger: list = field(default_factory=list)
+    #: Segments bronze never produced at all -- no ADC channel for them on any
+    #: card. A different fact from "measured and rejected", and the two used to
+    #: be indistinguishable from the outputs.
+    unwired: list = field(default_factory=list)
+
+    def reach(self) -> list[dict]:
+        """Per segment: how far up in frequency it got, and what stopped it.
+
+        The blocking reason is the gate that removed the most points ABOVE the
+        highest surviving frequency -- which is the honest answer to "what is
+        limiting my bandwidth", rather than the most common reason overall.
+        """
+        by_seg: dict[str, list[dict]] = {}
+        for row in self.point_ledger:
+            by_seg.setdefault(str(row["segment"]), []).append(row)
+        out = []
+        for seg in self.unwired:
+            out.append({
+                "segment": str(seg), "n_points": 0, "n_kept": 0,
+                "f_min_hz": float("nan"), "f_max_hz": float("nan"),
+                "n_above_f_max": 0, "blocked_by": "no_channel",
+                "explanation": "no ADC channel for this segment on any card "
+                               "file -- it was never recorded, so there is "
+                               "nothing to evaluate",
+                "verdict": "not wired",
+            })
+        for seg, rows in by_seg.items():
+            kept = [r for r in rows if r["kept"]]
+            f_max = max((r["freq_hz"] for r in kept), default=float("nan"))
+            above = [r for r in rows
+                     if not r["kept"]
+                     and (not kept or r["freq_hz"] > f_max)]
+            tally: dict[str, int] = {}
+            for r in above:
+                tally[r["reason"]] = tally.get(r["reason"], 0) + 1
+            blocking = max(tally.items(), key=lambda kv: kv[1])[0] if tally else ""
+            out.append({
+                "segment": seg,
+                "n_points": len(rows),
+                "n_kept": len(kept),
+                "f_min_hz": min((r["freq_hz"] for r in kept), default=float("nan")),
+                "f_max_hz": f_max,
+                "n_above_f_max": len(above),
+                "blocked_by": blocking,
+                "explanation": REJECT_REASONS.get(blocking, ""),
+                "verdict": rows[0]["segment_verdict"] if rows else "",
+            })
+        return sorted(out, key=lambda r: (len(r["segment"]), r["segment"]))
 
     def tiers(self) -> dict[str, int]:
         out: dict[str, int] = {}
@@ -1018,14 +1070,49 @@ def extrapolate_hf(drt: dict, f_hi: float, n: int = 40) -> dict:
 # ===========================================================================
 
 
+#: Why a point did not survive. The FIRST gate to reject a point owns it, so
+#: the counts add up to the number dropped instead of double-counting.
+REJECT_REASONS = {
+    "not_finite": "the phasor fit did not return a finite Z",
+    "outside_band": "outside cfg.f_min_hz .. cfg.f_max_hz",
+    "snr": "SNR below the gate for this point",
+    "thd": "harmonic distortion above cfg.max_thd",
+    "drift": "amplitude drifted during the dwell, above cfg.max_drift",
+    "magnitude": "|Z| outside the plausible 0.5 .. 800 mOhm.cm2 window",
+    "uncertainty": "propagated sigma above cfg.sigma_rel_max",
+    "cycles": "fewer than cfg.min_cycles_per_dwell cycles in the dwell",
+    "zmag_outlier": "local |Z| outlier against its neighbours",
+    "passivity": "Re Z negative above the passivity gate, after de-skew",
+}
+
+
 def process_segment(sp: BronzeSpectrum, skew: SkewModel, cfg: Config,
-                    log=None) -> SilverSpectrum | None:
-    """De-skew, weight, model, validate and grade one segment."""
+                    log=None, ledger: list | None = None
+                    ) -> SilverSpectrum | None:
+    """De-skew, weight, model, validate and grade one segment.
+
+    `ledger`, when given, is appended with one row per POINT recording which
+    gate removed it. Nine gates run in sequence and until now only their
+    totals were kept, so "my impedance stops at 400 Hz" and "this segment has
+    no spectrum at all" were unanswerable from the outputs -- the evidence was
+    computed and thrown away. The first gate to reject a point owns it.
+    """
     freq = np.asarray(sp.freq, float)
     Z = np.asarray(sp.Z_raw, complex)
 
-    keep = np.isfinite(freq) & (freq > 0) & np.isfinite(Z.real) & np.isfinite(Z.imag)
-    keep &= (freq >= cfg.f_min_hz) & (freq <= cfg.f_max_hz)
+    reason = np.array([""] * freq.size, dtype=object)
+
+    def gate(ok: np.ndarray, name: str) -> np.ndarray:
+        """Apply a gate, recording it for the points it is the first to kill."""
+        ok = np.asarray(ok, bool)
+        newly = (reason == "") & ~ok
+        reason[newly] = name
+        return ok
+
+    keep = gate(np.isfinite(freq) & (freq > 0)
+                & np.isfinite(Z.real) & np.isfinite(Z.imag), "not_finite")
+    keep &= gate((freq >= cfg.f_min_hz) & (freq <= cfg.f_max_hz),
+                 "outside_band")
 
     # Point-level gates.  An ON-GRID step is a real step -- a geometric
     # progression is not something noise produces -- so for those the SNR
@@ -1033,10 +1120,11 @@ def process_segment(sp: BronzeSpectrum, skew: SkewModel, cfg: Config,
     # still face the full gate.  This is what keeps the top-of-band points,
     # which are always the weakest, without letting noise in elsewhere.
     snr = np.asarray(sp.snr_comb_db, float)
-    gate = np.where(sp.on_grid, snr >= cfg.snr_floor_db, snr >= cfg.min_snr_db)
-    keep &= np.nan_to_num(gate, nan=False).astype(bool)
-    keep &= ~(np.isfinite(sp.thd) & (sp.thd > cfg.max_thd))
-    keep &= ~(np.isfinite(sp.drift) & (sp.drift > cfg.max_drift))
+    snr_gate = np.where(sp.on_grid, snr >= cfg.snr_floor_db,
+                        snr >= cfg.min_snr_db)
+    keep &= gate(np.nan_to_num(snr_gate, nan=False).astype(bool), "snr")
+    keep &= gate(~(np.isfinite(sp.thd) & (sp.thd > cfg.max_thd)), "thd")
+    keep &= gate(~(np.isfinite(sp.drift) & (sp.drift > cfg.max_drift)), "drift")
 
     # Plausibility on the magnitude always; on the SIGN of the real part only
     # above passivity_gate_min_hz.  See the note in config.py: a negative real
@@ -1046,7 +1134,7 @@ def process_segment(sp: BronzeSpectrum, skew: SkewModel, cfg: Config,
     # magnitude bound is safe to apply to the uncorrected spectrum.
     mag = np.abs(Z) * 1000.0
     lo, hi = 0.5, 800.0
-    keep &= np.isfinite(mag) & (mag > lo) & (mag < hi)
+    keep &= gate(np.isfinite(mag) & (mag > lo) & (mag < hi), "magnitude")
     hf_region = freq >= cfg.passivity_gate_min_hz
     # THE SIGN OF Re Z IS *NOT* AN INVARIANT.  It is deferred to after the
     # de-skew below.  Applied here, it deleted points that the very next
@@ -1064,7 +1152,8 @@ def process_segment(sp: BronzeSpectrum, skew: SkewModel, cfg: Config,
                                          model=cfg.uncertainty_model,
                                          floor=cfg.sigma_rel_floor,
                                          ceiling=1e9)
-    keep &= np.isfinite(s_all) & (s_all <= cfg.sigma_rel_max)
+    keep &= gate(np.isfinite(s_all) & (s_all <= cfg.sigma_rel_max),
+                 "uncertainty")
 
     # 2. CYCLES IN THE DWELL.  A phasor fitted to a fraction of a period is
     #    not a measurement of that period; at the low-frequency end the fit
@@ -1072,7 +1161,8 @@ def process_segment(sp: BronzeSpectrum, skew: SkewModel, cfg: Config,
     #    trade against each other.
     with np.errstate(invalid="ignore", divide="ignore"):
         cycles = sp.n_per_step / sp.fs * freq
-    keep &= np.isfinite(cycles) & (cycles >= cfg.min_cycles_per_dwell)
+    keep &= gate(np.isfinite(cycles) & (cycles >= cfg.min_cycles_per_dwell),
+                 "cycles")
 
     # 3. LOCAL |Z| OUTLIERS.  Targets the runaway points directly instead of
     #    inferring them from SNR, so weak-but-consistent points at the top of
@@ -1080,14 +1170,47 @@ def process_segment(sp: BronzeSpectrum, skew: SkewModel, cfg: Config,
     Zg = np.where(keep, Z, np.nan)
     bad_z = utils.zmag_outliers(freq, Zg, n_mad=cfg.zmag_outlier_mad,
                                 win=cfg.zmag_outlier_win)
-    keep &= ~bad_z
+    keep &= gate(~bad_z, "zmag_outlier")
 
     n_drop = int((~keep).sum())
     n_drop_unc = int(np.sum(np.isfinite(s_all) & (s_all > cfg.sigma_rel_max)))
     n_drop_cyc = int(np.sum(np.isfinite(cycles)
                             & (cycles < cfg.min_cycles_per_dwell)))
     n_drop_out = int(bad_z.sum())
+    def _emit(final_keep: np.ndarray, verdict: str) -> None:
+        if ledger is None:
+            return
+        for i in range(freq.size):
+            ledger.append({
+                "segment": sp.segment, "card": sp.card,
+                "freq_hz": round(float(freq[i]), 6),
+                "kept": int(bool(final_keep[i])),
+                "reason": "" if final_keep[i] else (reason[i] or "unknown"),
+                "snr_db": (round(float(snr[i]), 2)
+                           if np.isfinite(snr[i]) else ""),
+                "cycles": (round(float(cycles[i]), 2)
+                           if np.isfinite(cycles[i]) else ""),
+                "sigma_rel": (round(float(s_all[i]), 4)
+                              if np.isfinite(s_all[i]) else ""),
+                "segment_verdict": verdict,
+            })
+
     if keep.sum() < cfg.min_points_per_spectrum:
+        # The segment is abandoned here. It used to vanish with no record at
+        # all, which is why "why is segment 33 not evaluated?" had no answer
+        # anywhere in the outputs.
+        _emit(keep, f"dropped: only {int(keep.sum())} point(s) survived, "
+                    f"cfg.min_points_per_spectrum is "
+                    f"{cfg.min_points_per_spectrum}")
+        if log:
+            worst = {}
+            for r in reason[~keep]:
+                worst[r] = worst.get(r, 0) + 1
+            top = sorted(worst.items(), key=lambda kv: -kv[1])[:3]
+            log.warning(
+                f"    segment {sp.segment}: dropped -- {int(keep.sum())} of "
+                f"{freq.size} points survived; most removed by "
+                + ", ".join(f"{k} ({v})" for k, v in top))
         return None
 
     f = freq[keep]
@@ -1111,8 +1234,21 @@ def process_segment(sp: BronzeSpectrum, skew: SkewModel, cfg: Config,
     passive = ~(hf_f & np.isfinite(asr) & (asr <= 0))
     n_neg_lf = int(np.sum(~hf_f & np.isfinite(asr) & (asr < 0)))
     n_drop_pass = int((~passive).sum())
+    # Map the passivity verdict back onto the ORIGINAL point index, so the
+    # ledger stays one row per recorded point rather than per survivor.
+    idx = np.flatnonzero(keep)
+    reason[idx[~passive]] = "passivity"
+    keep[idx[~passive]] = False
+
     if passive.sum() < cfg.min_points_per_spectrum:
+        _emit(keep, f"dropped: {int(passive.sum())} point(s) left after the "
+                    f"passivity gate, cfg.min_points_per_spectrum is "
+                    f"{cfg.min_points_per_spectrum}")
         return None
+
+    _emit(keep, f"kept: {int(keep.sum())} of {freq.size} points, "
+                f"{float(freq[keep].min()):.4g}-{float(freq[keep].max()):.4g} Hz")
+
     f, z, z_corr = f[passive], z[passive], z_corr[passive]
     s_rel = s_rel[passive]
     n_drop += n_drop_pass
@@ -1326,10 +1462,13 @@ def run(bronze_run: BronzeRun, cfg: Config = DEFAULT, log=None) -> SilverRun:
     utils.section("measurement model per segment", log)
     spectra: dict[str, SilverSpectrum] = {}
     failed: list[str] = []
+    #: One row per segment per recorded point, with the gate that removed it.
+    point_ledger: list[dict] = []
     for seg in bronze_run.segments_measured():
         sp = bronze_run.spectra[seg]
         try:
-            res = process_segment(sp, skew[sp.card], cfg, log)
+            res = process_segment(sp, skew[sp.card], cfg, log,
+                                  ledger=point_ledger)
         except Exception as exc:                      # never lose the plate
             log.warning(f"    segment {seg}: {type(exc).__name__}: {exc}")
             res = None
@@ -1387,7 +1526,9 @@ def run(bronze_run: BronzeRun, cfg: Config = DEFAULT, log=None) -> SilverRun:
         log.info(f"  cell aggregate: area-weighted harmonic mean over "
                  f"{len(spectra)} segments, {len(f_cell)} frequencies")
 
-    return SilverRun(spectra=spectra, skew=skew, dc_closure=dcc,
+    return SilverRun(point_ledger=point_ledger,
+                     unwired=list(bronze_run.segments_missing()),
+                     spectra=spectra, skew=skew, dc_closure=dcc,
                      cell_freq=f_cell, Z_cell=Z_cell)
 
 
@@ -1446,6 +1587,13 @@ def save(sr: SilverRun, cfg: Config, log=None) -> Path:
         "cost_gain_pct": round(100 * v.cost_gain, 1),
         "n_segments": v.n_segments, "applied": int(v.applied), "note": v.note,
     } for k, v in sorted(sr.skew.items())])
+
+    # The rejection ledger: one row per segment per point. This is the file to
+    # open when a spectrum stops lower than expected or a segment is missing
+    # altogether -- it names the gate rather than leaving it to be guessed.
+    if sr.point_ledger:
+        utils.write_table(out / "point_rejections.csv", sr.point_ledger)
+        utils.write_table(out / "segment_reach.csv", sr.reach())
 
     if len(sr.cell_freq):
         utils.write_table(out / "cell_aggregate.csv", [{

@@ -19,6 +19,7 @@ from dash import Input, Output, dcc, html
 
 from app.plates import registry
 from app.services import store
+from app.settings import SETTINGS
 from app.services.figures import empty_figure, plate_heatmap
 from app.views import common as ui
 
@@ -87,6 +88,33 @@ def layout():
     ])
 
 
+def _search_roots(run) -> list[Path]:
+    """Where to look for the bench log and the reference sweeps, in order.
+
+    Beside the run first, because that is the common case, and then the
+    CONFIGURED Gamry root. That second half is not optional: the sweeps and
+    the MF4 usually live on a different branch of the share from the results
+    -- .../Lokale_EIS/EIS_Daten_Gamry_Tom against
+    .../Lokale_EIS/Daten/EIS_Results/<order>/<condition> -- and no amount of
+    walking up from the run reaches them. Looking only near the run is why
+    this tab reported "no bench log" while EIS_GAMRY_ROOT was set correctly.
+    """
+    roots: list[Path] = []
+    if run is not None and run.path:
+        base = Path(run.path)
+        roots += [base, base.parent, base.parent.parent]
+    roots += SETTINGS.resolved_gamry_roots()
+
+    seen: set[str] = set()
+    out: list[Path] = []
+    for root in roots:
+        key = str(root)
+        if key not in seen:
+            seen.add(key)
+            out.append(root)
+    return out
+
+
 def _bench_state(selection):
     """The bench log reading at this run's condition, if there is one."""
     _pipeline_on_path()
@@ -98,8 +126,7 @@ def _bench_state(selection):
     if run is None or not run.path:
         return None, None, "no run selected"
 
-    base = Path(run.path)
-    roots = [base, base.parent, base.parent.parent]
+    roots = _search_roots(run)
     log_path = None
     for folder in roots:
         try:
@@ -109,10 +136,11 @@ def _bench_state(selection):
         if log_path is not None:
             break
     if log_path is None:
+        looked = "\n".join(f"      {r}" for r in roots)
         return None, None, (
-            "No bench log (.mf4) found near this run. Put the MF4 that was "
-            "recorded with this campaign beside the results, or beside the "
-            "Gamry sweeps, and it will be picked up.")
+            "No bench log (.mf4) found. Set EIS_GAMRY_ROOT to the folder "
+            "holding the MF4 recorded with this campaign, or put it beside "
+            "the results. Looked in:\n" + looked)
 
     try:
         bench = GC.read_bench_log(log_path)
@@ -123,7 +151,7 @@ def _bench_state(selection):
         return None, None, f"bench log unreadable: {exc}"
 
     sweeps = []
-    for folder in roots:
+    for folder in roots:                      # the same ordered list
         try:
             sweeps = GC.find_cell_sweeps(folder)
         except OSError:

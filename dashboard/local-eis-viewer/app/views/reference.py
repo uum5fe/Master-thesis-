@@ -23,6 +23,8 @@ import plotly.graph_objects as go
 from dash import Input, Output, dcc, html
 
 from app.services import store
+from app.settings import SETTINGS
+from app.plates import registry
 from app.services.figures import SERIES_COLOURS, TEMPLATE, empty_figure
 from app.views import common as ui
 
@@ -147,21 +149,97 @@ _HINT = (
 # for a RunRef field that does not exist; every test passed, because the only
 # code that could raise was unreachable from outside the Dash app.
 
+def _live_comparison(selection):
+    """Compute the comparison now, from what is already on disk.
+
+    The pipeline writes gamry_comparison.csv only when it was given --gamry.
+    A run made without it still has everything needed -- silver wrote
+    cell_aggregate.csv, and the sweeps are wherever EIS_GAMRY_ROOT points --
+    so there is no reason to make someone re-process gigabytes to see a
+    comparison that takes a fraction of a second to compute.
+
+    Returns the same (rows, curves) shape the CSV path produces, so the
+    drawing below does not care which way the numbers arrived.
+    """
+    _pipeline_on_path()
+    import gamry_compare as GC
+
+    run = store.current_catalog().find(
+        selection.get("measurement_id", ""), selection.get("condition", ""),
+        selection.get("kind", "results"))
+    if run is None or not run.path:
+        return [], {}, ""
+
+    base = Path(run.path)
+    aggregate = None
+    for candidate in (base / "silver" / "cell_aggregate.csv",
+                      base / "cell_aggregate.csv"):
+        if candidate.is_file():
+            aggregate = candidate
+            break
+    if aggregate is None:
+        return [], {}, ("This run has no cell_aggregate.csv, so there is "
+                        "nothing to compare. It is written by silver.")
+
+    roots = [base, base.parent, base.parent.parent]
+    roots += SETTINGS.resolved_gamry_roots()
+    sweeps = []
+    for root in roots:
+        try:
+            sweeps = GC.find_cell_sweeps(root)
+        except OSError:
+            continue
+        if sweeps:
+            break
+    if not sweeps:
+        return [], {}, ("No whole-cell Gamry .DTA sweeps found. Set "
+                        "EIS_GAMRY_ROOT to the folder holding them.")
+
+    condition = selection.get("condition", "")
+    match = next((sw for sw in sweeps if sw.condition == condition), None)
+    if match is None:
+        have = ", ".join(sorted({sw.condition for sw in sweeps})) or "none"
+        return [], {}, (f"No sweep at {condition}. The sweeps found cover: "
+                        f"{have}.")
+
+    geom = registry.get(selection.get("plate") or registry.default_key())
+    area = float(sum(geom.areas().values()))
+    freq, Z = GC.read_cell_aggregate(aggregate)
+    comparison = GC.compare(freq, Z, match, area)
+    if not comparison.n_points:
+        return [], {}, ("The local band and the sweep do not overlap, so "
+                        "there is nothing to compare.")
+
+    rows = [{k: ("" if v is None else v)
+             for k, v in comparison.summary().items()}]
+    curves = {comparison.condition: {
+        "f": comparison.freq,
+        "zl": comparison.Z_local * 1e3,
+        "zr": comparison.Z_ref * 1e3,
+        "dphi": comparison.phase_diff_deg,
+    }}
+    return rows, curves, ""
+
+
 def render(selection):
     blank = empty_figure("nothing to compare")
     if not selection:
         return ui.note(""), blank, blank, None
 
     folder = _comparison_dir(selection)
-    if folder is None:
-        return (ui.warnings_block([_HINT], "No reference comparison"),
-                blank, blank, None)
+    rows = _read_summary(folder) if folder else []
+    curves = _read_curves(folder) if folder else {}
+    computed_now = False
 
-    rows = _read_summary(folder)
-    curves = _read_curves(folder)
     if not rows or not curves:
-        return (ui.warnings_block([_HINT], "No reference comparison"),
-                blank, blank, None)
+        # Nothing was written for this run. Compute it rather than asking for
+        # a re-processing run that would produce the same numbers.
+        rows, curves, problem = _live_comparison(selection)
+        computed_now = bool(rows)
+        if not rows:
+            return (ui.warnings_block([problem or _HINT],
+                                      "No reference comparison"),
+                    blank, blank, None)
 
     order = [r["condition"] for r in rows]
 
@@ -215,9 +293,10 @@ def render(selection):
                       title="How the two instruments differ")
     notes = [f"{r['condition']}: {r['notes']}" for r in rows
              if r.get("notes")]
-    status = ui.note(
-        f"{len(rows)} condition(s) compared · reference folder "
-        f"{folder.name}")
+    source = ("computed now, from this run's cell_aggregate.csv and the "
+              "configured Gamry sweeps"
+              if computed_now else f"reference folder {folder.name}")
+    status = ui.note(f"{len(rows)} condition(s) compared · {source}")
     if notes:
         status = html.Div([status,
                            ui.warnings_block(notes, "Worth knowing")])

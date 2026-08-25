@@ -182,7 +182,11 @@ def test_the_tab_renders_without_a_comparison_instead_of_raising(
     status, nyq, res, table = reference.render(sel)
     assert table is None
     assert not nyq.data and not res.data
-    assert "--gamry" in str(status)
+    # And the message is actionable: it names one of the two ways to get a
+    # comparison, rather than only reporting that there is not one. Which of
+    # them depends on how far the run got, so either is acceptable.
+    text = str(status)
+    assert "--gamry" in text or "EIS_GAMRY_ROOT" in text, text[:200]
 
     # And an empty selection is not a crash either.
     assert reference.render({})[3] is None
@@ -205,3 +209,99 @@ def test_the_tab_draws_the_comparison_that_is_there(tmp_path, monkeypatch,
     assert len(nyq.data) == 4
     assert len(res.data) == 4
     assert "Z′" in nyq.layout.xaxis.title.text
+
+
+# ---------------------------------------------------------------------------
+# computing the comparison instead of demanding a re-run
+# ---------------------------------------------------------------------------
+
+def _run_with_aggregate_and_sweeps(tmp_path):
+    """A finished run, and sweeps on a different branch. No comparison CSV."""
+    import pandas as pd
+    GC = _pipeline()
+
+    results = tmp_path / "Daten" / "EIS_Results" / "2611976" / "45A"
+    gamry = tmp_path / "EIS_Daten_Gamry_Tom"
+    (results / "silver").mkdir(parents=True)
+    (results / "gold").mkdir(parents=True)
+    gamry.mkdir(parents=True)
+
+    pd.DataFrame({"segment": ["1"], "R_ohmic": [0.06]}).to_csv(
+        results / "gold" / "plate_summary.csv", index=False)
+
+    freq = np.logspace(np.log10(0.3), np.log10(4500), 45)
+    Z = _cell(freq)
+    pd.DataFrame({"freq_hz": freq,
+                  "z_re_mohm_cm2": 1e3 * Z.real,
+                  "z_im_mohm_cm2": 1e3 * Z.imag}).to_csv(
+        results / "silver" / "cell_aggregate.csv", index=False)
+
+    wide = np.logspace(np.log10(0.3), np.log10(30000), 61)
+    _write_gamry(gamry / "cell_CurrVal_45.dta", wide, _cell(wide) / A_CELL)
+    return results, gamry
+
+
+def _write_gamry(path, freq, Z_ohm):
+    head = ["EXPLAIN", "TAG\tGALVEIS",
+            "STARTTIME\tLABEL\t16.07.2026 07:47:03\tStart Time",
+            "ZCURVE\tTABLE",
+            "\tPt\tTime\tFreq\tZreal\tZimag\tZsig\tZmod\tZphz\tIdc\tVdc\tIERange",
+            "\t#\ts\tHz\tohm\tohm\tV\tohm\tdeg\tA\tV\t#"]
+    g = lambda v: f"{v:.6E}".replace(".", ",")
+    for i, (f, z) in enumerate(zip(freq, Z_ohm), start=1):
+        head.append("\t".join(["", str(i), "1", g(f), g(z.real), g(z.imag), "1",
+                               g(abs(z)), g(np.degrees(np.angle(z))),
+                               g(4e-3), g(0.77), "13"]))
+    path.write_text("\n".join(head) + "\n", encoding="latin-1")
+
+
+def test_the_comparison_is_computed_when_none_was_written(tmp_path,
+                                                          monkeypatch):
+    """A run made without --gamry still has everything the comparison needs.
+
+    Re-processing gigabytes to obtain numbers that take a fraction of a second
+    to compute is not a reasonable thing to ask for.
+    """
+    from app.data.sources import Catalog
+    from app.settings import Settings
+
+    results, gamry = _run_with_aggregate_and_sweeps(tmp_path)
+    assert not (results / "gamry_comparison.csv").exists()
+
+    settings = Settings(results_roots=[str(tmp_path / "Daten" / "EIS_Results")],
+                        gamry_roots=[str(gamry)], famos_roots=[], csv_roots=[])
+    catalog = Catalog(settings).refresh(kinds=("results",))
+    monkeypatch.setattr(reference.store, "current_catalog", lambda: catalog)
+    monkeypatch.setattr(reference, "SETTINGS", settings)
+
+    sel = {"kind": "results", "measurement_id": "2611976", "condition": "45A",
+           "plate": "gen1_r2d2_72"}
+    status, nyq, res, table = reference.render(sel)
+
+    assert table is not None
+    assert len(nyq.data) == 2                    # reference and local
+    assert "computed now" in str(status)
+    # identical physics in, so the difference must be nil
+    rows, _curves, _problem = reference._live_comparison(sel)
+    assert abs(float(rows[0]["mag_rel_median_pct"])) < 0.5
+
+
+def test_a_missing_sweep_for_this_condition_says_which_ones_exist(tmp_path,
+                                                                  monkeypatch):
+    from app.data.sources import Catalog
+    from app.settings import Settings
+
+    results, gamry = _run_with_aggregate_and_sweeps(tmp_path)
+    (gamry / "cell_CurrVal_45.dta").rename(gamry / "cell_CurrVal_450.dta")
+
+    settings = Settings(results_roots=[str(tmp_path / "Daten" / "EIS_Results")],
+                        gamry_roots=[str(gamry)], famos_roots=[], csv_roots=[])
+    catalog = Catalog(settings).refresh(kinds=("results",))
+    monkeypatch.setattr(reference.store, "current_catalog", lambda: catalog)
+    monkeypatch.setattr(reference, "SETTINGS", settings)
+
+    _rows, _curves, problem = reference._live_comparison(
+        {"kind": "results", "measurement_id": "2611976", "condition": "45A",
+         "plate": "gen1_r2d2_72"})
+    assert "No sweep at 45A" in problem
+    assert "450A" in problem, "it must say what it did find"

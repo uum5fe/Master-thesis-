@@ -207,3 +207,67 @@ def test_the_tab_explains_itself_when_there_is_no_bench_log(tmp_path,
 def test_an_empty_selection_does_not_raise():
     fields, _meta, problem = operating.fields_for({})
     assert fields is None and problem
+
+
+# ---------------------------------------------------------------------------
+# finding the bench log when it is not beside the run
+# ---------------------------------------------------------------------------
+
+def _split_share(tmp_path):
+    """Results and reference on different branches, as on the real share."""
+    import pandas as pd
+
+    results = tmp_path / "Daten" / "EIS_Results" / "2611976" / "45A"
+    gamry = tmp_path / "EIS_Daten_Gamry_Tom"
+    (results / "gold").mkdir(parents=True)
+    gamry.mkdir(parents=True)
+    pd.DataFrame({"segment": ["1"], "R_ohmic": [0.06]}).to_csv(
+        results / "gold" / "plate_summary.csv", index=False)
+    (gamry / "run_2611976.mf4").write_bytes(b"not a real mf4")
+    return results, gamry
+
+
+def test_the_configured_gamry_root_is_searched_not_just_the_run(tmp_path,
+                                                                monkeypatch):
+    """Walking up from the run cannot reach a different branch of the share.
+
+    The results live at .../Daten/EIS_Results/<order>/<condition> and the
+    sweeps at .../EIS_Daten_Gamry_Tom. No number of parents joins those, which
+    is why this tab said "no bench log" while EIS_GAMRY_ROOT was set right.
+    """
+    from app.data.sources import Catalog
+    from app.settings import Settings
+
+    results, gamry = _split_share(tmp_path)
+    settings = Settings(results_roots=[str(tmp_path / "Daten" / "EIS_Results")],
+                        gamry_roots=[str(gamry)], famos_roots=[], csv_roots=[])
+    catalog = Catalog(settings).refresh(kinds=("results",))
+    monkeypatch.setattr(operating.store, "current_catalog", lambda: catalog)
+    monkeypatch.setattr(operating, "SETTINGS", settings)
+
+    run = catalog.runs[0]
+    roots = [str(r) for r in operating._search_roots(run)]
+    assert str(gamry) in roots, roots
+    # the run's own folder is still tried first
+    assert roots[0] == str(results)
+
+
+def test_the_message_lists_where_it_looked(tmp_path, monkeypatch):
+    """"Not found" is only useful with the search path attached."""
+    from app.data.sources import Catalog
+    from app.settings import Settings
+
+    results, _gamry = _split_share(tmp_path)
+    empty = tmp_path / "nothing_here"
+    empty.mkdir()
+    settings = Settings(results_roots=[str(tmp_path / "Daten" / "EIS_Results")],
+                        gamry_roots=[str(empty)], famos_roots=[], csv_roots=[])
+    catalog = Catalog(settings).refresh(kinds=("results",))
+    monkeypatch.setattr(operating.store, "current_catalog", lambda: catalog)
+    monkeypatch.setattr(operating, "SETTINGS", settings)
+
+    _fields, _meta, problem = operating.fields_for(
+        {"kind": "results", "measurement_id": "2611976", "condition": "45A",
+         "plate": "gen1_r2d2_72"})
+    assert "EIS_GAMRY_ROOT" in problem
+    assert str(empty) in problem, "it must say where it actually looked"

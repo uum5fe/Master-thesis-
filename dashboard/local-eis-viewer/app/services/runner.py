@@ -21,6 +21,7 @@ calibration and the output root all come from :mod:`app.settings`, hence from
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -161,10 +162,15 @@ def run_famos(progress, ref: RunRef, geom: PlateGeometry | None = None,
     progress(0, len(STAGES), f"starting: {' '.join(argv[1:])}")
     collected = log_lines if log_lines is not None else []
 
+    # The parent reads the child's output as UTF-8, so the child must write it
+    # as UTF-8. On Windows it defaults to the console code page (cp1252 here),
+    # which cannot carry the box drawing in the banners or the units in the
+    # results -- and every such line would come back mangled.
+    child_env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
     process = subprocess.Popen(
         argv, cwd=str(directory), stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, text=True, bufsize=1,
-        encoding="utf-8", errors="replace",
+        encoding="utf-8", errors="replace", env=child_env,
     )
     stage = 0
     assert process.stdout is not None

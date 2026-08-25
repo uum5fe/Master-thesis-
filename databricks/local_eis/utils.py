@@ -53,6 +53,7 @@ Everything is plain numpy/scipy.
 from __future__ import annotations
 
 import json
+import io
 import logging
 import re
 import sys
@@ -68,13 +69,96 @@ import numpy as np
 # ===========================================================================
 
 _LOGGER_NAME = "eis"
-_RULE = "\u2550" * 75
+
+#: Rule characters, chosen once when the handler is built.  A Windows console
+#: is cp1252 by default and cannot encode U+2500; logging then catches the
+#: UnicodeEncodeError and prints a "--- Logging error ---" traceback for EVERY
+#: banner, which buries the output the run exists to produce.  The run itself
+#: is unaffected -- but a log nobody can read is not much of a log.
+_RULE_HEAVY = "\u2550"
+_RULE_LIGHT = "\u2500"
+
+
+def _console_stream():
+    """stdout, put into UTF-8 if the platform allows it.
+
+    Three attempts, weakest last.  Reconfiguring is the real fix and works on
+    any modern console.  Failing that, a fresh wrapper over the same byte
+    buffer does the same job.  Failing that, the stream is used as it is and
+    the rules fall back to ASCII, so the output stays readable even where the
+    console genuinely cannot carry box drawing.
+
+    `errors="backslashreplace"` is the safety net for everything else in the
+    log: micro, degree, ohm and plus-minus all appear in normal output, and a
+    single one of them must not be able to break the handler.
+    """
+    stream = sys.stdout
+    try:
+        stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+        return stream
+    except Exception:                                       # noqa: BLE001
+        pass
+    buffer = getattr(stream, "buffer", None)
+    if buffer is not None:
+        try:
+            return io.TextIOWrapper(buffer, encoding="utf-8",
+                                    errors="backslashreplace",
+                                    line_buffering=True)
+        except Exception:                                   # noqa: BLE001
+            pass
+    return stream
+
+
+class _SafeStreamHandler(logging.StreamHandler):
+    """A handler no console character can break.
+
+    `logging.StreamHandler.emit` catches the UnicodeEncodeError itself and
+    routes it to `handleError`, which is what prints the "--- Logging error
+    ---" traceback -- so catching around `super().emit()` does not help. The
+    write is therefore done here, with a lossy re-encode as the fallback.
+
+    Losing a degree sign is a fair price. Losing the line that says which
+    segment failed, and gaining twelve lines of traceback in its place, is not.
+    """
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            try:
+                self.stream.write(msg + self.terminator)
+            except UnicodeEncodeError:
+                enc = getattr(self.stream, "encoding", None) or "ascii"
+                self.stream.write(
+                    msg.encode(enc, "replace").decode(enc) + self.terminator)
+            self.flush()
+        except RecursionError:
+            raise
+        except Exception:                                   # noqa: BLE001
+            self.handleError(record)
+
+
+def _rules_for(stream) -> tuple[str, str]:
+    """The heavy and light rule characters this stream can actually carry."""
+    encoding = getattr(stream, "encoding", None) or "ascii"
+    try:
+        (_RULE_HEAVY + _RULE_LIGHT).encode(encoding)
+        return _RULE_HEAVY, _RULE_LIGHT
+    except (UnicodeEncodeError, LookupError):
+        return "=", "-"
+
+
+_HEAVY, _LIGHT = _RULE_HEAVY, _RULE_LIGHT
+_RULE = _RULE_HEAVY * 75
 
 
 def get_logger(verbose: bool = True) -> logging.Logger:
+    global _HEAVY, _LIGHT, _RULE
     log = logging.getLogger(_LOGGER_NAME)
     if not log.handlers:
-        h = logging.StreamHandler(sys.stdout)
+        stream = _console_stream()
+        _HEAVY, _LIGHT = _rules_for(stream)
+        _RULE = _HEAVY * 75
+        h = _SafeStreamHandler(stream)
         h.setFormatter(logging.Formatter("%(message)s"))
         log.addHandler(h)
     log.setLevel(logging.INFO if verbose else logging.WARNING)
@@ -88,7 +172,8 @@ def banner(text: str, log: logging.Logger | None = None) -> None:
 
 
 def section(text: str, log: logging.Logger | None = None) -> None:
-    (log or get_logger()).info(f"\n\u2500\u2500\u2500 {text} " + "\u2500" * max(0, 60 - len(text)))
+    log = log or get_logger()
+    log.info(f"\n{_LIGHT * 3} {text} " + _LIGHT * max(0, 60 - len(text)))
 
 
 @contextmanager

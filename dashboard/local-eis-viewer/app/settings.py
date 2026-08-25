@@ -132,6 +132,12 @@ class Settings:
     calibration_roots: list[str] = field(
         default_factory=lambda: _env_list("EIS_CALIBRATION_ROOT"))
 
+    #: Whole-cell Gamry .DTA sweeps, and the bench .mf4 beside them. Feeds the
+    #: Whole-cell check and the Operating map. Falls back to the FAMOS and
+    #: results roots, so files kept beside the measurements need no setting.
+    gamry_roots: list[str] = field(
+        default_factory=lambda: _env_list("EIS_GAMRY_ROOT"))
+
     # -- the processing pipeline --------------------------------------------
     #: Folder holding main.py, bronze.py, silver.py and gold.py. Empty means
     #: the copy bundled in this project, which is the same code that ran on
@@ -172,6 +178,13 @@ class Settings:
 
     def resolved_csv_roots(self) -> list[Path]:
         roots = [Path(p) for p in self.csv_roots]
+        for extra in self.famos_roots + self.results_roots:
+            if Path(extra) not in roots:
+                roots.append(Path(extra))
+        return roots
+
+    def resolved_gamry_roots(self) -> list[Path]:
+        roots = [Path(p) for p in self.gamry_roots]
         for extra in self.famos_roots + self.results_roots:
             if Path(extra) not in roots:
                 roots.append(Path(extra))

@@ -52,6 +52,15 @@ def main(argv=None) -> int:
                    help="list the recordings found, then exit")
     p.add_argument("--self-test", action="store_true",
                    help="run the pipeline's synthetic checks, then exit")
+    p.add_argument("--plate", choices=["gen1", "gen2"], default=None,
+                   help="plate generation to evaluate with (default: the "
+                        "dashboard's EIS_DEFAULT_PLATE, else gen1). The areas "
+                        "differ between generations, so this changes every "
+                        "area-weighted result")
+    p.add_argument("--gamry", metavar="DIR",
+                   help="folder of whole-cell Gamry .DTA sweeps; sets "
+                        "EIS_GAMRY_ROOT for this run so the whole-cell "
+                        "comparison is written")
     p.add_argument("--equal-areas", action="store_true",
                    help="treat every segment as A_cell/72 — a deliberate "
                         "simplification, recorded in the manifest")
@@ -73,7 +82,8 @@ def main(argv=None) -> int:
     a = p.parse_args(argv)
 
     for value, name in ((a.famos, "EIS_FAMOS_ROOT"), (a.out, "EIS_RESULTS_ROOT"),
-                        (a.curr_cal, "EIS_CURR_CAL"), (a.temp_cal, "EIS_TEMP_CAL")):
+                        (a.curr_cal, "EIS_CURR_CAL"), (a.temp_cal, "EIS_TEMP_CAL"),
+                        (a.gamry, "EIS_GAMRY_ROOT")):
         if value:
             os.environ[name] = str(Path(value).expanduser())
     os.environ.setdefault("EIS_ALLOW_INLINE_PIPELINE", "1")
@@ -107,6 +117,13 @@ def main(argv=None) -> int:
               '      python run_evaluation.py --famos "<folder>" --list',
               file=sys.stderr)
         return 2
+
+    from app.plates import registry
+    PLATE_KEYS = {"gen1": "gen1_r2d2_72", "gen2": "gen2_r2d2_naboo_72"}
+    geom = registry.get(PLATE_KEYS.get(a.plate) or registry.default_key())
+    print(f"\nplate: {geom.name}")
+    if not geom.verified:
+        print("  NOTE: this layout is unverified — its areas are provisional")
 
     refs = FamosSource(SETTINGS.famos_roots, SETTINGS.famos_glob).scan()
     if a.leepa:
@@ -195,7 +212,8 @@ def main(argv=None) -> int:
                     lambda done, total, message="": print(f"    {message}"))
             runner.run_famos(
                 lambda done, total, message="": print(f"  {message}"),
-                source, settings=SETTINGS, equal_areas=a.equal_areas,
+                source, geom=geom, settings=SETTINGS,
+                equal_areas=a.equal_areas,
                 no_png=a.no_png, stop_after=a.stop_after)
         except Exception as exc:
             print(f"  FAILED: {exc}")

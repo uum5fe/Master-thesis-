@@ -108,7 +108,8 @@ def warnings_for(settings: Settings = SETTINGS) -> list[str]:
 
 def build_command(ref: RunRef, out: Path, settings: Settings = SETTINGS,
                   equal_areas: bool = False, no_png: bool = False,
-                  stop_after: str = "gold") -> list[str]:
+                  stop_after: str = "gold",
+                  geom: PlateGeometry | None = None) -> list[str]:
     """The exact command line, so it can be shown, logged and reproduced."""
     argv = [
         sys.executable, "main.py",
@@ -119,6 +120,18 @@ def build_command(ref: RunRef, out: Path, settings: Settings = SETTINGS,
         "--out", str(out),
         "--stop-after", stop_after,
     ]
+    # THE PLATE. This used to be dropped: run_famos took a geometry and never
+    # passed it on, so every run evaluated whatever the pipeline defaulted to
+    # regardless of the generation picked in the sidebar. A Gen 2 plate
+    # evaluated with Gen 1 areas is wrong in every area-weighted quantity.
+    if geom is not None:
+        argv += ["--plate", "gen2" if "gen2" in geom.key else "gen1"]
+    # The whole-cell reference, if there is one to find. Without this the
+    # comparison never runs and its tab has nothing to show.
+    for root in settings.resolved_gamry_roots():
+        if any(root.rglob("*.dta")) or any(root.rglob("*.DTA")):
+            argv += ["--gamry", str(root)]
+            break
     if settings.temp_cal:
         argv += ["--temp-cal", str(settings.temp_cal)]
     if settings.areas_file:
@@ -141,7 +154,8 @@ def run_famos(progress, ref: RunRef, geom: PlateGeometry | None = None,
 
     out = output_dir(ref, settings)
     out.mkdir(parents=True, exist_ok=True)
-    argv = build_command(ref, out, settings, equal_areas, no_png, stop_after)
+    argv = build_command(ref, out, settings, equal_areas, no_png, stop_after,
+                         geom=geom)
     directory = pipeline_dir(settings)
 
     progress(0, len(STAGES), f"starting: {' '.join(argv[1:])}")

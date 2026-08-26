@@ -408,6 +408,168 @@ def flow_trend(values: dict[str, float], plate_key: str = "gen1",
 
 
 # ===========================================================================
+# 4b. The series resistance, summed in parallel
+# ===========================================================================
+#
+# The sharpest scalar check the method has, and the one a reader asks for
+# first: the segments sit in parallel across one cell voltage, so their ohmic
+# resistances combine in parallel, and the result must equal the whole cell's
+# HFR.  One number against one number, no curve fitting on either side.
+#
+# WHY THIS IS NOT THE SAME AS COMPARING THE SPECTRA
+# -------------------------------------------------
+# `aggregate_vs_reference` below compares |Z| over the whole overlapping band.
+# That is a broader test but a blunter one, and on this campaign it is also
+# the one that keeps coming back "not measurable": reading an HFR off a curve
+# needs the curve to cross the real axis, and the delivered Gamry sweeps stop
+# at 1.2-3.0 kHz while the cell is still capacitive.
+#
+# R_ohmic per segment does NOT have that problem.  silver fits it from the top
+# of each segment's band with the unresolved arc carried as a bias term
+# (`hf_arc_open`, folded into R_ohmic_sd), so it exists as a number with an
+# error bar whether or not any curve reached its intercept.  Summing those in
+# parallel therefore gives a cell R_s where reading an intercept gives NaN --
+# which is why this check earns its place next to the other one rather than
+# duplicating it.
+
+
+def parallel_series_resistance(r_ohmic: dict[str, float],
+                               areas: dict[str, float],
+                               r_sd: dict[str, float] | None = None
+                               ) -> dict:
+    """Combine per-segment R_s (ohm.cm2) in parallel, back into ohm.cm2.
+
+    Each segment's actual resistance is R_s / A_s ohms, because R_s is
+    area-specific.  In parallel::
+
+        1 / R_par[ohm]  =  sum_s A_s / R_s
+
+    and multiplying back by the measured area returns an area-specific value
+    directly comparable with a whole-cell HFR in ohm.cm2::
+
+        R_par[ohm.cm2]  =  A_measured / sum_s (A_s / R_s)
+
+    which is the area-weighted HARMONIC mean of the segment resistances -- the
+    same form as the impedance aggregate, as it must be, since this is that
+    aggregate evaluated at omega -> infinity.
+
+    Note what the harmonic mean does: it is dominated by the LOW-resistance
+    segments.  A segment with twice the plate's resistance pulls the cell
+    value up far less than a segment with half of it pulls it down, which is
+    the arithmetic behind "an integral measurement hides local faults".
+
+    A second and less obvious property: the areas here are WEIGHTS, not
+    scale factors.  Getting one wrong reweights the mean rather than scaling
+    it, so the error cancels EXACTLY when the segments share one R_s, and
+    otherwise enters only in proportion to the spread of R_s.  Measured on
+    this plate: a 3x area error on one segment moves the result by 0.0 % at
+    zero spread and under 2 % at a realistic 20 %.  So this check is close to
+    blind to the geometry and sharp on the resistances -- the complement of
+    the DC current closure, which is sharp on the geometry.  Disagreeing here
+    but closing there points at the calibration; the reverse points at the
+    areas.
+    """
+    terms, var, used, a_meas = [], 0.0, [], 0.0
+    for seg, r in r_ohmic.items():
+        a = areas.get(seg)
+        if a is None or not np.isfinite(r) or not np.isfinite(a) or r <= 0:
+            continue
+        terms.append(a / r)
+        used.append(seg)
+        a_meas += float(a)
+    if not terms:
+        return {"ok": False, "n_used": 0}
+
+    S = float(np.sum(terms))
+    r_par = a_meas / S
+
+    sd = float("nan")
+    if r_sd:
+        # dR/dR_s = A_meas * (A_s / R_s^2) / S^2, summed in quadrature.
+        acc = 0.0
+        for seg in used:
+            sigma = r_sd.get(seg, float("nan"))
+            if not np.isfinite(sigma):
+                continue
+            a, r = float(areas[seg]), float(r_ohmic[seg])
+            acc += (a_meas * (a / r ** 2) / S ** 2 * sigma) ** 2
+        sd = float(np.sqrt(acc)) if acc > 0 else float("nan")
+
+    return {"ok": True, "r_par_ohm_cm2": r_par, "sd_ohm_cm2": sd,
+            "n_used": len(used), "area_cm2": a_meas,
+            "r_par_ohm": r_par / a_meas if a_meas else float("nan")}
+
+
+def series_resistance_closure(r_ohmic: dict[str, float],
+                              areas: dict[str, float],
+                              reference_hfr_ohm_cm2: float,
+                              r_sd: dict[str, float] | None = None,
+                              area_fraction: float = 1.0,
+                              reference_label: str = "whole-cell HFR"
+                              ) -> Check:
+    """Parallel sum of the segment R_s against the whole cell's own R_s.
+
+    This is the check in its strongest form: both sides are one number, both
+    are ohm.cm2, and nothing in the local chain was fitted to the reference.
+    A disagreement is therefore attributable -- to the areas, to the shunt
+    calibration, or to the plate genuinely not being uniform over the
+    unmeasured part -- rather than being absorbed into a curve.
+    """
+    par = parallel_series_resistance(r_ohmic, areas, r_sd)
+    if not par["ok"]:
+        return Check("R_s parallel closure", NA,
+                     "no segment has a finite positive R_ohmic")
+    if not np.isfinite(reference_hfr_ohm_cm2) or reference_hfr_ohm_cm2 <= 0:
+        return Check("R_s parallel closure", NA,
+                     f"{1e3 * par['r_par_ohm_cm2']:.2f} mohm.cm2 from "
+                     f"{par['n_used']} segments in parallel, but the "
+                     f"{reference_label} is not available to compare against",
+                     par["r_par_ohm_cm2"])
+
+    local = par["r_par_ohm_cm2"]
+    dev = local / reference_hfr_ohm_cm2 - 1.0
+    sd_txt = (f" +/- {1e3 * par['sd_ohm_cm2']:.2f}"
+              if np.isfinite(par["sd_ohm_cm2"]) else "")
+    detail = (f"{par['n_used']} segments in parallel give "
+              f"{1e3 * local:.2f}{sd_txt} mohm.cm2 vs {reference_label} "
+              f"{1e3 * reference_hfr_ohm_cm2:.2f} ({100 * dev:+.1f} %)")
+
+    # Same reasoning as the spectral aggregate: a partial plate may legitimately
+    # differ from the whole by roughly how non-uniform the plate is, so the
+    # tolerance follows the coverage instead of one number pretending to fit
+    # both the 69 % block and the 31 % one.
+    tol = 0.08 + 0.32 * (1.0 - max(0.0, min(1.0, area_fraction)))
+    if abs(dev) <= tol:
+        verdict = PASS
+    elif abs(dev) <= 2 * tol:
+        verdict = WARN
+        detail += (f" -- outside the {100 * tol:.0f} % this coverage should "
+                   f"hold to")
+    else:
+        verdict = FAIL
+        detail += (f" -- far outside the {100 * tol:.0f} % this coverage should "
+                   f"hold to. Since the areas are only weights here and "
+                   f"barely move this number, look at the shunt calibration "
+                   f"or at whether the two instruments saw the same operating "
+                   f"point, not at the geometry")
+
+    if np.isfinite(par["sd_ohm_cm2"]) and par["sd_ohm_cm2"] > 0:
+        n_sigma = abs(local - reference_hfr_ohm_cm2) / par["sd_ohm_cm2"]
+        detail += f", {n_sigma:.1f} sigma on the propagated error"
+    return Check("R_s parallel closure", verdict, detail, dev,
+                 rests_on="the unmeasured area having a similar area-specific "
+                          "R_s to the measured area. Notably NOT on the areas "
+                          "themselves: they are the weights of a weighted "
+                          "harmonic mean, so an area error only reweights it "
+                          "and cancels exactly when R_s is uniform -- even a "
+                          "3x error on one segment moves the result under 2 % "
+                          "at the ~20 % R_s spread this plate shows. That "
+                          "makes this a test of the RESISTANCES, where the DC "
+                          "current closure is a test of the AREAS; run both "
+                          "and the two error classes separate")
+
+
+# ===========================================================================
 # 5. The aggregate, against an instrument that shares nothing
 # ===========================================================================
 
@@ -465,8 +627,8 @@ def aggregate_vs_reference(freq: np.ndarray, Z_agg: np.ndarray,
 # ===========================================================================
 
 def check_run(sr, cfg=None, plate_key: str = "gen1",
-              reference: tuple[np.ndarray, np.ndarray] | None = None
-              ) -> Report:
+              reference: tuple[np.ndarray, np.ndarray] | None = None,
+              reference_hfr: float = float("nan")) -> Report:
     """Every check that the available data supports, on a finished SilverRun."""
     spectra = sr.spectra
     measured = list(spectra)
@@ -485,6 +647,12 @@ def check_run(sr, cfg=None, plate_key: str = "gen1",
     r_ohmic = {s: sp.R_ohmic for s, sp in spectra.items()}
     checks.append(neighbour_smoothness(r_ohmic, plate_key))
     checks.append(flow_trend(r_ohmic, plate_key))
+
+    checks.append(series_resistance_closure(
+        r_ohmic, {s: sp.area_cm2 for s, sp in spectra.items()},
+        reference_hfr,
+        r_sd={s: sp.R_ohmic_sd for s, sp in spectra.items()},
+        area_fraction=float(cov.value)))
 
     if reference is not None and len(getattr(sr, "cell_freq", [])):
         checks.append(aggregate_vs_reference(

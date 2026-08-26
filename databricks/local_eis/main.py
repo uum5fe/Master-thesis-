@@ -298,6 +298,7 @@ def run_pipeline(cfg: Config, stop_after: str = "gold") -> dict:
     # non-fatal, because a missing or unreadable reference must not throw away
     # a run that is otherwise complete.
     reference_asr = None
+    reference_hfr = float("nan")
     if cfg.gamry_dir:
         utils.banner("WHOLE-CELL REFERENCE  --  local aggregate vs Gamry", log)
         try:
@@ -312,6 +313,14 @@ def run_pipeline(cfg: Config, stop_after: str = "gold") -> dict:
                 # the reference arm of the plausibility aggregate check, in
                 # the same ohm.cm2 the local side already uses
                 reference_asr = (comps[0].freq, comps[0].Z_ref)
+                # ... and its R_s, for the parallel-sum closure. The measured
+                # intercept when the sweep reached it, otherwise the
+                # extrapolation, which is what the local parallel sum should
+                # be compared against when neither curve crosses the axis.
+                import math
+                reference_hfr = (comps[0].hfr_ref
+                                 if math.isfinite(comps[0].hfr_ref)
+                                 else comps[0].hfr_ref_fit)
             if cfg.write_png and comps:
                 gamry_compare.plot(
                     comps, Path(cfg.out_dir) / "gamry_comparison.png")
@@ -325,7 +334,8 @@ def run_pipeline(cfg: Config, stop_after: str = "gold") -> dict:
     try:
         import plausibility
         rep = plausibility.check_run(
-            sr, cfg, plate_key=cfg.plate, reference=reference_asr)
+            sr, cfg, plate_key=cfg.plate, reference=reference_asr,
+            reference_hfr=reference_hfr)
         plausibility.report(rep, log)
         plausibility.save(rep, cfg.out_dir)
         manifest["stages"]["plausibility"] = rep.rows()

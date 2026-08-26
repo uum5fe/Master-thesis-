@@ -302,3 +302,145 @@ def test_not_applicable_outranks_pass_but_not_warn() -> None:
 
 def test_an_empty_report_is_not_a_pass() -> None:
     assert P.Report([]).verdict == P.NA
+
+
+# ---------------------------------------------------------------------------
+# the parallel sum of R_s -- the scalar check
+# ---------------------------------------------------------------------------
+
+def test_a_uniform_plate_parallels_back_to_its_own_value() -> None:
+    """The identity the whole check rests on.
+
+    If every segment has the same area-specific R_s, the area-weighted
+    harmonic mean is that same R_s -- whatever the areas are, and whatever
+    fraction of the plate is measured. Nothing to rescale.
+    """
+    for segs in (range(1, 37), range(37, 73), range(1, 73)):
+        r = {str(n): 0.094 for n in segs}
+        a = {str(n): AREAS[n] for n in segs}
+        par = P.parallel_series_resistance(r, a)
+        assert par["r_par_ohm_cm2"] == pytest.approx(0.094, rel=1e-12)
+
+
+def test_the_parallel_sum_is_the_harmonic_not_the_arithmetic_mean() -> None:
+    """The distinction that makes an integral measurement hide local faults.
+
+    One flooded segment at four times the plate's R_s moves the cell value
+    far less than one segment at a quarter of it, because admittances add.
+    A check built on the arithmetic mean would weight them equally and be
+    wrong in the direction that matters.
+    """
+    segs = list(range(1, 37))
+    base = 0.10
+
+    high = {str(n): base for n in segs}
+    high[str(segs[0])] = 4 * base          # one flooded
+    low = {str(n): base for n in segs}
+    low[str(segs[0])] = 0.25 * base        # one shorted
+
+    a = {str(n): AREAS[n] for n in segs}
+    r_hi = P.parallel_series_resistance(high, a)["r_par_ohm_cm2"]
+    r_lo = P.parallel_series_resistance(low, a)["r_par_ohm_cm2"]
+
+    assert r_hi > base and r_lo < base
+    assert (r_hi - base) < (base - r_lo), (
+        "the low-resistance segment must dominate; that asymmetry IS the "
+        "harmonic mean and the reason local faults hide in a cell curve")
+
+    arithmetic = float(np.mean([4 * base] + [base] * (len(segs) - 1)))
+    assert r_hi < arithmetic, "an arithmetic mean would over-state the effect"
+
+
+def test_a_uniform_plate_closes_against_the_reference() -> None:
+    segs = list(range(1, 37))
+    r = {str(n): 0.094 for n in segs}
+    a = {str(n): AREAS[n] for n in segs}
+    c = P.series_resistance_closure(r, a, 0.094, area_fraction=0.686)
+    assert c.verdict == P.PASS
+    assert abs(c.value) < 1e-9
+
+
+def test_the_areas_are_weights_here_so_an_area_error_barely_moves_it() -> None:
+    """The property that makes this check complement the current closure.
+
+    The areas are the WEIGHTS of a weighted harmonic mean, not scale factors,
+    so getting one wrong reweights the mean instead of scaling it. That
+    cancels exactly when the segments share one R_s, and otherwise enters only
+    in proportion to the spread of R_s. So this check is sharp on the
+    RESISTANCES and nearly blind to the geometry -- while `current_closure` is
+    sharp on the geometry. Failing one and passing the other is what separates
+    a calibration error from an area error.
+    """
+    segs = list(range(1, 37))
+    a_true = {str(n): AREAS[n] for n in segs}
+    a_one = dict(a_true)
+    a_one[str(segs[0])] = 3.0 * AREAS[segs[0]]      # one area 3x wrong
+
+    # uniform R_s: the error cancels exactly, however wrong the area is
+    flat = {str(n): 0.094 for n in segs}
+    assert (P.parallel_series_resistance(flat, a_one)["r_par_ohm_cm2"]
+            == pytest.approx(
+                P.parallel_series_resistance(flat, a_true)["r_par_ohm_cm2"],
+                rel=1e-12))
+
+    # with a realistic 20 % spread it enters, but stays small
+    rng = np.random.default_rng(0)
+    varied = {str(n): 0.094 * (1 + 0.20 * rng.standard_normal()) for n in segs}
+    good = P.parallel_series_resistance(varied, a_true)["r_par_ohm_cm2"]
+    bad = P.parallel_series_resistance(varied, a_one)["r_par_ohm_cm2"]
+    assert abs(bad / good - 1.0) < 0.05, (
+        "a 3x area error must not be able to masquerade as a resistance error")
+
+    c = P.series_resistance_closure(varied, a_one, good, area_fraction=0.686)
+    assert "NOT on the areas" in c.rests_on
+
+
+def test_a_missing_reference_is_not_a_pass() -> None:
+    """The campaign's actual situation: sweeps that never reach the intercept.
+
+    The parallel sum still exists and is still reported -- that is the point
+    of computing R_s per segment rather than reading it off a curve -- but
+    with nothing to compare it against the verdict is n/a, not pass.
+    """
+    segs = list(range(1, 37))
+    r = {str(n): 0.094 for n in segs}
+    a = {str(n): AREAS[n] for n in segs}
+    c = P.series_resistance_closure(r, a, float("nan"))
+    assert c.verdict == P.NA
+    assert "94.00 mohm.cm2" in c.detail, "the local number is still reported"
+    assert c.value == pytest.approx(0.094)
+
+
+def test_a_gross_disagreement_fails_at_any_coverage() -> None:
+    segs = list(range(1, 37))
+    r = {str(n): 0.094 for n in segs}
+    a = {str(n): AREAS[n] for n in segs}
+    for frac in (0.314, 0.686, 1.0):
+        c = P.series_resistance_closure(r, a, 0.250, area_fraction=frac)
+        assert c.verdict == P.FAIL, f"coverage {frac}"
+
+
+def test_the_propagated_error_is_reported_in_sigma() -> None:
+    """A 5 % disagreement means different things at 1 % and at 20 % error."""
+    segs = list(range(1, 37))
+    r = {str(n): 0.094 for n in segs}
+    a = {str(n): AREAS[n] for n in segs}
+    tight = P.series_resistance_closure(
+        r, a, 0.090, r_sd={str(n): 0.001 for n in segs}, area_fraction=0.686)
+    assert "sigma" in tight.detail
+
+    par = P.parallel_series_resistance(
+        r, a, {str(n): 0.001 for n in segs})
+    assert 0 < par["sd_ohm_cm2"] < 0.001, (
+        "averaging 36 segments must shrink the error below any one of them")
+
+
+def test_non_physical_segments_are_excluded_not_propagated() -> None:
+    segs = list(range(1, 37))
+    r = {str(n): 0.094 for n in segs}
+    r[str(segs[0])] = -0.05          # a negative intercept is not a measurement
+    r[str(segs[1])] = float("nan")
+    a = {str(n): AREAS[n] for n in segs}
+    par = P.parallel_series_resistance(r, a)
+    assert par["n_used"] == len(segs) - 2
+    assert par["r_par_ohm_cm2"] == pytest.approx(0.094, rel=1e-12)

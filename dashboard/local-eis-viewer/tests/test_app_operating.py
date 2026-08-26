@@ -271,3 +271,50 @@ def test_the_message_lists_where_it_looked(tmp_path, monkeypatch):
          "plate": "gen1_r2d2_72"})
     assert "EIS_GAMRY_ROOT" in problem
     assert str(empty) in problem, "it must say where it actually looked"
+
+
+def test_a_missing_asammdf_names_the_interpreter_to_install_into(tmp_path,
+                                                                 monkeypatch):
+    """"pip install asammdf" is ambiguous on a machine with several Pythons.
+
+    This one has a Microsoft Store placeholder, a Python Install Manager shim
+    and possibly a .venv. Installing into the wrong one leaves the message on
+    screen unchanged and looks like the fix did not work, so the message
+    quotes sys.executable.
+    """
+    import sys
+
+    from app.data.sources import Catalog
+    from app.settings import Settings
+
+    results, gamry = _split_share(tmp_path)
+    settings = Settings(results_roots=[str(tmp_path / "Daten" / "EIS_Results")],
+                        gamry_roots=[str(gamry)], famos_roots=[], csv_roots=[])
+    catalog = Catalog(settings).refresh(kinds=("results",))
+    monkeypatch.setattr(operating.store, "current_catalog", lambda: catalog)
+    monkeypatch.setattr(operating, "SETTINGS", settings)
+
+    operating._pipeline_on_path()
+    import gamry_compare as GC
+
+    def _no_asammdf(_path):
+        raise ImportError("No module named 'asammdf'")
+
+    monkeypatch.setattr(GC, "read_bench_log", _no_asammdf)
+
+    _fields, _meta, problem = operating.fields_for(
+        {"kind": "results", "measurement_id": "2611976", "condition": "45A",
+         "plate": "gen1_r2d2_72"})
+
+    assert "asammdf" in problem
+    assert sys.executable in problem, "it must name the interpreter"
+    assert "-m pip install" in problem
+    # and it should say the log WAS found, so this does not read as a
+    # configuration problem when it is only a missing package
+    assert "run_2611976.mf4" in problem
+
+
+def test_asammdf_is_a_listed_dependency():
+    """The Operating map cannot work without it, so it belongs in the file."""
+    text = (Path(__file__).resolve().parents[1] / "requirements.txt").read_text()
+    assert "asammdf" in text

@@ -9,6 +9,11 @@ dash>=2.16
 plotly>=5.18
 
 # optional
+asammdf>=7.0                   # read the bench .mf4 log: the Operating map's
+                               # temperature, pressure and humidity fields, and
+                               # the operating point printed beside each
+                               # whole-cell comparison. Everything else works
+                               # without it.
 pyarrow>=12.0                  # Parquet output; without it the pipeline writes CSV
 databricks-sql-connector>=3.0  # datago source; not needed for file-system results
 gunicorn>=21.0                 # production server for the Dash app

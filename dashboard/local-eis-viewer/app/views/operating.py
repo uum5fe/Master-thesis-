@@ -145,8 +145,17 @@ def _bench_state(selection):
     try:
         bench = GC.read_bench_log(log_path)
     except ImportError:
-        return None, None, ("Reading an MF4 needs the `asammdf` package: "
-                            "pip install asammdf")
+        # Name the interpreter. This machine has a Store placeholder, a Python
+        # Install Manager shim and possibly a .venv on PATH; "pip install
+        # asammdf" is ambiguous between them and installing into the wrong one
+        # leaves this message on screen unchanged.
+        import sys
+        return None, None, (
+            "Reading the bench log needs the asammdf package. Install it into "
+            "the interpreter running this app:\n\n"
+            f'    "{sys.executable}" -m pip install asammdf\n\n'
+            "Everything else works without it; only the operating fields need "
+            f"it. Found the log at {log_path}.")
     except Exception as exc:                                # noqa: BLE001
         return None, None, f"bench log unreadable: {exc}"
 

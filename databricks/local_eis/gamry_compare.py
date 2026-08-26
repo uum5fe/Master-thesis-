@@ -553,9 +553,11 @@ def run(results_root, gamry_root, area_cm2: float, out_dir=None,
             log.info(f"bench log: {Path(bench_path).name} "
                      f"(t0 {bench.t0}, {len(bench.series)} channels)")
         except ImportError:
-            log.warning("asammdf not installed -- operating point not read; "
-                        "install it to have the bench state reported next to "
-                        "each comparison")
+            import sys
+            log.warning(
+                f"asammdf not installed -- the operating point will not be "
+                f"reported next to each comparison. To have it: "
+                f'"{sys.executable}" -m pip install asammdf')
         except Exception as exc:                            # noqa: BLE001
             log.warning(f"bench log unreadable: {exc}")
 

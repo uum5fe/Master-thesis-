@@ -69,14 +69,25 @@ def preflight(ref: RunRef, settings: Settings = SETTINGS) -> list[str]:
             "folder holding main.py, bronze.py, silver.py and gold.py")
 
     if not ref.files:
-        problems.append("no .DAT files in this selection")
-
-    if not settings.curr_cal:
         problems.append(
-            "EIS_CURR_CAL is not set. The per-segment shunt calibration is the "
-            "only absolute scale in the chain once the potentiostat is gone; "
-            "without it the impedances come out in shunt volts per amp rather "
-            "than in ohms, and every map is wrong by an unknown factor.")
+            "no CSV files in this selection" if ref.kind == "csvlog"
+            else "no .DAT files in this selection")
+
+    # The R2-D2 CSV logger applies its own coefficient set before writing --
+    # its s columns are already a current density, and csv_pipeline says so
+    # and declines to apply curr.csv a second time. So a CSV selection must
+    # not be blocked for want of a file it will not use. A TIME-DOMAIN CSV
+    # does need it, and csv_pipeline raises with that exact explanation, which
+    # is a better message than anything guessable from here without reading
+    # the file.
+    if not settings.curr_cal:
+        if ref.kind != "csvlog":
+            problems.append(
+                "EIS_CURR_CAL is not set. The per-segment shunt calibration is "
+                "the only absolute scale in the chain once the potentiostat is "
+                "gone; without it the impedances come out in shunt volts per "
+                "amp rather than in ohms, and every map is wrong by an unknown "
+                "factor.")
     elif not Path(settings.curr_cal).exists():
         problems.append(f"shunt calibration not found: {settings.curr_cal}")
 
@@ -112,15 +123,28 @@ def build_command(ref: RunRef, out: Path, settings: Settings = SETTINGS,
                   stop_after: str = "gold",
                   geom: PlateGeometry | None = None) -> list[str]:
     """The exact command line, so it can be shown, logged and reproduced."""
+    # WHICH READER. A csvlog selection is not a folder of FAMOS cards, and
+    # sending it through --dat hands the CSV path to the FAMOS reader, which
+    # finds no .DAT files and produces a run with no spectra -- silently, and
+    # looking exactly like "the CSV files do not evaluate". main.py dispatches
+    # on --source, and the CSV path arrives on --csv rather than --dat (see
+    # config.py's argument group "hardware / source"), so both have to change
+    # together.
+    if ref.kind == "csvlog":
+        source = ["--source", "csv", "--csv", str(Path(ref.path))]
+    else:
+        source = ["--dat", str(Path(ref.path))]
+
     argv = [
         sys.executable, "main.py",
-        "--dat", str(Path(ref.path)),
-        "--curr-cal", str(settings.curr_cal),
+        *source,
         "--leepa", ref.measurement_id,
         "--condition", ref.condition,
         "--out", str(out),
         "--stop-after", stop_after,
     ]
+    if settings.curr_cal:
+        argv += ["--curr-cal", str(settings.curr_cal)]
     # THE PLATE. This used to be dropped: run_famos took a geometry and never
     # passed it on, so every run evaluated whatever the pipeline defaulted to
     # regardless of the generation picked in the sidebar. A Gen 2 plate

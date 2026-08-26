@@ -242,3 +242,74 @@ def test_the_command_points_at_the_gamry_folder_when_there_is_one(tmp_path):
     (sweeps / "cell_CurrVal_45.dta").write_text("EXPLAIN\nZCURVE\tTABLE\n")
     argv = build_command(ref, tmp_path / "out", settings)
     assert argv[argv.index("--gamry") + 1] == str(sweeps)
+
+
+# ---------------------------------------------------------------------------
+# a CSV selection is not a folder of FAMOS cards
+# ---------------------------------------------------------------------------
+
+def test_a_csv_selection_is_sent_to_the_csv_reader(tmp_path):
+    """The bug behind "the gen2 CSV files do not evaluate".
+
+    build_command emitted --dat for every source kind, so a csvlog selection
+    handed its folder to the FAMOS reader. main.py then printed "source:
+    FAMOS", found no .DAT files, and produced a run with no spectra -- which
+    looks exactly like the CSV path being broken, when it was never entered.
+    """
+    from app.data.sources import RunRef
+
+    ref = RunRef(kind="csvlog", measurement_id="FC2600265-02",
+                 condition="Spectrum10_65degC_450A",
+                 path=str(tmp_path / "sweep"), files=("p1.csv",))
+    argv = runner.build_command(ref, tmp_path / "out")
+
+    assert "--source" in argv and argv[argv.index("--source") + 1] == "csv"
+    assert "--csv" in argv and argv[argv.index("--csv") + 1] == str(tmp_path / "sweep")
+    assert "--dat" not in argv, "a CSV folder must never reach the FAMOS reader"
+
+
+def test_a_famos_selection_still_uses_dat(tmp_path):
+    from app.data.sources import RunRef
+
+    ref = RunRef(kind="famos", measurement_id="2611976", condition="45A",
+                 path=str(tmp_path / "cards"), files=("a.DAT",))
+    argv = runner.build_command(ref, tmp_path / "out")
+
+    assert "--dat" in argv and argv[argv.index("--dat") + 1] == str(tmp_path / "cards")
+    assert "--source" not in argv and "--csv" not in argv
+
+
+def test_a_csv_run_is_not_blocked_for_want_of_a_shunt_calibration(tmp_path):
+    """The R2-D2 logger already applied its coefficients.
+
+    csv_pipeline says so explicitly and declines to apply curr.csv twice, so
+    demanding the file before a CSV run refuses a run that would have worked.
+    """
+    from app.data.sources import RunRef
+    from app.settings import Settings
+
+    pipeline = tmp_path / "pipeline"
+    pipeline.mkdir()
+    (pipeline / "main.py").write_text("")
+    settings = Settings(pipeline_dir=str(pipeline), curr_cal="",
+                        allow_inline_pipeline=True)
+
+    csv_ref = RunRef(kind="csvlog", measurement_id="x", condition="y",
+                     path=str(tmp_path), files=("p1.csv",))
+    assert runner.preflight(csv_ref, settings) == []
+
+    famos_ref = RunRef(kind="famos", measurement_id="x", condition="y",
+                       path=str(tmp_path), files=("a.DAT",))
+    problems = runner.preflight(famos_ref, settings)
+    assert any("EIS_CURR_CAL" in p for p in problems), (
+        "FAMOS has no other absolute scale, so it must still be required")
+
+
+def test_the_empty_selection_message_names_the_right_extension(tmp_path):
+    from app.data.sources import RunRef
+    from app.settings import Settings
+
+    settings = Settings(curr_cal="", allow_inline_pipeline=True)
+    csv_ref = RunRef(kind="csvlog", measurement_id="x", condition="y", files=())
+    assert any("no CSV files" in p
+               for p in runner.preflight(csv_ref, settings))

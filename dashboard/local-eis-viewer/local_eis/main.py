@@ -304,7 +304,8 @@ def run_pipeline(cfg: Config, stop_after: str = "gold") -> dict:
             comps = gamry_compare.run(
                 cfg.out_dir, cfg.gamry_dir, geom_area(cfg),
                 out_dir=cfg.out_dir, bench_path=cfg.bench_log,
-                chain_applied=cfg.gain_file is not None, log=log)
+                chain_applied=cfg.gain_file is not None,
+                only=cfg.condition, order_id=cfg.leepa, log=log)
             manifest["stages"]["gamry"] = [c.summary() for c in comps]
             if cfg.write_png and comps:
                 gamry_compare.plot(

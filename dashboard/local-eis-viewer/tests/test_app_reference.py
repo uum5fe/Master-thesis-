@@ -305,3 +305,26 @@ def test_a_missing_sweep_for_this_condition_says_which_ones_exist(tmp_path,
          "plate": "gen1_r2d2_72"})
     assert "No sweep at 45A" in problem
     assert "450A" in problem, "it must say what it did find"
+
+
+def test_an_extrapolated_hfr_is_shown_but_marked_as_one():
+    """Several delivered sweeps stop below the real-axis crossing.
+
+    A dash in every HFR cell of the whole campaign tells the reader nothing;
+    the extrapolation tells them something, as long as it never pretends to be
+    the measurement.
+    """
+    row = {"hfr_local_mohm_cm2": "nan", "hfr_local_fit_mohm_cm2": "59.90",
+           "hfr_rel_pct": "nan", "hfr_fit_rel_pct": "5.0"}
+    assert reference._hfr(row, "hfr_local_mohm_cm2") == "~59.90"
+    assert reference._hfr(row, "hfr_rel_pct", 1) == "~5.0"
+
+
+def test_a_measured_hfr_is_never_overwritten_by_the_extrapolation():
+    row = {"hfr_local_mohm_cm2": "62.26", "hfr_local_fit_mohm_cm2": "59.90"}
+    assert reference._hfr(row, "hfr_local_mohm_cm2") == "62.26"
+
+
+def test_a_comparison_csv_without_the_fit_columns_still_renders():
+    """Results written before the fallback existed have no such column."""
+    assert reference._hfr({"hfr_ref_mohm_cm2": "nan"}, "hfr_ref_mohm_cm2") == "—"

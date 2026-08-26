@@ -151,6 +151,41 @@ def _hf_intercept(freq: np.ndarray, Z: np.ndarray) -> float:
     return float("nan")
 
 
+def _hf_extrapolated(freq: np.ndarray, Z: np.ndarray, n_top: int = 5) -> float:
+    """Z' extrapolated to Z'' = 0 from the top of the band.
+
+    `_hf_intercept` refuses when the sweep stops below the inductive crossover,
+    and on this campaign BOTH sides stop there: the Gamry whole-cell sweeps run
+    out at 1.2-3.0 kHz while this cell is still capacitive.  Refusing is right
+    -- there is no measured intercept -- but it leaves the cross-check with
+    nothing to compare, so this offers the next best thing.
+
+    Near the top of the band the Nyquist curve is close to a straight line, so
+    a least-squares fit of Z' against Z'' over the top `n_top` points, read at
+    Z'' = 0, lands on the intercept the sweep did not reach.  It is an
+    EXTRAPOLATION, biased by whatever remains of the arc, and it is reported
+    under its own name -- never as the intercept, never merged into `hfr`.
+    What makes it useful is that both instruments get the identical treatment
+    over the identical band, so the DIFFERENCE between the two extrapolations
+    is a fair comparison even though each absolute value carries the bias.
+
+    On the synthetic cell of the test suite the bias is measurable and it is
+    what you would expect -- it grows as the band is cut shorter, and it is
+    LOW, because the arc still closing above the band has not yet given back
+    its real part: -3.8 % from a band ending at 3.0 kHz, -17 % from one ending
+    at 1.2 kHz.  So it is a cross-check, not a measurement of R_ohm.
+    """
+    if freq.size < 3:
+        return float("nan")
+    o = np.argsort(freq)[::-1]
+    zi = Z[o].imag[:max(3, n_top)]
+    zr = Z[o].real[:max(3, n_top)]
+    if zi.size < 3 or np.ptp(zi) <= 0.0:
+        return float("nan")            # a flat imaginary part fixes no line
+    b, a = np.polyfit(zi, zr, 1)       # Z' = a + b * Z''
+    return float(a)
+
+
 def read_cell_sweep(path) -> CellSweep:
     path = Path(path)
     sweep = gamry_dta.read_dta(path).sorted()
@@ -384,8 +419,10 @@ class Comparison:
     freq: np.ndarray                  # the overlap band, ascending
     Z_local: np.ndarray               # ohm.cm2
     Z_ref: np.ndarray                 # ohm.cm2
-    hfr_local: float                  # ohm.cm2
-    hfr_ref: float                    # ohm.cm2
+    hfr_local: float                  # ohm.cm2, measured intercept or NaN
+    hfr_ref: float                    # ohm.cm2, measured intercept or NaN
+    hfr_local_fit: float = float("nan")   # ohm.cm2, extrapolated
+    hfr_ref_fit: float = float("nan")     # ohm.cm2, extrapolated
     bench: dict[str, float] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
 
@@ -401,6 +438,18 @@ class Comparison:
         if not np.isfinite(self.hfr_ref) or self.hfr_ref == 0:
             return float("nan")
         return float(self.hfr_local / self.hfr_ref - 1.0)
+
+    @property
+    def hfr_fit_rel(self) -> float:
+        """Relative difference of the two EXTRAPOLATED intercepts.
+
+        Reported only when the measured intercept is missing on at least one
+        side; when both sides measured it, `hfr_rel` is the honest number and
+        this one adds nothing.
+        """
+        if not np.isfinite(self.hfr_ref_fit) or self.hfr_ref_fit == 0:
+            return float("nan")
+        return float(self.hfr_local_fit / self.hfr_ref_fit - 1.0)
 
     @property
     def mag_rel_median(self) -> float:
@@ -426,6 +475,9 @@ class Comparison:
             "hfr_local_mohm_cm2": 1e3 * self.hfr_local,
             "hfr_ref_mohm_cm2": 1e3 * self.hfr_ref,
             "hfr_rel_pct": 100 * self.hfr_rel,
+            "hfr_local_fit_mohm_cm2": 1e3 * self.hfr_local_fit,
+            "hfr_ref_fit_mohm_cm2": 1e3 * self.hfr_ref_fit,
+            "hfr_fit_rel_pct": 100 * self.hfr_fit_rel,
             "mag_rel_median_pct": 100 * self.mag_rel_median,
             "rms_rel_pct": 100 * self.rms_rel,
             "phase_diff_max_deg": (float(np.max(np.abs(self.phase_diff_deg)))
@@ -464,11 +516,34 @@ def compare(freq_local: np.ndarray, Z_local: np.ndarray, sweep: CellSweep,
     Zl = Z_local[band]
     Zr = utils.interp_complex(f, ref_f, ref_Z) if f.size else np.zeros(0, complex)
 
-    if f.size and not np.isfinite(_hf_intercept(f, Zl)):
+    # Both HFRs are read off the same way: the real part where the imaginary
+    # part crosses zero from below.  Which side failed to reach that crossing
+    # decides which note the reader needs, so resolve both before writing any.
+    local_hfr = _hf_intercept(f, Zl) if f.size else float("nan")
+    ref_hfr = _hf_intercept(ref_f, ref_Z) if ref_f.size else float("nan")
+
+    # When a side did not reach its own intercept, extrapolate the top of its
+    # band to Z'' = 0 so the cross-check still has a like-for-like number.
+    # Both sides get the same treatment over the same overlap band.
+    local_fit = ref_fit = float("nan")
+    if f.size and (not np.isfinite(local_hfr) or not np.isfinite(ref_hfr)):
+        local_fit = _hf_extrapolated(f, Zl)
+        ref_fit = _hf_extrapolated(f, Zr)
+
+    if not np.isfinite(ref_hfr) and ref_f.size:
+        notes.append(
+            f"HFR not measurable on EITHER side: the whole-cell sweep is still "
+            f"capacitive at its own top frequency, {ref_f.max():.4g} Hz, so "
+            f"neither instrument reached the intercept. The comparison of |Z| "
+            f"and phase over the {f.size} overlapping point(s) is unaffected; "
+            f"the HFR columns fall back to hfr_*_fit, an extrapolation of the "
+            f"top of the band to Z''=0, which is biased by the unclosed arc on "
+            f"both sides equally and so is only meaningful as a difference")
+    elif f.size and not np.isfinite(local_hfr):
         notes.append(
             f"HFR not measurable locally: still capacitive at {f.max():.4g} Hz, "
             "so the intercept is above the evaluated band (raise cfg.f_max_hz "
-            "to reach it)")
+            "to reach it); hfr_local_fit extrapolates it instead")
     if chain_applied is False:
         notes.append("chain response NOT applied to the local side -- a phase "
                      "difference growing with frequency is expected and is an "
@@ -479,8 +554,10 @@ def compare(freq_local: np.ndarray, Z_local: np.ndarray, sweep: CellSweep,
     return Comparison(
         condition=sweep.condition, sweep_name=sweep.name, area_cm2=area_cm2,
         freq=f, Z_local=Zl, Z_ref=Zr,
-        hfr_local=_hf_intercept(f, Zl) if f.size else float("nan"),
-        hfr_ref=_hf_intercept(ref_f, ref_Z),
+        hfr_local=local_hfr,
+        hfr_ref=ref_hfr,
+        hfr_local_fit=local_fit,
+        hfr_ref_fit=ref_fit,
         bench=dict(bench or {}), notes=notes,
     )
 
@@ -535,12 +612,17 @@ def write_outputs(comparisons: list[Comparison], out_dir, log=None) -> None:
     if log:
         for c in comparisons:
             s = c.summary()
+            if np.isfinite(c.hfr_ref):
+                hfr = (f"HFR {s['hfr_local_mohm_cm2']:.2f} vs "
+                       f"{s['hfr_ref_mohm_cm2']:.2f} mohm.cm2 "
+                       f"({s['hfr_rel_pct']:+.1f} %)")
+            else:
+                hfr = (f"HFR~ {s['hfr_local_fit_mohm_cm2']:.2f} vs "
+                       f"{s['hfr_ref_fit_mohm_cm2']:.2f} mohm.cm2 "
+                       f"({s['hfr_fit_rel_pct']:+.1f} %, extrapolated)")
             log.info(f"  {s['condition']:>6}  vs {s['reference']}: "
                      f"{s['n_points']} pts {s['f_lo_hz']:.3g}-{s['f_hi_hz']:.3g} Hz, "
-                     f"HFR {s['hfr_local_mohm_cm2']:.2f} vs "
-                     f"{s['hfr_ref_mohm_cm2']:.2f} mohm.cm2 "
-                     f"({s['hfr_rel_pct']:+.1f} %), "
-                     f"|Z| {s['mag_rel_median_pct']:+.1f} %")
+                     f"{hfr}, |Z| {s['mag_rel_median_pct']:+.1f} %")
             for note in c.notes:
                 log.warning(f"         {note}")
 
@@ -594,6 +676,7 @@ def plot(comparisons: list[Comparison], path="gamry_comparison.png"):
 
 def run(results_root, gamry_root, area_cm2: float, out_dir=None,
         bench_path=None, chain_applied: bool | None = None,
+        only: str | None = None, order_id: str | None = None,
         log=None) -> list[Comparison]:
     """Compare every condition that has BOTH a local result and a sweep.
 
@@ -601,11 +684,24 @@ def run(results_root, gamry_root, area_cm2: float, out_dir=None,
     ``<root>/<condition>/silver/cell_aggregate.csv`` or a single such folder.
     Conditions with only one of the two are reported and skipped: a comparison
     against a missing half is not a weak comparison, it is not one at all.
+
+    `only` restricts the comparison to one condition. A run of 150A writes its
+    results into 150A's folder alone, so without this the other three sweeps
+    in the campaign each produce a "no local result" warning -- three lines of
+    alarm about conditions that were never part of this run and are not
+    missing anything.
     """
     log = log or utils.get_logger(True)
     results_root, gamry_root = Path(results_root), Path(gamry_root)
 
-    sweeps = {s.condition: s for s in find_cell_sweeps(gamry_root)}
+    sweeps = {s.condition: s
+              for s in find_cell_sweeps(gamry_root, order_id=order_id)}
+    if only and only.upper() != "ALL":
+        sweeps = {k: v for k, v in sweeps.items()
+                  if k.upper() == only.upper()}
+        if not sweeps:
+            log.warning(f"no whole-cell sweep at {only} under {gamry_root}")
+            return []
     if not sweeps:
         log.warning(f"no whole-cell .dta sweeps under {gamry_root}")
         return []

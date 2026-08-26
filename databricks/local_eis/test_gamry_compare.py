@@ -204,3 +204,61 @@ def test_per_segment_chain_files_are_not_read_as_cell_references(tmp_path):
               cell_asr(freq) / A_CELL, 60)
     found = GC.find_cell_sweeps(tmp_path)
     assert [s.condition for s in found] == ["60A"]
+
+
+# ---------------------------------------------------------------------------
+# the campaign's own case: NEITHER sweep reaches the intercept
+# ---------------------------------------------------------------------------
+
+def test_a_truncated_reference_is_reported_as_missing_on_both_sides(tmp_path):
+    """V26_086 stops at 3.0 kHz, below where this cell crosses the real axis.
+
+    The old note blamed the local side alone, which sent the reader off to
+    raise f_max -- a change that cannot help, because the reference has no
+    intercept either.
+    """
+    freq = np.logspace(np.log10(0.324), np.log10(2987), 27)
+    write_dta(tmp_path / "V26_086_HFR_101_CurrVal_45.dta",
+              freq, cell_asr(freq) / A_CELL, 45)
+    sweep = GC.read_cell_sweep(tmp_path / "V26_086_HFR_101_CurrVal_45.dta")
+
+    c = GC.compare(freq, cell_asr(freq), sweep, A_CELL)
+    assert not np.isfinite(c.hfr_local) and not np.isfinite(c.hfr_ref)
+    assert any("EITHER side" in n for n in c.notes)
+    assert not any("raise cfg.f_max_hz" in n for n in c.notes)
+
+
+def test_the_extrapolation_lands_near_the_intercept_the_sweep_never_reached():
+    fine = np.logspace(np.log10(0.3), np.log10(3e5), 4001)
+    truth = GC._hf_intercept(fine, cell_asr(fine))
+    assert np.isfinite(truth)
+
+    for top, tol in ((2987.0, 0.05), (4500.0, 0.03)):
+        f = np.logspace(np.log10(0.324), np.log10(top), 27)
+        assert not np.isfinite(GC._hf_intercept(f, cell_asr(f)))
+        got = GC._hf_extrapolated(f, cell_asr(f))
+        assert got == pytest.approx(truth, rel=tol), f"at {top} Hz"
+        assert got < truth, "the unclosed arc biases the extrapolation LOW"
+
+
+def test_the_extrapolation_is_not_reported_when_the_intercept_was_measured(sweep):
+    """`sweep` runs to 30 kHz, where the cell is inductive: HFR is real."""
+    f = np.logspace(np.log10(0.5), np.log10(20000), 40)
+    c = GC.compare(f, cell_asr(f), sweep, A_CELL)
+    assert np.isfinite(c.hfr_local) and np.isfinite(c.hfr_ref)
+    assert not np.isfinite(c.hfr_local_fit), "no fallback when the truth is there"
+
+
+def test_a_common_scale_error_survives_the_extrapolation(tmp_path):
+    """The point of the fallback: the DIFFERENCE is still recoverable.
+
+    Both sides carry the same bias from the unclosed arc, so a 5 % error
+    planted on the local side must still read as 5 %, not as the bias.
+    """
+    freq = np.logspace(np.log10(0.324), np.log10(2987), 27)
+    write_dta(tmp_path / "V26_086_HFR_101_CurrVal_45.dta",
+              freq, cell_asr(freq) / A_CELL, 45)
+    sweep = GC.read_cell_sweep(tmp_path / "V26_086_HFR_101_CurrVal_45.dta")
+
+    c = GC.compare(freq, 1.05 * cell_asr(freq), sweep, A_CELL)
+    assert c.hfr_fit_rel == pytest.approx(0.05, abs=0.005)

@@ -347,7 +347,17 @@ def _asammdf_advice(exc: ImportError) -> list[str]:
     import sys
 
     missing = getattr(exc, "name", "") or ""
-    if missing and missing.split(".")[0] != "asammdf":
+    top = missing.split(".")[0]
+
+    if top == "zstandard":
+        # _ensure_zstd_importable() reached for the vendored shim -- see
+        # _vendor/zstd.py -- and even THAT has nothing to import from,
+        # because zstandard itself was never installed.
+        return ["asammdf cannot import: its zstd compatibility shim needs "
+                "the zstandard package, which is not installed",
+                f"  interpreter: {sys.executable}",
+                f'  fix: "{sys.executable}" -m pip install zstandard']
+    if top and top != "asammdf":
         return [f"asammdf is installed but cannot import: {exc}",
                 f"  its dependency {missing!r} is missing or incompatible "
                 f"(a numpy built for another version is the usual cause)",
@@ -358,13 +368,42 @@ def _asammdf_advice(exc: ImportError) -> list[str]:
             "  the operating point (T, p, RH, current) will not be reported "
             "next to each comparison; everything else is unaffected",
             f"  interpreter: {sys.executable}",
-            f'  fix: "{sys.executable}" -m pip install asammdf',
-            "  (running plain `pip install asammdf` installs into whichever "
-            "Python is first on PATH, which is often not this one)"]
+            f'  fix: "{sys.executable}" -m pip install --no-deps asammdf',
+            f'       "{sys.executable}" -m pip install chardet '
+            f'"canmatrix[arxml,dbc]" lxml lz4 numexpr python-dateutil '
+            f"typing-extensions zstandard",
+            "  (NOT plain `pip install asammdf`: it also pulls in a package "
+            "named \"zstd\", which has no Windows wheel past Python 3.10 and "
+            "fails to compile without Microsoft's C++ Build Tools -- the "
+            "two commands above install everything asammdf needs except "
+            "that one, and this pipeline's own zstd stand-in covers it)"]
+
+
+def _ensure_zstd_importable() -> None:
+    """Make `from zstd import decompress` succeed without a C compiler.
+
+    asammdf imports the PyPI package "zstd" unconditionally, and that
+    package has published no Windows wheel past Python 3.10 -- installing it
+    on a newer Python means compiling it, which needs Microsoft's C++ Build
+    Tools. `_vendor/zstd.py` stands in for it using `zstandard`, an
+    unrelated, actively maintained project that does ship Windows wheels.
+    If the real "zstd" is already importable (Linux/macOS still get wheels
+    for it), it takes priority -- this only reaches for the stand-in when it
+    is not, so it never shadows a working real installation.
+    """
+    import importlib.util
+    import sys
+
+    if importlib.util.find_spec("zstd") is not None:
+        return
+    vendor = str(Path(__file__).resolve().parent / "_vendor")
+    if vendor not in sys.path:
+        sys.path.insert(0, vendor)
 
 
 def read_bench_log(path) -> BenchLog:
     """Read an MF4 bench log.  Requires `asammdf`; absent, this is skipped."""
+    _ensure_zstd_importable()
     from asammdf import MDF                                 # noqa: PLC0415
 
     path = Path(path)

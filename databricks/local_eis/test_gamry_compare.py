@@ -7,6 +7,8 @@ the metrics that should not stay quiet.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -288,10 +290,8 @@ def test_the_asammdf_advice_names_the_interpreter_on_its_own_line():
     lines = GC._asammdf_advice(ImportError("No module named 'asammdf'"))
     assert any(line.strip().startswith("interpreter:") and sys.executable
                in line for line in lines)
-    assert any(sys.executable in line and "pip install asammdf" in line
+    assert any(sys.executable in line and "--no-deps asammdf" in line
                for line in lines)
-    assert any("first on PATH" in line for line in lines), (
-        "must say why a successful `pip install` can leave it missing")
 
 
 def test_a_broken_asammdf_is_not_reported_as_a_missing_one():
@@ -306,3 +306,90 @@ def test_a_broken_asammdf_is_not_reported_as_a_missing_one():
     assert "not installed" not in " ".join(lines)
     assert any("cannot import" in line for line in lines)
     assert any("force-reinstall" in line for line in lines)
+
+
+# ---------------------------------------------------------------------------
+# the "zstd" package has no Windows wheel past Python 3.10
+# ---------------------------------------------------------------------------
+
+def test_the_vendor_shim_is_reached_for_only_when_the_real_package_is_absent(
+        monkeypatch):
+    """`_ensure_zstd_importable` must never shadow a real installation.
+
+    Linux and macOS still get "zstd" wheels; only Windows on Python 3.11+
+    is stuck, so the vendored stand-in has to be a fallback, not a
+    replacement.
+    """
+    import importlib.util
+    import sys
+
+    vendor = str(Path(GC.__file__).resolve().parent / "_vendor")
+    sys.path[:] = [p for p in sys.path if p != vendor]
+
+    monkeypatch.setattr(importlib.util, "find_spec",
+                        lambda name: object() if name == "zstd" else None)
+    GC._ensure_zstd_importable()
+    assert vendor not in sys.path, "the real package must win when present"
+
+
+def test_the_vendor_shim_is_added_when_zstd_is_missing(monkeypatch):
+    import importlib.util
+    import sys
+
+    vendor = str(Path(GC.__file__).resolve().parent / "_vendor")
+    sys.path[:] = [p for p in sys.path if p != vendor]
+
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: None)
+    GC._ensure_zstd_importable()
+    assert vendor in sys.path
+    sys.path.remove(vendor)
+
+
+def test_the_shim_re_exports_exactly_what_asammdf_imports_from_zstd():
+    """asammdf imports BOTH names at module load -- `compress` from
+    v4_blocks.py (its MDF4 writer, never exercised by this read-only
+    pipeline) and `decompress` from both utils.py and v4_blocks.py -- and
+    the import runs regardless of which functions ever get called. Shipping
+    only `decompress` looks right in isolation and then fails the moment
+    `import asammdf` actually runs, which is exactly the shape of bug a
+    quick look at one file misses and an end-to-end import does not.
+    """
+    pytest.importorskip("zstandard")
+    import importlib.util
+
+    vendor = Path(GC.__file__).resolve().parent / "_vendor" / "zstd.py"
+    spec = importlib.util.spec_from_file_location("_shim_under_test", vendor)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    public = {n for n in vars(mod) if not n.startswith("_")}
+    assert public == {"compress", "decompress", "annotations"}
+    import zstandard
+    assert mod.decompress is zstandard.decompress
+    assert mod.compress is zstandard.compress
+
+
+def test_a_missing_zstandard_is_diagnosed_by_name_not_blamed_on_numpy():
+    """If even the shim's own dependency is absent, the advice must say
+    that -- not repeat the generic "probably numpy" guess, which would send
+    the reader reinstalling the wrong package.
+    """
+    exc = ImportError("No module named 'zstandard'")
+    exc.name = "zstandard"
+    lines = GC._asammdf_advice(exc)
+    assert any("zstandard" in line and "pip install zstandard" in line
+              for line in lines)
+    assert "numpy" not in " ".join(lines)
+
+
+def test_the_not_installed_advice_never_says_plain_pip_install_asammdf():
+    """That is the exact command that fails to build "zstd" on Windows;
+    telling the reader to run it again would send them in a circle.
+    """
+    lines = GC._asammdf_advice(ImportError("No module named 'asammdf'"))
+    fix_lines = [ln for ln in lines if "pip install" in ln]
+    assert any("--no-deps asammdf" in ln for ln in fix_lines)
+    assert not any(ln.strip().rstrip('"').endswith("pip install asammdf")
+                  for ln in fix_lines), ("must not tell the reader to re-run "
+                  "the exact command that failed")
+    assert any("zstandard" in ln for ln in fix_lines)

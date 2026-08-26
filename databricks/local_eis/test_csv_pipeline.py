@@ -31,6 +31,7 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 import csv_pipeline
 import csv_source
@@ -536,3 +537,39 @@ def _median_sigma(out_dir: Path) -> float:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+def test_the_campaign_parent_is_refused_by_naming_its_sweeps(tmp_path):
+    """`csv_files/` is not a sweep -- it is the folder of sweeps.
+
+    The reader globs one level, so a parent used to fail with "no .csv and
+    no .DTA files", which is true of that directory and useless to the reader:
+    there are dozens of point files one level down. The error now names the
+    sweep folders so the message doubles as the menu.
+    """
+    import csv_source
+
+    campaign = tmp_path / "csv_files"
+    for cond in ("Spectrum10_65degC_450A", "Spectrum11_65degC_150A"):
+        d = campaign / cond
+        d.mkdir(parents=True)
+        (d / "p1.csv").write_text(
+            "timestamp\ts1\ts2\ntimeshifts\t0.0\t1.1\n"
+            "2026.04.20 10:21:11,792662\t1.9\t2.0\n")
+
+    with pytest.raises(ValueError) as exc:
+        csv_source.detect_dialect(campaign)
+
+    message = str(exc.value)
+    assert "campaign folder" in message
+    assert "Spectrum10_65degC_450A" in message
+    assert "Spectrum11_65degC_150A" in message
+    assert "2 sweep folder(s)" in message
+
+
+def test_a_genuinely_empty_folder_still_says_so(tmp_path):
+    """The new message must not swallow the real 'there is nothing here'."""
+    empty = tmp_path / "nothing"
+    empty.mkdir()
+    with pytest.raises(ValueError, match="no .csv and no .DTA files"):
+        csv_source.detect_dialect(empty)

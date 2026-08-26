@@ -1,0 +1,14 @@
+# Local EIS pipeline — runtime dependencies
+#
+# Databricks ML runtimes already carry all of these; this file is for a local
+# checkout.  No pinned versions: nothing here uses an API that has moved in
+# years, and pinning inside a Databricks workspace fights the runtime.
+
+numpy>=1.22
+scipy>=1.8
+matplotlib>=3.5
+
+# Optional, used only by the notebook's interactive figures and tables.
+# The pipeline itself writes CSV/PNG without them.
+pandas>=1.4
+plotly>=5.0

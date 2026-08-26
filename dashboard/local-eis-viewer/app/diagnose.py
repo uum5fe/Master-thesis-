@@ -1,0 +1,296 @@
+r"""Explain why the picker is empty.
+
+"No runs discovered" has a handful of causes and they are indistinguishable
+from the dashboard: a ``.env`` that was never created, one Notepad saved as
+``.env.txt``, a root pointing at the folder *above* the one with the data, a
+results folder that is not laid out ``<order>/<condition>/``, or recordings
+whose filenames do not match any known convention.
+
+Each of those has a different fix, so this module looks at what is actually on
+disk and names the one that applies, rather than repeating the message that
+sent the reader here.
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+from app.data.loaders import detect_layout
+from app.data.sources import Catalog, famos_patterns
+from app.services.staging import is_network_path
+from app.settings import DOTENV_LOADED, SETTINGS, Settings
+
+TICK, CROSS, WARN, INFO = "[ok]", "[--]", "[!!]", "  ->"
+
+
+def _env_section(out: list[str]) -> None:
+    out.append("1. SETTINGS FILE")
+    if DOTENV_LOADED:
+        out.append(f"   {TICK} read {DOTENV_LOADED}")
+    else:
+        root = Path(__file__).resolve().parent.parent
+        out.append(f"   {CROSS} no .env found. Looked in:")
+        looked = dict.fromkeys([root / ".env", Path.cwd() / ".env"])
+        for candidate in looked:
+            out.append(f"        {candidate}")
+        # The classic Windows trap: Notepad appends .txt and Explorer hides it.
+        strays = [p for d in (root, Path.cwd()) if d.is_dir()
+                  for p in d.glob(".env.*") if p.suffix != ".example"]
+        if strays:
+            out.append(f"   {WARN} but these exist: "
+                       + ", ".join(p.name for p in strays))
+            out.append(f"{INFO} rename to exactly '.env' (no .txt). In Explorer, "
+                       "turn on View > File name extensions first.")
+        elif (root / ".env.example").is_file():
+            out.append(f"{INFO} copy .env.example to .env and put your paths in it")
+        out.append(f"{INFO} not fatal if you passed --results / --famos or set "
+                   "the variables in your shell")
+
+    for name in ("EIS_FAMOS_ROOT", "EIS_RESULTS_ROOT", "EIS_CURR_CAL",
+                 "EIS_ALLOW_INLINE_PIPELINE", "EIS_PLATE_SPEC_DIR"):
+        value = os.environ.get(name)
+        if value:
+            out.append(f"   {TICK} {name} = {value}")
+    out.append("")
+
+
+def _famos_section(out: list[str], settings: Settings) -> None:
+    out.append("2. RAW FAMOS RECORDINGS  (EIS_FAMOS_ROOT)")
+    if not settings.famos_roots:
+        out.append(f"   {CROSS} not set — skipping. Set EIS_FAMOS_ROOT to view "
+                   ".DAT recordings.")
+        out.append("")
+        return
+
+    patterns = famos_patterns()
+    for raw in settings.famos_roots:
+        root = Path(raw)
+        out.append(f"   folder: {root}")
+        if not root.exists():
+            out.append(f"   {CROSS} does not exist")
+            out.append(f"{INFO} check for a typo, and that OneDrive has the "
+                       "folder downloaded rather than online-only")
+            continue
+        if not root.is_dir():
+            out.append(f"   {CROSS} that is a file, not a folder")
+            continue
+
+        files = sorted(list(root.rglob("*.DAT")) + list(root.rglob("*.dat")))
+        if not files:
+            out.append(f"   {CROSS} no .DAT files anywhere under it")
+            subdirs = [p.name for p in root.iterdir() if p.is_dir()][:8]
+            if subdirs:
+                out.append(f"{INFO} subfolders here: {', '.join(subdirs)}")
+                out.append(f"{INFO} if the recordings are in one of those, "
+                           "either point at it or leave this root — subfolders "
+                           "are searched, so the files would have been found")
+            continue
+
+        out.append(f"   {TICK} {len(files)} .DAT file(s) found")
+        if is_network_path(root):
+            size = sum(f.stat().st_size for f in files) / 1e9
+            out.append(f"   {WARN} this is a network share ({size:.1f} GB here)")
+            out.append(f"{INFO} the reader memory-maps each card and bronze "
+                       "walks it repeatedly, so every page fault is an SMB "
+                       "round trip — expect it to be far slower than local "
+                       "disk, and to fail on a network hiccup")
+            out.append(f"{INFO} copy the cards to local disk first: "
+                       "run_evaluation.py --stage-local")
+        matched, unmatched = [], []
+        for path in files:
+            for pattern in patterns:
+                m = pattern.search(path.name)
+                if m:
+                    matched.append((path.name, m.group("measurement_id"),
+                                    m.group("condition")))
+                    break
+            else:
+                unmatched.append(path.name)
+
+        if matched:
+            groups = sorted({(mid, cond) for _n, mid, cond in matched})
+            out.append(f"   {TICK} {len(matched)} recognised, giving "
+                       f"{len(groups)} selectable run(s):")
+            for mid, cond in groups[:10]:
+                out.append(f"        order {mid}  condition {cond}")
+        if unmatched:
+            out.append(f"   {WARN} {len(unmatched)} filename(s) not recognised, "
+                       f"e.g. {unmatched[0]}")
+            out.append(f"{INFO} recognised conventions are:")
+            out.append("        Leepa_<order>_Current_<condition>_Test_<nn>_Karte_<n>.DAT")
+            out.append("        RO<order>-01_Current_<condition>_Test_<nn>_Karte_<n>.DAT")
+            out.append(f"{INFO} for anything else set EIS_FAMOS_REGEX with named "
+                       "groups measurement_id, condition, test, card")
+    out.append("")
+
+
+def _csv_section(out: list[str], settings: Settings) -> None:
+    """R2-D2 CSV sweeps.
+
+    This is the only source whose unit of selection is a FOLDER rather than a
+    file: a sweep is metadata.csv plus p1.csv, p2.csv, ... in one directory.
+    Either the parent or the sweep folder itself works as a root, since the
+    search is recursive -- what does NOT work is a folder of point files with
+    no metadata.csv, and that is indistinguishable from "no data" unless it is
+    said out loud.  So the check reports what it saw at each level, down to the
+    cell and the point count, rather than a bare verdict.
+    """
+    out.append("3. RAW R2-D2 CSV SWEEPS  (EIS_CSV_ROOT)")
+    if not settings.csv_roots:
+        out.append(f"   {CROSS} not set — skipping. Set EIS_CSV_ROOT to view "
+                   "CSV sweeps (this is how the Gen 2 plate is measured; "
+                   "there is no FAMOS recording for it).")
+        out.append(f"{INFO} the FAMOS and results roots are still searched, so "
+                   "a sweep sitting beside them is found without this — a "
+                   "sweep kept in its own folder is not")
+        out.append("")
+        return
+
+    for raw in settings.csv_roots:
+        root = Path(raw)
+        out.append(f"   folder: {root}")
+        if not root.exists():
+            out.append(f"   {CROSS} does not exist")
+            out.append(f"{INFO} check for a typo, and that you are signed in "
+                       "to the share")
+            continue
+        if not root.is_dir():
+            out.append(f"   {CROSS} that is a file, not a folder")
+            continue
+
+        meta = sorted(root.rglob("metadata.csv"))
+        if not meta:
+            out.append(f"   {CROSS} no metadata.csv anywhere under it, so no "
+                       "sweep folder was recognised")
+            subdirs = [d.name for d in root.iterdir() if d.is_dir()][:8]
+            loose = [f.name for f in root.glob("p*.csv")][:4]
+            if loose:
+                out.append(f"   {WARN} there are point files ({', '.join(loose)}) "
+                           "directly in this folder but no metadata.csv beside "
+                           "them")
+                out.append(f"{INFO} a sweep needs its metadata.csv: that is "
+                           "where the cell (Leepa:) and the coefficient set "
+                           "come from, and without it these point files "
+                           "cannot be grouped into a run")
+                out.append(f"{INFO} copy metadata.csv in beside them, or point "
+                           "EIS_CSV_ROOT at the folder the sweep was copied "
+                           "from")
+            elif subdirs:
+                out.append(f"{INFO} subfolders here: {', '.join(subdirs)}")
+            continue
+
+        out.append(f"   {TICK} {len(meta)} sweep folder(s) found")
+        if is_network_path(root):
+            out.append(f"   {WARN} this is a network share — the first read of "
+                       "a sweep will be slow, but each point file is read once, "
+                       "so this is far less painful than FAMOS over SMB")
+        for m in meta[:10]:
+            folder = m.parent
+            points = sorted(folder.glob("p*.csv"))
+            cell = "?"
+            for line in m.read_text(errors="ignore").splitlines():
+                if line.lower().startswith("leepa"):
+                    cell = line.split(":", 1)[-1].strip() or "?"
+                    break
+            mark = TICK if points else CROSS
+            out.append(f"        {mark} {folder.name}: cell {cell}, "
+                       f"{len(points)} frequency point(s)")
+            if not points:
+                out.append(f"{INFO} metadata.csv with no p*.csv beside it is "
+                           "not a usable sweep")
+    out.append("")
+
+
+def _results_section(out: list[str], settings: Settings) -> None:
+    out.append("4. PROCESSED RESULTS  (EIS_RESULTS_ROOT)")
+    roots = [r for r in settings.resolved_results_roots()]
+    if not settings.results_roots:
+        out.append(f"   {CROSS} not set — skipping. Set EIS_RESULTS_ROOT to view "
+                   "finished pipeline output.")
+        out.append("")
+        return
+
+    for root in roots:
+        if str(root) not in settings.results_roots:
+            continue                       # the scratch root; not user-configured
+        out.append(f"   folder: {root}")
+        if not root.is_dir():
+            out.append(f"   {CROSS} does not exist")
+            continue
+
+        layout = detect_layout(root)
+        if layout:
+            out.append(f"   {WARN} this folder IS itself one run ({layout}).")
+            out.append(f"{INFO} that works, but it shows up as a single entry. "
+                       "The normal layout is "
+                       "<root>\\<order id>\\<condition>\\gold\\plate_summary.csv")
+            continue
+
+        found = 0
+        children = sorted(p for p in root.iterdir() if p.is_dir())
+        if not children:
+            out.append(f"   {CROSS} empty, or contains only files")
+        for child in children:
+            sub = detect_layout(child)
+            if sub == "eis_tables":
+                out.append(f"   {TICK} {child.name}: {sub}")
+                found += 1
+                continue
+            if sub:
+                out.append(f"   {TICK} {child.name}: {sub} (no condition level)")
+                found += 1
+                continue
+            conditions = [c for c in sorted(p for p in child.iterdir() if p.is_dir())
+                          if detect_layout(c)]
+            if conditions:
+                out.append(f"   {TICK} {child.name}: "
+                           f"{', '.join(c.name for c in conditions)}")
+                found += len(conditions)
+            else:
+                out.append(f"   {CROSS} {child.name}: nothing recognisable inside")
+
+        if not found:
+            out.append(f"{INFO} expected, under each order id and condition, a "
+                       "'gold' folder with plate_summary.csv or a 'silver' "
+                       "folder with spectra_clean.csv")
+            out.append(f"{INFO} to use an existing results folder, copy it so it "
+                       "sits at <root>\\<order id>\\<condition>\\  — e.g. "
+                       "<root>\\2611976\\45A\\gold\\plate_summary.csv")
+    out.append("")
+
+
+def _summary(out: list[str], settings: Settings) -> None:
+    out.append("5. WHAT THE APP WILL SHOW")
+    catalog = Catalog(settings).refresh()
+    if not catalog.runs:
+        out.append(f"   {CROSS} nothing — every dropdown will be empty")
+        out.append(f"{INFO} fix whichever section above is marked {CROSS} or "
+                   f"{WARN}, then start the app again")
+    else:
+        by_kind: dict[str, int] = {}
+        for ref in catalog.runs:
+            by_kind[ref.kind] = by_kind.get(ref.kind, 0) + 1
+        out.append(f"   {TICK} {len(catalog.runs)} run(s): "
+                   + ", ".join(f"{n} {k}" for k, n in sorted(by_kind.items())))
+        for ref in catalog.runs[:12]:
+            out.append(f"        [{ref.kind}] {ref.measurement_id} / "
+                       f"{ref.condition}   {ref.describe()}")
+    for message in catalog.messages:
+        out.append(f"   note: {message}")
+    out.append("")
+
+
+def report(settings: Settings = SETTINGS) -> str:
+    out = ["", "=" * 68, "  Local EIS Viewer — configuration check", "=" * 68, ""]
+    _env_section(out)
+    _famos_section(out, settings)
+    _csv_section(out, settings)
+    _results_section(out, settings)
+    _summary(out, settings)
+    out.append("=" * 68)
+    return "\n".join(out)
+
+
+if __name__ == "__main__":
+    print(report())

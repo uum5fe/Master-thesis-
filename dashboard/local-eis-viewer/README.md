@@ -264,6 +264,55 @@ Two hardware/protocol changes that remove problems rather than correcting them:
   of base periods enables the synchronous path *and* separates nonlinear
   distortion from noise, for no extra measurement time.
 
+## Frontend (`app/`)
+
+A Dash application so that colleagues can read the results without a notebook
+and without anybody's personal path. It reads what the pipeline already wrote —
+it never re-derives a spectrum of its own.
+
+```bash
+pip install -r requirements.txt
+
+python run_evaluation.py --all     # raw .DAT -> gold/silver results
+python run_dashboard.py --open     # look at them
+```
+
+Both read their paths from one `.env`; see `.env.example`. The processing
+pipeline is bundled in `local_eis/` — the same modules that ran on Databricks —
+so nothing about the evaluation needs a cluster.
+
+`run_dashboard.py` prints the link (`http://127.0.0.1:8050`) and a count of the
+runs it discovered before the server starts, so an empty dropdown is diagnosable
+without opening the browser.
+
+Three choices drive everything: **where** the data is (a Volumes / file-system
+root, or the datago metadata tables), **what format** it is in (finished
+results as CSV/Parquet, or raw FAMOS `.DAT` that still has to be processed),
+and **which plate generation** produced it.
+
+| Tab | What it answers |
+| --- | --- |
+| Overview | Is this result trustworthy? DC closure, quality tiers, inferred fraction, per-card acquisition skew |
+| Plate map | Any per-segment scalar in true plate geometry; click a segment for its spectrum |
+| Spectra | Nyquist and Bode for any set of segments, against the area-weighted cell aggregate |
+| ECM fitting | Weighted circuit fits with uncertainties, an AICc-selected ladder, residuals, and fitted-parameter maps |
+| Conditions | The same parameter across operating currents, plus difference maps against a reference condition |
+| Calibration | Campaign evaluation: sensitivity and temperature coefficient per segment, sweep linearity, agreement with the shipped coefficients, repeat drift, sensor check |
+| Plate & sources | Geometry self-check for the selected generation, and every path the app is reading |
+
+### Plate generations are data, not code
+
+Gen 1 is `app/plates/specs/gen1_r2d2_72.json`: 15 full-height strips, 72
+segments over 900 pads, areas from 0.678 to 8.470 cm². Gen 2 and Gen 3 are new
+JSON files — in the repository or in a Volume named by `EIS_PLATE_SPEC_DIR` —
+and they appear in the dropdown with no redeploy. `python -m app.plates.registry`
+(and the **Plate & sources** tab) checks that a spec's segments cover every pad
+exactly once and that their areas add up to the active area, because a spec
+with a typo draws a heat map that looks entirely plausible and is wrong.
+
+Deployment as a Databricks App, the full environment-variable list, and how to
+add a generation: **[docs/FRONTEND.md](docs/FRONTEND.md)**.
+
 ## Layout
 
 ```
@@ -279,33 +328,26 @@ eis/
   model/ecm.py     weighted fitting, model selection, CIs
   pipeline.py      orchestration
   viz.py           figures
-run_pipeline.py    CLI
-tests/             synthetic generator + 33 tests
+app/
+  app.py           Dash frontend: sidebar selection, tabs, callbacks
+  settings.py      every path from the environment - no personal paths
+  plates/          plate geometry as data; one JSON spec per generation
+  data/            canonical run model, loaders, source discovery
+  services/        figures, ECM fitting, pipeline jobs, caching
+  views/           one module per tab
+local_eis/         the bronze/silver/gold pipeline, as it ran on Databricks
+app.yaml           Databricks App manifest
+run_dashboard.py   start the dashboard (prints the link)
+run_dashboard.cmd  the same on Windows (PowerShell: .\run_dashboard.cmd)
+run_evaluation.cmd the same for run_evaluation.py
+run_evaluation.py  process raw .DAT into results the dashboard reads
+run_pipeline.py    the packaged eis/ pipeline CLI
+tests/             synthetic generator + tests for pipeline and frontend
 config/example.yaml
-
-databricks/local_eis/   the pipeline that runs in the Databricks workspace:
-                        bronze/silver/gold on FAMOS, the CSV evaluation path,
-                        both plate maps, and the runner notebook
-
-docs/EIS_PIPELINE_DEVELOPMENT_PLAN.md    three-tier development plan
-docs/GEN2_PLATE_AND_CSV_PIPELINE.md      the gen2 plate and the CSV path
+docs/EIS_PIPELINE_DEVELOPMENT_PLAN.md   three-tier development plan
+docs/FRONTEND.md                        frontend architecture and deployment
+docs/CALIBRATION.md                     calibration campaigns and what they evaluate
 ```
 
 Notebooks contain no algorithms: every numerical step is an importable, tested
 module.
-
-## Two plates, two source formats
-
-The Databricks pipeline covers both hardware revisions of the R2-D2 measuring
-plate and both measurement file formats. Neither is a default you can ignore:
-
-| | |
-| --- | --- |
-| **Plate** | `gen1` = green / Kashyyyk, `gen2` = blue / Naboo. Same 45×20 pad grid and 72 segments; segments 37…72 are cut differently, so their areas — and those of the interior segments that gave pad rows to them — differ. Selecting the wrong one does not fail, it draws the right numbers on the wrong squares. |
-| **Source** | `famos` = five free-running cards, which need the measured inter-card synchronisation. `csv` = one logger with one clock, where that stage is not merely unnecessary but undefined; it is a separate pipeline sharing only the geometry and the Abgleich. |
-
-See [`docs/GEN2_PLATE_AND_CSV_PIPELINE.md`](docs/GEN2_PLATE_AND_CSV_PIPELINE.md)
-for the gen2 reconstruction and its evidence, what the Abgleich files say, the
-−11°-at-4.5 kHz measuring-chain roll-off that has never been corrected, the
-R2-D2 logger format and its per-row channel scan, and what the CSV path does
-instead of synchronisation.

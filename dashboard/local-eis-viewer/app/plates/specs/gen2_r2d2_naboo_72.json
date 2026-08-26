@@ -1,0 +1,530 @@
+{
+  "key": "gen2_r2d2_naboo_72",
+  "name": "Gen 2 - R2-D2 blue / Naboo, 72 segments",
+  "pad_w_mm": 5.6,
+  "pad_h_mm": 6.05,
+  "n_cols": 45,
+  "n_rows": 20,
+  "flow_axis": "x",
+  "temp_sensor_x_mm": {
+    "temp1": 0.0,
+    "temp2": 84.0,
+    "temp3": 168.0,
+    "temp4": 252.0
+  },
+  "flow_channel_y_mm": [
+    30.25,
+    60.5,
+    90.75
+  ],
+  "known_bad": {},
+  "verified": false,
+  "notes": "UNVERIFIED LAYOUT -- every segment here is described as a rectangle, and on this hardware that is known to be the wrong shape. The Gen 1 plate was modelled the same way, from the same kind of evidence (a drawing, the printed label pads, and an exact tiling of the 45x20 pad grid), and when the plant's own get_900_matrix pad map arrived it disagreed with 60 of the 72 areas -- one segment by more than a factor of two. 40 of the Gen 1 segments turned out to be staircases where they meet the rounded corners of the plate. There is no reason to expect Gen 2 to be different, so the areas in this file should be treated as provisional and the plate map drawn from it as indicative. Testing whether Gen 2 is merely a renumbering of Gen 1 fails: matching these rectangles onto the Gen 1 pad map is not a bijection, and the best overlaps run as low as 44 %, so the correspondence cannot be recovered this way either. TO FIX: supply the get_900_matrix output for the Gen 2 plate as a 'pad_matrix' key (20 rows of 45 segment numbers), exactly as the Gen 1 spec now carries, and delete the 'strips'/'bands'/'numbering' keys. Nothing else needs to change. Until then the KiCad board file remains the other way to settle it, and the edge segments are the part in doubt -- the column strips are certain to within one pad row.",
+  "segments": [
+    {
+      "name": "1",
+      "col0": 2,
+      "col1": 4,
+      "row0": 1,
+      "row1": 3
+    },
+    {
+      "name": "2",
+      "col0": 2,
+      "col1": 4,
+      "row0": 7,
+      "row1": 10
+    },
+    {
+      "name": "3",
+      "col0": 2,
+      "col1": 4,
+      "row0": 11,
+      "row1": 14
+    },
+    {
+      "name": "4",
+      "col0": 2,
+      "col1": 4,
+      "row0": 18,
+      "row1": 20
+    },
+    {
+      "name": "5",
+      "col0": 7,
+      "col1": 9,
+      "row0": 1,
+      "row1": 5
+    },
+    {
+      "name": "6",
+      "col0": 7,
+      "col1": 9,
+      "row0": 6,
+      "row1": 10
+    },
+    {
+      "name": "7",
+      "col0": 7,
+      "col1": 9,
+      "row0": 11,
+      "row1": 15
+    },
+    {
+      "name": "8",
+      "col0": 7,
+      "col1": 9,
+      "row0": 16,
+      "row1": 20
+    },
+    {
+      "name": "9",
+      "col0": 11,
+      "col1": 15,
+      "row0": 3,
+      "row1": 6
+    },
+    {
+      "name": "10",
+      "col0": 11,
+      "col1": 15,
+      "row0": 7,
+      "row1": 10
+    },
+    {
+      "name": "11",
+      "col0": 11,
+      "col1": 15,
+      "row0": 11,
+      "row1": 14
+    },
+    {
+      "name": "12",
+      "col0": 11,
+      "col1": 15,
+      "row0": 15,
+      "row1": 18
+    },
+    {
+      "name": "13",
+      "col0": 16,
+      "col1": 20,
+      "row0": 3,
+      "row1": 6
+    },
+    {
+      "name": "14",
+      "col0": 16,
+      "col1": 20,
+      "row0": 7,
+      "row1": 10
+    },
+    {
+      "name": "15",
+      "col0": 16,
+      "col1": 20,
+      "row0": 11,
+      "row1": 14
+    },
+    {
+      "name": "16",
+      "col0": 16,
+      "col1": 20,
+      "row0": 15,
+      "row1": 18
+    },
+    {
+      "name": "17",
+      "col0": 21,
+      "col1": 25,
+      "row0": 1,
+      "row1": 5
+    },
+    {
+      "name": "18",
+      "col0": 21,
+      "col1": 25,
+      "row0": 6,
+      "row1": 10
+    },
+    {
+      "name": "19",
+      "col0": 21,
+      "col1": 25,
+      "row0": 11,
+      "row1": 15
+    },
+    {
+      "name": "20",
+      "col0": 21,
+      "col1": 25,
+      "row0": 16,
+      "row1": 20
+    },
+    {
+      "name": "21",
+      "col0": 26,
+      "col1": 30,
+      "row0": 3,
+      "row1": 6
+    },
+    {
+      "name": "22",
+      "col0": 26,
+      "col1": 30,
+      "row0": 7,
+      "row1": 10
+    },
+    {
+      "name": "23",
+      "col0": 26,
+      "col1": 30,
+      "row0": 11,
+      "row1": 14
+    },
+    {
+      "name": "24",
+      "col0": 26,
+      "col1": 30,
+      "row0": 15,
+      "row1": 18
+    },
+    {
+      "name": "25",
+      "col0": 31,
+      "col1": 35,
+      "row0": 3,
+      "row1": 6
+    },
+    {
+      "name": "26",
+      "col0": 31,
+      "col1": 35,
+      "row0": 7,
+      "row1": 10
+    },
+    {
+      "name": "27",
+      "col0": 31,
+      "col1": 35,
+      "row0": 11,
+      "row1": 14
+    },
+    {
+      "name": "28",
+      "col0": 31,
+      "col1": 35,
+      "row0": 15,
+      "row1": 18
+    },
+    {
+      "name": "29",
+      "col0": 37,
+      "col1": 39,
+      "row0": 1,
+      "row1": 5
+    },
+    {
+      "name": "30",
+      "col0": 37,
+      "col1": 39,
+      "row0": 6,
+      "row1": 10
+    },
+    {
+      "name": "31",
+      "col0": 37,
+      "col1": 39,
+      "row0": 11,
+      "row1": 15
+    },
+    {
+      "name": "32",
+      "col0": 37,
+      "col1": 39,
+      "row0": 16,
+      "row1": 20
+    },
+    {
+      "name": "33",
+      "col0": 42,
+      "col1": 44,
+      "row0": 1,
+      "row1": 3
+    },
+    {
+      "name": "34",
+      "col0": 42,
+      "col1": 44,
+      "row0": 7,
+      "row1": 10
+    },
+    {
+      "name": "35",
+      "col0": 42,
+      "col1": 44,
+      "row0": 11,
+      "row1": 14
+    },
+    {
+      "name": "36",
+      "col0": 42,
+      "col1": 44,
+      "row0": 18,
+      "row1": 20
+    },
+    {
+      "name": "37",
+      "col0": 1,
+      "col1": 1,
+      "row0": 1,
+      "row1": 5
+    },
+    {
+      "name": "38",
+      "col0": 2,
+      "col1": 4,
+      "row0": 4,
+      "row1": 6
+    },
+    {
+      "name": "39",
+      "col0": 1,
+      "col1": 1,
+      "row0": 6,
+      "row1": 10
+    },
+    {
+      "name": "40",
+      "col0": 1,
+      "col1": 1,
+      "row0": 11,
+      "row1": 15
+    },
+    {
+      "name": "41",
+      "col0": 2,
+      "col1": 4,
+      "row0": 15,
+      "row1": 17
+    },
+    {
+      "name": "42",
+      "col0": 1,
+      "col1": 1,
+      "row0": 16,
+      "row1": 20
+    },
+    {
+      "name": "43",
+      "col0": 5,
+      "col1": 6,
+      "row0": 1,
+      "row1": 3
+    },
+    {
+      "name": "44",
+      "col0": 5,
+      "col1": 6,
+      "row0": 4,
+      "row1": 6
+    },
+    {
+      "name": "45",
+      "col0": 5,
+      "col1": 6,
+      "row0": 7,
+      "row1": 10
+    },
+    {
+      "name": "46",
+      "col0": 5,
+      "col1": 6,
+      "row0": 11,
+      "row1": 14
+    },
+    {
+      "name": "47",
+      "col0": 5,
+      "col1": 6,
+      "row0": 15,
+      "row1": 17
+    },
+    {
+      "name": "48",
+      "col0": 5,
+      "col1": 6,
+      "row0": 18,
+      "row1": 20
+    },
+    {
+      "name": "49",
+      "col0": 11,
+      "col1": 15,
+      "row0": 1,
+      "row1": 2
+    },
+    {
+      "name": "50",
+      "col0": 10,
+      "col1": 10,
+      "row0": 1,
+      "row1": 10
+    },
+    {
+      "name": "51",
+      "col0": 16,
+      "col1": 20,
+      "row0": 1,
+      "row1": 2
+    },
+    {
+      "name": "52",
+      "col0": 16,
+      "col1": 20,
+      "row0": 19,
+      "row1": 20
+    },
+    {
+      "name": "53",
+      "col0": 10,
+      "col1": 10,
+      "row0": 11,
+      "row1": 20
+    },
+    {
+      "name": "54",
+      "col0": 11,
+      "col1": 15,
+      "row0": 19,
+      "row1": 20
+    },
+    {
+      "name": "55",
+      "col0": 31,
+      "col1": 35,
+      "row0": 1,
+      "row1": 2
+    },
+    {
+      "name": "56",
+      "col0": 36,
+      "col1": 36,
+      "row0": 1,
+      "row1": 10
+    },
+    {
+      "name": "57",
+      "col0": 26,
+      "col1": 30,
+      "row0": 1,
+      "row1": 2
+    },
+    {
+      "name": "58",
+      "col0": 26,
+      "col1": 30,
+      "row0": 19,
+      "row1": 20
+    },
+    {
+      "name": "59",
+      "col0": 36,
+      "col1": 36,
+      "row0": 11,
+      "row1": 20
+    },
+    {
+      "name": "60",
+      "col0": 31,
+      "col1": 35,
+      "row0": 19,
+      "row1": 20
+    },
+    {
+      "name": "61",
+      "col0": 40,
+      "col1": 41,
+      "row0": 1,
+      "row1": 3
+    },
+    {
+      "name": "62",
+      "col0": 40,
+      "col1": 41,
+      "row0": 4,
+      "row1": 6
+    },
+    {
+      "name": "63",
+      "col0": 40,
+      "col1": 41,
+      "row0": 7,
+      "row1": 10
+    },
+    {
+      "name": "64",
+      "col0": 40,
+      "col1": 41,
+      "row0": 11,
+      "row1": 14
+    },
+    {
+      "name": "65",
+      "col0": 40,
+      "col1": 41,
+      "row0": 15,
+      "row1": 17
+    },
+    {
+      "name": "66",
+      "col0": 40,
+      "col1": 41,
+      "row0": 18,
+      "row1": 20
+    },
+    {
+      "name": "67",
+      "col0": 45,
+      "col1": 45,
+      "row0": 1,
+      "row1": 5
+    },
+    {
+      "name": "68",
+      "col0": 42,
+      "col1": 44,
+      "row0": 4,
+      "row1": 6
+    },
+    {
+      "name": "69",
+      "col0": 45,
+      "col1": 45,
+      "row0": 6,
+      "row1": 10
+    },
+    {
+      "name": "70",
+      "col0": 45,
+      "col1": 45,
+      "row0": 11,
+      "row1": 15
+    },
+    {
+      "name": "71",
+      "col0": 42,
+      "col1": 44,
+      "row0": 15,
+      "row1": 17
+    },
+    {
+      "name": "72",
+      "col0": 45,
+      "col1": 45,
+      "row0": 16,
+      "row1": 20
+    }
+  ],
+  "verification_note": "RECONSTRUCTION, not the plant's pad map. Needs the get_900_matrix output for the Gen 2 plate to become authoritative."
+}

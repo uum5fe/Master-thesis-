@@ -1,0 +1,11 @@
+out/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+.venv*/
+venv/
+
+# local settings, never committed
+.env
+local_eis/__pycache__/

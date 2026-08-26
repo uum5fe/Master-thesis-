@@ -407,3 +407,64 @@ def test_a_sweep_from_another_session_is_refused(tmp_path):
     far = log.state_at(t0 + timedelta(days=13))
     assert far.get("out_of_record") == 1.0
     assert "I_S" not in far, "no value may be reported from outside the record"
+
+
+def test_one_configured_parent_serves_every_cell(tmp_path, monkeypatch):
+    """The point of the design: configure the parent once, never touch it again.
+
+    Adding a campaign means creating a folder named after its order id and
+    dropping the files in. Selecting that order in the sidebar then finds them,
+    with no settings change. Folder naming is deliberately loose -- RO2611976-01,
+    RO2611976, 2611976 and Leepa_2611976_campaign all work -- because a
+    convention nobody enforces is a convention that will be broken.
+    """
+    import pandas as pd
+    from app.data.sources import Catalog
+    from app.settings import Settings
+
+    operating._pipeline_on_path()
+    import gamry_compare as GC
+
+    res_root = tmp_path / "Daten" / "EIS_Results"
+    parent = tmp_path / "EIS_Daten_Gamry_Tom"
+    cells = {"2611976": "RO2611976-01", "2611959": "RO2611959",
+             "2612101": "2612101", "2612222": "Leepa_2612222_campaign"}
+    for order, folder in cells.items():
+        gold = res_root / order / "45A" / "gold"
+        gold.mkdir(parents=True)
+        pd.DataFrame({"segment": ["1"], "R_ohmic": [0.06]}).to_csv(
+            gold / "plate_summary.csv", index=False)
+        cell_dir = parent / folder
+        cell_dir.mkdir(parents=True)
+        (cell_dir / f"20260716_0742_RO{order}-01_V26_lokale_EIS.mf4"
+         ).write_bytes(b"x")
+
+    settings = Settings(results_roots=[str(res_root)],
+                        gamry_roots=[str(parent)],   # the parent, once
+                        famos_roots=[], csv_roots=[])
+    catalog = Catalog(settings).refresh(kinds=("results",))
+    monkeypatch.setattr(operating.store, "current_catalog", lambda: catalog)
+    monkeypatch.setattr(operating, "SETTINGS", settings)
+
+    def _log_for(run):
+        for folder in operating._search_roots(run):
+            found = GC.find_bench_log(folder, order_id=run.measurement_id)
+            if found is not None:
+                return found
+        return None
+
+    for run in catalog.runs:
+        found = _log_for(run)
+        assert found is not None, run.measurement_id
+        assert run.measurement_id in found.name, (
+            f"{run.measurement_id} got {found.name}")
+
+    # And a cell with results but no folder takes nobody else's log.
+    gold = res_root / "2699999" / "45A" / "gold"
+    gold.mkdir(parents=True)
+    pd.DataFrame({"segment": ["1"], "R_ohmic": [0.06]}).to_csv(
+        gold / "plate_summary.csv", index=False)
+    catalog = Catalog(settings).refresh(kinds=("results",))
+    monkeypatch.setattr(operating.store, "current_catalog", lambda: catalog)
+    orphan = next(r for r in catalog.runs if r.measurement_id == "2699999")
+    assert _log_for(orphan) is None

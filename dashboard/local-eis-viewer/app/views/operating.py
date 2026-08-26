@@ -210,7 +210,7 @@ def fields_for(selection, inlet: str = "min"):
     if state is None:
         return None, None, problem
 
-    geom = registry.get(selection.get("plate") or registry.default_key())
+    geom = registry.get(selection.get("plate_key") or registry.default_key())
     run = None
     try:
         run = store.current_run(selection.get("kind", "results"),
@@ -272,7 +272,7 @@ def render(selection, which="temperature", inlet="min"):
         return blank, blank, ui.warnings_block([problem], "No operating data"), None
 
     field = fields[which]
-    geom = registry.get(selection.get("plate") or registry.default_key())
+    geom = registry.get(selection.get("plate_key") or registry.default_key())
 
     if field.provenance == "unavailable":
         return (empty_figure(f"{field.name} is not available for this run"),

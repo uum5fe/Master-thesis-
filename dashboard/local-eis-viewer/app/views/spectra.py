@@ -8,11 +8,14 @@ healthy can hide two segments pulling in opposite directions.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 from dash import Input, Output, State, dcc, html
 
 from app.services import store
 from app.services.figures import bode, empty_figure, nyquist
+from app.settings import SETTINGS
 from app.views import common as ui
 
 
@@ -33,15 +36,23 @@ def layout():
                                            "value": "cell"},
                                           {"label": " the pipeline's fitted curve",
                                            "value": "model"},
+                                          {"label": " Gamry (whole-cell reference)",
+                                           "value": "gamry"},
                                       ],
                                       value=["cell", "model"],
                                       labelStyle={"display": "block",
                                                   "fontSize": "12px"}),
-                                  "The whole-cell curve is Z_cell = A / Σ(A_s/Z_s): "
-                                  "what a single-lead measurement of this cell would "
-                                  "see. A healthy-looking cell curve can hide two "
-                                  "segments pulling opposite ways, which is the point "
-                                  "of drawing both."),
+                                  "Whole cell: Z_cell = A / Σ(A_s/Z_s), what a "
+                                  "single-lead measurement of this cell would see. "
+                                  "Pipeline's fitted curve: the ECM this segment was "
+                                  "fitted to, dashed, so a systematic gap between "
+                                  "points and dashes shows where the circuit model "
+                                  "stops explaining the data. Gamry: the independent "
+                                  "whole-cell sweep for this condition, drawn over "
+                                  "its own full band -- unlike the Reference tab, "
+                                  "not cropped to where the local band overlaps it, "
+                                  "so it shows how far past the local ceiling the "
+                                  "instrument itself was able to go."),
                          style={"flex": "1 1 220px"}),
                 html.Div(ui.field("Quick pick",
                                   dcc.Dropdown(
@@ -113,6 +124,58 @@ def _pick(run, mode: str) -> list[str]:
     return run.segment_names[:3]
 
 
+def _pipeline_on_path() -> None:
+    import sys
+    from app.services.runner import pipeline_dir
+    for candidate in (pipeline_dir(), Path(__file__).resolve().parents[2]):
+        text = str(candidate)
+        if candidate.is_dir() and text not in sys.path:
+            sys.path.insert(0, text)
+
+
+def _gamry_curve(selection) -> dict | None:
+    """The whole-cell Gamry sweep for this run's condition, on its own band.
+
+    The Reference tab crops both instruments to where their bands OVERLAP,
+    because that comparison is only meaningful there. Here the point is the
+    opposite: showing the frequencies the Gamry galvanostat reached that the
+    local, externally-sampled measurement never could, so the sweep is drawn
+    in full, not cropped to match.
+    """
+    if not selection or not selection.get("measurement_id"):
+        return None
+    _pipeline_on_path()
+    import gamry_compare as GC
+    from app.plates import registry
+
+    run = store.current_catalog().find(
+        selection.get("measurement_id", ""), selection.get("condition", ""),
+        selection.get("kind", "results"))
+    if run is None or not run.path:
+        return None
+
+    base = Path(run.path)
+    roots = [base, base.parent, base.parent.parent, *SETTINGS.resolved_gamry_roots()]
+    sweeps = []
+    for root in roots:
+        try:
+            sweeps = GC.find_cell_sweeps(root)
+        except OSError:
+            continue
+        if sweeps:
+            break
+    condition = selection.get("condition", "")
+    match = next((sw for sw in sweeps if sw.condition == condition), None)
+    if match is None:
+        return None
+
+    geom = registry.get(selection.get("plate_key") or registry.default_key())
+    area = float(sum(geom.areas().values()))
+    Z = match.asr(area) * 1e3               # ohm.cm2 -> mohm.cm2, local's units
+    return dict(name=f"Gamry ({match.name})", f=match.freq,
+               z_re=Z.real, z_im=Z.imag, dash="dashdot")
+
+
 def register(app):
 
     @app.callback(Output("sp-segments", "options"), Output("sp-segments", "value"),
@@ -178,6 +241,24 @@ def register(app):
                                z_re=cell["z_re_mohm_cm2"], z_im=cell["z_im_mohm_cm2"],
                                dash="dot"))
 
+        gamry_note = None
+        if "gamry" in extras:
+            gamry = _gamry_curve(selection)
+            if gamry is None:
+                gamry_note = ("no matching Gamry sweep found for this "
+                             "condition -- check the Gamry path under Settings")
+            else:
+                import pandas as pd
+                f = np.asarray(gamry["f"], float)
+                keep = (f >= lo) & (f <= hi)
+                if keep.any():
+                    curves.append(dict(gamry, f=f[keep],
+                                       z_re=np.asarray(gamry["z_re"])[keep],
+                                       z_im=np.asarray(gamry["z_im"])[keep]))
+                else:
+                    gamry_note = (f"the Gamry sweep has no points between "
+                                 f"{lo:.4g} and {hi:.4g} Hz either")
+
         if not curves:
             msg = ("no points between "
                    f"{lo:.4g} and {hi:.4g} Hz — widen the frequency range"
@@ -196,8 +277,13 @@ def register(app):
         import pandas as pd
         table = (pd.concat(frames, ignore_index=True)
                  if frames else pd.DataFrame())
-        note = ui.note(f"{n_after} of {n_before} points shown "
-                       f"({lo:.4g} – {hi:.4g} Hz)") if n_after != n_before else None
+        note_text = []
+        if n_after != n_before:
+            note_text.append(f"{n_after} of {n_before} points shown "
+                             f"({lo:.4g} – {hi:.4g} Hz)")
+        if gamry_note:
+            note_text.append(gamry_note)
+        note = ui.note("; ".join(note_text)) if note_text else None
         body = [note, ui.table(table, "sp-points", max_rows=500)] if note \
             else ui.table(table, "sp-points", max_rows=500)
         return fig, bode_fig, body

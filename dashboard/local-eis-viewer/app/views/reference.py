@@ -202,7 +202,7 @@ def _live_comparison(selection):
         return [], {}, (f"No sweep at {condition}. The sweeps found cover: "
                         f"{have}.")
 
-    geom = registry.get(selection.get("plate") or registry.default_key())
+    geom = registry.get(selection.get("plate_key") or registry.default_key())
     area = float(sum(geom.areas().values()))
     freq, Z = GC.read_cell_aggregate(aggregate)
     comparison = GC.compare(freq, Z, match, area)

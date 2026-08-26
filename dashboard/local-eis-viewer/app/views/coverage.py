@@ -130,7 +130,7 @@ def render(selection):
         return (ui.warnings_block([_HINT], "No coverage report"),
                 blank, blank, blank, None)
 
-    geom = registry.get(selection.get("plate") or registry.default_key())
+    geom = registry.get(selection.get("plate_key") or registry.default_key())
 
     # --- the map: how high each segment reached ---------------------------
     f_max = {r["segment"]: _f(r["f_max_hz"]) for r in reach}

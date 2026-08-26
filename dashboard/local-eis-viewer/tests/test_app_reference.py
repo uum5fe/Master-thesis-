@@ -275,7 +275,7 @@ def test_the_comparison_is_computed_when_none_was_written(tmp_path,
     monkeypatch.setattr(reference, "SETTINGS", settings)
 
     sel = {"kind": "results", "measurement_id": "2611976", "condition": "45A",
-           "plate": "gen1_r2d2_72"}
+           "plate_key": "gen1_r2d2_72"}
     status, nyq, res, table = reference.render(sel)
 
     assert table is not None
@@ -302,7 +302,7 @@ def test_a_missing_sweep_for_this_condition_says_which_ones_exist(tmp_path,
 
     _rows, _curves, problem = reference._live_comparison(
         {"kind": "results", "measurement_id": "2611976", "condition": "45A",
-         "plate": "gen1_r2d2_72"})
+         "plate_key": "gen1_r2d2_72"})
     assert "No sweep at 45A" in problem
     assert "450A" in problem, "it must say what it did find"
 
@@ -356,3 +356,35 @@ def test_a_comparison_csv_without_the_fit_columns_still_renders():
                                   "hfr_ref_mohm_cm2": "nan",
                                   "hfr_rel_pct": "nan"})
     assert set(cells.values()) == {"—"}
+
+
+def test_the_selected_plate_is_the_one_actually_used(tmp_path, monkeypatch):
+    """`selection` carries the key as "plate_key" (see app.py's `_selection`
+    callback) -- this tab used to read `selection.get("plate")`, which is
+    never present, so it silently fell back to registry.default_key() no
+    matter which plate the sidebar had selected. That is invisible on this
+    campaign, where gen1 and gen2 happen to share one total area, but
+    operating.py reads the SAME key for per-segment centroids, where the two
+    plates genuinely differ -- so it is worth pinning down here.
+    """
+    results, gamry = _run_with_aggregate_and_sweeps(tmp_path)
+    from app.data.sources import Catalog
+    from app.settings import Settings
+
+    settings = Settings(results_roots=[str(tmp_path / "Daten" / "EIS_Results")],
+                        gamry_roots=[str(gamry)], famos_roots=[], csv_roots=[])
+    catalog = Catalog(settings).refresh(kinds=("results",))
+    monkeypatch.setattr(reference.store, "current_catalog", lambda: catalog)
+    monkeypatch.setattr(reference, "SETTINGS", settings)
+
+    seen: list[str] = []
+    real_get = reference.registry.get
+    monkeypatch.setattr(reference.registry, "get",
+                        lambda key: seen.append(key) or real_get(key))
+
+    reference._live_comparison(
+        {"kind": "results", "measurement_id": "2611976", "condition": "45A",
+         "plate_key": "gen2_r2d2_naboo_72"})
+    assert seen == ["gen2_r2d2_naboo_72"], (
+        "the plate the sidebar selected must be the one looked up, not "
+        "always the registry default")

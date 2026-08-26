@@ -235,7 +235,22 @@ class Config:
     # search window must be generous -- a wrong lag is caught by the
     # correlation peak height, not by clipping the search.
     align_max_lag_s: float = 12.0
-    align_min_corr: float = 0.30     # reject a lag whose peak is weaker
+    # A lag is accepted on how far its correlation peak stands above the rest
+    # of the curve, not on the peak's absolute height.  Height alone does not
+    # separate right from wrong here: on the 45 A set the known-correct
+    # near-zero lag of card 2 scored |r| = 0.269 while cards 3/4/5 scored
+    # 0.276-0.278 for lags that reproduce this file's own recorded true
+    # offsets (5.712 / 2.536 / 2.549 s) to four decimals.  The old 0.30
+    # threshold refused all four, and because a refused lag was still applied
+    # one way in consensus_schedule, that cost every segment on cards 3-5.
+    # The prominence threshold is set from the two distributions, not by
+    # taste.  Measured on a 60 s synthetic sweep at this fs (see
+    # test_card_alignment.py): unrelated noise peaks at prominence 8.5 over
+    # 30 seeds, while a correct lag at the field data's own |r| ~ 0.27 scores
+    # ~250.  25 sits three times above the noise ceiling and ten times below
+    # the real signal, so it is not a close call in either direction.
+    align_min_corr: float = 0.05        # absolute floor against pure garbage
+    align_min_prominence: float = 25.0  # robust sigma above the background
 
     # ---- per-step quality gates -------------------------------------------
     # A step that lies on the sweep's own geometric grid is a real step: a

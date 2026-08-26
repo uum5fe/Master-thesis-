@@ -367,13 +367,34 @@ def estimate_card_lags(files: list[Path], cards: dict[str, CardInfo],
     HOW
     ---
     Every card carries a copy of the same cell-voltage reference, so a plain
-    cross-correlation of the band-passed reference against card 1 gives the
-    offset directly.  The correlation is dominated by the excitation window,
-    which is where the signal is, so the estimate is well determined.  The
-    peak height is reported and a weak peak is refused rather than applied:
-    a wrong shift is worse than no shift.
+    cross-correlation of the band-passed reference gives the offset directly.
+    The correlation is dominated by the excitation window, which is where the
+    signal is, so the estimate is well determined.
 
-    Returns {stem: {"lag": int samples, "corr": float, "applied": bool}}.
+    WHICH CARD IS THE ANCHOR
+    ------------------------
+    Not simply the first one.  A card whose reference channel is degraded
+    makes a bad anchor: every other card then correlates weakly against it,
+    and a gate on peak HEIGHT refuses them all.  That is not hypothetical --
+    on the 45 A set card 1's reference yields 2 detectable steps where the
+    others yield 44-49, and anchoring on it scored every card at |r| ~ 0.27.
+    So the anchor is the card the others agree with best, chosen by the
+    median cross-correlation each candidate achieves against the rest.
+
+    WHY THE PEAK IS JUDGED BY PROMINENCE, NOT HEIGHT
+    ------------------------------------------------
+    Absolute |r| carries almost no information about whether a lag is right.
+    On the 45 A set the KNOWN-correct near-zero lag of card 2 scores 0.269 --
+    indistinguishable from the 0.276-0.278 of cards 3/4/5, whose lags are
+    also known to be correct because they reproduce the TRUE offsets recorded
+    above to four decimals.  A fixed threshold of 0.30 therefore refused four
+    correct answers.  What actually separates a real lag from noise is how
+    far the peak stands above the rest of the correlation curve, which is
+    scale-free: a sharp peak at 0.27 on a flat background is certain, a
+    ragged 0.5 is not.  `align_min_corr` stays only as an absolute floor
+    against pure garbage.
+
+    Returns {stem: {"lag", "corr", "prominence", "applied"}}.
     """
     log = log or utils.get_logger(cfg.verbose)
     utils.section("card alignment (shared reference cross-correlation)", log)
@@ -381,7 +402,6 @@ def estimate_card_lags(files: list[Path], cards: dict[str, CardInfo],
     stems = [fp.stem for fp in files if fp.stem in cards]
     if not stems:
         return {}
-    base = stems[0]
 
     def _ac(stem):
         c = cards[stem]
@@ -396,33 +416,39 @@ def estimate_card_lags(files: list[Path], cards: dict[str, CardInfo],
         X[(fr < 0.5) | (fr > 300.0)] = 0.0
         return np.fft.irfft(X, n)
 
-    ref = _ac(base)
-    out = {base: {"lag": 0, "corr": 1.0, "applied": True}}
-    max_lag = int(cfg.align_max_lag_s * cards[base].fs)
+    traces = {stem: _ac(stem) for stem in stems}
+    max_lag = int(cfg.align_max_lag_s * cards[stems[0]].fs)
+
+    base = _pick_anchor(stems, traces, max_lag, log)
+    ref = traces[base]
+    out = {base: {"lag": 0, "corr": 1.0, "prominence": float("inf"),
+                  "applied": True}}
     log.info(f"  reference card: {base} (ref channel {cards[base].ref_name})")
 
-    for stem in stems[1:]:
-        x = _ac(stem)
-        n = min(len(x), len(ref))
-        a, b = x[:n], ref[:n]
-        m = 1 << int(np.ceil(np.log2(2 * n)))
-        cc = np.fft.irfft(np.fft.rfft(a, m) * np.conj(np.fft.rfft(b, m)), m)
-        cc = np.concatenate([cc[-(n - 1):], cc[:n]])
-        lags = np.arange(-(n - 1), n)
-        sel = np.abs(lags) <= max_lag
-        k = int(np.argmax(np.abs(cc[sel])))
-        lag = int(lags[sel][k])
-        denom = np.sqrt(float(np.dot(a, a)) * float(np.dot(b, b)))
-        corr = float(cc[sel][k] / denom) if denom > 0 else 0.0
+    for stem in stems:
+        if stem == base:
+            continue
+        lag, corr, prom = _best_lag(traces[stem], ref, max_lag)
         # lag < 0 means this card's record RUNS AHEAD of the reference's,
         # i.e. it was armed later; the schedule index must be shifted by
         # +lag to read the same instant.
-        applied = bool(cfg.align_cards and abs(corr) >= cfg.align_min_corr)
-        out[stem] = {"lag": lag, "corr": corr, "applied": applied}
+        strong = prom >= cfg.align_min_prominence
+        above_floor = abs(corr) >= cfg.align_min_corr
+        applied = bool(cfg.align_cards and strong and above_floor)
+        out[stem] = {"lag": lag, "corr": corr, "prominence": prom,
+                     "applied": applied}
+        why = ("" if applied else
+               "   REFUSED (peak not prominent)" if not strong else
+               "   REFUSED (below the absolute floor)")
         log.info(f"  {stem[-8:]}: lag {lag:+8d} samples = "
                  f"{lag / cards[stem].fs:+8.4f} s   peak corr {corr:+.3f}"
-                 + ("" if applied else "   REFUSED (peak too weak)"))
-        if applied and abs(lag) >= max_lag - 1:
+                 f"   prominence {prom:5.1f}" + why)
+        if not applied:
+            log.warning(f"    {stem[-8:]} stays on its own clock. If its true "
+                        f"offset is not ~0 its dwell windows will land on the "
+                        f"wrong tone and EVERY segment on this card will fail "
+                        f"the SNR gate in silver.")
+        elif abs(lag) >= max_lag - 1:
             log.warning("    lag is at the search limit - raise "
                         "align_max_lag_s and re-run")
     if not cfg.align_cards:
@@ -430,6 +456,68 @@ def estimate_card_lags(files: list[Path], cards: dict[str, CardInfo],
                     "to every card unshifted, which is only correct if the "
                     "cards were hardware-triggered together")
     return out
+
+
+def _best_lag(x: np.ndarray, ref: np.ndarray,
+              max_lag: int) -> tuple[int, float, float]:
+    """The lag of best agreement, its correlation, and its prominence."""
+    n = min(len(x), len(ref))
+    a, b = x[:n], ref[:n]
+    m = 1 << int(np.ceil(np.log2(2 * n)))
+    cc = np.fft.irfft(np.fft.rfft(a, m) * np.conj(np.fft.rfft(b, m)), m)
+    cc = np.concatenate([cc[-(n - 1):], cc[:n]])
+    lags = np.arange(-(n - 1), n)
+    sel = np.abs(lags) <= max_lag
+    cc_sel, lag_sel = cc[sel], lags[sel]
+    k = int(np.argmax(np.abs(cc_sel)))
+    denom = np.sqrt(float(np.dot(a, a)) * float(np.dot(b, b)))
+    corr = float(cc_sel[k] / denom) if denom > 0 else 0.0
+    return int(lag_sel[k]), corr, _prominence(np.abs(cc_sel), k)
+
+
+def _prominence(mag: np.ndarray, k: int, guard: int = 5000) -> float:
+    """How many robust sigma the peak stands above the rest of the curve.
+
+    Median and MAD rather than mean and sd, because the correlation of a
+    stepped sweep against itself is not flat -- it has broad structure that
+    a mean-based score would read as signal.  The guard band excludes the
+    peak's own shoulders, which are part of the peak, not of the background.
+    """
+    lo, hi = max(0, k - guard), min(mag.size, k + guard + 1)
+    background = np.concatenate([mag[:lo], mag[hi:]])
+    if background.size < 64:
+        return float("nan")
+    med = float(np.median(background))
+    mad = float(np.median(np.abs(background - med)))
+    if mad <= 0:
+        return float("inf") if mag[k] > med else 0.0
+    return float((float(mag[k]) - med) / (1.4826 * mad))
+
+
+def _pick_anchor(stems: list[str], traces: dict[str, np.ndarray],
+                 max_lag: int, log) -> str:
+    """The card the others agree with best.
+
+    Anchoring on whichever card happens to be first is a coin flip, and it
+    loses when that card's reference channel is the degraded one: every
+    other card then scores weakly against it and a height gate refuses the
+    lot.  Scoring each candidate by the MEDIAN correlation it achieves
+    against the rest picks an anchor that is good for the group, and the
+    median keeps one bad card from deciding it.
+    """
+    if len(stems) < 3:
+        return stems[0]
+    scores: dict[str, float] = {}
+    for cand in stems:
+        others = [abs(_best_lag(traces[s], traces[cand], max_lag)[1])
+                  for s in stems if s != cand]
+        scores[cand] = float(np.median(others))
+    best = max(scores, key=lambda s: scores[s])
+    if log is not None and best != stems[0]:
+        log.info(f"  anchoring on {best[-8:]} (median |r| {scores[best]:.3f}) "
+                 f"rather than {stems[0][-8:]} ({scores[stems[0]]:.3f}): "
+                 f"the first card is not the one the others agree with best")
+    return best
 
 
 # ===========================================================================
@@ -476,7 +564,19 @@ def consensus_schedule(files: list[Path], cards: dict[str, CardInfo],
         # Detection runs in each card's own sample index; the consensus that
         # follows mixes windows from different cards, so they have to mean
         # the same instant first.  process_card shifts them back.
-        d = int(lags.get(stem, {}).get("lag", 0)) if lags else 0
+        #
+        # The `applied` test is not optional and must MATCH the one in the
+        # phasor pass, which reads `lag` only when `applied`.  Without it a
+        # refused card is shifted ONE WAY: onto the common base here, never
+        # back onto its own clock there, so every window on it is off by
+        # exactly the lag that was judged untrustworthy.  On the 45 A set
+        # that silently cost 43 of 68 segments -- all of cards 3, 4 and 5,
+        # whose refused lags were 5.71 s, 2.54 s and 2.55 s -- and it looked
+        # like an SNR problem, because what silver sees is a dwell window
+        # sitting on the wrong tone.  Refusing a lag has to mean NO shift
+        # anywhere, not half a shift.
+        info = lags.get(stem, {}) if lags else {}
+        d = int(info.get("lag", 0)) if info.get("applied") else 0
         if d:
             steps = [Step(freq=s.freq, start=s.start - d, stop=s.stop - d,
                           amp=s.amp, snr_db=s.snr_db, thd=s.thd,

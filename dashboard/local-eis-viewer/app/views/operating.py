@@ -103,7 +103,19 @@ def _search_roots(run) -> list[Path]:
     if run is not None and run.path:
         base = Path(run.path)
         roots += [base, base.parent, base.parent.parent]
-    roots += SETTINGS.resolved_gamry_roots()
+
+    # A campaign share holds one folder per cell. Look inside the one for THIS
+    # cell first, so the parent's other cells are never the nearest match.
+    order = (run.measurement_id if run is not None else "") or ""
+    digits = "".join(c for c in order if c.isdigit())
+    for configured in SETTINGS.resolved_gamry_roots():
+        if digits:
+            try:
+                roots += sorted(d for d in configured.iterdir()
+                                if d.is_dir() and digits in d.name)
+            except OSError:
+                pass
+        roots.append(configured)
 
     seen: set[str] = set()
     out: list[Path] = []
@@ -127,10 +139,11 @@ def _bench_state(selection):
         return None, None, "no run selected"
 
     roots = _search_roots(run)
+    order = run.measurement_id
     log_path = None
     for folder in roots:
         try:
-            log_path = GC.find_bench_log(folder)
+            log_path = GC.find_bench_log(folder, order_id=order)
         except OSError:
             continue
         if log_path is not None:
@@ -162,7 +175,7 @@ def _bench_state(selection):
     sweeps = []
     for folder in roots:                      # the same ordered list
         try:
-            sweeps = GC.find_cell_sweeps(folder)
+            sweeps = GC.find_cell_sweeps(folder, order_id=order)
         except OSError:
             continue
         if sweeps:
@@ -175,7 +188,17 @@ def _bench_state(selection):
         return None, log_path, (
             "The bench log was found but nothing says WHEN this condition was "
             "recorded. A Gamry .dta beside it supplies that timestamp.")
-    return bench.state_at(match.started), log_path, ""
+    state = bench.state_at(match.started)
+    if state.get("out_of_record"):
+        return None, log_path, (
+            f"The sweep at {match.name} is timestamped "
+            f"{state['t_rel_s'] / 3600:.1f} h into a recording that is only "
+            f"{state['record_span_s'] / 3600:.1f} h long, so this bench log "
+            f"and this sweep are not the same session.\n\n"
+            f"    log   : {log_path}\n"
+            f"    sweep : {match.path}\n\n"
+            "Point EIS_GAMRY_ROOT at the folder for this cell.")
+    return state, log_path, ""
 
 
 def fields_for(selection, inlet: str = "min"):

@@ -318,3 +318,92 @@ def test_asammdf_is_a_listed_dependency():
     """The Operating map cannot work without it, so it belongs in the file."""
     text = (Path(__file__).resolve().parents[1] / "requirements.txt").read_text()
     assert "asammdf" in text
+
+
+# ---------------------------------------------------------------------------
+# the right cell's bench log, not merely the first one
+# ---------------------------------------------------------------------------
+
+def _two_cells(tmp_path):
+    """A Gamry parent holding one folder per cell, as on the real share."""
+    import pandas as pd
+
+    results = tmp_path / "Daten" / "EIS_Results" / "2611976" / "45A"
+    (results / "gold").mkdir(parents=True)
+    pd.DataFrame({"segment": ["1"], "R_ohmic": [0.06]}).to_csv(
+        results / "gold" / "plate_summary.csv", index=False)
+
+    parent = tmp_path / "EIS_Daten_Gamry_Tom"
+    wrong, right = parent / "RO2611959-01", parent / "RO2611976-01"
+    wrong.mkdir(parents=True)
+    right.mkdir(parents=True)
+    # The wrong one sorts first, which is how it used to win.
+    (wrong / "20260703_0848_1268_70758_RO2611959-01_V26_087_EIS_Test_3.mf4"
+     ).write_bytes(b"x")
+    (right / "20260716_0742_1269_70758_RO2611976-01_V26_088_lokale_EIS.mf4"
+     ).write_bytes(b"x")
+    return results, parent, right
+
+
+def test_the_bench_log_of_another_cell_is_never_used(tmp_path):
+    """Not a near miss: a different cell at a different operating point.
+
+    Every field derived from it -- temperature, pressure, humidity -- would be
+    fiction, and nothing on screen would say so.
+    """
+    operating._pipeline_on_path()
+    import gamry_compare as GC
+
+    _results, parent, right = _two_cells(tmp_path)
+
+    # Pointed at the parent, it picks the one that names this cell.
+    assert GC.find_bench_log(parent, order_id="2611976").parent == right
+    # Pointed at the wrong cell's folder, it refuses rather than substituting.
+    assert GC.find_bench_log(parent / "RO2611959-01", order_id="2611976") is None
+    # And a file that names no cell is still allowed: silence is not a denial.
+    quiet = tmp_path / "quiet"
+    quiet.mkdir()
+    (quiet / "bench.mf4").write_bytes(b"x")
+    assert GC.find_bench_log(quiet, order_id="2611976") is not None
+
+
+def test_the_cells_own_folder_is_searched_first(tmp_path, monkeypatch):
+    from app.data.sources import Catalog
+    from app.settings import Settings
+
+    results, parent, right = _two_cells(tmp_path)
+    settings = Settings(results_roots=[str(tmp_path / "Daten" / "EIS_Results")],
+                        gamry_roots=[str(parent)], famos_roots=[], csv_roots=[])
+    catalog = Catalog(settings).refresh(kinds=("results",))
+    monkeypatch.setattr(operating.store, "current_catalog", lambda: catalog)
+    monkeypatch.setattr(operating, "SETTINGS", settings)
+
+    roots = [str(r) for r in operating._search_roots(catalog.runs[0])]
+    assert roots.index(str(right)) < roots.index(str(parent))
+
+
+def test_a_sweep_from_another_session_is_refused(tmp_path):
+    """13 days into a 30 minute recording is not an operating point.
+
+    A zero-order hold is right for a channel logged on change and wrong for a
+    timestamp outside the recording: it reports a number from another day as
+    though it were this run's state.
+    """
+    from datetime import datetime, timedelta
+
+    operating._pipeline_on_path()
+    import gamry_compare as GC
+    import numpy as np
+
+    t0 = datetime(2026, 7, 16, 7, 42)
+    log = GC.BenchLog(path=Path("bench.mf4"), t0=t0,
+                      series={"I_S": (np.linspace(0, 1800, 50),
+                                      np.full(50, 45.0))})
+
+    inside = log.state_at(t0 + timedelta(seconds=900))
+    assert inside["I_S"] == pytest.approx(45.0)
+    assert not inside.get("out_of_record")
+
+    far = log.state_at(t0 + timedelta(days=13))
+    assert far.get("out_of_record") == 1.0
+    assert "I_S" not in far, "no value may be reported from outside the record"

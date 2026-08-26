@@ -174,7 +174,8 @@ def read_cell_sweep(path) -> CellSweep:
                      current_a=current, started=started, meta=dict(sweep.meta))
 
 
-def find_cell_sweeps(root, pattern: str = "*.dta") -> list[CellSweep]:
+def find_cell_sweeps(root, pattern: str = "*.dta",
+                     order_id: str | None = None) -> list[CellSweep]:
     """Every whole-cell sweep under `root`, newest naming first.
 
     Per-segment chain-response files carry a "#<n>" in the name and live in a
@@ -190,10 +191,16 @@ def find_cell_sweeps(root, pattern: str = "*.dta") -> list[CellSweep]:
             continue
         if any(s.path == path for s in out):
             continue
+        if names_order(path.name, order_id) is False:
+            continue                     # names a different cell
         try:
             out.append(read_cell_sweep(path))
         except Exception:                                   # noqa: BLE001
             continue
+    if order_id:
+        named = [s for s in out if names_order(s.path.name, order_id) is True]
+        if named:
+            return named                 # prefer the ones that say so
     return out
 
 
@@ -234,6 +241,10 @@ class BenchLog:
     path: Path
     t0: datetime | None
     series: dict[str, tuple[np.ndarray, np.ndarray]]
+    #: How far outside the recording a request may fall before it is refused.
+    #: Generous, because clocks drift and a sweep can start just after the log
+    #: stops -- but far short of the days that a wrong-file match produces.
+    tolerance_s: float = 900.0
 
     def state_at(self, when: datetime, window_s: float = 30.0) -> dict[str, float]:
         """Bench state at `when`.
@@ -254,6 +265,19 @@ class BenchLog:
         if self.t0 is None:
             return {}
         t_rel = (when - self.t0).total_seconds()
+
+        # A zero-order hold is right for a channel logged on change. It is NOT
+        # right for a timestamp that falls outside the recording altogether:
+        # that means this log and this sweep are not the same session, and
+        # holding the last value would report a number from a different day as
+        # though it were the operating point. The delivered case was a sweep
+        # timestamped 13 days after the log it was matched to.
+        span = max((float(t[-1]) for t, _v in self.series.values() if t.size),
+                   default=0.0)
+        if t_rel < -self.tolerance_s or t_rel > span + self.tolerance_s:
+            return {"t_rel_s": t_rel, "out_of_record": 1.0,
+                    "record_span_s": span}
+
         out: dict[str, float] = {}
         for key, (t, v) in self.series.items():
             good = np.isfinite(v)
@@ -297,11 +321,53 @@ def read_bench_log(path) -> BenchLog:
     return BenchLog(path=path, t0=t0, series=series)
 
 
-def find_bench_log(root) -> Path | None:
+def _order_core(text: str) -> str:
+    """The digits of an order id, so RO2611976-01 and 2611976 compare equal."""
+    return re.sub(r"\D", "", text or "")
+
+
+def names_order(name: str, order_id: str | None) -> bool | None:
+    """Does this filename name this cell?
+
+    True  -- it names this order.
+    False -- it names a DIFFERENT one, so it is the wrong cell.
+    None  -- it names none, so the filename cannot settle it either way.
+
+    The distinction matters: a file that is silent about the cell may still be
+    the right one and is allowed through as a last resort, but a file that
+    names another cell never is. Reading RO2611959's bench log for a run of
+    RO2611976 is not a near miss -- it is a different cell at a different
+    operating point, and every field derived from it is fiction.
+    """
+    want = _order_core(order_id or "")
+    if not want:
+        return None
+    found = {_order_core(m.group(0)) for m in _ORDER_RE.finditer(name)}
+    if not found:
+        return None
+    return want in found
+
+
+def find_bench_log(root, order_id: str | None = None) -> Path | None:
+    """The bench .mf4 for this cell, or None.
+
+    A campaign share holds one folder per cell, and pointing at the parent used
+    to return whichever file sorted first -- silently, and for a different
+    cell.
+    """
     files = sorted(Path(root).rglob("*.mf4")) + sorted(Path(root).rglob("*.MF4"))
     # The "_Anfang" file is the run-up; the main file is the one with the data.
-    main = [f for f in files if "anfang" not in f.name.lower()]
-    return (main or files or [None])[0]
+    files = [f for f in files if "anfang" not in f.name.lower()] or files
+    if not files:
+        return None
+
+    named = [f for f in files if names_order(f.name, order_id) is True]
+    if named:
+        return named[0]
+    # Nothing names the order. A file that names ANOTHER one is excluded;
+    # what is left is silent about the cell and may legitimately be it.
+    silent = [f for f in files if names_order(f.name, order_id) is None]
+    return silent[0] if silent else None
 
 
 # ---------------------------------------------------------------------------

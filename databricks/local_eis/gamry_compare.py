@@ -329,6 +329,40 @@ class BenchLog:
         return out
 
 
+def _asammdf_advice(exc: ImportError) -> list[str]:
+    """Why the import failed, and the command that fixes THIS interpreter.
+
+    "pip install asammdf" followed by "asammdf not installed" almost always
+    means the pip that ran belongs to a different interpreter -- a system
+    Python, a Store alias, another venv.  So the advice has to name the
+    interpreter that is actually running, on a line of its own: the previous
+    message put the path mid-sentence, where an 80-column console cut it off
+    after "C:\\Use" and told the reader nothing.
+
+    A second case looks identical from the outside: asammdf IS installed but
+    fails to import, usually because it was built against a different numpy.
+    The exception names which, so pass it on rather than repeating "not
+    installed" at someone who just installed it.
+    """
+    import sys
+
+    missing = getattr(exc, "name", "") or ""
+    if missing and missing.split(".")[0] != "asammdf":
+        return [f"asammdf is installed but cannot import: {exc}",
+                f"  its dependency {missing!r} is missing or incompatible "
+                f"(a numpy built for another version is the usual cause)",
+                f"  interpreter: {sys.executable}",
+                f'  try: "{sys.executable}" -m pip install --force-reinstall '
+                f"asammdf"]
+    return ["asammdf not installed in the interpreter running this pipeline",
+            "  the operating point (T, p, RH, current) will not be reported "
+            "next to each comparison; everything else is unaffected",
+            f"  interpreter: {sys.executable}",
+            f'  fix: "{sys.executable}" -m pip install asammdf',
+            "  (running plain `pip install asammdf` installs into whichever "
+            "Python is first on PATH, which is often not this one)"]
+
+
 def read_bench_log(path) -> BenchLog:
     """Read an MF4 bench log.  Requires `asammdf`; absent, this is skipped."""
     from asammdf import MDF                                 # noqa: PLC0415
@@ -542,8 +576,13 @@ def compare(freq_local: np.ndarray, Z_local: np.ndarray, sweep: CellSweep,
     elif f.size and not np.isfinite(local_hfr):
         notes.append(
             f"HFR not measurable locally: still capacitive at {f.max():.4g} Hz, "
-            "so the intercept is above the evaluated band (raise cfg.f_max_hz "
-            "to reach it); hfr_local_fit extrapolates it instead")
+            f"so the intercept is above the evaluated band -- raising "
+            f"cfg.f_max_hz would reach it, since the reference did. Until "
+            f"then the HFR columns fall back to hfr_*_fit, which extrapolates "
+            f"BOTH sides from the same overlap band; the reference's own "
+            f"measured intercept is {1e3 * ref_hfr:.2f} mohm.cm2, but "
+            f"comparing it against an extrapolation would charge the "
+            f"extrapolation's bias to the local side")
     if chain_applied is False:
         notes.append("chain response NOT applied to the local side -- a phase "
                      "difference growing with frequency is expected and is an "
@@ -612,7 +651,7 @@ def write_outputs(comparisons: list[Comparison], out_dir, log=None) -> None:
     if log:
         for c in comparisons:
             s = c.summary()
-            if np.isfinite(c.hfr_ref):
+            if np.isfinite(c.hfr_ref) and np.isfinite(c.hfr_local):
                 hfr = (f"HFR {s['hfr_local_mohm_cm2']:.2f} vs "
                        f"{s['hfr_ref_mohm_cm2']:.2f} mohm.cm2 "
                        f"({s['hfr_rel_pct']:+.1f} %)")
@@ -714,12 +753,9 @@ def run(results_root, gamry_root, area_cm2: float, out_dir=None,
             bench = read_bench_log(bench_path)
             log.info(f"bench log: {Path(bench_path).name} "
                      f"(t0 {bench.t0}, {len(bench.series)} channels)")
-        except ImportError:
-            import sys
-            log.warning(
-                f"asammdf not installed -- the operating point will not be "
-                f"reported next to each comparison. To have it: "
-                f'"{sys.executable}" -m pip install asammdf')
+        except ImportError as exc:
+            for line in _asammdf_advice(exc):
+                log.warning(line)
         except Exception as exc:                            # noqa: BLE001
             log.warning(f"bench log unreadable: {exc}")
 
@@ -736,13 +772,29 @@ def run(results_root, gamry_root, area_cm2: float, out_dir=None,
         m = re.match(r"([\d.]+)\s*A", cond, re.I)
         return (0, float(m.group(1)), "") if m else (1, 0.0, cond)
 
+    # A sweep with no local counterpart is the normal case, not a fault: one
+    # pipeline run evaluates one condition and writes one folder, while the
+    # campaign folder holds the sweeps for all of them.  Three warnings about
+    # conditions that were never part of this run read as three failures, so
+    # they are one informational line instead.  A LOCAL result with no sweep
+    # is the other way round -- that one really is a gap -- and stays a
+    # warning.
+    unmatched = [c for c in sorted(set(sweeps) - set(locals_), key=by_current)]
+    if unmatched and locals_:
+        log.info(f"not evaluated in this run, so not compared: "
+                 f"{', '.join(unmatched)} "
+                 f"(sweeps exist; re-run the pipeline at those conditions to "
+                 f"compare them)")
+    elif unmatched:
+        log.warning(f"no local results found under {results_root} -- nothing "
+                    f"to compare against the {len(unmatched)} sweep(s) found")
+
     out: list[Comparison] = []
     for cond in sorted(set(sweeps) | set(locals_), key=by_current):
         if cond not in sweeps:
             log.warning(f"{cond}: local result but no whole-cell sweep")
             continue
         if cond not in locals_:
-            log.warning(f"{cond}: whole-cell sweep but no local result")
             continue
         f, z = read_cell_aggregate(locals_[cond])
         state = {}

@@ -314,17 +314,45 @@ def test_an_extrapolated_hfr_is_shown_but_marked_as_one():
     the extrapolation tells them something, as long as it never pretends to be
     the measurement.
     """
-    row = {"hfr_local_mohm_cm2": "nan", "hfr_local_fit_mohm_cm2": "59.90",
-           "hfr_rel_pct": "nan", "hfr_fit_rel_pct": "5.0"}
-    assert reference._hfr(row, "hfr_local_mohm_cm2") == "~59.90"
-    assert reference._hfr(row, "hfr_rel_pct", 1) == "~5.0"
+    cells = reference._hfr_cells({
+        "hfr_local_mohm_cm2": "nan", "hfr_ref_mohm_cm2": "nan",
+        "hfr_rel_pct": "nan",
+        "hfr_local_fit_mohm_cm2": "59.90", "hfr_ref_fit_mohm_cm2": "57.05",
+        "hfr_fit_rel_pct": "5.0"})
+    assert cells == {"HFR local": "~59.90", "HFR ref": "~57.05",
+                     "ΔHFR [%]": "~5.0"}
 
 
 def test_a_measured_hfr_is_never_overwritten_by_the_extrapolation():
-    row = {"hfr_local_mohm_cm2": "62.26", "hfr_local_fit_mohm_cm2": "59.90"}
-    assert reference._hfr(row, "hfr_local_mohm_cm2") == "62.26"
+    cells = reference._hfr_cells({
+        "hfr_local_mohm_cm2": "62.26", "hfr_ref_mohm_cm2": "59.30",
+        "hfr_rel_pct": "5.0",
+        "hfr_local_fit_mohm_cm2": "59.90", "hfr_ref_fit_mohm_cm2": "57.05",
+        "hfr_fit_rel_pct": "4.9"})
+    assert cells == {"HFR local": "62.26", "HFR ref": "59.30",
+                     "ΔHFR [%]": "5.0"}
+
+
+def test_a_measured_reference_is_not_compared_against_an_extrapolation():
+    """Only the local side lacks an intercept -- the campaign's 45 A case.
+
+    Printing the reference's measured 71.53 beside the local extrapolation
+    would charge the extrapolation's bias to the local side and read as a real
+    disagreement, so the row switches to the like-for-like pair together.
+    """
+    cells = reference._hfr_cells({
+        "hfr_local_mohm_cm2": "nan", "hfr_ref_mohm_cm2": "71.53",
+        "hfr_rel_pct": "nan",
+        "hfr_local_fit_mohm_cm2": "68.40", "hfr_ref_fit_mohm_cm2": "69.10",
+        "hfr_fit_rel_pct": "-1.0"})
+    assert cells["HFR ref"] == "~69.10", "not the measured 71.53"
+    assert cells["HFR local"] == "~68.40"
+    assert cells["ΔHFR [%]"] == "~-1.0"
 
 
 def test_a_comparison_csv_without_the_fit_columns_still_renders():
     """Results written before the fallback existed have no such column."""
-    assert reference._hfr({"hfr_ref_mohm_cm2": "nan"}, "hfr_ref_mohm_cm2") == "—"
+    cells = reference._hfr_cells({"hfr_local_mohm_cm2": "nan",
+                                  "hfr_ref_mohm_cm2": "nan",
+                                  "hfr_rel_pct": "nan"})
+    assert set(cells.values()) == {"—"}

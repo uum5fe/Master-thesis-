@@ -306,9 +306,7 @@ def render(selection):
         "condition": r["condition"],
         "points": r["n_points"],
         "band [Hz]": f"{float(r['f_lo_hz']):.3g} – {float(r['f_hi_hz']):.4g}",
-        "HFR local": _hfr(r, "hfr_local_mohm_cm2"),
-        "HFR ref": _hfr(r, "hfr_ref_mohm_cm2"),
-        "ΔHFR [%]": _hfr(r, "hfr_rel_pct", 1),
+        **_hfr_cells(r),
         "Δ|Z| [%]": _fmt(r["mag_rel_median_pct"], 1),
         "rms [%]": _fmt(r["rms_rel_pct"], 1),
         "max Δφ [°]": _fmt(r["phase_diff_max_deg"], 2),
@@ -326,24 +324,35 @@ def register(app):
     def _show(selection):
         return render(selection)
 
-def _hfr(row: dict, key: str, digits: int = 2) -> str:
-    """The measured intercept, or the extrapolated one marked with a tilde.
+def _hfr_cells(row: dict) -> dict:
+    """The three HFR columns, decided together rather than one at a time.
 
-    Several of the delivered Gamry sweeps stop at 1.2-3.0 kHz, below where the
-    cell crosses the real axis, so no intercept exists on EITHER side and the
-    measured columns are empty for the whole campaign.  The pipeline then also
-    writes an extrapolation of the top of the band; showing it is better than
-    showing a dash, but showing it as if it were measured would be a lie, so it
-    carries a tilde and the note under the table says what it is.  Old
-    comparison CSVs have no such column, hence the .get().
+    Some delivered Gamry sweeps stop at 1.2-3.0 kHz, below where the cell
+    crosses the real axis, so one side or both has no measured intercept and
+    the pipeline also writes an extrapolation of the top of the band.  Showing
+    that is better than three dashes, but it has to be marked, hence the tilde.
+
+    The whole row switches together, and that is the point: when only the
+    local side is missing, mixing its extrapolation against the reference's
+    MEASURED intercept would charge the extrapolation's bias entirely to the
+    local side and read as a real disagreement.  The pipeline's ΔHFR fallback
+    extrapolates both sides over the same band, so the two values shown beside
+    it must be the same two it divided.  Old comparison CSVs have no fit
+    column at all, so this falls back to dashes -- hence the .get().
     """
-    text = _fmt(row.get(key), digits)
-    if text != "—":
-        return text
-    fit_key = key.replace("_mohm_cm2", "_fit_mohm_cm2") \
-                 .replace("_rel_pct", "_fit_rel_pct")
-    fit = _fmt(row.get(fit_key), digits)
-    return f"~{fit}" if fit != "—" else "—"
+    measured = (_fmt(row.get("hfr_local_mohm_cm2")),
+                _fmt(row.get("hfr_ref_mohm_cm2")),
+                _fmt(row.get("hfr_rel_pct"), 1))
+    if "—" not in measured:
+        local, ref, rel = measured
+    else:
+        def fit(key, digits=2):
+            text = _fmt(row.get(key), digits)
+            return f"~{text}" if text != "—" else "—"
+        local = fit("hfr_local_fit_mohm_cm2")
+        ref = fit("hfr_ref_fit_mohm_cm2")
+        rel = fit("hfr_fit_rel_pct", 1)
+    return {"HFR local": local, "HFR ref": ref, "ΔHFR [%]": rel}
 
 
 def _fmt(value: str, digits: int = 2) -> str:

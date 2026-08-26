@@ -182,16 +182,25 @@ def test_a_condition_with_only_one_half_is_skipped_not_guessed(tmp_path):
     } for f, z in zip(freq, cell_asr(freq))])
 
     said: list[str] = []
+    noted: list[str] = []
 
     class _Log:
-        def info(self, m, *a, **k): pass
+        def info(self, m, *a, **k): noted.append(str(m))
         def warning(self, m, *a, **k): said.append(str(m))
 
     out = GC.run(tmp_path / "res", tmp_path, A_CELL,
                  out_dir=tmp_path / "res", log=_Log())
     assert out == []
+
+    # A local result with no sweep is a gap: something was evaluated and
+    # cannot be checked.  That warns.
     assert any("450A" in m and "no whole-cell sweep" in m for m in said)
-    assert any("60A" in m and "no local result" in m for m in said)
+
+    # A sweep with no local result is the ordinary case -- one run evaluates
+    # one condition while the campaign folder holds every sweep -- so it is
+    # still reported, but not as an alarm.
+    assert any("60A" in m for m in noted)
+    assert not any("60A" in m for m in said)
 
 
 def test_per_segment_chain_files_are_not_read_as_cell_references(tmp_path):
@@ -262,3 +271,38 @@ def test_a_common_scale_error_survives_the_extrapolation(tmp_path):
 
     c = GC.compare(freq, 1.05 * cell_asr(freq), sweep, A_CELL)
     assert c.hfr_fit_rel == pytest.approx(0.05, abs=0.005)
+
+
+# ---------------------------------------------------------------------------
+# "I installed it and it still says not installed"
+# ---------------------------------------------------------------------------
+
+def test_the_asammdf_advice_names_the_interpreter_on_its_own_line():
+    """The old message buried the path mid-sentence, where the console cut it.
+
+    The user's terminal showed `... To have it: "C:\\Use` and stopped, so the
+    one piece of information that resolves the problem -- WHICH python -- was
+    the piece that got truncated.
+    """
+    import sys
+    lines = GC._asammdf_advice(ImportError("No module named 'asammdf'"))
+    assert any(line.strip().startswith("interpreter:") and sys.executable
+               in line for line in lines)
+    assert any(sys.executable in line and "pip install asammdf" in line
+               for line in lines)
+    assert any("first on PATH" in line for line in lines), (
+        "must say why a successful `pip install` can leave it missing")
+
+
+def test_a_broken_asammdf_is_not_reported_as_a_missing_one():
+    """asammdf built against another numpy raises ImportError too.
+
+    Telling someone to install what they already installed sends them round
+    the same loop, so the two cases have to read differently.
+    """
+    exc = ImportError("numpy.core.multiarray failed to import")
+    exc.name = "numpy.core.multiarray"
+    lines = GC._asammdf_advice(exc)
+    assert "not installed" not in " ".join(lines)
+    assert any("cannot import" in line for line in lines)
+    assert any("force-reinstall" in line for line in lines)

@@ -297,6 +297,7 @@ def run_pipeline(cfg: Config, stop_after: str = "gold") -> dict:
     # Last, because it needs the aggregate silver has just written, and
     # non-fatal, because a missing or unreadable reference must not throw away
     # a run that is otherwise complete.
+    reference_asr = None
     if cfg.gamry_dir:
         utils.banner("WHOLE-CELL REFERENCE  --  local aggregate vs Gamry", log)
         try:
@@ -307,11 +308,29 @@ def run_pipeline(cfg: Config, stop_after: str = "gold") -> dict:
                 chain_applied=cfg.gain_file is not None,
                 only=cfg.condition, order_id=cfg.leepa, log=log)
             manifest["stages"]["gamry"] = [c.summary() for c in comps]
+            if comps and comps[0].freq.size:
+                # the reference arm of the plausibility aggregate check, in
+                # the same ohm.cm2 the local side already uses
+                reference_asr = (comps[0].freq, comps[0].Z_ref)
             if cfg.write_png and comps:
                 gamry_compare.plot(
                     comps, Path(cfg.out_dir) / "gamry_comparison.png")
         except Exception as exc:                            # noqa: BLE001
             log.warning(f"  whole-cell comparison skipped: {exc}")
+
+    # ---- does the finished plate hold together as physics? ----------------
+    # After gold, because it judges the assembled map rather than any single
+    # point, and non-fatal for the same reason the cross-check is: a
+    # diagnostic that can end a run is a liability, not a safeguard.
+    try:
+        import plausibility
+        rep = plausibility.check_run(
+            sr, cfg, plate_key=cfg.plate, reference=reference_asr)
+        plausibility.report(rep, log)
+        plausibility.save(rep, cfg.out_dir)
+        manifest["stages"]["plausibility"] = rep.rows()
+    except Exception as exc:                                # noqa: BLE001
+        log.warning(f"  plausibility checks skipped: {exc}")
 
     dt = time.time() - t0
     utils.banner("DONE", log)

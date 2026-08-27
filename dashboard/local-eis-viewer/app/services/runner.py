@@ -80,16 +80,21 @@ def preflight(ref: RunRef, settings: Settings = SETTINGS) -> list[str]:
     # does need it, and csv_pipeline raises with that exact explanation, which
     # is a better message than anything guessable from here without reading
     # the file.
-    if not settings.curr_cal:
-        if ref.kind != "csvlog":
+    if ref.kind != "csvlog":
+        if not settings.curr_cal:
             problems.append(
                 "EIS_CURR_CAL is not set. The per-segment shunt calibration is "
                 "the only absolute scale in the chain once the potentiostat is "
                 "gone; without it the impedances come out in shunt volts per "
                 "amp rather than in ohms, and every map is wrong by an unknown "
                 "factor.")
-    elif not Path(settings.curr_cal).exists():
-        problems.append(f"shunt calibration not found: {settings.curr_cal}")
+        elif not Path(settings.curr_cal).exists():
+            problems.append(f"shunt calibration not found: {settings.curr_cal}")
+    # For a CSV run the calibration is irrelevant either way -- unset, missing,
+    # or on a share that is not reachable right now. Blocking on a file the
+    # run will not open refuses a run that would have succeeded, and the
+    # "set but not found" branch did exactly that even after the "unset"
+    # branch was excused.
 
     if not settings.allow_inline_pipeline:
         problems.append(
@@ -143,7 +148,13 @@ def build_command(ref: RunRef, out: Path, settings: Settings = SETTINGS,
         "--out", str(out),
         "--stop-after", stop_after,
     ]
-    if settings.curr_cal:
+    # FAMOS always carries the flag when one is configured, even if the file
+    # is missing: it is mandatory there, and main.py naming the unreadable
+    # path beats this quietly dropping the argument. A CSV run only carries
+    # one that actually exists, because the reader ignores it either way (the
+    # logger already applied its coefficients) and a dead path is pure noise.
+    if settings.curr_cal and (ref.kind != "csvlog"
+                              or Path(settings.curr_cal).exists()):
         argv += ["--curr-cal", str(settings.curr_cal)]
     # THE PLATE. This used to be dropped: run_famos took a geometry and never
     # passed it on, so every run evaluated whatever the pipeline defaulted to
@@ -168,11 +179,16 @@ def build_command(ref: RunRef, out: Path, settings: Settings = SETTINGS,
     return argv
 
 
-def run_famos(progress, ref: RunRef, geom: PlateGeometry | None = None,
-              settings: Settings = SETTINGS, equal_areas: bool = False,
-              no_png: bool = False, stop_after: str = "gold",
-              log_lines: list[str] | None = None) -> str:
-    """Process one condition. Signature matches :class:`~app.services.store.JobTable`."""
+def run_pipeline(progress, ref: RunRef, geom: PlateGeometry | None = None,
+                 settings: Settings = SETTINGS, equal_areas: bool = False,
+                 no_png: bool = False, stop_after: str = "gold",
+                 log_lines: list[str] | None = None) -> str:
+    """Process one condition, whatever kind of recording it is.
+
+    build_command dispatches FAMOS vs CSV, so nothing here is format-specific
+    -- which is why the old name `run_famos` was a lie once the CSV path
+    existed. It stays as an alias so no caller breaks.
+    """
     problems = preflight(ref, settings)
     if problems:
         raise PipelineUnavailable("; ".join(problems))
@@ -217,6 +233,10 @@ def run_famos(progress, ref: RunRef, geom: PlateGeometry | None = None,
     progress(len(STAGES), len(STAGES), f"results written to {out}")
     return str(out)
 
+
+
+#: The name this had before the CSV path existed.
+run_famos = run_pipeline
 
 def self_test(settings: Settings = SETTINGS) -> tuple[bool, str]:
     """Run the pipeline's own synthetic checks; needs no measurement data."""

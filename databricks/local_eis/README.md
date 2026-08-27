@@ -18,6 +18,7 @@ Full write-up of the gen2 plate and the CSV path:
 | `eis_local.py` `utils.py` `eis_measurement_model.py` `eis_validation.py` | shared estimators, KK, measurement model |
 | `csv_source.py` | CSV reader, seven layouts incl. the R2-D2 logger, dialect auto-detection |
 | `csv_pipeline.py` | the CSV evaluation path |
+| `famos_segments.py` | the real segment number of every FAMOS channel; writes a relabelled copy |
 | `gamry_dta.py` | Gamry `.DTA` reader; builds the chain-response gain file |
 | `abgleich.py` | reads the raw `Step*_<T>Grad.csv` bench files; refits and verifies `curr.csv`/`temp.csv` |
 | `test_csv_pipeline.py` | end-to-end synthetic checks for the CSV path |
@@ -69,6 +70,42 @@ Nyquist. On the delivered `p1.csv` the record shows 923 Hz at fs = 11 001 Hz
 while the scan says ~10 kHz: that point is an alias. Pass the sweep's own
 frequency list in `cfg.csv_tones` (file order) to replace the inference with a
 cross-check.
+
+## FAMOS channels are named after the card slot, not the segment
+
+A DASYLab card that records segments 64..79 writes its channels out as
+`"0", "1", ... "15"` — the slot on the card, not the segment on the plate. The
+samples are fine; only the labels are wrong, which is the dangerous kind of
+wrong: a spectrum filed under segment 3 that belongs to segment 67 looks like
+a perfectly good measurement.
+
+`famos_segments.py` reads the real channel table out of the FAMOS keys and
+puts the segment numbers back:
+
+```bash
+# what belongs to what -- the range is read from the "KANAL_6479" in the name
+python famos_segments.py map 2026_08_27_KANAL_6479RO2612025_60A.DDF_1.DAT --stats
+
+# say the range yourself when the name does not carry it
+python famos_segments.py map FILE --segments 64-79 --csv map.csv
+
+# a corrected copy, so the rest of the pipeline reads the right names
+python famos_segments.py relabel FILE --out corrected.DAT
+```
+
+The pairing is positional and ascending — first channel in the header (lowest
+byte offset in the frame) to lowest segment — and `--reverse` flips it. If the
+range does not hold exactly as many segments as the file has channels, it
+refuses to map rather than pairing the two lists off as far as they go.
+
+`relabel` rewrites only the `|CN` name keys and copies every sample byte
+through untouched, so the output is the same measurement under the right
+names, and the input is never modified. The names come out as bare digits,
+which is what `eis_local.FamosFile.segment_names` recognises.
+
+Note that these 16-channel cards are float64 with the channel names in `|CN`
+keys, while `eis_local.FamosFile` expects the gen1 dialect — float32 with the
+names in `|CP`. Use `famos_segments.read_header` for the former.
 
 ## Quick checks
 

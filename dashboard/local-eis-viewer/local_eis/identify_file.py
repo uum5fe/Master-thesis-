@@ -58,10 +58,11 @@ SIGNATURES: list[tuple[bytes, int, str, str]] = [
 #: Extensions that are claimed by more than one product. Named so the report
 #: can say WHY the bytes matter rather than just showing them.
 AMBIGUOUS = {
-    ".ddf": ("at least three unrelated products write .ddf: DEWETRON's older "
-             "DEWE-x data files, a plain-text key/value format of the same "
-             "name, and several in-house bench formats. The bytes below "
-             "settle which"),
+    ".ddf": ("DASYLab measurement data, most likely -- also written by "
+             "DEWETRON's older DEWE-x tools and by an unrelated plain-text "
+             "key/value format of the same name. For DASYLab, run "
+             "`python ddf_source.py probe <file>`, which works out the "
+             "layout and says how confident it is"),
     ".dat": ("imc FAMOS, and a great many loggers that simply meant 'data'"),
     ".dsd": ("Dewesoft's own sequential data format"),
     ".dmd": ("DEWETRON Oxygen -- read with pyDmdReader"),

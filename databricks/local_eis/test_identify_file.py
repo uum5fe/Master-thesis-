@@ -20,7 +20,8 @@ def test_an_ambiguous_extension_is_called_out(tmp_path):
     f = tmp_path / "bench.ddf"
     f.write_bytes(bytes(range(256)))
     text = "\n".join(I.identify(f))
-    assert "at least three unrelated products" in text
+    assert "DASYLab" in text, "name the likely product, not just the ambiguity"
+    assert "ddf_source.py probe" in text, "and point at the tool for it"
     assert "BINARY, no known signature" in text
 
 

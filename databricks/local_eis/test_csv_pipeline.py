@@ -31,6 +31,7 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 import csv_pipeline
 import csv_source
@@ -536,3 +537,114 @@ def _median_sigma(out_dir: Path) -> float:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+def test_the_campaign_parent_is_refused_by_naming_its_sweeps(tmp_path):
+    """`csv_files/` is not a sweep -- it is the folder of sweeps.
+
+    The reader globs one level, so a parent used to fail with "no .csv and
+    no .DTA files", which is true of that directory and useless to the reader:
+    there are dozens of point files one level down. The error now names the
+    sweep folders so the message doubles as the menu.
+    """
+    import csv_source
+
+    campaign = tmp_path / "csv_files"
+    for cond in ("Spectrum10_65degC_450A", "Spectrum11_65degC_150A"):
+        d = campaign / cond
+        d.mkdir(parents=True)
+        (d / "p1.csv").write_text(
+            "timestamp\ts1\ts2\ntimeshifts\t0.0\t1.1\n"
+            "2026.04.20 10:21:11,792662\t1.9\t2.0\n")
+
+    with pytest.raises(ValueError) as exc:
+        csv_source.detect_dialect(campaign)
+
+    message = str(exc.value)
+    assert "campaign folder" in message
+    assert "Spectrum10_65degC_450A" in message
+    assert "Spectrum11_65degC_150A" in message
+    assert "2 sweep folder(s)" in message
+
+
+def test_a_genuinely_empty_folder_still_says_so(tmp_path):
+    """The new message must not swallow the real 'there is nothing here'."""
+    empty = tmp_path / "nothing"
+    empty.mkdir()
+    with pytest.raises(ValueError, match="no .csv and no .DTA files"):
+        csv_source.detect_dialect(empty)
+
+
+def test_the_csv_path_writes_where_the_viewer_looks(tmp_path):
+    """Same products means the same PATHS, not just the same numbers.
+
+    This module's docstring promises "the same products as
+    bronze/silver/gold". It produced them into `csv/`, where nothing looks:
+    the viewer decides a folder is a result by finding
+    silver/spectra_clean.csv or gold/plate_summary.csv, so a CSV run wrote
+    every number correctly and was then invisible -- the campaign never
+    appeared under the results source at all.
+    """
+    import csv_pipeline
+    from config import DEFAULT
+
+    sweep = tmp_path / "Spectrum10_65degC_450A"
+    sweep.mkdir()
+    src = Path(__file__).resolve().parent / "fixtures" / "r2d2_sample"
+    for f in src.glob("*.csv"):
+        (sweep / f.name).write_bytes(f.read_bytes())
+
+    out = tmp_path / "out"
+    cfg = DEFAULT.replace(source_format="csv", csv_path=sweep, out_dir=out,
+                          plate="gen2", write_png=False, verbose=False)
+    csv_pipeline.run_csv(cfg, stop_after="gold")
+
+    assert (out / "silver" / "spectra_clean.csv").is_file()
+    assert (out / "gold" / "plate_summary.csv").is_file()
+    assert (out / "silver" / "cell_aggregate.csv").is_file()
+    # the original layout is kept: something outside this repo may read it
+    assert (out / "csv" / "spectra_clean.csv").is_file()
+
+
+def test_the_two_layouts_hold_the_same_spectra(tmp_path):
+    """Writing twice must not mean writing two different things."""
+    import csv_pipeline
+    from config import DEFAULT
+
+    sweep = tmp_path / "sweep"
+    sweep.mkdir()
+    src = Path(__file__).resolve().parent / "fixtures" / "r2d2_sample"
+    for f in src.glob("*.csv"):
+        (sweep / f.name).write_bytes(f.read_bytes())
+
+    out = tmp_path / "out"
+    cfg = DEFAULT.replace(source_format="csv", csv_path=sweep, out_dir=out,
+                          plate="gen2", write_png=False, verbose=False)
+    csv_pipeline.run_csv(cfg, stop_after="gold")
+
+    assert ((out / "csv" / "spectra_clean.csv").read_text()
+            == (out / "silver" / "spectra_clean.csv").read_text())
+
+
+def test_the_plate_summary_carries_one_row_per_measured_segment(tmp_path):
+    """gold/plate_summary.csv is what every heat map reads."""
+    import csv
+    import csv_pipeline
+    from config import DEFAULT
+
+    sweep = tmp_path / "sweep"
+    sweep.mkdir()
+    src = Path(__file__).resolve().parent / "fixtures" / "r2d2_sample"
+    for f in src.glob("*.csv"):
+        (sweep / f.name).write_bytes(f.read_bytes())
+
+    out = tmp_path / "out"
+    cfg = DEFAULT.replace(source_format="csv", csv_path=sweep, out_dir=out,
+                          plate="gen2", write_png=False, verbose=False)
+    csv_pipeline.run_csv(cfg, stop_after="gold")
+
+    with (out / "gold" / "plate_summary.csv").open(newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    assert len(rows) == 72
+    assert {"segment", "area_cm2", "R_ohmic", "j_dc", "measured"} <= set(rows[0])
+    assert all(r["measured"] == "1" for r in rows)

@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-r"""Process raw FAMOS recordings into results the dashboard can read.
+r"""Process raw recordings -- FAMOS cards or R2-D2 CSV sweeps -- into results
+the dashboard can read.
 
     python run_evaluation.py --list                 # what recordings are there?
-    python run_evaluation.py --all                  # process every condition
+    python run_evaluation.py --all                  # process everything found
     python run_evaluation.py --condition 45A        # just one
+    python run_evaluation.py --source csv --all     # only the CSV sweeps
     python run_evaluation.py --self-test            # check the install, no data
 
 This is the bronze/silver/gold pipeline from ``local_eis/`` - the same code
@@ -11,14 +13,26 @@ that ran on Databricks - driven from the paths in ``.env``.  Output lands
 directly in ``<EIS_RESULTS_ROOT>\<order id>\<condition>``, which is where the
 dashboard looks, so there is no copying step afterwards.
 
+Both recording formats are found and processed the same way; the reader is
+chosen per recording, so a mixed campaign needs no flags.  A FAMOS condition
+is a folder of ``.DAT`` cards; a CSV condition is one sweep folder of point
+files, and the campaign folder holding several of those is what goes in
+``.env``.
+
 Paths are never given here.  Put them in ``.env`` once:
 
     EIS_FAMOS_ROOT=C:\Users\me\OneDrive - Bosch Group\Local_Eis\2611976_16_07
+    EIS_CSV_ROOT=C:\Users\me\OneDrive - Bosch Group\Local_Eis\csv_files
     EIS_RESULTS_ROOT=C:\Users\me\OneDrive - Bosch Group\Local_Eis\results
     EIS_CURR_CAL=C:\Users\me\OneDrive - Bosch Group\Local_Eis\cal\curr.csv
     EIS_TEMP_CAL=C:\Users\me\OneDrive - Bosch Group\Local_Eis\cal\temp.csv
 
-Expect minutes per condition: bronze reads every sample of every card.
+Either root alone is enough.  EIS_CURR_CAL is needed for FAMOS, which has no
+other absolute scale; the R2-D2 CSV logger applies its own coefficients before
+writing, so a CSV-only setup does not need it.
+
+Expect minutes per FAMOS condition: bronze reads every sample of every card.
+CSV sweeps are far quicker -- the logger already reduced them.
 """
 
 from __future__ import annotations
@@ -39,6 +53,11 @@ def main(argv=None) -> int:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--famos", metavar="DIR", help="override EIS_FAMOS_ROOT")
+    p.add_argument("--csv", metavar="DIR", help="override EIS_CSV_ROOT: the "
+                   "CAMPAIGN folder holding one sub-folder per sweep, not a "
+                   "single sweep")
+    p.add_argument("--source", choices=["auto", "famos", "csv"], default="auto",
+                   help="which recordings to consider (default: both)")
     p.add_argument("--out", metavar="DIR", help="override EIS_RESULTS_ROOT")
     p.add_argument("--curr-cal", metavar="CSV", help="override EIS_CURR_CAL")
     p.add_argument("--temp-cal", metavar="CSV", help="override EIS_TEMP_CAL")
@@ -81,14 +100,16 @@ def main(argv=None) -> int:
                    help="print the command that would run, and stop")
     a = p.parse_args(argv)
 
-    for value, name in ((a.famos, "EIS_FAMOS_ROOT"), (a.out, "EIS_RESULTS_ROOT"),
+    for value, name in ((a.famos, "EIS_FAMOS_ROOT"), (a.csv, "EIS_CSV_ROOT"),
+                        (a.out, "EIS_RESULTS_ROOT"),
                         (a.curr_cal, "EIS_CURR_CAL"), (a.temp_cal, "EIS_TEMP_CAL"),
                         (a.gamry, "EIS_GAMRY_ROOT")):
         if value:
             os.environ[name] = str(Path(value).expanduser())
     os.environ.setdefault("EIS_ALLOW_INLINE_PIPELINE", "1")
 
-    from app.data.sources import FamosSource, _condition_sort_key
+    from app.data.sources import (CsvLoggerSource, FamosSource,
+                                  _condition_sort_key)
     from app.services import runner, staging
     from app.settings import SETTINGS
 
@@ -98,15 +119,22 @@ def main(argv=None) -> int:
         print("PASS" if ok else "FAIL")
         return 0 if ok else 1
 
-    if not SETTINGS.famos_roots:
+    want_famos = a.source in ("auto", "famos")
+    want_csv = a.source in ("auto", "csv")
+    have_famos = bool(SETTINGS.famos_roots) and want_famos
+    have_csv = bool(SETTINGS.csv_roots) and want_csv
+
+    if not (have_famos or have_csv):
         from app.settings import DOTENV_LOADED
         env_path = ROOT / ".env"
-        print("error: EIS_FAMOS_ROOT is not set.\n", file=sys.stderr)
+        needed = {"famos": "EIS_FAMOS_ROOT", "csv": "EIS_CSV_ROOT"}.get(
+            a.source, "EIS_FAMOS_ROOT or EIS_CSV_ROOT")
+        print(f"error: {needed} is not set.\n", file=sys.stderr)
         if DOTENV_LOADED:
-            print(f"  {DOTENV_LOADED} was read, but it does not set "
-                  f"EIS_FAMOS_ROOT.\n"
-                  f"  Add a line to it:\n"
-                  f"      EIS_FAMOS_ROOT=<folder holding the .DAT files>",
+            print(f"  {DOTENV_LOADED} was read, but it does not set it.\n"
+                  f"  Add whichever applies:\n"
+                  f"      EIS_FAMOS_ROOT=<folder holding the .DAT cards>\n"
+                  f"      EIS_CSV_ROOT=<campaign folder of R2-D2 sweep folders>",
                   file=sys.stderr)
         else:
             print(f"  There is no settings file yet. Create one:\n"
@@ -114,7 +142,8 @@ def main(argv=None) -> int:
                   f"  It will be written to:\n"
                   f"      {env_path}", file=sys.stderr)
         print("\n  Or pass the folder directly, just this once:\n"
-              '      python run_evaluation.py --famos "<folder>" --list',
+              '      python run_evaluation.py --famos "<folder>" --list\n'
+              '      python run_evaluation.py --csv "<folder>" --list',
               file=sys.stderr)
         return 2
 
@@ -125,20 +154,31 @@ def main(argv=None) -> int:
     if not geom.verified:
         print("  NOTE: this layout is unverified — its areas are provisional")
 
-    refs = FamosSource(SETTINGS.famos_roots, SETTINGS.famos_glob).scan()
+    refs = []
+    searched = []
+    if have_famos:
+        refs += FamosSource(SETTINGS.famos_roots, SETTINGS.famos_glob).scan()
+        searched += list(SETTINGS.famos_roots)
+    if have_csv:
+        refs += CsvLoggerSource(SETTINGS.resolved_csv_roots()).scan()
+        searched += [str(r) for r in SETTINGS.resolved_csv_roots()]
+
     if a.leepa:
         refs = [r for r in refs if r.measurement_id == a.leepa]
-    refs.sort(key=lambda r: (r.measurement_id, _condition_sort_key(r.condition)))
+    refs.sort(key=lambda r: (r.kind, r.measurement_id,
+                             _condition_sort_key(r.condition)))
 
     if not refs:
-        print(f"no recordings found under {', '.join(SETTINGS.famos_roots)}")
+        print(f"no recordings found under {', '.join(dict.fromkeys(searched))}")
         print("run `python run_dashboard.py --check` to see why")
         return 1
 
     print(f"\nfound {len(refs)} condition(s):")
+    width = max((len(r.condition) for r in refs), default=8)
     for ref in refs:
-        print(f"  {ref.measurement_id} / {ref.condition:<8} "
-              f"{len(ref.files)} card file(s)  ->  "
+        what = ("card file(s)" if ref.kind == "famos" else "CSV point file(s)")
+        print(f"  [{ref.kind:<6}] {ref.measurement_id} / "
+              f"{ref.condition:<{width}}  {len(ref.files)} {what}  ->  "
               f"{runner.output_dir(ref, SETTINGS)}")
     if a.list:
         return 0
@@ -210,7 +250,7 @@ def main(argv=None) -> int:
                 source = staging.stage(
                     ref, SETTINGS.stage_dir or None,
                     lambda done, total, message="": print(f"    {message}"))
-            runner.run_famos(
+            runner.run_pipeline(
                 lambda done, total, message="": print(f"  {message}"),
                 source, geom=geom, settings=SETTINGS,
                 equal_areas=a.equal_areas,

@@ -427,6 +427,22 @@ def detect_dialect(path) -> str:
             return "gamry"
         cands = r2d2_point_files(p)
         if not cands:
+            # A CAMPAIGN PARENT, not a sweep. `csv_files/` holds one folder
+            # per operating point and no point files of its own, so the bare
+            # "no .csv files" is both true and useless -- there are dozens,
+            # one level down. Naming them turns a dead end into a menu.
+            nested = sorted(d for d in p.iterdir()
+                            if d.is_dir() and r2d2_point_files(d)) \
+                if p.is_dir() else []
+            if nested:
+                listed = "\n  ".join(str(d) for d in nested[:12])
+                more = (f"\n  ... and {len(nested) - 12} more"
+                        if len(nested) > 12 else "")
+                raise ValueError(
+                    f"{p} holds no point files itself -- it is the campaign "
+                    f"folder, and a sweep is one operating point. Point --csv "
+                    f"at one of the {len(nested)} sweep folder(s) inside "
+                    f"it:\n  {listed}{more}")
             raise ValueError(f"{p}: no .csv and no .DTA files")
         # A folder of R2-D2 point files is one sweep, not several unrelated
         # measurements: each file holds a single frequency and the spectrum

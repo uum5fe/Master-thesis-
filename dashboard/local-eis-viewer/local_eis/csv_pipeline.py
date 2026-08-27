@@ -1215,7 +1215,21 @@ def write_outputs(spectra, ecm, agg, cfg, log, extra: dict) -> dict:
     import r2d2_geometry as geom
 
     out = Path(cfg.out_dir)
+    # THE SAME LAYOUT THE FAMOS PATH WRITES, not a parallel one.
+    #
+    # This module's own docstring promises "the same products as
+    # bronze/silver/gold", and it did produce them -- into `csv/`, where
+    # nothing looks for them. The viewer decides a folder is a result by
+    # finding `silver/spectra_clean.csv` or `gold/plate_summary.csv` (see
+    # app/data/loaders.py detect_layout), so a CSV run completed, wrote every
+    # number correctly, and was then invisible: the campaign never appeared
+    # in the results source at all. Same products means the same paths.
+    #
+    # `csv/` is still written, because it is what this path has always
+    # written and something outside this repo may read it.
     (out / "csv").mkdir(parents=True, exist_ok=True)
+    (out / "silver").mkdir(parents=True, exist_ok=True)
+    (out / "gold").mkdir(parents=True, exist_ok=True)
     areas = utils.segment_areas(cfg)
 
     rows = []
@@ -1231,6 +1245,7 @@ def write_outputs(spectra, ecm, agg, cfg, log, extra: dict) -> dict:
                 "flags": ";".join(sp.flags),
             })
     utils.write_table(out / "csv" / "spectra_clean.csv", rows)
+    utils.write_table(out / "silver" / "spectra_clean.csv", rows)
 
     erows = []
     for seg in sorted(ecm, key=int):
@@ -1253,11 +1268,42 @@ def write_outputs(spectra, ecm, agg, cfg, log, extra: dict) -> dict:
         erows.append(d)
     utils.write_table(out / "csv" / "ecm_parameters.csv", erows)
 
+    # gold/plate_summary.csv is the per-segment scalar table every map on the
+    # plate-map and coverage tabs reads. The FAMOS path builds it in gold.py;
+    # here the same quantities come straight off the ECM fit, so it is
+    # assembled rather than recomputed. Units match gold's: ohm.cm2, not
+    # mohm.cm2, because that is what the reader expects to divide by.
+    summary = []
+    for seg in sorted(spectra, key=int):
+        r = ecm.get(seg, {})
+        ok = bool(r.get("ok"))
+        sp = spectra[seg]
+        summary.append({
+            "segment": int(seg),
+            "area_cm2": areas.get(seg, float("nan")),
+            "R_ohmic": r["R_ohmic"] if ok else float("nan"),
+            "R_ct": r["R_ct"] if ok else float("nan"),
+            "R_mt": r["R_mt"] if ok else float("nan"),
+            "R_pol": r["R_pol"] if ok else float("nan"),
+            "tau_peak": r["tau_peak"] if ok else float("nan"),
+            "chi2_nu": r.get("chi2_nu", float("nan")),
+            "j_dc": getattr(sp, "j_dc", float("nan")),
+            "T_C": sp.T_C,
+            "n_points": len(sp.freq),
+            "measured": 1,
+            "inferred": 0,
+            "tier": r.get("verdict", "") if ok else "",
+            "flags": ";".join(sp.flags),
+        })
+    utils.write_table(out / "gold" / "plate_summary.csv", summary)
+
     if agg[0].size:
-        utils.write_table(out / "csv" / "cell_aggregate.csv", [
-            {"freq_hz": f, "z_re_mohm_cm2": 1000 * Z.real,
-             "z_im_mohm_cm2": 1000 * Z.imag}
-            for f, Z in zip(agg[0], agg[1])])
+        cell_rows = [{"freq_hz": f, "z_re_mohm_cm2": 1000 * Z.real,
+                      "z_im_mohm_cm2": 1000 * Z.imag}
+                     for f, Z in zip(agg[0], agg[1])]
+        utils.write_table(out / "csv" / "cell_aggregate.csv", cell_rows)
+        # Also where the whole-cell check and the viewer look for it.
+        utils.write_table(out / "silver" / "cell_aggregate.csv", cell_rows)
 
     maps = {}
     if cfg.write_png:

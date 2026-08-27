@@ -39,6 +39,10 @@ python famos_rename.py apply KANAL_6479.DAT --names names.csv --out renamed.DAT
 # 4. renamed.DAT is an ordinary FAMOS file -- use it for the EIS evaluation
 ```
 
+For a second file, change the path in the command — see *Doing this for
+several files* below, or edit `run_rename.py` if you would rather not type
+commands at all.
+
 `names.csv` after step 2, with the third column yours to change:
 
 ```csv
@@ -62,6 +66,58 @@ python famos_rename.py apply FILE --names UC1,64,65,temp1 --out renamed.DAT
 `UC1`, `temp1`, `seg_67`, whatever your evaluation expects.
 
 Add `--dry-run` to see the table it would write and write nothing.
+
+## Doing this for several files
+
+Each file gets its own names, so there are two ways to say which is which.
+
+**On the command line, the path is an argument** — nothing inside the script
+is edited. Run it once per file:
+
+```bash
+python famos_rename.py apply "KANAL_6479.DAT" --names 64-79
+python famos_rename.py apply "KANAL_8095.DAT" --names 80-95
+```
+
+`--out` is optional: the copy lands beside the original as
+`KANAL_6479_renamed.DAT`. The input is never written over.
+
+**Or edit `run_rename.py` and press Run**, if that suits you better. One
+block at the top holds every path and its names:
+
+```python
+FILES = {
+
+    r"C:\EIS_data\2026_08_27_KANAL_6479RO2612025_60A.DDF_1.DAT":
+        "64-79",
+
+    r"C:\EIS_data\2026_08_27_KANAL_8095RO2612025_60A.DDF_1.DAT":
+        "80-95",
+
+    r"C:\EIS_data\2026_08_27_KANAL_4863RO2612025_60A.DDF_1.DAT":
+        ["UC1", "49", "50", "51", "52", "53", "54", "55",
+         "56", "57", "58", "59", "60", "61", "62", "63"],
+}
+
+OUT_DIR = None        # None puts each copy beside its original
+SUFFIX  = "_renamed"
+DRY_RUN = False       # True shows what would happen and writes nothing
+```
+
+Then `python run_rename.py`. It does them one after another and prints the
+old and new name of every channel; a file that fails is reported and the
+rest still run. Set `DRY_RUN = True` once first to read the table before
+anything is written.
+
+The names for each file may be written any of the ways above — `"64-79"`,
+`"UC1,65-79"`, a Python list, or `"names.csv"` from `template` — and you can
+mix them between files. Windows paths go in `r"..."` so the backslashes are
+left alone.
+
+**Names are in header order**, which is the order `list` prints them and the
+order the channels sit in the file — not sorted by name. For a file you have
+not renamed before, run `list` on it first and check the channel count is
+what you expect before trusting a list you have not seen applied.
 
 ## What it writes
 

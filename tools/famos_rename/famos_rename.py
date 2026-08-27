@@ -442,6 +442,12 @@ def build_cn_key(group: int, name: str, comment: str) -> bytes:
     return b"|CN,1,%d,%s;" % (len(body), body)
 
 
+def default_out(path) -> Path:
+    """Where a renamed copy goes when you do not say: beside the original."""
+    p = Path(path)
+    return p.with_name(p.stem + "_renamed" + p.suffix)
+
+
 def rename(path, out_path, names: list[str]) -> FamosHeader:
     """Copy the file with `names` in its |CN keys, one per channel.
 
@@ -618,6 +624,7 @@ def cmd_apply(a) -> int:
     names, source = load_names(a.names)
     head = read_header(a.file)
     check_names(names, head)
+    out_path = a.out or default_out(a.file)
 
     print(describe(head))
     print(f"names from : {source}")
@@ -628,8 +635,8 @@ def cmd_apply(a) -> int:
         print("\ndry run    : nothing written")
         return 0
 
-    out = rename(a.file, a.out, names)
-    print(f"\nwritten    : {a.out}")
+    out = rename(a.file, out_path, names)
+    print(f"\nwritten    : {out_path}")
     print(f"names now  : {', '.join(out.names)}")
     if a.verify:
         ok = data_digest(head) == data_digest(out)
@@ -685,7 +692,10 @@ def main(argv=None) -> int:
     ap.add_argument("--names", required=True,
                     help="an edited template, a file of one name per line, "
                          "or the names themselves: '64-79' or 'UC1,64,65,...'")
-    ap.add_argument("--out", default=None, help="the file to write")
+    ap.add_argument("--out", default=None,
+                    help="the file to write. Defaults to the input with "
+                         "'_renamed' before the extension; the input itself "
+                         "is never written over.")
     ap.add_argument("--dry-run", action="store_true",
                     help="show what would be renamed and write nothing")
     ap.add_argument("--no-verify", dest="verify", action="store_false",
@@ -710,8 +720,6 @@ def main(argv=None) -> int:
     ex.set_defaults(func=cmd_export)
 
     a = p.parse_args(argv)
-    if a.cmd == "apply" and not a.dry_run and not a.out:
-        p.error("apply needs --out (or --dry-run)")
     try:
         return a.func(a)
     except FamosError as exc:

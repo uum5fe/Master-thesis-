@@ -63,6 +63,8 @@ def survey_roots(roots, patterns) -> list[str]:
     """
     import collections
 
+    from app.data.sources import _order_id_from_parts as order_id_from_parts
+
     lines: list[str] = []
     folders = 0
     for root in roots:
@@ -79,10 +81,22 @@ def survey_roots(roots, patterns) -> list[str]:
                 path.suffix.lower() or "(none)"] += 1
             if path.suffix.lower() != ".dat":
                 continue
-            if any(pat.search(path.name) for pat in patterns):
+            # Matching the NAME is not enough -- the scan also needs an order
+            # id, from the name or from the folder, and drops the file when
+            # there is none. Testing only the pattern here would call a file
+            # fine that the scan silently discarded, which is the exact class
+            # of disagreement this survey exists to end.
+            hit = next((m for m in (pat.search(path.name) for pat in patterns)
+                        if m), None)
+            has_id = bool(hit) and bool(
+                (hit.groupdict().get("measurement_id") or "").strip()
+                or order_id_from_parts(path))
+            if has_id:
                 matched.add(path.parent)
             else:
-                unmatched.setdefault(path.parent, []).append(path.name)
+                unmatched.setdefault(path.parent, []).append(
+                    (path.name, "no order id in the name or the folder"
+                     if hit else "name matches no known pattern"))
 
         for directory in sorted(by_dir):
             if directory in matched:
@@ -103,11 +117,17 @@ def survey_roots(roots, patterns) -> list[str]:
             folders += 1
             lines.append(f"  {shown}  --  {what}")
             if directory in unmatched:
-                sample = sorted(unmatched[directory])[0]
-                lines.append(f"      .DAT present but the names do not match "
-                             f"any known pattern, e.g. {sample!r}")
-                lines.append(f"      set EIS_FAMOS_REGEX to a pattern with "
-                             f"named groups measurement_id and condition")
+                sample, why = sorted(unmatched[directory])[0]
+                lines.append(f"      .DAT present but {why}, e.g. {sample!r}")
+                if "no order id" in why:
+                    lines.append(f"      the name gives the condition but no "
+                                 f"order number, and neither does any folder "
+                                 f"above it -- rename the folder to include "
+                                 f"the 7-digit order, e.g. 2611959_03_07")
+                else:
+                    lines.append(f"      set EIS_FAMOS_REGEX to a pattern "
+                                 f"with named groups measurement_id and "
+                                 f"condition")
             elif ".ddf" in interesting:
                 example = next(iter(sorted(
                     q.name for q in directory.glob("*.ddf"))), "<file>.ddf")
@@ -352,6 +372,25 @@ def main(argv=None) -> int:
                                          a.no_png, a.stop_after)
             print("  would run, in " + str(runner.pipeline_dir(SETTINGS)) + ":")
             print("    " + " ".join(argv_))
+            continue
+
+        # CARDS SPLIT ACROSS FOLDERS. build_command passes ONE --dat folder
+        # (the first card's parent), so bronze only ever globs that one and
+        # the rest are silently absent -- a run that looks complete with half
+        # its plate missing. Staging copies every file in ref.files into a
+        # single directory, which is exactly the fix, so say so rather than
+        # letting it pass.
+        folders = {str(Path(f).parent) for f in ref.files}
+        if len(folders) > 1 and not a.stage_local:
+            print(f"  WARNING: this condition's {len(ref.files)} card file(s) "
+                  f"are spread over {len(folders)} folders:")
+            for folder in sorted(folders):
+                print(f"    {folder}")
+            print(f"  Only the first is passed to the pipeline, so the rest "
+                  f"would be missing from the result.")
+            print(f"  Re-run with --stage-local, which copies them all into "
+                  f"one folder first.")
+            failures += 1
             continue
 
         problems = runner.preflight(ref, SETTINGS)

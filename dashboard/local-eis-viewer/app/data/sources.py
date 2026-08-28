@@ -38,12 +38,70 @@ from app.settings import SETTINGS, Settings
 #: convention (``Leepa_<id>_...``) and the order convention (``RO<id>-01_...``)
 #: appear in the recordings, and a site can add a third through the
 #: ``EIS_FAMOS_REGEX`` environment variable without touching this file.
+# The card files are named half a dozen different ways across this
+# campaign -- one scheme per person who set up a worksheet -- and a name
+# that matches nothing is a measurement that silently does not exist. Every
+# pattern below was written against a REAL file name from the share; the
+# comment gives that name, so a future reader can tell a supported scheme
+# from a speculative one.
+#
+# `measurement_id` is OPTIONAL: several schemes carry no order number at all
+# (Channel_1_60A.dat), and for those the id comes from the folder, which is
+# where it actually is. See _order_id_from_parts.
 _FAMOS_PATTERNS = [
+    # Leepa_2611976_Current_45A_Test_01_Karte_1.DAT
     r"Leepa_(?P<measurement_id>[^_]+)_Current_(?P<condition>.+?)"
     r"_Test_(?P<test>\d+)_Karte_(?P<card>\w+)\.DAT$",
+    # RO2611976-01_Current_45A_Test_01_Karte_1.DAT
     r"RO(?P<measurement_id>[^_-]+)(?:-\d+)?_Current_(?P<condition>.+?)"
     r"_Test_(?P<test>\d+)_Karte_(?P<card>\w+)\.DAT$",
+    # 2026_08_27_KANAL_0_15-RO2612025_45A.DDF_1.DAT
+    # Converted out of DASYLab: KANAL_0_15 is the channel range this card
+    # carries, and the trailing _1 after .DDF is the card index.
+    r"KANAL_\d+_\d+-RO(?P<measurement_id>\d+)_(?P<condition>\d+\s*A)"
+    r"\.DDF_(?P<card>\d+)\.DAT$",
+    # Karte_1_Leepa_2611921_Measurement_01_Test_1_45A.DAT
+    r"Karte_(?P<card>\w+)_Leepa_(?P<measurement_id>\d+)_Measurement_\d+"
+    r"_Test_\d+_(?P<condition>\d+\s*A)\.DAT$",
+    # Karte_2_Messung_leepa_2611959_Versuch_test01_450A.DAT
+    r"Karte_(?P<card>\w+)_Messung_leepa_(?P<measurement_id>\d+)_Versuch"
+    r"_[^_]+_(?P<condition>\d+\s*A)\.DAT$",
+    # RO2611922-01_KARTE_1_LEEPA__MEASUREMENT_01_TEST_1_150A.DAT
+    r"RO(?P<measurement_id>\d+)(?:-\d+)?_KARTE_(?P<card>\w+)_LEEPA_"
+    r".*?_(?P<condition>\d+\s*A)\.DAT$",
+    # Channel_1_60A.dat and Channel_1_150.dat -- no order number in the name,
+    # so it has to come from the folder. The bare "150" is normalised to
+    # "150A" by _normalise_condition; its sibling Channel_1_60A.dat is what
+    # establishes that the trailing number is the current.
+    r"Channel_(?P<card>\d+)_(?P<condition>\d+\s*A?)\.DAT$",
 ]
+
+
+def _normalise_condition(text: str) -> str:
+    """`150` and `45 A` both become `150A` / `45A`.
+
+    One scheme drops the unit on some files and keeps it on others, and two
+    spellings of one operating point would otherwise become two conditions
+    that never merge -- each with half the cards, so neither is evaluable.
+    """
+    text = str(text).strip().replace(" ", "").upper()
+    return text if text.endswith("A") else text + "A"
+
+
+def _order_id_from_parts(path: Path) -> str:
+    """The order number from the folder, for names that do not carry one.
+
+    Walks upward, because the id sits on the campaign folder
+    (2611959_03_07) while the cards may be a level below it (…/Kopie,
+    …/FAMOS). Seven digits, optionally RO-prefixed, is the order-number
+    shape here; requiring it stops a date folder like 2026_07_15 from being
+    read as an order.
+    """
+    for part in path.parts[::-1]:
+        m = re.search(r"(?<!\d)(?:RO)?(\d{7})(?!\d)", part, re.IGNORECASE)
+        if m:
+            return m.group(1)
+    return ""
 
 
 def famos_patterns() -> list[re.Pattern]:
@@ -203,15 +261,34 @@ class FamosSource:
                 path = Path(path)
                 for pattern in patterns:
                     m = pattern.search(path.name)
-                    if m:
-                        key = (m.group("measurement_id"), m.group("condition"))
-                        groups.setdefault(key, []).append(path)
+                    if not m:
+                        continue
+                    mid = (m.groupdict().get("measurement_id") or "").strip()
+                    if not mid:
+                        mid = _order_id_from_parts(path)
+                    if not mid:
+                        # A card with no order number anywhere -- in its name
+                        # or its path -- cannot be filed under one. Counting
+                        # it as unmatched is honest; inventing an id would put
+                        # a real measurement under a label nobody can find.
+                        unmatched += 1
                         break
+                    key = (mid, _normalise_condition(m.group("condition")))
+                    groups.setdefault(key, []).append(path)
+                    break
                 else:
                     unmatched += 1
 
         out = []
         for (mid, cond), paths in sorted(groups.items()):
+            # The same card can sit in two folders (a working copy next to
+            # the original). Both are the same physical recording, and
+            # feeding bronze two copies of one card makes it believe it has
+            # twice the coverage it has, so keep one per file NAME.
+            seen: dict[str, Path] = {}
+            for q in paths:
+                seen.setdefault(q.name.lower(), q)
+            paths = sorted(seen.values())
             out.append(RunRef(
                 kind="famos", measurement_id=mid, condition=cond,
                 path=str(paths[0].parent), layout="famos",

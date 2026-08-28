@@ -48,6 +48,80 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
+def survey_roots(roots, patterns) -> list[str]:
+    r"""What is in these folders that did NOT become a run, and why.
+
+    FamosSource matches on the FILE NAME and silently drops everything else,
+    which is right for a scanner and useless for a person: an order whose
+    recording is a DASYLab .ddf, or whose cards were renamed, simply does not
+    appear, with no line of output pointing at it. "It is not listing" is
+    then the only available diagnosis.
+
+    So this walks the same roots and reports the folders that contributed
+    nothing, with what they actually hold. It reads names only -- no file is
+    opened -- so it costs nothing over a share.
+    """
+    import collections
+
+    lines: list[str] = []
+    folders = 0
+    for root in roots:
+        root = Path(root)
+        if not root.is_dir():
+            continue
+        by_dir: dict[Path, collections.Counter] = {}
+        unmatched: dict[Path, list[str]] = {}
+        matched: set[Path] = set()
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            by_dir.setdefault(path.parent, collections.Counter())[
+                path.suffix.lower() or "(none)"] += 1
+            if path.suffix.lower() != ".dat":
+                continue
+            if any(pat.search(path.name) for pat in patterns):
+                matched.add(path.parent)
+            else:
+                unmatched.setdefault(path.parent, []).append(path.name)
+
+        for directory in sorted(by_dir):
+            if directory in matched:
+                continue
+            counts = by_dir[directory]
+            # Folders of results, figures or notes are not failed recordings.
+            interesting = {ext: n for ext, n in counts.items()
+                           if ext in (".dat", ".ddf", ".mf4", ".tdms", ".hdf5",
+                                      ".h5", ".dmd", ".dxd", ".d7d", ".dsd")}
+            if not interesting:
+                continue
+            what = ", ".join(f"{n} x {ext}" for ext, n in
+                             sorted(interesting.items(), key=lambda kv: -kv[1]))
+            try:
+                shown = directory.relative_to(root)
+            except ValueError:
+                shown = directory
+            folders += 1
+            lines.append(f"  {shown}  --  {what}")
+            if directory in unmatched:
+                sample = sorted(unmatched[directory])[0]
+                lines.append(f"      .DAT present but the names do not match "
+                             f"any known pattern, e.g. {sample!r}")
+                lines.append(f"      set EIS_FAMOS_REGEX to a pattern with "
+                             f"named groups measurement_id and condition")
+            elif ".ddf" in interesting:
+                example = next(iter(sorted(
+                    q.name for q in directory.glob("*.ddf"))), "<file>.ddf")
+                lines.append(f"      DASYLab .ddf is not a format this "
+                             f"pipeline reads yet -- run")
+                lines.append(f"        python local_eis/ddf_source.py probe "
+                             f'"{directory / example}"')
+                lines.append(f"      or export ASCII from DASYLab and use "
+                             f"--source csv")
+            else:
+                lines.append(f"      no .DAT cards here")
+    return [f"__folders__:{folders}"] + lines
+
+
 def normalise_order_id(text: str) -> str:
     r"""The bare order number, however it was written.
 
@@ -218,6 +292,16 @@ def main(argv=None) -> int:
               f"{ref.condition:<{width}}  {len(ref.files)} {what}  ->  "
               f"{runner.output_dir(ref, SETTINGS)}")
     if a.list:
+        from app.data.sources import famos_patterns
+        skipped = survey_roots(
+            [r for r in SETTINGS.famos_roots] if have_famos else [],
+            famos_patterns())
+        count = int(skipped[0].split(":")[1]) if skipped else 0
+        if count:
+            print(f"\n{count} folder(s) under the FAMOS root produced no "
+                  f"run:")
+            for line in skipped[1:]:
+                print(line)
         return 0
 
     if a.condition:

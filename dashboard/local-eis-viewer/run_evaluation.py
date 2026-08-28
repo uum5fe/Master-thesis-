@@ -48,6 +48,26 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
+def normalise_order_id(text: str) -> str:
+    r"""The bare order number, however it was written.
+
+    On disk the same order appears three ways: the folder is
+    ``2612025_27_08``, the card files are ``RO2612025-01_Current_...``, and
+    the catalogue key the pattern extracts is ``2612025``. Someone selecting
+    an order copies whichever they are looking at, and only one of the three
+    used to work -- the other two returned "no recordings found under
+    <roots>", which blames the path for a filter mismatch.
+    """
+    import re
+
+    core = str(text).split("_")[0]
+    # Drop the station suffix FIRST. Stripping non-digits before it turns
+    # "RO2612025-01" into "261202501", which matches nothing -- the suffix
+    # digits get welded onto the order number.
+    core = re.sub(r"-\d+$", "", core)
+    return re.sub(r"[^0-9]", "", core)
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(
         description=__doc__,
@@ -61,8 +81,11 @@ def main(argv=None) -> int:
     p.add_argument("--out", metavar="DIR", help="override EIS_RESULTS_ROOT")
     p.add_argument("--curr-cal", metavar="CSV", help="override EIS_CURR_CAL")
     p.add_argument("--temp-cal", metavar="CSV", help="override EIS_TEMP_CAL")
-    p.add_argument("--leepa", metavar="ID",
-                   help="process only this order id (default: all found)")
+    p.add_argument("--leepa", metavar="ID", action="append",
+                   help="process only this order id; repeatable. Written how "
+                        "you like: 2612025, RO2612025, RO2612025-01 and "
+                        "ro2612025 all select the same order (default: all "
+                        "found)")
     p.add_argument("--condition", metavar="COND", action="append",
                    help="process this condition; repeatable")
     p.add_argument("--all", action="store_true",
@@ -163,11 +186,25 @@ def main(argv=None) -> int:
         refs += CsvLoggerSource(SETTINGS.resolved_csv_roots()).scan()
         searched += [str(r) for r in SETTINGS.resolved_csv_roots()]
 
+    discovered = list(refs)
     if a.leepa:
-        refs = [r for r in refs if r.measurement_id == a.leepa]
+        wanted = {normalise_order_id(x) for x in a.leepa}
+        refs = [r for r in refs
+                if normalise_order_id(r.measurement_id) in wanted]
     refs.sort(key=lambda r: (r.kind, r.measurement_id,
                              _condition_sort_key(r.condition)))
 
+    if not refs and discovered:
+        # The filter emptied the list, not the disk. Saying "no recordings
+        # found under <roots>" here is simply false and sends the reader to
+        # check paths that are fine, so name the filter and list what it
+        # could have matched.
+        have = sorted({r.measurement_id for r in discovered})
+        print(f"\nno recording matches order id "
+              f"{', '.join(a.leepa)}", file=sys.stderr)
+        print(f"  {len(discovered)} recording(s) were found; the order ids "
+              f"present are: {', '.join(have)}", file=sys.stderr)
+        return 1
     if not refs:
         print(f"no recordings found under {', '.join(dict.fromkeys(searched))}")
         print("run `python run_dashboard.py --check` to see why")

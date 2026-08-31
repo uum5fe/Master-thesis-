@@ -84,6 +84,94 @@ T_FALLBACK_C = 58.4          # used only if the temperature channels are unusabl
 # ===========================================================================
 
 
+#: imc numeric format code -> numpy dtype.
+_IMC_NUMFORMAT = {1: "<u1", 2: "<i1", 3: "<u2", 4: "<i2",
+                  5: "<u4", 6: "<i4", 7: "<f4", 8: "<f8"}
+
+
+def _imc_int(body: bytes, pos: int) -> tuple[int, int]:
+    """One comma-terminated integer, tolerating DASYLab's space padding."""
+    end = body.find(b",", pos)
+    if end < 0:
+        raise ValueError(f"expected a comma after offset {pos}")
+    token = body[pos:end].strip()
+    if not token or not token.lstrip(b"+-").isdigit():
+        raise ValueError(f"expected an integer at offset {pos}, got {token!r}")
+    return int(token), end + 1
+
+
+def _imc_str(body: bytes, pos: int) -> tuple[str, int]:
+    """A length-prefixed string, ``<n>,<n bytes>,``.
+
+    The prefix is why this cannot be read by walking to the next comma: the
+    names here are "0".."15", and walking works by luck up to "9".
+    """
+    n, pos = _imc_int(body, pos)
+    text = body[pos:pos + n].decode("latin-1")
+    pos += n
+    return text, pos + 1 if body[pos:pos + 1] == b"," else pos
+
+
+def _read_imc_keys(raw: bytes, path):
+    """Parse a proper imc FAMOS key stream: |KK,<ver>,<len>,<body>;
+
+    Returns (fs, n_ch, names, data_offset, dtype, declared_bytes).
+    """
+    fs = float("nan")
+    numformat = 7
+    names: list[str] = []
+    offset = 0
+    declared = 0
+
+    pos = 0
+    while True:
+        start = raw.find(b"|", pos)
+        if start < 0:
+            break
+        comma = raw.find(b",", start)
+        if comma < 0:
+            break
+        key = raw[start + 1:comma].decode("latin-1")
+        try:
+            _ver, p = _imc_int(raw, comma + 1)
+            length, p = _imc_int(raw, p)
+        except ValueError:
+            break
+
+        if key == "CS":
+            # The body is the samples. DASYLab streams and leaves the declared
+            # length at 0, so the count comes from the file size instead.
+            declared = length
+            nxt = raw.find(b",", p)
+            offset = nxt + 1 if nxt >= 0 else p
+            break
+
+        body = raw[p:p + length]
+        try:
+            if key == "CD":
+                dt = float(body[:body.find(b",")].strip())
+                fs = 1.0 / dt if dt else float("nan")
+            elif key == "CP":
+                _buf, q = _imc_int(body, 0)
+                _bytes, q = _imc_int(body, q)
+                numformat, q = _imc_int(body, q)
+            elif key == "CN":
+                q = 0
+                for _ in range(3):
+                    _v, q = _imc_int(body, q)
+                name, q = _imc_str(body, q)
+                names.append(name)
+        except (ValueError, IndexError):
+            pass                       # a key we cannot read is not fatal
+        pos = p + length
+
+    if not names or not offset:
+        raise ValueError(f"{path.name}: incomplete FAMOS header "
+                         f"({len(names)} |CN name(s), data offset {offset})")
+    dtype = np.dtype(_IMC_NUMFORMAT.get(numformat, "<f4"))
+    return fs, len(names), names, offset, dtype, declared
+
+
 @dataclass
 class FamosFile:
     """imc FAMOS binary reader.
@@ -103,28 +191,51 @@ class FamosFile:
     n_ch: int = field(init=False)
     n_samples: int = field(init=False)
     offset: int = field(init=False)
+    #: float32 for the imc-written cards, float64 for a DASYLab export. Read
+    #: from the file rather than assumed -- see __post_init__.
+    dtype: np.dtype = field(init=False)
 
     def __post_init__(self):
         self.path = Path(self.path)
-        raw = self.path.open("rb").read(8192).decode("latin-1", errors="replace")
+        raw = self.path.open("rb").read(1 << 20)
+        text = raw.decode("latin-1", errors="replace")
 
-        m_cd = re.search(r"\|CD,\d+,([\d.eE+-]+)", raw)
-        m_cr = re.search(r"\|CR,\d+,(\d+)", raw)
-        m_cp = re.search(r"\|CP,([^;]*);", raw)
-        m_cs = re.search(r"\|CS,(\d+),(\d+),", raw)
-        if not all((m_cd, m_cr, m_cp, m_cs)):
-            raise ValueError(f"{self.path.name}: incomplete FAMOS header")
+        m_cd = re.search(r"\|CD,\d+,([\d.eE+-]+)", text)
+        m_cr = re.search(r"\|CR,\d+,(\d+)", text)
+        m_cp = re.search(r"\|CP,([^;]*);", text)
+        m_cs = re.search(r"\|CS,(\d+),(\d+),", text)
+        names = ([n.strip() for n in re.findall(r"7,32,([^,;]*)", m_cp.group(1))]
+                 if m_cp else [])
 
-        self.fs = 1.0 / float(m_cd.group(1))
-        self.n_ch = int(m_cr.group(1))
-        self.names = [n.strip() for n in re.findall(r"7,32,([^,;]*)", m_cp.group(1))]
-        self.offset = m_cs.end()
+        if all((m_cd, m_cr, m_cp, m_cs)) and names:
+            # The imc-written cards from this rig: no length field on |CD,
+            # channel names carried as 7,32,<name> triples inside |CP, and
+            # float32 samples.
+            self.fs = 1.0 / float(m_cd.group(1))
+            self.n_ch = int(m_cr.group(1))
+            self.names = names
+            self.offset = m_cs.end()
+            self.dtype = np.dtype("<f4")
+            declared = int(m_cs.group(2))
+        else:
+            # A DASYLab FAMOS export. A different shape entirely, and every
+            # difference is silent in the reader above:
+            #   * proper imc keys, |KK,<ver>,<byte length>,<body>; -- so the
+            #     |CD regex captures the LENGTH and calls 25 s a sample
+            #     interval, and the |CR one calls the length the channel count;
+            #   * integers space padded, so |CS,1,<19 spaces>0, matches no
+            #     \d+ and the header is declared "incomplete";
+            #   * channel names in per-channel |CN keys, LENGTH PREFIXED, not
+            #     in |CP -- so `names` comes back empty;
+            #   * float64 samples. Read as float32 that is not an error, it is
+            #     alternating zeros and nonsense that still plots.
+            self.fs, self.n_ch, self.names, self.offset, self.dtype, declared \
+                = _read_imc_keys(raw, self.path)
 
-        declared = int(m_cs.group(2))
         available = self.path.stat().st_size - self.offset
-        self.n_samples = available // (4 * self.n_ch)
+        self.n_samples = available // (self.dtype.itemsize * self.n_ch)
 
-        if abs(available - declared) > 64:
+        if declared and abs(available - declared) > 64:
             print(f"  [{self.path.name}] |CS declares {declared} bytes, "
                   f"{available} present. Using the full file: "
                   f"{self.n_samples} samples = {self.n_samples/self.fs:.1f} s")
@@ -135,7 +246,7 @@ class FamosFile:
     def channel(self, name: str) -> np.ndarray:
         if name not in self.names:
             raise KeyError(f"{name!r} not in {self.path.name}: {self.names}")
-        mm = np.memmap(self.path, dtype="<f4", mode="r",
+        mm = np.memmap(self.path, dtype=self.dtype, mode="r",
                        offset=self.offset, shape=(self.n_samples, self.n_ch))
         return np.asarray(mm[:, self.names.index(name)], dtype=np.float64)
 

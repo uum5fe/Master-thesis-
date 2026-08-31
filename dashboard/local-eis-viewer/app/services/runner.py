@@ -58,6 +58,48 @@ def output_dir(ref: RunRef, settings: Settings = SETTINGS) -> Path:
     return root / ref.measurement_id / ref.condition
 
 
+#: The FAMOS keys a card must carry to be readable at all, and how far in to
+#: look for them. The header holds one entry per channel, so a card with many
+#: channels has a long one; 1 MiB is far past anything imc writes.
+_FAMOS_KEYS = (b"|CD,", b"|CR,", b"|CP,", b"|CS,")
+_MAX_HEADER_BYTES = 1 << 20
+
+
+def unreadable_cards(ref: RunRef, limit: int = 5) -> list[str]:
+    """Cards whose FAMOS header cannot be found, checked before any staging.
+
+    WHY THIS IS WORTH A SEPARATE, DUPLICATED CHECK
+    ----------------------------------------------
+    The pipeline parses these headers properly and says so precisely when it
+    cannot -- but it runs as a subprocess AFTER the cards have been copied to
+    local disk. A folder whose headers are unreadable therefore costs the
+    whole staging copy before anything reports the problem: 25 GB over SMB,
+    to learn that byte 300 of the first file is not what was expected.
+
+    Reading a few kilobytes from the head of each card over the share takes
+    no measurable time and turns that into an immediate refusal. It
+    deliberately does NOT parse: it looks for the keys, and leaves saying
+    what is wrong with them to the reader that knows.
+    """
+    bad: list[str] = []
+    for path in list(ref.files)[:limit]:
+        try:
+            chunk = 65_536
+            with open(path, "rb") as fh:
+                while True:
+                    raw = fh.read(chunk)
+                    if all(key in raw for key in _FAMOS_KEYS):
+                        break
+                    if len(raw) < chunk or chunk >= _MAX_HEADER_BYTES:
+                        bad.append(Path(path).name)
+                        break
+                    chunk *= 2
+                    fh.seek(0)
+        except OSError as exc:
+            bad.append(f"{Path(path).name} ({exc.strerror or exc})")
+    return bad
+
+
 def preflight(ref: RunRef, settings: Settings = SETTINGS) -> list[str]:
     """Everything that would stop a run, reported before one is started."""
     problems: list[str] = []
@@ -95,6 +137,18 @@ def preflight(ref: RunRef, settings: Settings = SETTINGS) -> list[str]:
     # run will not open refuses a run that would have succeeded, and the
     # "set but not found" branch did exactly that even after the "unset"
     # branch was excused.
+
+    # BEFORE STAGING, NOT AFTER. See unreadable_cards.
+    if ref.kind != "csvlog" and ref.files:
+        bad = unreadable_cards(ref)
+        if bad:
+            problems.append(
+                "no FAMOS header found in: " + ", ".join(bad)
+                + ". These may not be FAMOS files, or their headers may be "
+                  "laid out differently than the reader expects. Run "
+                  "`python local_eis/identify_file.py \"<one card>\"` to "
+                  "establish what they are -- checked here so a folder that "
+                  "cannot be read does not cost a staging copy first.")
 
     if not settings.allow_inline_pipeline:
         problems.append(

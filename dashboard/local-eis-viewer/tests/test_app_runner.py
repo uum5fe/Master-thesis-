@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -30,13 +31,27 @@ def _settings(tmp_path, **kwargs) -> Settings:
     return Settings(**{**base, **kwargs})
 
 
+def _famos_card(path, n_ch=8, n=200, name_len=1):
+    import numpy as np
+    names = ["UC1"] + [f"{'c' * name_len}{i}" for i in range(1, n_ch)]
+    cp = ",".join(f"7,32,{nm}" for nm in names)
+    data = np.zeros((n, n_ch), dtype="<f4")
+    path.write_bytes(
+        (f"|CF,2,1,1;|CK,1,3,1,1;|CD,2,0.0001,1;|CR,1,{n_ch},1,0,1;"
+         f"|CP,{cp};|CS,1,{data.nbytes},").encode("latin-1") + data.tobytes())
+
+
 def _ref(tmp_path) -> RunRef:
     dat = tmp_path / "famos"
     dat.mkdir(exist_ok=True)
     files = []
     for card in range(1, 6):
         path = dat / f"Leepa_2611976_Current_45A_Test_01_Karte_{card}.DAT"
-        path.touch()
+        # A real (if tiny) FAMOS header rather than an empty file. preflight
+        # now checks the cards are readable BEFORE staging copies them, so a
+        # fixture standing in for a card has to look like one -- an empty
+        # file is a folder that legitimately cannot be evaluated.
+        _famos_card(path)
         files.append(str(path))
     return RunRef(kind="famos", measurement_id="2611976", condition="45A",
                   path=str(dat), layout="famos", files=tuple(files))
@@ -313,3 +328,67 @@ def test_the_empty_selection_message_names_the_right_extension(tmp_path):
     csv_ref = RunRef(kind="csvlog", measurement_id="x", condition="y", files=())
     assert any("no CSV files" in p
                for p in runner.preflight(csv_ref, settings))
+
+
+# ---------------------------------------------------------------------------
+# a folder that cannot be read should not cost a staging copy first
+# ---------------------------------------------------------------------------
+
+class _Ref:
+    kind = "famos"
+
+    def __init__(self, files):
+        self.files = list(files)
+
+
+def test_readable_cards_pass(tmp_path) -> None:
+    from app.services import runner
+    for i in range(3):
+        _famos_card(tmp_path / f"card{i}.DAT")
+    assert runner.unreadable_cards(_Ref(sorted(tmp_path.glob("*.DAT")))) == []
+
+
+def test_a_long_header_is_not_mistaken_for_an_unreadable_card(tmp_path) -> None:
+    """The check must grow its read exactly as the reader does.
+
+    Otherwise it refuses, before staging, a folder the pipeline could have
+    read -- which is a worse failure than the one it is preventing.
+    """
+    from app.services import runner
+    _famos_card(tmp_path / "many.DAT", n_ch=200, name_len=40)
+    assert (tmp_path / "many.DAT").stat().st_size > 8192
+    assert runner.unreadable_cards(_Ref([tmp_path / "many.DAT"])) == []
+
+
+def test_a_non_famos_card_is_caught(tmp_path) -> None:
+    from app.services import runner
+    bad = tmp_path / "other.DAT"
+    bad.write_bytes(b"\x89HDF\r\n\x1a\n" + b"\x00" * 5000)
+    assert runner.unreadable_cards(_Ref([bad])) == ["other.DAT"]
+
+
+def test_preflight_refuses_before_staging_and_says_what_to_run(tmp_path,
+                                                               monkeypatch):
+    """25 GB copied to learn byte 300 is wrong is the failure being removed."""
+    from app.services import runner
+    bad = tmp_path / "other.DAT"
+    bad.write_bytes(b"not famos at all" + b"\x00" * 5000)
+
+    class Ref:
+        kind = "famos"
+        files = [bad]
+        path = tmp_path
+        measurement_id = "2612025"
+        condition = "45A"
+
+    settings = SimpleNamespace(
+        pipeline_dir=str(tmp_path), results_roots=[str(tmp_path)],
+        scratch_results_root=str(tmp_path), curr_cal="", temp_cal="",
+        allow_inline_pipeline=True, areas_file="", stage_dir="",
+        gamry_roots=[], resolved_gamry_roots=lambda: [])
+    (tmp_path / "main.py").write_text("")
+    monkeypatch.setattr(runner, "SETTINGS", settings, raising=False)
+
+    problems = runner.preflight(Ref(), settings)
+    assert any("no FAMOS header found" in p for p in problems)
+    assert any("identify_file.py" in p for p in problems)

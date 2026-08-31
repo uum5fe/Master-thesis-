@@ -156,3 +156,126 @@ def test_dominant_frequency_ignores_a_neighbouring_step() -> None:
     y[int(0.85 * n):] += 0.8 * np.sin(2 * np.pi * neighbour * t[int(0.85 * n):])
     assert E.dominant_frequency(y, fs, 900.0, 1600.0) == pytest.approx(
         wanted, rel=0.01)
+
+
+# ---------------------------------------------------------------------------
+# reading only what you need
+# ---------------------------------------------------------------------------
+
+def test_a_bounded_channel_read_equals_slicing_the_full_one(tmp_path) -> None:
+    """Same numbers, a fraction of the file touched.
+
+    `fam.channel(c)[:n]` materialises the whole column first and then throws
+    most of it away. Locally that costs nothing noticeable, which is why it
+    survived; over SMB it is the whole recording of every card pulled across
+    the wire to answer a question about the first twenty seconds.
+    """
+    fs, n_ch, n = 10_000.0, 8, 40_000
+    rng = np.random.default_rng(0)
+    data = rng.standard_normal((n, n_ch)).astype("<f4")
+    names = ["UC1"] + [str(i) for i in range(1, n_ch)]
+    cp = ",".join(f"7,32,{nm}" for nm in names)
+    header = (f"|CF,2,1,1;|CK,1,3,1,1;|CD,2,{1.0 / fs},1;"
+              f"|CR,1,{n_ch},1,0,1;|CP,{cp};|CS,1,{data.nbytes},").encode("latin-1")
+    path = tmp_path / "card.DAT"
+    path.write_bytes(header + data.tobytes())
+
+    fam = E.FamosFile(path)
+    full = fam.channel("UC1")
+    assert len(full) == n
+    for stop in (1, 1000, n // 3, n):
+        assert np.array_equal(fam.channel("UC1", 0, stop), full[:stop])
+    assert np.array_equal(fam.channel("UC1", 500, 1500), full[500:1500])
+
+
+def test_a_bounded_read_clamps_instead_of_failing(tmp_path) -> None:
+    """A caller asking for twenty seconds of a five-second card gets five."""
+    fs, n_ch, n = 10_000.0, 4, 5_000
+    data = np.zeros((n, n_ch), dtype="<f4")
+    names = ["UC1", "1", "2", "3"]
+    cp = ",".join(f"7,32,{nm}" for nm in names)
+    header = (f"|CF,2,1,1;|CK,1,3,1,1;|CD,2,{1.0 / fs},1;"
+              f"|CR,1,{n_ch},1,0,1;|CP,{cp};|CS,1,{data.nbytes},").encode("latin-1")
+    path = tmp_path / "short.DAT"
+    path.write_bytes(header + data.tobytes())
+
+    fam = E.FamosFile(path)
+    assert len(fam.channel("UC1", 0, 10 * n)) == n
+    assert len(fam.channel("UC1", n, n + 100)) == 0
+    assert len(fam.channel("UC1", 100, 50)) == 0
+
+
+# ---------------------------------------------------------------------------
+# reading the header at all
+# ---------------------------------------------------------------------------
+
+def _write_card(path, n_ch=8, n=2000, fs=10_000.0, name_len=1):
+    """A FAMOS card whose header length is controlled by the channel names."""
+    names = ["UC1"] + [f"{'c' * name_len}{i}" for i in range(1, n_ch)]
+    cp = ",".join(f"7,32,{nm}" for nm in names)
+    data = np.zeros((n, n_ch), dtype="<f4")
+    header = (f"|CF,2,1,1;|CK,1,3,1,1;|CD,2,{1.0 / fs},1;"
+              f"|CR,1,{n_ch},1,0,1;|CP,{cp};|CS,1,{data.nbytes},"
+              ).encode("latin-1")
+    path.write_bytes(header + data.tobytes())
+    return len(header)
+
+
+def test_a_header_longer_than_eight_kilobytes_is_still_read(tmp_path) -> None:
+    """The read grows until it finds |CS.
+
+    It was a flat read(8192). The header carries one entry per channel, so a
+    card with many channels pushes |CS past that window -- and the only
+    thing said about it was "incomplete FAMOS header", which points at the
+    file rather than at the reader and is indistinguishable from the file
+    genuinely being some other format.
+    """
+    path = tmp_path / "many.DAT"
+    size = _write_card(path, n_ch=200, name_len=40)
+    assert size > 8192, f"this test needs a header past 8 KB; got {size}"
+
+    fam = E.FamosFile(path)
+    assert fam.n_ch == 200
+    assert fam.fs == pytest.approx(10_000.0)
+    assert len(fam.names) == 200
+
+
+def test_a_short_header_still_reads(tmp_path) -> None:
+    """The ordinary case must not regress."""
+    path = tmp_path / "few.DAT"
+    _write_card(path, n_ch=8)
+    fam = E.FamosFile(path)
+    assert fam.n_ch == 8 and fam.n_samples == 2000
+
+
+def test_a_file_that_is_not_famos_says_so_and_says_what_to_run(tmp_path) -> None:
+    """Naming the symptom is not a diagnosis.
+
+    The two causes need opposite responses -- a header longer than the reader
+    looked at, versus a file that is not FAMOS at all -- and which one it is
+    follows directly from which keys were present.
+    """
+    path = tmp_path / "other.DAT"
+    path.write_bytes(b"\x89HDF\r\n\x1a\n" + b"\x00" * 5000)
+    with pytest.raises(ValueError) as excinfo:
+        E.FamosFile(path)
+    message = str(excinfo.value)
+    assert "none of the keys" in message
+    assert "identify_file.py" in message, "it must say what to run next"
+    assert "89 48 44 46" in message, "and show the bytes it judged on"
+
+
+def test_a_famos_file_with_an_odd_layout_is_told_apart(tmp_path) -> None:
+    """Some keys present means the reader is wrong, not the file."""
+    path = tmp_path / "odd.DAT"
+    path.write_bytes(b"|CF,2,1,1;|CD,2,0.0001,1;|CR,1,8,1,0,1;"
+                     + b"\x00" * 4000)
+    with pytest.raises(ValueError) as excinfo:
+        E.FamosFile(path)
+    message = str(excinfo.value)
+    assert "|CD (sample interval)" in message
+    assert "|CS (payload start)" in message
+    assert "laid out differently" in message
+    assert "identify_file.py" not in message, (
+        "a file that clearly IS FAMOS should not be sent to the "
+        "what-format-is-this tool")

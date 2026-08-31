@@ -67,6 +67,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -111,6 +112,86 @@ def parse_start_time(text: str) -> datetime | None:
         return None
 
 
+#: How far into a file to look for the |CS payload key before giving up.
+#: The header carries one name per channel, so a card with many channels has
+#: a long one; 1 MiB is far past anything imc writes and still a trivial read
+#: over a network share.
+_MAX_HEADER_BYTES = 1 << 20
+
+#: The keys the reader needs, and what each one carries.
+_HEADER_KEYS = {
+    "CD": ("sample interval", r"\|CD,\d+,([\d.eE+-]+)"),
+    "CR": ("channel count", r"\|CR,\d+,(\d+)"),
+    "CP": ("channel names", r"\|CP,([^;]*);"),
+    "CS": ("payload start", r"\|CS,(\d+),(\d+),"),
+}
+
+
+def read_famos_header(path) -> tuple[str, int]:
+    """Header text and the byte offset just past ``|CS,n,m,``.
+
+    THE READ GROWS UNTIL IT FINDS THE PAYLOAD KEY
+    ---------------------------------------------
+    This used to be a flat ``read(8192)``.  Eight kilobytes is enough for the
+    cards this was written against and not enough in general: the header
+    carries one ``7,32,<name>`` entry per channel plus whatever else the
+    exporting tool wrote, so a card with many channels pushes ``|CS`` past
+    the fixed window.  The keys are then not found, and the only thing said
+    about it is "incomplete FAMOS header" -- which points at the file rather
+    than at the reader, and is indistinguishable from the file genuinely
+    being some other format.
+
+    Reads no more than it must: it stops at ``|CS``, which is the start of
+    the payload, so a 6 GB card still costs one small read.
+    """
+    size = os.path.getsize(path)
+    chunk = 65_536
+    with open(path, "rb") as fh:
+        while True:
+            raw = fh.read(chunk)
+            text = raw.decode("latin-1", errors="replace")
+            match = re.search(_HEADER_KEYS["CS"][1], text)
+            if match is not None:
+                return text[: match.end()], match.end()
+            if len(raw) < chunk or chunk >= min(size, _MAX_HEADER_BYTES):
+                return text, -1
+            chunk *= 2
+            fh.seek(0)
+
+
+def _header_diagnosis(path, text: str, scanned: int) -> str:
+    """Say which keys were found and which were not, and what to do next.
+
+    "incomplete FAMOS header" names the symptom and nothing else. The two
+    causes need opposite responses -- a header longer than the reader looked,
+    versus a file that is not FAMOS at all -- and which one it is follows
+    directly from WHICH keys were present.
+    """
+    found, missing = [], []
+    for key, (what, pattern) in _HEADER_KEYS.items():
+        (found if re.search(pattern, text) else missing).append(f"|{key} ({what})")
+    head = open(path, "rb").read(32)
+    lines = [
+        f"{Path(path).name}: could not read the FAMOS header.",
+        f"  scanned:  {scanned} bytes",
+        f"  found:    {', '.join(found) if found else 'none of the keys'}",
+        f"  missing:  {', '.join(missing)}",
+        f"  first 32 bytes: {head.hex(' ')}",
+        f"  as text       : {head.decode('latin-1', 'replace')!r}",
+    ]
+    if found:
+        lines.append(
+            "  Some keys are present, so this IS a FAMOS file whose header is "
+            "laid out differently than the reader expects. Send the two lines "
+            "above with the missing key names.")
+    else:
+        lines.append(
+            "  No FAMOS key was found at all, so this is very likely not a "
+            "FAMOS file. Establish what it is before writing a reader for it:")
+        lines.append(f'      python identify_file.py "{path}"')
+    return "\n".join(lines)
+
+
 @dataclass
 class FamosFile:
     """imc FAMOS binary reader.
@@ -140,15 +221,15 @@ class FamosFile:
 
     def __post_init__(self):
         self.path = Path(self.path)
-        raw = self.path.open("rb").read(8192).decode("latin-1", errors="replace")
+        raw, payload_at = read_famos_header(self.path)
         self.start_time = parse_start_time(raw)
 
-        m_cd = re.search(r"\|CD,\d+,([\d.eE+-]+)", raw)
-        m_cr = re.search(r"\|CR,\d+,(\d+)", raw)
-        m_cp = re.search(r"\|CP,([^;]*);", raw)
-        m_cs = re.search(r"\|CS,(\d+),(\d+),", raw)
-        if not all((m_cd, m_cr, m_cp, m_cs)):
-            raise ValueError(f"{self.path.name}: incomplete FAMOS header")
+        m_cd = re.search(_HEADER_KEYS["CD"][1], raw)
+        m_cr = re.search(_HEADER_KEYS["CR"][1], raw)
+        m_cp = re.search(_HEADER_KEYS["CP"][1], raw)
+        m_cs = re.search(_HEADER_KEYS["CS"][1], raw)
+        if payload_at < 0 or not all((m_cd, m_cr, m_cp, m_cs)):
+            raise ValueError(_header_diagnosis(self.path, raw, len(raw)))
 
         self.fs = 1.0 / float(m_cd.group(1))
         self.n_ch = int(m_cr.group(1))
@@ -167,12 +248,32 @@ class FamosFile:
             print(f"  [{self.path.name}] WARNING: {len(self.names)} names for "
                   f"{self.n_ch} channels")
 
-    def channel(self, name: str) -> np.ndarray:
+    def channel(self, name: str, start: int = 0,
+                stop: int | None = None) -> np.ndarray:
+        """One channel, optionally only the samples in [start, stop).
+
+        THE RANGE IS APPLIED TO THE MEMMAP, NOT TO THE RESULT.  Slicing
+        afterwards -- `fam.channel(c)[:n]` -- reads the whole file first and
+        then throws most of it away, because materialising the column faults
+        in every page that holds it.  The samples are interleaved across
+        channels, so that is the entire recording.
+
+        It costs nothing noticeable on local disk, which is why it survived,
+        and it is the difference between seconds and many minutes over SMB:
+        a caller that wants twenty seconds of a five-minute recording to
+        decide what the excitation is should move twenty seconds of it
+        across the network, not five minutes of it per card.
+        """
         if name not in self.names:
             raise KeyError(f"{name!r} not in {self.path.name}: {self.names}")
+        stop = self.n_samples if stop is None else min(int(stop), self.n_samples)
+        start = max(0, int(start))
+        if stop <= start:
+            return np.empty(0, dtype=np.float64)
         mm = np.memmap(self.path, dtype="<f4", mode="r",
                        offset=self.offset, shape=(self.n_samples, self.n_ch))
-        return np.asarray(mm[:, self.names.index(name)], dtype=np.float64)
+        return np.asarray(mm[start:stop, self.names.index(name)],
+                          dtype=np.float64)
 
     def position(self, name: str) -> int:
         """Channel index in the header = ADC acquisition order."""

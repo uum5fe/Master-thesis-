@@ -49,9 +49,9 @@ from eis_local import (FamosFile, PlateCalibration,          # noqa: E402
                        classify_excitation)
 
 
-def _cards(files, cfg, log):
+def _cards(files, cfg, log, max_samples=None):
     utils.section("cards", log)
-    return B.inventory_channels(files, cfg, log)
+    return B.inventory_channels(files, cfg, log, max_samples=max_samples)
 
 
 def excitation_survey(files, cards, cfg, log, seconds: float = 20.0) -> dict:
@@ -70,7 +70,10 @@ def excitation_survey(files, cards, cfg, log, seconds: float = 20.0) -> dict:
             continue
         fam = FamosFile(fp)
         n = min(fam.n_samples, int(seconds * fam.fs))
-        ref = fam.channel(cards[stem].ref_name)[:n]
+        # Bounded at the memmap, not after it: see FamosFile.channel. Slicing
+        # a materialised column reads the whole recording first, which over
+        # SMB is the entire cost this command exists to avoid.
+        ref = fam.channel(cards[stem].ref_name, 0, n)
         f_hi = cfg.f_hi(fam.fs)
         verdict = classify_excitation(ref, fam.fs, cfg.f_min_hz, f_hi)
         head = B.excitation_above_ceiling(ref, fam.fs, f_hi)
@@ -126,7 +129,15 @@ def main(argv=None) -> int:
         log.error("  nothing to check")
         return 1
 
-    channels, cards = _cards(files, cfg, log)
+    # Everything below reads only a bounded slice of each card. The point of
+    # this command is to answer, over a network share, in seconds -- and a
+    # survey that pulls every card across the wire is not a survey, it is the
+    # expensive half of the run without the results.
+    # Samples, from the highest rate any card could plausibly run at, so the
+    # bound is never tighter than `--seconds` on the fastest card. Each read
+    # clamps to that card's own length anyway.
+    look = int(a.seconds * 200_000)
+    channels, cards = _cards(files, cfg, log, max_samples=look)
 
     timebase = B.timebase_report(cards, cfg, log)
 
@@ -134,7 +145,8 @@ def main(argv=None) -> int:
     rejected: dict[str, str] = {}
     utils.section("plate temperature", log)
     T_seg, sensor_T = B.plate_temperatures(files, cards, cal, cfg, log,
-                                           rejected=rejected)
+                                           rejected=rejected,
+                                           max_samples=look)
     calrep = B.calibration_report(cal, cfg, sensor_T, T_seg, rejected, log)
 
     excitation = excitation_survey(files, cards, cfg, log, a.seconds)

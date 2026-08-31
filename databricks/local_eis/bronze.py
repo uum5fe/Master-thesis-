@@ -308,9 +308,18 @@ def _digest(items) -> str:
     return h.hexdigest()[:16]
 
 
-def inventory_channels(files: list[Path], cfg: Config,
-                       log=None) -> tuple[dict[str, ChannelInfo], dict[str, CardInfo]]:
-    """Open every card once and record what is on it, including slot order."""
+def inventory_channels(files: list[Path], cfg: Config, log=None,
+                       max_samples: int | None = None
+                       ) -> tuple[dict[str, ChannelInfo], dict[str, CardInfo]]:
+    """Open every card once and record what is on it, including slot order.
+
+    `max_samples` bounds the read used to pick the reference channel.  That
+    choice is "which UC channel carries the most AC content", and a few
+    seconds settles it as well as the whole recording does -- but reading
+    the whole recording of every card to decide it is what makes a header
+    survey as expensive as an evaluation over a network share. bronze leaves
+    it unbounded; preflight sets it.
+    """
     log = log or utils.get_logger(cfg.verbose)
     channels: dict[str, ChannelInfo] = {}
     cards: dict[str, CardInfo] = {}
@@ -323,8 +332,11 @@ def inventory_channels(files: list[Path], cfg: Config,
             continue
 
         # the reference is the UC channel carrying the most AC content
+        n_look = (fam.n_samples if max_samples is None
+                  else min(fam.n_samples, int(max_samples)))
         ref = max(fam.uc_names,
-                  key=lambda c: float(np.std(fam.channel(c)[::cfg_stride(cfg)])))
+                  key=lambda c: float(np.std(
+                      fam.channel(c, 0, n_look)[::cfg_stride(cfg)])))
         ref_slot = fam.position(ref)
 
         for name in fam.names:
@@ -1579,7 +1591,8 @@ def _sensor_key(channel_name: str) -> str:
 
 def plate_temperatures(files: list[Path], cards: dict[str, CardInfo],
                        cal: PlateCalibration, cfg: Config, log=None,
-                       rejected: dict[str, str] | None = None
+                       rejected: dict[str, str] | None = None,
+                       max_samples: int | None = None
                        ) -> tuple[dict[str, float], dict]:
     """One temperature field for the whole plate, from every sensor on every
     card.
@@ -1603,7 +1616,9 @@ def plate_temperatures(files: list[Path], cards: dict[str, CardInfo],
                 if rejected is not None:
                     rejected[tn] = f"no calibration row for {key!r}"
                 continue
-            u = float(np.mean(fam.channel(tn)[::cfg_stride(cfg)]))
+            n_look = (fam.n_samples if max_samples is None
+                      else min(fam.n_samples, int(max_samples)))
+            u = float(np.mean(fam.channel(tn, 0, n_look)[::cfg_stride(cfg)]))
             T = cal.temperature(key, u)
             if 0.0 < T < 120.0:
                 sensor_T[key] = T

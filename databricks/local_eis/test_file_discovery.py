@@ -109,3 +109,52 @@ def test_an_empty_folder_says_what_it_looked_for(tmp_path):
     with pytest.raises(SystemExit) as excinfo:
         bronze.discover_files(cfg)
     assert "Karte" in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# what the log says was matched
+# ---------------------------------------------------------------------------
+
+def test_the_pattern_reported_is_the_one_that_matched(tmp_path):
+    """The log used to name patterns[0] whichever pattern actually matched.
+
+    A run over `RO2612025-01_Current_45A_Test_01_Karte_1.DAT` announced
+    itself as `1 file(s) matching 'Leepa_2612025_Current_45A_...DAT'` -- a
+    pattern that matches nothing in that folder. It reads as a filename
+    problem, and the next hour goes on renaming files that were already
+    right.
+    """
+    (tmp_path / "RO2612025-01_Current_45A_Test_01_Karte_1.DAT").write_bytes(b"")
+    cfg = DEFAULT.replace(dat_dir=tmp_path, leepa="2612025",
+                          condition="45A")
+
+    files, how = bronze.discover_files_verbose(cfg)
+    assert len(files) == 1
+    assert "RO" in how or "2612025" in how
+    assert "Leepa_2612025_Current_45A" not in how, (
+        "reported a pattern that did not match")
+
+
+def test_the_fallback_says_it_is_a_fallback(tmp_path):
+    """Taking every .DAT in the folder is a different claim from matching.
+
+    Reported as "matching <pattern>" it looks like the naming convention was
+    recognised, which is exactly when a stray file from another condition
+    goes unnoticed.
+    """
+    (tmp_path / "something_entirely_else_45A_x.DAT").write_bytes(b"")
+    cfg = DEFAULT.replace(dat_dir=tmp_path, leepa="2612025",
+                          condition="45A")
+
+    _, how = bronze.discover_files_verbose(cfg)
+    assert "no known naming convention" in how
+
+
+def test_the_thin_wrapper_still_returns_just_the_files(tmp_path):
+    """discover_files is called from stage_bronze and from the tests above."""
+    (tmp_path / "RO2612025-01_Current_45A_Test_01_Karte_1.DAT").write_bytes(b"")
+    cfg = DEFAULT.replace(dat_dir=tmp_path, leepa="2612025",
+                          condition="45A")
+
+    got = bronze.discover_files(cfg)
+    assert isinstance(got, list) and all(isinstance(p, Path) for p in got)

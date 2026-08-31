@@ -221,6 +221,11 @@ _CURRENT_IN_NAME = re.compile(r"\d+(?:[.,]\d+)?\s*A(?![A-Za-z])")
 
 
 def discover_files(cfg: Config) -> list[Path]:
+    """FAMOS files for THIS RUN, without the route that found them."""
+    return discover_files_verbose(cfg)[0]
+
+
+def discover_files_verbose(cfg: Config) -> tuple[list[Path], str]:
     """FAMOS files for THIS RUN, sorted so card order is deterministic.
 
     Every filename convention is tried before any fallback, because the
@@ -233,6 +238,12 @@ def discover_files(cfg: Config) -> list[Path]:
     So the fallback still filters on the condition, and if it cannot -- if the
     files that remain describe more than one condition -- this refuses rather
     than guessing. Reading the wrong data slowly is worse than stopping.
+
+    Returns the files and a phrase describing HOW they were found, because
+    the caller logged the first pattern regardless and that is often not the
+    one that matched: a run over `RO2612025-01_Current_45A_...DAT` announced
+    itself as matching `'Leepa_2612025_Current_45A_...DAT'`, which sends the
+    reader hunting a filename problem that does not exist.
     """
     d = Path(cfg.dat_dir)
     if not d.exists():
@@ -240,10 +251,12 @@ def discover_files(cfg: Config) -> list[Path]:
 
     patterns = cfg.famos_patterns()
     files: list[Path] = []
-    for pattern in patterns:
+    for i, pattern in enumerate(patterns):
         files = sorted(d.glob(pattern))
         if files:
-            return files
+            extra = (f" (pattern {i + 1} of {len(patterns)} tried)"
+                     if i else "")
+            return files, f"matching {pattern!r}{extra}"
 
     # Nothing matched a known convention. Take what is there, but keep the
     # condition: the run was asked for one.
@@ -255,12 +268,14 @@ def discover_files(cfg: Config) -> list[Path]:
 
     cond = cfg.condition
     if not cond or cond == "ALL":
-        return every
+        return every, ("matching no known naming convention - taking every "
+                       ".DAT in the folder")
 
     wanted = [f for f in every
               if f"_Current_{cond}_".lower() in f.name.lower()]
     if wanted:
-        return wanted
+        return wanted, (f"matching no known naming convention - taking every "
+                        f".DAT whose name carries {cond}")
 
     # Still no filter. Before widening, find out what is actually in the
     # folder: any "<number>A" in a name is a current setpoint, whatever the
@@ -269,7 +284,9 @@ def discover_files(cfg: Config) -> list[Path]:
                    for m in (_CURRENT_IN_NAME.search(f.name) for f in every)
                    if m})
     if seen == [cond.upper()]:
-        return every                       # one condition, and it is the one
+        # one condition in the folder, and it is the one that was asked for
+        return every, (f"matching no known naming convention - taking every "
+                       f".DAT in the folder, which holds {cond} only")
     raise SystemExit(
         f"bronze: none of the known filename patterns matched in {d}, and the "
         f"files there cannot be narrowed to the requested condition.\n"
@@ -656,18 +673,42 @@ def consensus_schedule(files: list[Path], cards: dict[str, CardInfo],
                     grid["ok"] = False
 
     # ---- accept ------------------------------------------------------------
+    # FEWER CARDS THAN `min_ref_channels` IS NOT WEAK EVIDENCE, IT IS NONE.
+    # The agreement test asks how many cards saw a step; with one card the
+    # answer is always 1, so the test can never pass and EVERY step falls
+    # through to the grid rescue.  The schedule then rests entirely on the
+    # grid fit, and the moment that fit is refused the schedule is empty --
+    # 44 candidates in, 0 steps out, from a single converted DASYLab card.
+    #
+    # Where agreement cannot be asked for, the honest substitute is the
+    # evidence a lone card does carry: the step's own SNR, against the same
+    # threshold that decides which steps are confident enough to fit the
+    # grid on.  This is a genuinely weaker basis than corroboration -- a
+    # repeatable artefact on the one card now passes where two cards would
+    # have disagreed about it -- so it is recorded on the grid dict and said
+    # out loud rather than quietly substituted.
+    solo = len(per_card) < cfg.min_ref_channels
+    if solo:
+        log.warning(f"  only {len(per_card)} card(s) present, "
+                    f"{cfg.min_ref_channels} needed to corroborate a step - "
+                    f"falling back to each step's own SNR "
+                    f"(>= {cfg.min_snr_db:.0f} dB) as the acceptance test")
+        grid["solo_card"] = True
+        grid["evidence"] = "snr"
+
     kept: list[Step] = []
     n_votes_kept, n_grid_rescued = 0, 0
     for cl, f_hat in zip(clusters, prov):
         cards_seen = {c for c, _ in cl}
+        snr = float(np.nanmax([s.snr_db for _, s in cl]))
         on_grid = bool(grid.get("ok")) and _on_grid(f_hat, grid, cfg.grid_tol)
-        enough = len(cards_seen) >= cfg.min_ref_channels
+        enough = (snr >= cfg.min_snr_db if solo
+                  else len(cards_seen) >= cfg.min_ref_channels)
         if not (enough or on_grid):
             continue
         # representative window: the longest dwell in the cluster, which is
         # the one least likely to have been truncated by a neighbour
         best = max(cl, key=lambda cs: cs[1].stop - cs[1].start)[1]
-        snr = float(np.nanmax([s.snr_db for _, s in cl]))
         thd = float(np.nanmedian([s.thd for _, s in cl]))
         drift = float(np.nanmedian([s.stationarity for _, s in cl]))
         kept.append(Step(freq=float(f_hat), start=best.start, stop=best.stop,
@@ -676,9 +717,41 @@ def consensus_schedule(files: list[Path], cards: dict[str, CardInfo],
         n_grid_rescued += (on_grid and not enough)
 
     kept.sort(key=lambda s: s.freq)
+
+    # An empty schedule used to crash HERE, indexing kept[0] to print the
+    # range -- which buried the diagnosis under an IndexError and threw away
+    # the one line that explains it, the grid warning three lines below.
+    # Nothing downstream can proceed without a schedule, so say why and stop.
+    if not kept:
+        log.error(f"  consensus: NO steps accepted out of {len(clusters)} "
+                  f"candidate cluster(s) spanning "
+                  f"{prov.min():.3f}..{prov.max():.1f} Hz")
+        if not grid.get("ok"):
+            log.error("  reason: the geometric grid fit was refused, so no "
+                      "step could be rescued by grid membership")
+        elif grid.get("weak_basis"):
+            log.error("  reason: the grid could only be fitted on the weak "
+                      "steps themselves, which cannot then vouch for them")
+        raise SystemExit(
+            "bronze: every candidate step was rejected.\n"
+            f"  cards      : {len(per_card)} "
+            f"(need {cfg.min_ref_channels} to corroborate a step)\n"
+            f"  candidates : {len(clusters)} cluster(s), "
+            f"best SNR {float(np.nanmax(prov_snr)):.1f} dB\n"
+            f"  grid       : {_grid_verdict(grid)}\n"
+            "  A single card carries no corroboration, so the schedule rests "
+            "on the grid\n"
+            "  fit and on each step's SNR. Both failed here, which usually "
+            "means the\n"
+            "  detector found noise rather than a stepped sweep: check that "
+            "the reference\n"
+            "  channel is the right one, and that the recording covers the "
+            "excitation.")
+
+    label = "by SNR (single card)" if solo else "by card agreement"
     log.info(f"  consensus: {len(kept)} steps "
              f"({kept[0].freq:.3f}..{kept[-1].freq:.1f} Hz), "
-             f"{n_votes_kept} by card agreement, "
+             f"{n_votes_kept} {label}, "
              f"{n_grid_rescued} rescued by grid membership")
     if grid.get("ok"):
         log.info(f"  geometric grid fitted on {grid.get('n_fitted_on','?')} "
@@ -687,9 +760,24 @@ def consensus_schedule(files: list[Path], cards: dict[str, CardInfo],
                  f"f0={grid['f0']:.1f} Hz, "
                  f"{grid['n_on_grid']}/{grid['n_total']} on grid")
     else:
-        log.warning("  geometric grid: NOT recovered - every step had to be "
-                    "carried by card agreement alone")
+        carried = ("each step's own SNR alone" if solo
+                   else "card agreement alone")
+        log.warning(f"  geometric grid: NOT recovered - every step had to be "
+                    f"carried by {carried}")
     return kept, grid
+
+
+def _grid_verdict(grid: dict) -> str:
+    """How the grid fit ended, in the three words that distinguish the cases.
+
+    "fitted" alone is misleading for a weak-basis fit: it did fit, and it is
+    still refused as evidence, which reads as a contradiction unless said.
+    """
+    if not grid.get("ok"):
+        return "REFUSED"
+    if grid.get("weak_basis"):
+        return "fitted on the weak steps only - not usable as evidence"
+    return "fitted"
 
 
 def _on_grid(f: float, grid: dict, tol: float) -> bool:
@@ -697,6 +785,15 @@ def _on_grid(f: float, grid: dict, tol: float) -> bool:
     # this check a discarded fit still set on_grid, which then swapped the
     # SNR gate for the far looser snr_floor_db on those points.
     if not grid.get("ok"):
+        return False
+    # A grid FITTED ON THE WEAK STEPS cannot then vouch for them.  That is
+    # the circularity the comment in consensus_schedule spells out: the junk
+    # defines the spacing it is afterwards validated against, and everything
+    # lands on grid because the grid was drawn through everything.  The flag
+    # was being set and never read, so the argument held only in the branch
+    # that did not need it.  A weak-basis grid is still worth REPORTING --
+    # its ppd and f0 describe what was seen -- it is just not evidence.
+    if grid.get("weak_basis"):
         return False
     f0, r = grid.get("f0"), grid.get("ratio")
     if not f0 or not r or r <= 1:
@@ -940,8 +1037,8 @@ def run(cfg: Config = DEFAULT, log=None) -> BronzeRun:
     log = log or utils.get_logger(cfg.verbose)
     utils.banner("BRONZE  --  raw ingestion", log)
 
-    files = discover_files(cfg)
-    log.info(f"  {len(files)} file(s) matching {cfg.famos_pattern()!r}")
+    files, how = discover_files_verbose(cfg)
+    log.info(f"  {len(files)} file(s) {how}")
 
     utils.section("channel inventory", log)
     channels, cards = inventory_channels(files, cfg, log)

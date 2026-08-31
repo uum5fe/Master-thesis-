@@ -53,10 +53,6 @@ class DriftEstimate:
         """Fractional sample-clock error of the test card, for reporting."""
         return -self.delay_slope_ppm
 
-    def tau_at(self, t_s):
-        """Delay predicted at time ``t_s`` [s]."""
-        return self.tau0_s + (self.delay_slope_ppm * 1e-6) * np.asarray(t_s, float)
-
     def max_excursion_s(self, duration_s: float) -> float:
         """How much the delay changes over a record of ``duration_s``."""
         return abs(self.delay_slope_ppm * 1e-6) * duration_s

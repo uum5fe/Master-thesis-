@@ -3,6 +3,36 @@
 **Scope:** 80-segment PEM fuel cell, multi-card DAQ writing imc FAMOS `.DAT`, 10 kHz/channel, broadband galvanostatic excitation at several DC operating points.
 **Goal:** rebuild the existing pipeline into a metrologically defensible, automated analysis platform producing per-segment Nyquist/Bode spectra, ECM parameters, and spatial maps.
 
+> **Status.** This plan is implemented. The three tiers are `eis/pipeline/bronze.py`,
+> `silver.py` and `gold.py`, driven by `main.py`; the audit findings A1–A13 below are
+> all addressed.
+>
+> Two things turned out differently from the plan and are worth reading before
+> the rest of it:
+>
+> 1. **The largest high-frequency error was not a timing error at all.** With
+>    the §1.1 budget met to 0.1°, the via shunt's own loop inductance was still
+>    worth **26°** at 3.8 kHz — the shunt is 25 µΩ, so half a nanohenry is a
+>    20 µs time constant. No timing diagnostic can see it, because the cards
+>    are correctly synchronised and the *transducer* is complex. §S5 item 5
+>    ("shunt transfer function H(T), magnitude only") is wrong; it is a complex
+>    element.
+> 2. **The Δt-vs-L degeneracy of A5/§S5 is breakable**, but not the way §S5
+>    suggested. The residual delay is common to a card while the wiring
+>    inductance is individual, so regressing the fitted `L_k` on the fitted
+>    `Rs_k` across the plate gives the delay in closed form as the slope.
+>
+> Both, plus the multi-resolution spectral estimate and a Lin-KK model-order bug
+> that was making every KK verdict meaningless, are written up in
+> **[HF_ACCURACY_METHOD.md](HF_ACCURACY_METHOD.md)**.
+>
+> Departures from the target layout of §2: the `spectra/`, `correct/`,
+> `validate/` and `viz/` sub-packages are single modules (`eis/spectra.py`,
+> `eis/validate.py`, `eis/viz.py`), the corrections live in `eis/hf.py` beside
+> the identification that produces their constants, and the linked
+> heatmap/spectrum dashboard of G3 is `eis/dashboard.py` — one self-contained
+> HTML file with no Plotly dependency. DRT (G2, optional) is not implemented.
+
 ---
 
 ## 0. Why a rebuild — audit of the current pipeline

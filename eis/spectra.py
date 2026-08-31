@@ -26,8 +26,17 @@ What this module does differently from a plain Welch ratio
   multisine, analysing an integer number of base periods with a rectangular
   window puts each tone in exactly one bin: no scalloping, no picket-fence
   error, no window correction.
+* **Multi-resolution windows.**  One window length cannot serve a band that
+  spans four decades.  A window long enough to hold eight periods of a 1 Hz
+  tone throws away almost all the averaging available at 3 kHz, where the same
+  record holds thousands of short windows.  The multi-resolution path picks the
+  shortest window each band can afford, which is what makes the top of the
+  spectrum measurable rather than merely present.
 * **Per-point uncertainty.**  Every returned point carries a standard
   deviation derived from its coherence and the number of retained windows.
+* **Nothing is deleted.**  Points that fail the coherence gate are *marked*
+  through the ``used`` mask, so every segment keeps the same frequency grid and
+  a reader can see that a point exists and was not trusted.
 """
 
 from __future__ import annotations
@@ -52,11 +61,27 @@ class SpectralResult:
     sigma_rel: np.ndarray         #: relative 1-sigma on |Z| (= sigma_phi in rad)
     n_windows_total: int = 0
     n_windows_used: int = 0
-    n_eff: float = 0.0            #: effective independent averages
+    n_eff: float = 0.0            #: effective independent averages (median)
     estimator: str = "hv"
     method: str = "welch"
     Z_h1: np.ndarray | None = None
     Z_h2: np.ndarray | None = None
+    #: Effective averages *per point*.  Constant for a single-window-length
+    #: estimate, strongly frequency-dependent for the multi-resolution one.
+    n_eff_f: np.ndarray | None = None
+    #: Analysis window length used for each point, for the same reason.
+    nperseg_f: np.ndarray | None = None
+    #: Points that passed the coherence gate.  ``None`` means "not yet
+    #: judged"; a mask means the point exists and the verdict is recorded.
+    used: np.ndarray | None = None
+    #: The *random* part of ``sigma_rel``, before any systematic term was
+    #: folded in.  Keeping the two apart matters: a systematic uncertainty -
+    #: an unknown delay, say - rotates the whole spectrum coherently rather
+    #: than scattering it, so it belongs in the *verdict* on a fit, never in
+    #: the weights of one.  Weighting a Kramers-Kronig fit by a systematic
+    #: makes it ignore the band the systematic is largest in, and then report
+    #: an enormous residual there.
+    sigma_rel_random: np.ndarray | None = None
     rejected_reason: dict[str, int] = field(default_factory=dict)
     note: str = ""
 
@@ -65,24 +90,64 @@ class SpectralResult:
         return np.abs(self.Z) * self.sigma_rel
 
     @property
-    def sigma_imag(self) -> np.ndarray:
-        return np.abs(self.Z) * self.sigma_rel
+    def sigma_random(self) -> np.ndarray:
+        """Absolute random uncertainty - the correct weight for a fit."""
+        rel = self.sigma_rel if self.sigma_rel_random is None else self.sigma_rel_random
+        return np.abs(self.Z) * rel
+
+    @property
+    def used_mask(self) -> np.ndarray:
+        if self.used is None:
+            return np.ones(len(self.f), dtype=bool)
+        return np.asarray(self.used, bool)
+
+    @property
+    def n_used(self) -> int:
+        return int(self.used_mask.sum())
 
     def band(self, f_min: float, f_max: float) -> "SpectralResult":
         m = (self.f >= f_min) & (self.f <= f_max)
         return self._mask(m)
 
     def gate(self, min_coherence: float) -> "SpectralResult":
+        """Drop points below ``min_coherence``."""
         return self._mask(self.coherence >= min_coherence)
 
+    def mark(self, min_coherence: float) -> "SpectralResult":
+        """Record the verdict without dropping anything.
+
+        This is the form the pipeline uses: a segment keeps every frequency it
+        measured, so all segments share one grid and a low-coherence point can
+        be seen to be low-coherence rather than inferred from a gap.
+        """
+        out = self._mask(np.ones(len(self.f), bool))
+        out.used = self.coherence >= min_coherence
+        return out
+
+    def usable(self) -> "SpectralResult":
+        """The subset that passed :meth:`mark`, for fitting and validation."""
+        return self._mask(self.used_mask)
+
+    def with_impedance(self, Z: np.ndarray, sigma_rel=None) -> "SpectralResult":
+        """Copy carrying a corrected impedance (and optionally new sigma)."""
+        out = self._mask(np.ones(len(self.f), bool))
+        out.Z = np.asarray(Z, complex)
+        if sigma_rel is not None:
+            out.sigma_rel = np.asarray(sigma_rel, float)
+        return out
+
     def _mask(self, m: np.ndarray) -> "SpectralResult":
+        def sub(a):
+            return None if a is None else np.asarray(a)[m]
+
         return SpectralResult(
             f=self.f[m], Z=self.Z[m], coherence=self.coherence[m],
             sigma_rel=self.sigma_rel[m],
             n_windows_total=self.n_windows_total, n_windows_used=self.n_windows_used,
             n_eff=self.n_eff, estimator=self.estimator, method=self.method,
-            Z_h1=None if self.Z_h1 is None else self.Z_h1[m],
-            Z_h2=None if self.Z_h2 is None else self.Z_h2[m],
+            Z_h1=sub(self.Z_h1), Z_h2=sub(self.Z_h2),
+            n_eff_f=sub(self.n_eff_f), nperseg_f=sub(self.nperseg_f),
+            used=sub(self.used), sigma_rel_random=sub(self.sigma_rel_random),
             rejected_reason=dict(self.rejected_reason), note=self.note,
         )
 
@@ -329,12 +394,144 @@ def impedance_welch(
     n_eff = int(keep.sum()) / overlap_factor
     Z = {"h1": H1, "h2": H2, "hv": Hv}[estimator]
 
+    n_points = int(band.sum())
     return SpectralResult(
         f=freqs[band], Z=Z, coherence=gamma2,
         sigma_rel=relative_uncertainty(gamma2, n_eff),
         n_windows_total=int(X.shape[0]), n_windows_used=int(keep.sum()),
         n_eff=float(n_eff), estimator=estimator, method="welch",
-        Z_h1=H1, Z_h2=H2, rejected_reason=reasons, note=note,
+        Z_h1=H1, Z_h2=H2,
+        n_eff_f=np.full(n_points, float(n_eff)),
+        nperseg_f=np.full(n_points, float(nperseg)),
+        rejected_reason=reasons, note=note,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Multi-resolution Welch
+# ---------------------------------------------------------------------------
+
+def multiresolution_plan(
+    fs: float, f_min: float, f_max: float, min_periods: int = 8,
+    nperseg_min: int = 256, nperseg_max: int | None = None,
+    bands_per_decade: int = 3,
+) -> list[tuple[float, float, int]]:
+    """``[(f_lo, f_hi, nperseg), ...]`` covering ``[f_min, f_max]``.
+
+    Each band gets the shortest power-of-two window that still holds
+    ``min_periods`` periods of its lowest frequency.  Two things follow, and
+    both are the point of the exercise:
+
+    * the number of averages grows towards high frequency instead of staying
+      fixed, so the uncertainty at the top of the band falls as the square root
+      of that growth - typically a factor of four over a single 8192-point
+      window on a 40 s record;
+    * the analysis window shrinks towards high frequency, so a drift or a
+      transient smears fewer high-frequency windows and the gate can remove
+      them individually.
+
+    The cost is coarser absolute frequency resolution at the top, which is
+    exactly where an impedance spectrum does not need it: what matters there is
+    relative resolution, and that is constant across the plan.
+    """
+    f_min = max(float(f_min), 1e-9)
+    f_max = float(f_max)
+    if f_max <= f_min:
+        return [(f_min, f_max, int(nperseg_min))]
+    n_bands = max(1, int(np.ceil(np.log10(f_max / f_min) * max(bands_per_decade, 1))))
+    edges = np.logspace(np.log10(f_min), np.log10(f_max), n_bands + 1)
+
+    plan: list[tuple[float, float, int]] = []
+    for i in range(n_bands):
+        lo, hi = float(edges[i]), float(edges[i + 1])
+        needed = min_periods * fs / lo
+        nperseg = 1 << int(np.ceil(np.log2(max(needed, 1.0))))
+        nperseg = max(int(nperseg_min), nperseg)
+        if nperseg_max is not None:
+            nperseg = min(int(nperseg_max), nperseg)
+        # A band whose width is under one bin would return nothing.
+        if (hi - lo) < fs / nperseg:
+            hi = lo + fs / nperseg
+        plan.append((lo, hi, int(nperseg)))
+    return plan
+
+
+def impedance_multiresolution(
+    current: np.ndarray, voltage: np.ndarray, fs: float,
+    f_min: float = 1.0, f_max: float = 4000.0,
+    min_periods: int = 8, nperseg_min: int = 256, nperseg_max: int | None = None,
+    bands_per_decade: int = 3, window: str = "hann", detrend: str = "linear",
+    estimator: str = "hv", gate: bool = True,
+    amplitude_mad_k: float = 4.0, phase_outlier_rad: float = 0.5,
+    max_rejected_fraction: float = 0.5,
+) -> SpectralResult:
+    """Coherence-gated Welch with a window length chosen per octave band."""
+    n = min(len(current), len(voltage))
+    nperseg_max = int(nperseg_max or min(n // 2, 1 << 17))
+    plan = multiresolution_plan(
+        fs, f_min, min(f_max, 0.45 * fs), min_periods, nperseg_min,
+        nperseg_max, bands_per_decade,
+    )
+
+    pieces: list[SpectralResult] = []
+    reasons: dict[str, int] = {}
+    notes: list[str] = []
+    total_windows = 0
+    used_windows = 0
+    for lo, hi, nperseg in plan:
+        if nperseg > n:
+            notes.append(f"band {lo:.3g}-{hi:.3g} Hz needs {nperseg} samples, "
+                         f"record has {n}; skipped")
+            continue
+        try:
+            piece = impedance_welch(
+                current[:n], voltage[:n], fs, nperseg=nperseg, noverlap=nperseg // 2,
+                window=window, detrend=detrend, f_min=lo, f_max=hi,
+                estimator=estimator, gate=gate, amplitude_mad_k=amplitude_mad_k,
+                phase_outlier_rad=phase_outlier_rad,
+                max_rejected_fraction=max_rejected_fraction,
+            )
+        except ValueError:                       # band holds no bins
+            continue
+        # Bands are half-open so a bin sitting on a shared edge is not counted
+        # twice with two different window lengths.
+        keep = piece.f < hi if (lo, hi, nperseg) != plan[-1] else piece.f <= hi
+        piece = piece._mask(keep)
+        if len(piece.f) == 0:
+            continue
+        pieces.append(piece)
+        total_windows += piece.n_windows_total
+        used_windows += piece.n_windows_used
+        for key, value in piece.rejected_reason.items():
+            reasons[key] = reasons.get(key, 0) + value
+        if piece.note:
+            notes.append(piece.note)
+
+    if not pieces:
+        raise ValueError(
+            f"multi-resolution plan produced no usable band over "
+            f"[{f_min}, {f_max}] Hz with {n} samples at {fs} Hz"
+        )
+
+    f = np.concatenate([p.f for p in pieces])
+    order = np.argsort(f)
+
+    def stack(attr: str, dtype=float) -> np.ndarray:
+        return np.concatenate(
+            [np.asarray(getattr(p, attr), dtype) for p in pieces]
+        )[order]
+
+    n_eff_f = stack("n_eff_f")
+    return SpectralResult(
+        f=f[order], Z=stack("Z", complex), coherence=stack("coherence"),
+        sigma_rel=stack("sigma_rel"),
+        n_windows_total=total_windows, n_windows_used=used_windows,
+        n_eff=float(np.median(n_eff_f)), estimator=estimator,
+        method="multiresolution",
+        Z_h1=stack("Z_h1", complex), Z_h2=stack("Z_h2", complex),
+        n_eff_f=n_eff_f, nperseg_f=stack("nperseg_f"),
+        rejected_reason=reasons,
+        note="; ".join(notes[:3]),
     )
 
 
@@ -431,7 +628,10 @@ def impedance_synchronous(
         sigma_rel=relative_uncertainty(gamma2, n_eff),
         n_windows_total=int(X.shape[0]), n_windows_used=int(keep.sum()),
         n_eff=n_eff, estimator=estimator, method="synchronous",
-        Z_h1=H1, Z_h2=H2, rejected_reason=reasons, note=note,
+        Z_h1=H1, Z_h2=H2,
+        n_eff_f=np.full(len(kept_tones), n_eff),
+        nperseg_f=np.full(len(kept_tones), float(nperseg)),
+        rejected_reason=reasons, note=note,
     )
 
 

@@ -21,10 +21,15 @@ construction*, and inspect the residuals.  Two design points matter.
 
 The delay signature is usable, not just diagnostic: a Voigt series is
 minimum-phase and cannot represent ``exp(-j*omega*dt)``, so scanning the delay
-that minimises the KK residual recovers a residual timing error.  It is offered
-here only as a *bounded refinement* of the measured skew, because over a finite
-band a delay is degenerate with an inductance (``L = -Rs*dt`` to first order) -
-an unbounded KK-optimal delay would happily eat the cell's real inductance.
+that minimises the KK residual recovers a residual timing error.  Two
+conditions have to hold for that to mean anything, and both live in
+:func:`eis.hf.pooled_kk_delay`, which is where the scan is implemented:
+
+* the Voigt basis must be fitted **without** its ``j*omega*L`` term, which
+  otherwise absorbs a small delay exactly and leaves the residual blind to it;
+* the search must be **bounded by the measured skew**, because over a finite
+  band a delay is degenerate with an inductance (``L = -Rs*dt`` to first
+  order) and an unbounded search eats the cell's real inductance.
 """
 
 from __future__ import annotations
@@ -49,6 +54,10 @@ class KKResult:
     Z_fit: np.ndarray
     passed: bool
     shape_class: str = "random"
+    #: Largest residual expressed in units of that point's own uncertainty.
+    #: This, not the percentage, is what makes the verdict meaningful on a
+    #: segment whose high-frequency points are honestly imprecise.
+    max_normalised_residual: float = float("nan")
     note: str = ""
 
 
@@ -67,9 +76,19 @@ def _voigt_design(f: np.ndarray, taus: np.ndarray, with_inductance: bool) -> np.
 
 def _fit_voigt(
     f: np.ndarray, Z: np.ndarray, n_elements: int, weights: np.ndarray,
-    with_inductance: bool = True,
+    with_inductance: bool = True, max_inductance: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Weighted linear least squares.  Returns ``(coeffs, taus, Z_fit)``."""
+    """Weighted linear least squares.  Returns ``(coeffs, taus, Z_fit)``.
+
+    ``max_inductance`` box-constrains the ``jwL`` coefficient.  It exists for
+    the delay scan in :func:`eis.hf.pooled_kk_delay` and it is the thing that
+    makes that scan mean anything: an unconstrained ``L`` absorbs a delay
+    exactly, so the residual cannot see one, while dropping the term entirely
+    makes the fit absorb the cell's *real* inductance into the delay instead.
+    Bounding ``L`` to what the wiring can physically be is what separates the
+    two.  With one box constraint the projection is exact - fit free, and if
+    the bound is violated, pin the coefficient there and refit the rest.
+    """
     taus = np.logspace(
         np.log10(1.0 / (2 * np.pi * f.max())),
         np.log10(1.0 / (2 * np.pi * max(f.min(), 1e-6))),
@@ -79,6 +98,17 @@ def _fit_voigt(
     b = np.concatenate([Z.real, Z.imag])
     w = np.concatenate([weights, weights])
     coeffs, *_ = np.linalg.lstsq(A * w[:, None], b * w, rcond=None)
+
+    if with_inductance and max_inductance is not None and abs(coeffs[1]) > max_inductance:
+        pinned = float(np.sign(coeffs[1]) * max_inductance)
+        keep = [i for i in range(A.shape[1]) if i != 1]
+        reduced = A[:, keep]
+        residual_b = b - A[:, 1] * pinned
+        sub, *_ = np.linalg.lstsq(
+            reduced * w[:, None], residual_b * w, rcond=None
+        )
+        coeffs = np.insert(sub, 1, pinned)
+
     fitted = A @ coeffs
     return coeffs, taus, fitted[: len(f)] + 1j * fitted[len(f):]
 
@@ -122,14 +152,40 @@ def lin_kk(
     f: np.ndarray, Z: np.ndarray, sigma: np.ndarray | None = None,
     max_elements: int = 30, mu_target: float = 0.85,
     max_residual_pct: float = 1.0, with_inductance: bool = True,
+    max_sigma: float = 3.0, sigma_total: np.ndarray | None = None,
+    max_inductance: float | None = None,
 ) -> KKResult:
-    """Linear Kramers-Kronig test with automatic model order."""
+    """Linear Kramers-Kronig test with automatic model order.
+
+    The verdict uses **both** an absolute and a statistical criterion, and a
+    point has to fail both to count as a violation:
+
+    * ``|residual| > max_residual_pct`` - the deviation is large enough to
+      matter physically;
+    * ``|residual| > max_sigma * sigma`` - and large enough that the noise on
+      that point cannot explain it.
+
+    The second half is what makes the test usable on real data.  A segment
+    whose card was timed from a proxy carries an honest 20 % phase uncertainty
+    at the top of the band; judging its 2 % residual against a flat 1 %
+    threshold declares the data non-causal when all it is, is imprecise.
+    Conversely a 1.2 % residual on a point known to 0.05 % is a genuine
+    systematic error and still fails.  ``max_sigma = 0`` restores the plain
+    absolute test.
+
+    ``sigma`` weights the fit and should be the **random** uncertainty only.
+    ``sigma_total`` judges the residual and should include the systematic terms
+    as well; it defaults to ``sigma``.
+    """
     f = np.asarray(f, float)
     Z = np.asarray(Z, complex)
     order = np.argsort(f)
     f, Z = f[order], Z[order]
     if sigma is not None:
         sigma = np.asarray(sigma, float)[order]
+    if sigma_total is not None:
+        sigma_total = np.asarray(sigma_total, float)[order]
+    verdict_sigma = sigma if sigma_total is None else sigma_total
 
     if len(f) < 6:
         return KKResult(
@@ -141,48 +197,67 @@ def lin_kk(
     # proportional weighting (the standard choice for impedance data).
     weights = 1.0 / np.maximum(sigma, 1e-15) if sigma is not None else 1.0 / np.abs(Z)
 
-    best = None
+    # --- model order ------------------------------------------------------
+    # The mu-criterion is a test for over-fitting: mu falls when the fit starts
+    # buying accuracy with oscillating positive and negative resistances.  It is
+    # *not* monotonic in the number of elements - on real data it alternates,
+    # because an even element count can place a pair symmetrically where an odd
+    # one cannot - so stopping at the first value below the target selects a
+    # badly under-fitted model.  On a clean single-arc spectrum that rule
+    # returns four elements and a 13 % model residual, which then gets reported
+    # as the data's Kramers-Kronig residual.
+    #
+    # So every order is evaluated, the ones that show over-fitting are
+    # discarded, and among the rest the smallest order that gets within a
+    # factor of the best achievable residual wins.  Parsimony among the models
+    # that fit, rather than the first model that stops improving.
     max_m = int(min(max_elements, max(3, len(f) // 2 - 1)))
+    trials = []
     for m in range(3, max_m + 1):
-        coeffs, _, Z_fit = _fit_voigt(f, Z, m, weights, with_inductance)
-        mu = _mu(coeffs, with_inductance)
-        best = (m, mu, Z_fit)
-        if mu < mu_target:
-            break
+        coeffs, _, Z_fit = _fit_voigt(
+            f, Z, m, weights, with_inductance, max_inductance
+        )
+        misfit = float(np.sqrt(np.mean(
+            (np.concatenate([Z.real - Z_fit.real, Z.imag - Z_fit.imag])
+             / np.concatenate([np.abs(Z), np.abs(Z)])) ** 2
+        )))
+        trials.append((m, _mu(coeffs, with_inductance), misfit, Z_fit))
 
-    m, mu, Z_fit = best                                   # type: ignore[misc]
+    pool = [t for t in trials if t[1] >= mu_target] or trials
+    best_misfit = min(t[2] for t in pool)
+    m, mu, _, Z_fit = next(
+        t for t in pool if t[2] <= max(2.0 * best_misfit, 1e-15)
+    )
     scale = np.abs(Z)
     dre = (Z.real - Z_fit.real) / scale
     dim = (Z.imag - Z_fit.imag) / scale
-    max_pct = float(np.max(np.abs(np.concatenate([dre, dim])))) * 100.0
-    rms_pct = float(np.sqrt(np.mean(np.concatenate([dre, dim]) ** 2))) * 100.0
+    residual = np.abs(np.concatenate([dre, dim]))
+    max_pct = float(np.max(residual)) * 100.0
+    rms_pct = float(np.sqrt(np.mean(residual ** 2))) * 100.0
+
+    # Relative uncertainty per point; the same value bounds both parts, since
+    # sigma_|Z|/|Z| and sigma_phi[rad] are equal for a transfer-function
+    # estimate (Bendat-Piersol).
+    if verdict_sigma is not None:
+        sigma_rel = np.concatenate([verdict_sigma, verdict_sigma]) / np.concatenate(
+            [scale, scale]
+        )
+        normalised = residual / np.maximum(sigma_rel, 1e-12)
+        max_normalised = float(np.max(normalised))
+        violation = (residual > max_residual_pct / 100.0) & (
+            normalised > max_sigma if max_sigma > 0 else True
+        )
+    else:
+        max_normalised = float("nan")
+        violation = residual > max_residual_pct / 100.0
 
     return KKResult(
         n_elements=m, mu=float(mu), residual_real=dre, residual_imag=dim,
         max_residual_pct=max_pct, rms_residual_pct=rms_pct, Z_fit=Z_fit,
-        passed=bool(max_pct <= max_residual_pct),
+        passed=bool(not violation.any()),
         shape_class=_classify_residual(f, dre, dim),
+        max_normalised_residual=max_normalised,
     )
-
-
-def kk_optimal_delay(
-    f: np.ndarray, Z: np.ndarray, sigma: np.ndarray | None = None,
-    bound_s: float = 200e-9, n_grid: int = 81, **kk_kwargs,
-) -> tuple[float, float]:
-    """Residual delay that minimises the KK residual, searched within a bound.
-
-    Returns ``(delay_s, rms_residual_pct)``.  The bound must come from the
-    measured skew uncertainty - see the module docstring for why an
-    unconstrained search is not meaningful.
-    """
-    grid = np.linspace(-abs(bound_s), abs(bound_s), n_grid)
-    best_tau, best_rms = 0.0, np.inf
-    for tau in grid:
-        rotated = Z * np.exp(1j * 2 * np.pi * f * tau)
-        result = lin_kk(f, rotated, sigma, **kk_kwargs)
-        if result.rms_residual_pct < best_rms:
-            best_rms, best_tau = result.rms_residual_pct, float(tau)
-    return best_tau, float(best_rms)
 
 
 # ---------------------------------------------------------------------------

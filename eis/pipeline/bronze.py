@@ -1,4 +1,10 @@
-"""End-to-end pipeline: FAMOS files -> synchronised signals -> Z(f) -> models.
+"""Bronze tier: raw FAMOS files -> provably aligned, physically scaled signals.
+
+What this tier promises
+-----------------------
+Every sample handed to Silver is on a common time base, that time base was
+*measured* rather than assumed, and the residual timing error is reported with
+each card so the tiers above can widen their error bars instead of pretending.
 
 Why synchronisation is measured even though it often cancels
 ------------------------------------------------------------
@@ -22,38 +28,50 @@ It does not make synchronisation optional:
 4. The measured skew and clock drift are hardware diagnostics worth reporting
    in their own right.
 
-So the pipeline always measures, always reports, and aligns whenever a segment
-is paired with a cell voltage from another card.
+Nothing is dropped here
+-----------------------
+A card whose timing could not be established used to take its segments out of
+the result entirely.  It no longer does: those segments are marked
+``timing_unverified`` and carry a timing uncertainty of their own, which Silver
+folds into the per-point phase uncertainty.  A segment with no shunt
+calibration is scaled by unity and marked ``no_calibration`` instead of
+vanishing.  The quality decision then lives in the data, where it can be
+queried, rather than in a set of segment numbers that never reached the table.
+
+Memory
+------
+Segment currents are produced one at a time by :meth:`BronzeCondition.segments`
+and never held together: eighty channels of a two-minute record at 10 kHz is
+three quarters of a gigabyte, and there is no reason to pay it.
 """
 
 from __future__ import annotations
 
-import subprocess
-import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from eis import __version__
 from eis.calibrate import (
     ShuntCalibration, TemperatureCalibration, TemperatureField,
-    build_temperature_field, load_shunt_calibration, load_temperature_calibration,
+    build_temperature_field, sensor_voltage_to_celsius,
+    shunt_voltage_to_current_density,
 )
-from eis.config import PipelineConfig
-from eis.io.famos import FamosFile, classify_channel, discover_files, open_famos
-from eis.model.ecm import ECMFit, select_model
-from eis.spectra import (
-    SpectralResult, apply_notch, impedance_synchronous, impedance_welch,
-)
+from eis.io.famos import FamosFile, classify_channel, open_famos
+from eis.pipeline.config import PipelineConfig
+from eis.pipeline.utils import ac_rms, align_channel
+from eis.spectra import apply_notch
 from eis.sync.drift import DriftEstimate, estimate_drift
-from eis.sync.resample import (
-    advance_affine, fractional_delay_fft, integer_and_fractional, valid_span,
-)
+from eis.sync.resample import valid_span
 from eis.sync.skew import DelayEstimate, closure_residual, estimate_delay
-from eis.validate import KKResult, admittance_sum, lin_kk, stationarity_split_half
+
+#: Statuses this tier can assign.  Silver may narrow them further but never
+#: removes a segment.
+STATUS_OK = "ok"
+STATUS_NO_CALIBRATION = "no_calibration"
+STATUS_TIMING_UNVERIFIED = "timing_unverified"
+STATUS_CHANNEL_FAULT = "channel_fault"
 
 
 # ---------------------------------------------------------------------------
@@ -76,6 +94,7 @@ class CardInventory:
 
 
 def inventory_card(path: str, card: int) -> CardInventory:
+    """Open one card's file and sort its channels into roles."""
     famos = open_famos(path, card=card)
     inv = CardInventory(card=card, path=path, famos=famos)
     for name in famos.channel_names:
@@ -114,6 +133,24 @@ class CardSync:
     ok: bool = True
     note: str = ""
 
+    @property
+    def timing_sigma_s(self) -> float:
+        """Uncertainty to propagate into the impedance phase.
+
+        Once the alignment has been verified, the honest figure is the measured
+        residual, not the uncertainty of the estimate that produced it.  When
+        it could not be verified the estimate's own sigma stands, and when the
+        timing failed outright the whole measured delay is uncertain.
+        """
+        if not self.ok:
+            return max(abs(self.tau_s), self.tau_sigma_s if
+                       np.isfinite(self.tau_sigma_s) else 0.0, 1e-6)
+        candidates = [self.tau_sigma_s]
+        if self.residual_tau_s is not None:
+            candidates.append(abs(self.residual_tau_s))
+        finite = [c for c in candidates if np.isfinite(c)]
+        return float(max(finite)) if finite else 0.0
+
 
 @dataclass
 class SyncReport:
@@ -135,6 +172,7 @@ class SyncReport:
                 "uc_healthy": s.healthy_uc,
                 "tau_ns": s.tau_s * 1e9,
                 "tau_sigma_ns": s.tau_sigma_s * 1e9,
+                "timing_sigma_ns": s.timing_sigma_s * 1e9,
                 "delay_slope_ppm": s.delay_slope_ppm,
                 "clock_rate_ppm": -s.delay_slope_ppm,
                 "drift_corrected": s.drift_corrected,
@@ -153,180 +191,39 @@ class SyncReport:
 
 
 # ---------------------------------------------------------------------------
-# Segment result
-# ---------------------------------------------------------------------------
-
-@dataclass
-class SegmentResult:
-    segment: int
-    card: int
-    uc_channel: str
-    uc_from_card: int
-    spectrum: SpectralResult
-    temperature_c: float
-    shunt_H: float
-    rs_hf_ohm: float
-    status: str = "ok"
-    reason: str = ""
-    kk: KKResult | None = None
-    ecm: ECMFit | None = None
-    ecm_all: dict[str, ECMFit] = field(default_factory=dict)
-
-
-@dataclass
-class ConditionResult:
-    measurement_id: str
-    condition: str
-    fs: float
-    duration_s: float
-    sync: SyncReport
-    temperature: TemperatureField
-    segments: dict[int, SegmentResult] = field(default_factory=dict)
-    rejected: dict[int, str] = field(default_factory=dict)
-    plate: object | None = None
-    provenance: dict[str, str] = field(default_factory=dict)
-    elapsed_s: float = 0.0
-
-    # -- tables ----------------------------------------------------------
-    def impedance_frame(self, segment_area_cm2: float) -> pd.DataFrame:
-        rows = []
-        for seg, r in sorted(self.segments.items()):
-            s = r.spectrum
-            asr = segment_area_cm2 * 1e3            # Ohm -> mOhm*cm^2
-            for i in range(len(s.f)):
-                z = s.Z[i]
-                rows.append({
-                    "measurement_id": self.measurement_id,
-                    "condition": self.condition,
-                    "segment": seg,
-                    "card": r.card,
-                    "uc_channel": r.uc_channel,
-                    "frequency_hz": float(s.f[i]),
-                    "z_real_ohm": float(z.real),
-                    "z_imag_ohm": float(z.imag),
-                    "z_mod_ohm": float(abs(z)),
-                    "z_phase_deg": float(np.degrees(np.angle(z))),
-                    "z_real_mohm_cm2": float(z.real) * asr,
-                    "z_imag_mohm_cm2": float(z.imag) * asr,
-                    "coherence": float(s.coherence[i]),
-                    "sigma_rel": float(s.sigma_rel[i]),
-                    "sigma_real_ohm": float(abs(z) * s.sigma_rel[i]),
-                    "sigma_imag_ohm": float(abs(z) * s.sigma_rel[i]),
-                    "n_eff": s.n_eff,
-                    "estimator": s.estimator,
-                    "method": s.method,
-                    **self.provenance,
-                })
-        return pd.DataFrame(rows)
-
-    def segment_frame(self, segment_area_cm2: float) -> pd.DataFrame:
-        rows = []
-        asr = segment_area_cm2 * 1e3
-        for seg, r in sorted(self.segments.items()):
-            row = {
-                "measurement_id": self.measurement_id,
-                "condition": self.condition,
-                "segment": seg,
-                "card": r.card,
-                "uc_channel": r.uc_channel,
-                "uc_from_card": r.uc_from_card,
-                "status": r.status,
-                "reason": r.reason,
-                "n_points": len(r.spectrum.f),
-                "n_windows_used": r.spectrum.n_windows_used,
-                "n_windows_total": r.spectrum.n_windows_total,
-                "median_coherence": float(np.median(r.spectrum.coherence))
-                if len(r.spectrum.coherence) else np.nan,
-                "median_sigma_rel": float(np.median(r.spectrum.sigma_rel))
-                if len(r.spectrum.sigma_rel) else np.nan,
-                "temperature_c": r.temperature_c,
-                "shunt_H_V_cm2_per_A": r.shunt_H,
-                "rs_hf_mohm_cm2": r.rs_hf_ohm * asr,
-            }
-            if r.kk is not None:
-                row |= {
-                    "kk_pass": r.kk.passed, "kk_elements": r.kk.n_elements,
-                    "kk_mu": r.kk.mu, "kk_max_residual_pct": r.kk.max_residual_pct,
-                    "kk_rms_residual_pct": r.kk.rms_residual_pct,
-                    "kk_shape": r.kk.shape_class,
-                }
-            if r.ecm is not None:
-                row |= {
-                    "ecm_model": r.ecm.model,
-                    "ecm_chi2_reduced": r.ecm.chi2_reduced,
-                    "ecm_aicc": r.ecm.aicc,
-                    "ecm_poorly_determined": ",".join(r.ecm.poorly_determined),
-                }
-                for name, value in r.ecm.params.items():
-                    scale = asr if name.startswith(("Rs", "Rct", "Aw")) else 1.0
-                    unit = "_mohm_cm2" if scale != 1.0 else ""
-                    row[f"ecm_{name}{unit}"] = value * scale
-                    row[f"ecm_{name}{unit}_sigma"] = r.ecm.sigma.get(name, np.nan) * scale
-                row["ecm_rp_mohm_cm2"] = r.ecm.r_polarisation * asr
-            rows.append(row)
-        for seg, reason in sorted(self.rejected.items()):
-            rows.append({
-                "measurement_id": self.measurement_id, "condition": self.condition,
-                "segment": seg, "status": "rejected", "reason": reason,
-            })
-        return pd.DataFrame(rows)
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _git_sha(default: str = "unknown") -> str:
-    try:
-        return subprocess.check_output(
-            ["git", "rev-parse", "--short", "HEAD"],
-            stderr=subprocess.DEVNULL, text=True, timeout=5,
-        ).strip()
-    except Exception:
-        return default
-
-
-def _ac_rms(x: np.ndarray) -> float:
-    x = np.asarray(x, float)
-    return float(np.sqrt(np.mean((x - x.mean()) ** 2)))
-
-
-def align_channel(
-    x: np.ndarray, fs: float, tau_s: float, delay_slope_ppm: float = 0.0
-) -> np.ndarray:
-    """Bring ``x`` onto the reference time base.
-
-    ``tau_s`` is the measured delay of this channel (positive = it lags), so
-    the channel has to be advanced by that amount.  A constant offset is
-    applied as an exact integer shift plus an FFT phase ramp; a drifting one
-    goes through the polyphase resampler.
-    """
-    if abs(delay_slope_ppm) > 1e-6:
-        return advance_affine(x, fs, tau_s, delay_slope_ppm)
-    whole, frac = integer_and_fractional(tau_s, fs)
-    out = np.asarray(x, float)
-    if whole:                                   # advance == take later samples
-        out = np.roll(out, -whole)
-        if whole > 0:
-            out[-whole:] = out[-whole - 1]
-        else:
-            out[:-whole] = out[-whole]
-    if abs(frac) > 1e-6:
-        out = fractional_delay_fft(out, -frac / fs, fs)
-    return out
-
-
-# ---------------------------------------------------------------------------
 # Stage 1: measure the synchronisation
 # ---------------------------------------------------------------------------
 
+def _deembed_shunt(trace: np.ndarray, fs: float, tau_s: float) -> np.ndarray:
+    """Divide a via-shunt's ``1 + jw*tau`` out of a segment trace.
+
+    Needed only on the timing path.  When a card's cell-voltage channel is dead
+    the delay has to be measured against a *segment* channel instead, and a
+    segment channel carries the shunt's own phase - tens of microseconds of
+    apparent delay, which is the same order as the accuracy the proxy claims.
+    Left in, it does not look like an error; it looks like the card is late.
+    """
+    if tau_s <= 0:
+        return trace
+    n = len(trace)
+    freqs = np.fft.rfftfreq(n, 1.0 / fs)
+    spectrum = np.fft.rfft(np.asarray(trace, float))
+    return np.fft.irfft(spectrum / (1.0 + 1j * 2 * np.pi * freqs * tau_s), n)
+
+
 def measure_sync(
-    inventories: dict[int, CardInventory], cfg: PipelineConfig
+    inventories: dict[int, CardInventory], cfg: PipelineConfig,
+    shunt: ShuntCalibration | None = None,
 ) -> tuple[SyncReport, dict[int, np.ndarray]]:
     """Measure inter-card skew and drift from the shared cell-voltage channel.
 
     Returns the report and the (unaligned) cell-voltage trace of each card,
     which the caller reuses so the files are not read twice.
+
+    ``shunt`` is optional and used for one thing only: when a card falls back
+    to a segment channel as its timing proxy, the shunt's own phase is removed
+    from that channel first, so the proxy measures a delay rather than a delay
+    plus an inductance.
     """
     fs = float(np.median([inv.famos.fs for inv in inventories.values()]))
     scfg = cfg.sync
@@ -339,7 +236,7 @@ def measure_sync(
         best_name, best_rms, best_trace = None, 0.0, None
         for name in inv.uc_channels:
             trace = inv.famos.channel(name)
-            rms = _ac_rms(trace)
+            rms = ac_rms(trace)
             if rms > best_rms:
                 best_name, best_rms, best_trace = name, rms, trace
         if best_name is not None:
@@ -377,6 +274,7 @@ def measure_sync(
 
         if card == reference:
             sync.note = "reference card"
+            sync.tau_sigma_s = 0.0
             report.cards[card] = sync
             continue
 
@@ -390,12 +288,13 @@ def measure_sync(
         if card in uc_traces and sync.healthy_uc:
             trace = uc_traces[card][:n_common]
         elif scfg.allow_segment_proxy and inv.segment_channels:
-            best_name, best_rms, best_trace = None, 0.0, None
-            for name in inv.segment_channels.values():
+            best_name, best_segment, best_rms, best_trace = None, None, 0.0, None
+            for segment, name in inv.segment_channels.items():
                 candidate = inv.famos.channel(name)
-                rms = _ac_rms(candidate)
+                rms = ac_rms(candidate)
                 if rms > best_rms:
-                    best_name, best_rms, best_trace = name, rms, candidate
+                    best_name, best_segment = name, segment
+                    best_rms, best_trace = rms, candidate
             if best_trace is None:
                 sync.ok = False
                 sync.note = "no usable timing channel on this card"
@@ -409,6 +308,27 @@ def measure_sync(
                 f"taken from segment channel {best_name}, good to about "
                 f"{scfg.segment_proxy_sigma_s*1e6:.0f} us only"
             )
+            # De-embed the shunt before timing off it: a via shunt's L/R is
+            # tens of microseconds, which the delay estimator would otherwise
+            # read as the card being that much late.
+            tau_shunt = 0.0
+            if cfg.hf.enabled and shunt is not None and best_segment is not None \
+                    and shunt.has(best_segment):
+                from eis.hf import shunt_time_constant
+
+                tau_shunt = shunt_time_constant(
+                    shunt.H(best_segment, cfg.calibration.temperature_fallback_c),
+                    cfg.geometry.segment_area_cm2,
+                    cfg.hf.shunt_inductance_nh_per_segment.get(
+                        best_segment, cfg.hf.shunt_inductance_nh
+                    ),
+                )
+            if tau_shunt > 0:
+                trace = _deembed_shunt(trace, fs, tau_shunt)
+                sync.note += (
+                    f"; the shunt's {tau_shunt*1e6:.1f} us time constant was "
+                    f"divided out of the proxy first"
+                )
         else:
             sync.ok = False
             sync.note = "no cell-voltage channel: timing cannot be measured"
@@ -491,8 +411,9 @@ def measure_sync(
         if not sync.ok:
             sync.tau_s, sync.delay_slope_ppm, sync.drift_corrected = 0.0, 0.0, False
             sync.note = (sync.note + "; " if sync.note else "") + (
-                "timing unknown - this card's segments are rejected rather "
-                "than processed with an unverified time base"
+                "timing unknown - this card's segments are processed on an "
+                "unverified time base and marked accordingly, with the whole "
+                "delay carried as uncertainty"
             )
         report.cards[card] = sync
 
@@ -542,25 +463,129 @@ def measure_sync(
 
 
 # ---------------------------------------------------------------------------
-# Stage 2: process one condition
+# Bronze product
 # ---------------------------------------------------------------------------
 
-def run_condition(
+@dataclass
+class SegmentSignal:
+    """One segment's current, on the reference time base, in amps."""
+
+    segment: int
+    card: int
+    channel: str
+    uc_from_card: int
+    uc_channel: str
+    current_a: np.ndarray
+    voltage_v: np.ndarray
+    temperature_c: float
+    shunt_H: float
+    timing_sigma_s: float
+    status: str = STATUS_OK
+    physical_units: bool = True
+    note: str = ""
+
+
+@dataclass
+class BronzeCondition:
+    """The aligned, scaled dataset one operating point produces."""
+
+    measurement_id: str
+    condition: str
+    fs: float
+    duration_s: float
+    span: tuple[int, int]
+    sync: SyncReport
+    temperature: TemperatureField
+    inventories: dict[int, CardInventory] = field(default_factory=dict)
+    uc_source: dict[int, int] = field(default_factory=dict)
+    voltage: dict[int, np.ndarray] = field(default_factory=dict)
+    all_segments: list[int] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+    #: Filled in by :meth:`segments` as it walks the plate.
+    _plan: dict[int, dict] = field(default_factory=dict)
+
+    @property
+    def n_cards(self) -> int:
+        return len(self.inventories)
+
+    def segments(self) -> Iterator[SegmentSignal]:
+        """Yield every segment's aligned current, one at a time."""
+        for segment in self.all_segments:
+            plan = self._plan.get(segment)
+            if plan is None:
+                continue
+            yield _materialise(self, segment, plan)
+
+    def to_frame(self) -> pd.DataFrame:
+        """Per-segment ingest record - what bronze knows before any spectrum."""
+        rows = []
+        for segment in self.all_segments:
+            plan = self._plan.get(segment, {})
+            rows.append({
+                "measurement_id": self.measurement_id,
+                "condition": self.condition,
+                "segment": segment,
+                "card": plan.get("card"),
+                "channel": plan.get("channel"),
+                "uc_from_card": plan.get("uc_card"),
+                "uc_channel": plan.get("uc_channel"),
+                "bronze_status": plan.get("status", STATUS_CHANNEL_FAULT),
+                "physical_units": plan.get("physical_units", False),
+                "temperature_c": plan.get("temperature_c"),
+                "shunt_H_V_cm2_per_A": plan.get("shunt_H"),
+                "channel_tau_ns": plan.get("tau") * 1e9 if plan.get("tau") is not None
+                else None,
+                "timing_sigma_ns": plan.get("timing_sigma_s", np.nan) * 1e9,
+                "note": plan.get("note", ""),
+            })
+        return pd.DataFrame(rows)
+
+
+def _materialise(bronze: BronzeCondition, segment: int, plan: dict) -> SegmentSignal:
+    """Read, align and scale one segment channel."""
+    inv = bronze.inventories[plan["card"]]
+    lo, hi = bronze.span
+    n_common = plan["n_common"]
+    raw = inv.famos.channel(plan["channel"])[:n_common]
+    if plan["polarity"] != 1:
+        raw = raw * plan["polarity"]
+    if abs(plan["tau"]) > 1e-12 or abs(plan["slope_ppm"]) > 1e-6:
+        raw = align_channel(raw, bronze.fs, plan["tau"], plan["slope_ppm"])
+    raw = raw[lo:hi]
+    if plan["notch"]:
+        raw = apply_notch(raw, bronze.fs, plan["notch"], plan["notch_q"])
+
+    if plan["shunt"] is not None:
+        density = shunt_voltage_to_current_density(
+            raw, segment, plan["shunt"], plan["temperature_c"]
+        )
+    else:
+        density = raw                               # shunt volts, not amps
+    current = density * plan["segment_area_cm2"]
+
+    return SegmentSignal(
+        segment=segment, card=plan["card"], channel=plan["channel"],
+        uc_from_card=plan["uc_card"], uc_channel=plan["uc_channel"],
+        current_a=current, voltage_v=bronze.voltage[plan["uc_card"]],
+        temperature_c=plan["temperature_c"], shunt_H=plan["shunt_H"],
+        timing_sigma_s=plan["timing_sigma_s"], status=plan["status"],
+        physical_units=plan["physical_units"], note=plan.get("note", ""),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Stage 2: build the aligned dataset
+# ---------------------------------------------------------------------------
+
+def run_bronze(
     cfg: PipelineConfig,
     condition: str,
     card_files: dict[int, str],
     shunt: ShuntCalibration | None = None,
     temp_cal: TemperatureCalibration | None = None,
-    reference_spectrum: tuple[np.ndarray, np.ndarray] | None = None,
-    verbose: bool = True,
-) -> ConditionResult:
-    """Full processing of one operating point."""
-    t_start = time.time()
-    log = print if verbose else (lambda *a, **k: None)
-
-    log(f"\n{'=' * 72}\n  {cfg.measurement_id} / {condition}\n{'=' * 72}")
-
-    # ---- inventory ----------------------------------------------------
+    log=print,
+) -> BronzeCondition:
+    """Read one operating point and produce the aligned, scaled dataset."""
     inventories = {c: inventory_card(p, c) for c, p in sorted(card_files.items())}
     for card, inv in inventories.items():
         log(f"  card {card}: {len(inv.segment_channels)} segments, "
@@ -568,12 +593,13 @@ def run_condition(
             f"{inv.n_samples:,} samples @ {inv.famos.fs:.0f} Hz")
 
     fs_values = {inv.famos.fs for inv in inventories.values()}
-    if max(fs_values) - min(fs_values) > cfg.acquisition.fs_tolerance_ppm * 1e-6 * max(fs_values):
+    tolerance = cfg.acquisition.fs_tolerance_ppm * 1e-6 * max(fs_values)
+    if max(fs_values) - min(fs_values) > tolerance:
         raise RuntimeError(f"cards disagree on the sampling rate: {sorted(fs_values)}")
     fs = float(np.median(list(fs_values)))
 
     # ---- synchronisation ----------------------------------------------
-    sync, uc_traces = measure_sync(inventories, cfg)
+    sync, uc_traces = measure_sync(inventories, cfg, shunt)
     log(f"\n  synchronisation (reference card {sync.reference_card}):")
     for card, s in sorted(sync.cards.items()):
         marker = "ok " if s.ok else "FAIL"
@@ -593,7 +619,9 @@ def run_condition(
         elif strategy == "same_card":
             uc_source[card] = card if s.uc_channel else sync.reference_card
         else:                                        # auto
-            uc_source[card] = card if (s.uc_channel and s.healthy_uc) else sync.reference_card
+            uc_source[card] = (
+                card if (s.uc_channel and s.healthy_uc) else sync.reference_card
+            )
     cross_card = {c for c, src in uc_source.items() if src != c}
     sync.alignment_applied = bool(cross_card)
     if cross_card:
@@ -601,7 +629,7 @@ def run_condition(
             f"{sorted(cross_card)} -> full time-base alignment applied")
     else:
         log("\n  every card uses its own cell-voltage copy: bulk inter-card "
-            "skew cancels in the ratio (verified above)")
+            "skew cancels in the ratio (verified below)")
 
     # ---- per-channel timing model ---------------------------------------
     # Every channel has an intrinsic delay made of its card's bulk offset plus
@@ -626,7 +654,9 @@ def run_condition(
         uc_name = sync.cards[src].uc_channel or ""
         tau_uc, slope_uc = tau_total(src, uc_name), slope_of[src]
         for channel in inv.segment_channels.values():
-            shifts.append((tau_total(card, channel) - tau_uc, slope_of[card] - slope_uc))
+            shifts.append(
+                (tau_total(card, channel) - tau_uc, slope_of[card] - slope_uc)
+            )
     for card, s in sync.cards.items():                # UC traces for verification
         shifts.append((s.tau_s, slope_of[card]))
 
@@ -637,22 +667,22 @@ def run_condition(
         if abs(tau) > 1e-12 or abs(slope) > 1e-6:
             a, b = valid_span(n_common, fs, tau, slope)
             lo, hi = max(lo, a), min(hi, b)
-    if hi - lo < cfg.spectral.nperseg * 2:
+    if hi - lo < cfg.spectral.nperseg_min * 4:
         raise RuntimeError(
             f"only {hi - lo} samples survive alignment trimming; "
-            f"need at least {cfg.spectral.nperseg * 2}"
+            f"need at least {cfg.spectral.nperseg_min * 4}"
         )
     duration = (hi - lo) / fs
     log(f"  common analysis span: samples [{lo}, {hi}) = {duration:.1f} s")
+
+    notch = cfg.spectral.notch_freqs_hz if cfg.spectral.apply_notch else []
 
     def prepare(trace: np.ndarray, tau: float, slope: float) -> np.ndarray:
         if abs(tau) > 1e-12 or abs(slope) > 1e-6:
             trace = align_channel(trace, fs, tau, slope)
         trace = trace[lo:hi]
-        if cfg.spectral.apply_notch and cfg.spectral.notch_freqs_hz:
-            trace = apply_notch(
-                trace, fs, cfg.spectral.notch_freqs_hz, cfg.spectral.notch_q
-            )
+        if notch:
+            trace = apply_notch(trace, fs, notch, cfg.spectral.notch_q)
         return trace
 
     # ---- cell-voltage traces --------------------------------------------
@@ -711,8 +741,10 @@ def run_condition(
         for card, inv in sorted(inventories.items()):
             for name in inv.temp_channels:
                 if index < len(temp_cal.c0):
-                    volts = float(np.mean(inv.famos.channel(name)[lo:hi]))
-                    sensor_readings[f"card{card}:{name}"] = temp_cal.to_celsius(index, volts)
+                    trace = inv.famos.channel(name)[lo:hi]
+                    sensor_readings[f"card{card}:{name}"] = sensor_voltage_to_celsius(
+                        trace, index, temp_cal
+                    )
                 index += 1
 
     all_segments = sorted({s for inv in inventories.values() for s in inv.segment_channels})
@@ -733,261 +765,65 @@ def run_condition(
     log(f"  temperature: {temperature.mean_c:.1f} degC "
         f"({'DEGRADED - ' if temperature.degraded else ''}{temperature.note})")
 
-    result = ConditionResult(
+    bronze = BronzeCondition(
         measurement_id=cfg.measurement_id, condition=condition, fs=fs,
-        duration_s=duration, sync=sync, temperature=temperature,
-        provenance={
-            "pipeline_version": __version__,
-            "param_hash": cfg.param_hash,
-            "git_sha": _git_sha(),
-            "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "channel_delay_table": cfg.acquisition.channel_delay_table_version,
-        },
+        duration_s=duration, span=(lo, hi), sync=sync, temperature=temperature,
+        inventories=inventories, uc_source=uc_source, voltage=local_uc,
+        all_segments=all_segments,
     )
 
-    # ---- per-segment impedance -----------------------------------------
-    scfg = cfg.spectral
-    f_max = min(scfg.f_max_hz, 0.45 * fs)
-    use_synchronous = scfg.method == "synchronous" or (
-        scfg.method == "auto" and scfg.base_frequency_hz and scfg.excitation_tones_hz
-    )
-    log(f"\n  impedance: {'synchronous DFT' if use_synchronous else 'coherence-gated Welch'}"
-        f", estimator={scfg.estimator}, band=[{scfg.f_min_hz}, {f_max:.0f}] Hz")
-
+    # ---- per-segment plan ------------------------------------------------
     polarity_table = cfg.acquisition.polarity
-
+    counts: dict[str, int] = {}
     for card, inv in sorted(inventories.items()):
         src = uc_source[card]
         uc_name = sync.cards[src].uc_channel or ""
         tau_uc, slope_uc = tau_total(src, uc_name), slope_of[src]
-
-        # Refuse to produce impedances on an unverified time base: a wrong
-        # alignment does not look wrong, it looks like a different spectrum.
-        if not sync.cards[card].ok or not sync.cards[src].ok:
-            for segment in inv.segment_channels:
-                result.rejected[segment] = (
-                    f"card {card} timing not established "
-                    f"({sync.cards[card].note or 'no detail'})"
-                )
-            continue
-        voltage = local_uc[src]
+        timing_sigma = float(np.hypot(
+            sync.cards[card].timing_sigma_s, sync.cards[src].timing_sigma_s
+        ))
+        card_ok = sync.cards[card].ok and sync.cards[src].ok
 
         for segment, channel in sorted(inv.segment_channels.items()):
-            try:
-                if shunt is not None and not shunt.has(segment):
-                    result.rejected[segment] = "no shunt calibration for this segment"
-                    continue
-
-                raw = inv.famos.channel(channel)[:n_common]
-
-                # polarity from the wiring map, not from a vote on the data
-                sign = polarity_table.get(card, {}).get(
+            status, note, physical = STATUS_OK, "", True
+            if not card_ok:
+                status = STATUS_TIMING_UNVERIFIED
+                note = (
+                    f"card {card} time base not verified "
+                    f"({sync.cards[card].note or 'no detail'}); the impedance is "
+                    f"still computed and its phase uncertainty widened to cover "
+                    f"the unknown delay"
+                )
+            temperature_c = temperature.at(segment)
+            if shunt is not None and shunt.has(segment):
+                shunt_H = shunt.H(segment, temperature_c)
+                shunt_obj: ShuntCalibration | None = shunt
+            else:
+                shunt_H, shunt_obj, physical = 1.0, None, False
+                if status == STATUS_OK:
+                    status = STATUS_NO_CALIBRATION
+                note = (note + "; " if note else "") + (
+                    "no via-shunt calibration for this segment; the impedance "
+                    "is in shunt volts per amp, not ohms"
+                )
+            counts[status] = counts.get(status, 0) + 1
+            bronze._plan[segment] = {
+                "card": card, "channel": channel, "uc_card": src,
+                "uc_channel": sync.cards[src].uc_channel or "?",
+                "tau": tau_total(card, channel) - tau_uc,
+                "slope_ppm": slope_of[card] - slope_uc,
+                "polarity": polarity_table.get(card, {}).get(
                     channel, cfg.acquisition.default_polarity
-                )
-                if sign != 1:
-                    raw = raw * sign
+                ),
+                "notch": notch, "notch_q": cfg.spectral.notch_q,
+                "shunt": shunt_obj, "shunt_H": shunt_H,
+                "temperature_c": temperature_c,
+                "segment_area_cm2": cfg.geometry.segment_area_cm2,
+                "timing_sigma_s": timing_sigma,
+                "status": status, "physical_units": physical,
+                "note": note, "n_common": n_common,
+            }
 
-                # Delay of this channel relative to the cell-voltage channel it
-                # is divided by.  Channel-level skew inside a card does NOT
-                # cancel in the ratio, so it is applied even when the segment
-                # uses its own card's cell voltage.
-                raw = prepare(
-                    raw,
-                    tau_total(card, channel) - tau_uc,
-                    slope_of[card] - slope_uc,
-                )
-
-                # shunt voltage -> local current density -> segment current
-                t_seg = temperature.at(segment)
-                H = shunt.H(segment, t_seg) if shunt is not None else 1.0
-                current_density = raw / H                     # A/cm^2
-                current = current_density * cfg.geometry.segment_area_cm2   # A
-
-                if use_synchronous:
-                    spectrum = impedance_synchronous(
-                        current, voltage, fs,
-                        base_frequency_hz=float(scfg.base_frequency_hz),
-                        tones_hz=list(scfg.excitation_tones_hz or []),
-                        periods=scfg.periods_per_window, estimator=scfg.estimator,
-                        gate=scfg.gate_windows, detrend=scfg.detrend,
-                        amplitude_mad_k=scfg.amplitude_mad_k,
-                        phase_outlier_rad=scfg.phase_outlier_rad,
-                        max_rejected_fraction=scfg.max_rejected_fraction,
-                    )
-                else:
-                    spectrum = impedance_welch(
-                        current, voltage, fs, nperseg=scfg.nperseg,
-                        noverlap=scfg.noverlap, window=scfg.window,
-                        detrend=scfg.detrend, f_min=scfg.f_min_hz, f_max=f_max,
-                        estimator=scfg.estimator, gate=scfg.gate_windows,
-                        amplitude_mad_k=scfg.amplitude_mad_k,
-                        phase_outlier_rad=scfg.phase_outlier_rad,
-                        max_rejected_fraction=scfg.max_rejected_fraction,
-                    )
-
-                gated = spectrum.gate(scfg.min_coherence)
-                if len(gated.f) < scfg.min_points_per_segment:
-                    result.rejected[segment] = (
-                        f"only {len(gated.f)} of {len(spectrum.f)} points reach "
-                        f"gamma^2 >= {scfg.min_coherence}"
-                    )
-                    continue
-
-                n_hf = max(2, len(gated.f) // 5)
-                rs_hf = float(np.median(np.sort(gated.Z.real[np.argsort(gated.f)][-n_hf:])))
-
-                result.segments[segment] = SegmentResult(
-                    segment=segment, card=card,
-                    uc_channel=sync.cards[src].uc_channel or "?", uc_from_card=src,
-                    spectrum=gated, temperature_c=t_seg, shunt_H=H, rs_hf_ohm=rs_hf,
-                )
-            except Exception as exc:                       # keep going
-                result.rejected[segment] = f"{type(exc).__name__}: {exc}"
-
-        del inv.famos                                       # release the memmap
-
-    log(f"  segments: {len(result.segments)} usable, {len(result.rejected)} rejected")
-
-    # ---- validation ------------------------------------------------------
-    if cfg.validation.run_lin_kk:
-        for r in result.segments.values():
-            r.kk = lin_kk(
-                r.spectrum.f, r.spectrum.Z, r.spectrum.sigma_real,
-                max_elements=cfg.validation.kk_max_elements,
-                mu_target=cfg.validation.kk_mu_target,
-                max_residual_pct=cfg.validation.kk_max_residual_pct,
-            )
-        passed = sum(1 for r in result.segments.values() if r.kk and r.kk.passed)
-        shapes: dict[str, int] = {}
-        for r in result.segments.values():
-            if r.kk:
-                shapes[r.kk.shape_class] = shapes.get(r.kk.shape_class, 0) + 1
-        log(f"  Kramers-Kronig: {passed}/{len(result.segments)} pass "
-            f"(<= {cfg.validation.kk_max_residual_pct}% residual); "
-            f"residual shapes: {shapes}")
-
-    if cfg.validation.run_admittance_sum and result.segments:
-        result.plate = admittance_sum(
-            {s: (r.spectrum.f, r.spectrum.Z) for s, r in result.segments.items()},
-            cfg.geometry.segment_area_cm2, cfg.geometry.cell_area_cm2,
-            reference_spectrum,
-        )
-        if result.plate is not None and getattr(result.plate, "n_segments", 0):
-            note = f"  plate admittance sum: {result.plate.n_segments} segments"
-            if result.plate.median_relative_difference is not None:
-                note += (f"; median deviation from the reference instrument "
-                         f"{result.plate.median_relative_difference:.1%}")
-            log(note)
-
-    # ---- modelling --------------------------------------------------------
-    if cfg.model.run_ecm:
-        fitted = 0
-        for r in result.segments.values():
-            best, allfits = select_model(
-                r.spectrum.f, r.spectrum.Z, cfg.model.models, r.spectrum.sigma_real,
-                n_starts=cfg.model.n_starts, max_nfev=cfg.model.max_nfev,
-                max_relative_sigma=cfg.model.max_relative_sigma,
-            )
-            r.ecm, r.ecm_all = best, allfits
-            fitted += best is not None
-        chosen: dict[str, int] = {}
-        for r in result.segments.values():
-            if r.ecm:
-                chosen[r.ecm.model] = chosen.get(r.ecm.model, 0) + 1
-        log(f"  ECM: {fitted}/{len(result.segments)} fitted; selected {chosen}")
-
-    result.elapsed_s = time.time() - t_start
-    log(f"  done in {result.elapsed_s:.1f} s")
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Stage 3: batch over conditions
-# ---------------------------------------------------------------------------
-
-def run_measurement(
-    cfg: PipelineConfig,
-    reference_spectra: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
-    write: bool = True,
-    verbose: bool = True,
-) -> dict[str, ConditionResult]:
-    """Discover, process and persist every requested condition."""
-    log = print if verbose else (lambda *a, **k: None)
-
-    discovered = discover_files(
-        cfg.raw_dir, cfg.acquisition.discovery_regex, cfg.measurement_id or None
-    )
-    if not discovered:
-        raise FileNotFoundError(
-            f"no files under {cfg.raw_dir} match {cfg.acquisition.discovery_regex!r}"
-        )
-    conditions = cfg.conditions or sorted(discovered)
-    log(f"discovered conditions: {sorted(discovered)}  ->  processing {conditions}")
-
-    shunt = (
-        load_shunt_calibration(cfg.calibration.shunt_csv)
-        if cfg.calibration.shunt_csv else None
-    )
-    temp_cal = (
-        load_temperature_calibration(cfg.calibration.temperature_csv)
-        if cfg.calibration.temperature_csv else None
-    )
-    if shunt is None:
-        log("WARNING: no shunt calibration configured - impedances will be in "
-            "shunt volts per amp, not physical ohms")
-
-    results: dict[str, ConditionResult] = {}
-    for condition in conditions:
-        if condition not in discovered:
-            log(f"  skipping {condition}: no files")
-            continue
-        results[condition] = run_condition(
-            cfg, condition, discovered[condition], shunt, temp_cal,
-            (reference_spectra or {}).get(condition), verbose=verbose,
-        )
-
-    if write and results:
-        write_outputs(cfg, results, verbose=verbose)
-    return results
-
-
-def write_outputs(
-    cfg: PipelineConfig, results: dict[str, ConditionResult], verbose: bool = True
-) -> dict[str, Path]:
-    """Persist impedance, per-segment and synchronisation tables."""
-    log = print if verbose else (lambda *a, **k: None)
-    out = Path(cfg.output_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    area = cfg.geometry.segment_area_cm2
-
-    impedance = pd.concat(
-        [r.impedance_frame(area) for r in results.values()], ignore_index=True
-    )
-    segments = pd.concat(
-        [r.segment_frame(area) for r in results.values()], ignore_index=True
-    )
-    sync = pd.concat(
-        [r.sync.to_frame().assign(condition=c) for c, r in results.items()],
-        ignore_index=True,
-    )
-
-    paths: dict[str, Path] = {}
-    for name, frame in (
-        ("impedance", impedance), ("segments", segments), ("sync", sync)
-    ):
-        path = out / f"{name}.parquet"
-        try:
-            frame.to_parquet(path, index=False)
-        except Exception:                            # no pyarrow -> CSV
-            path = out / f"{name}.csv"
-            frame.to_csv(path, index=False)
-        paths[name] = path
-        log(f"  wrote {path}  ({len(frame):,} rows)")
-
-    config_path = out / "config.yaml"
-    try:
-        cfg.save(config_path)
-        paths["config"] = config_path
-    except Exception:
-        pass
-    return paths
+    log(f"  segments ingested: {len(bronze._plan)} "
+        f"({', '.join(f'{v} {k}' for k, v in sorted(counts.items()))})")
+    return bronze

@@ -13,8 +13,6 @@ output_dir: ./out/2611976
 
 acquisition:
   fs_nominal: 10000.0
-  filename_template: "Leepa_{measurement_id}_Current_{condition}_Test_{test}_Karte_{card}.DAT"
-  test_index: "01"
 
   # Per-channel delay *within* a card, relative to that card's own time base.
   # This is the offset that does NOT cancel in the impedance ratio, so it has
@@ -72,8 +70,15 @@ sync:
   uc_min_rms_v: 0.002
 
 spectral:
-  # auto -> synchronous when base_frequency_hz and excitation_tones_hz are set,
-  # otherwise coherence-gated Welch.
+  # auto            -> synchronous when the multisine is declared below,
+  #                    otherwise multiresolution.
+  # multiresolution -> Welch with a window length chosen per octave band:
+  #                    long where the period is long, short (and therefore
+  #                    many times averaged) at the top of the band. This is
+  #                    what makes the high-frequency end measurable rather
+  #                    than merely present.
+  # welch           -> one window length for the whole band.
+  # synchronous     -> leakage-free DFT at the designed tones.
   method: auto
   estimator: hv                   # hv | h1 | h2  (h1 under-reads by gamma^2)
 
@@ -84,10 +89,16 @@ spectral:
   excitation_tones_hz: null
   periods_per_window: 4
 
-  nperseg: 8192                   # Welch fallback: df = fs/nperseg
+  nperseg: 8192                   # longest window; df = fs/nperseg
   noverlap: null                  # null = nperseg // 2
   window: hann
   detrend: linear
+
+  # Multi-resolution plan: each band gets the shortest window that still holds
+  # min_periods_per_window periods of its lowest frequency.
+  min_periods_per_window: 8
+  nperseg_min: 256
+  bands_per_decade: 3
 
   f_min_hz: 1.0
   f_max_hz: 4000.0
@@ -97,8 +108,15 @@ spectral:
   phase_outlier_rad: 0.5
   max_rejected_fraction: 0.5
 
+  # Points below this are MARKED, not deleted, so every segment keeps the
+  # same frequency grid and nothing disappears from the plate.
   min_coherence: 0.70
   min_points_per_segment: 5
+
+  # Fold the measured timing uncertainty into the per-point phase uncertainty.
+  # Kept separate from the random part, which is what fits are weighted by.
+  propagate_timing_uncertainty: true
+  verify_tones: true
 
   apply_notch: true
   notch_freqs_hz: [50.0, 100.0, 150.0]
@@ -107,11 +125,87 @@ spectral:
 validation:
   run_lin_kk: true
   kk_max_elements: 30
-  kk_mu_target: 0.85              # Schoenleber stopping criterion
+  kk_mu_target: 0.85              # Schoenleber over-fitting criterion
+  # A point is a violation only when it exceeds BOTH the percentage and this
+  # many times its own uncertainty. The pair is what stops an honestly
+  # imprecise segment being declared non-causal, and an over-precise one
+  # passing on a systematic error.
   kk_max_residual_pct: 1.0
+  kk_max_sigma: 3.0
   run_stationarity: true
   stationarity_tolerance: 0.05
   run_admittance_sum: true        # sum(A_k/Z_k) vs the cell-level reference
+
+# ---------------------------------------------------------------------------
+# High-frequency accuracy. See docs/HF_ACCURACY_METHOD.md.
+#
+# Above a few hundred hertz the measured impedance is dominated by the
+# instrument, not the cell, and every one of those errors is a phase error that
+# grows with frequency and never shows in the magnitude.
+# ---------------------------------------------------------------------------
+hf:
+  enabled: true
+
+  # THE BIG ONE. H/A is about 25 microohms, so half a nanohenry of shunt loop
+  # inductance is a time constant of tens of microseconds - 26 degrees at
+  # 3.8 kHz, three orders of magnitude above the 73 ns timing budget, and
+  # invisible to every timing diagnostic because it is not a timing error.
+  # Measure one shunt on a bridge at 100 kHz and put the number here.
+  # 0 disables the correction AND records that it was not applied.
+  shunt_inductance_nh: 0.0
+  shunt_inductance_nh_per_segment: {}
+
+  # Anti-alias filter. Only the MISMATCH between the segment and cell-voltage
+  # channels survives the ratio, so a shared front end costs nothing.
+  aa_order: 0
+  aa_corner_hz: 0.0
+  aa_corner_mismatch: 0.0         # 0.02 = 2 % corner tolerance ~ 0.5 deg
+
+  # The delay left over after all of the above, identified from the ENSEMBLE of
+  # segments rather than from any one of them: it is common to the card while
+  # the wiring inductance is individual, so a non-zero delay shows up as a
+  # spurious L-vs-Rs proportionality whose slope IS the delay.
+  identify_common_mode: true
+  common_mode_band_hz: [200.0, 4000.0]
+  delay_bound_s: 0.0              # 0 = derive from the measured skew sigma
+  delay_bound_floor_s: 3.0e-7
+  min_segments_for_pooling: 4
+
+  # Fallback for a card timed from a segment proxy, where the delay is unknown
+  # to microseconds: minimise the pooled Kramers-Kronig residual, bounded both
+  # by the measured skew and by a physical prior on the wiring inductance.
+  kk_fallback: true
+  kk_fallback_segments: 8
+  kk_fallback_grid: 21
+  kk_fallback_max_inductance_nh: 50.0
+  kk_fallback_min_sigma_ratio: 10.0
+
+  # Rs from a weighted Rs + jwL + arc fit over the top decade, not from the
+  # median of the highest real parts (which the inductive tail biases).
+  hfr_band_decades: 1.0
+  hfr_min_points: 4
+  hfr_arc_min_points: 8
+
+  # In-plane current shared with neighbouring segments. The measured
+  # admittances are a spatially smoothed version of the true ones; inverting
+  # the mixing sharpens the map. 0 disables - the mixing fraction has to come
+  # from a characterisation of the plate, not from taste.
+  crosstalk_alpha: 0.0
+  crosstalk_regularisation: 1.0e-3
+
+# ---------------------------------------------------------------------------
+# Segment quality. Nothing is rejected; everything is classified.
+# ---------------------------------------------------------------------------
+quality:
+  keep_all_segments: true
+  active_min_points: 3
+  w_coherence: 1.0
+  w_uncertainty: 1.0
+  w_kk: 1.0
+  w_timing: 1.0
+  sigma_reference: 0.10           # sigma at which that term of the score hits 0
+  kk_reference_pct: 3.0
+  good_quality: 0.60              # at or above this, drawn solid on the maps
 
 model:
   run_ecm: true
@@ -119,3 +213,22 @@ model:
   n_starts: 6
   max_nfev: 5000
   max_relative_sigma: 0.30        # wider than this is flagged, not plotted
+  fit_all_active_segments: true   # fit the flagged ones too, and label them
+
+report:
+  write_figures: true
+  write_dashboard: true           # one self-contained interactive HTML file
+  # Any of these becomes a plate map. Keys ending in @f are frequency-resolved
+  # and drive the dashboard's slider and the small-multiple figures.
+  heatmap_parameters:
+    - rs_hf
+    - rp
+    - quality
+    - coherence
+    - sigma_rel
+    - kk_max_residual_pct
+    - z_mod@f
+    - neg_z_imag@f
+    - phase@f
+  heatmap_frequencies_hz: []      # empty = every frequency in the shared grid
+  max_spectra_per_figure: 12

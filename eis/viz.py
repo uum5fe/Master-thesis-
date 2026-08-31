@@ -1,9 +1,18 @@
 """Figures: spectra with error bars, plate maps, and synchronisation diagnostics.
 
 Matplotlib only, so the figures render anywhere the pipeline runs (including a
-headless cluster).  The uncertainty computed in :mod:`eis.spectra` is shown
-rather than hidden: error bars on the spectra, and a hatch over segments whose
-fit is too poorly determined to be read as a number.
+headless cluster).  Two rules run through all of it:
+
+* **The uncertainty is shown, not hidden.**  Error bars on every spectrum, and
+  a hatch over segments whose value is too poorly determined to be read as a
+  number.
+* **Every segment is drawn.**  A plate map with holes in it invites the reader
+  to forget the holes.  Segments that failed are drawn desaturated with their
+  status written in them, and the colour scale is computed from the segments
+  that are trustworthy so that one broken channel cannot flatten the map.
+
+For the same picture with the spectra attached to it, see
+:mod:`eis.dashboard`.
 """
 
 from __future__ import annotations
@@ -46,9 +55,29 @@ def default_segment_grid(
 # ---------------------------------------------------------------------------
 
 def plot_spectra(result, cfg, segments: list[int] | None = None, max_segments: int = 12):
-    """Nyquist + Bode magnitude + phase, with per-point uncertainty."""
-    chosen = segments or sorted(result.segments)[:max_segments]
-    chosen = [s for s in chosen if s in result.segments][:max_segments]
+    """Nyquist + Bode magnitude + phase, with per-point uncertainty.
+
+    With eighty segments an overview figure has to choose.  It shows the
+    *active* ones, spread evenly across the plate rather than taking the first
+    twelve, so the figure reflects the spatial variation instead of one corner.
+    """
+    max_segments = getattr(
+        getattr(cfg, "report", None), "max_spectra_per_figure", max_segments
+    )
+    if segments is None:
+        active = [
+            s for s in sorted(result.segments)
+            if result.segments[s].active and len(result.segments[s].spectrum.f)
+        ]
+        if len(active) > max_segments:
+            picks = np.linspace(0, len(active) - 1, max_segments).round().astype(int)
+            segments = [active[i] for i in dict.fromkeys(picks)]
+        else:
+            segments = active
+    chosen = [
+        s for s in segments
+        if s in result.segments and len(result.segments[s].spectrum.f)
+    ][:max_segments]
     if not chosen:
         return None
     asr = cfg.geometry.segment_area_cm2 * 1e3          # Ohm -> mOhm*cm^2
@@ -116,39 +145,76 @@ def plot_spectra(result, cfg, segments: list[int] | None = None, max_segments: i
 def plot_plate(
     values: dict[int, float], cfg, title: str, unit: str = "",
     uncertain: set[int] | None = None, cmap: str = "viridis",
+    all_segments: list[int] | None = None,
+    status: dict[int, str] | None = None,
+    quality: dict[int, float] | None = None,
 ):
-    """Spatial map of one scalar per segment.
+    """Spatial map of one scalar per segment, with every segment on it.
 
-    Segments flagged as poorly determined are hatched rather than dropped, so a
-    reader can see that a value exists but should not be trusted.
+    ``values`` supplies the numbers.  ``all_segments`` names the segments that
+    should appear even when they have no number - they are drawn as empty
+    outlines carrying their status, so a gap in the data reads as a gap in the
+    data rather than as a plate with fewer segments.
+
+    ``quality`` desaturates the doubtful ones and, more importantly, keeps them
+    out of the colour scale: a single segment reading ten times the plate
+    median would otherwise compress every real variation into one shade.
     """
+    catalogue = sorted(set(all_segments or []) | set(values))
     coords = cfg.geometry.segment_coords or default_segment_grid(
-        sorted(values), cfg.geometry.plate_w_cm, cfg.geometry.plate_h_cm
+        catalogue, cfg.geometry.plate_w_cm, cfg.geometry.plate_h_cm
     )
     usable = {s: v for s, v in values.items() if s in coords and np.isfinite(v)}
     if not usable:
         return None
 
-    array = np.array(list(usable.values()), float)
-    norm = Normalize(vmin=float(array.min()), vmax=float(array.max()))
+    good_cut = getattr(getattr(cfg, "quality", None), "good_quality", 0.0)
+    trusted = [
+        v for s, v in usable.items()
+        if quality is None or quality.get(s, 1.0) >= good_cut
+    ]
+    basis = np.array(trusted if len(trusted) >= 3 else list(usable.values()), float)
+    norm = Normalize(vmin=float(basis.min()), vmax=float(basis.max()))
     colours = plt.get_cmap(cmap)
     uncertain = uncertain or set()
+    status = status or {}
 
     fig, ax = plt.subplots(figsize=(14, 6.5))
     ax.add_patch(Rectangle(
         (0, 0), cfg.geometry.plate_w_cm, cfg.geometry.plate_h_cm,
         facecolor="#EEE8DC", edgecolor="#7a6a4a", lw=1.6, zorder=0,
     ))
-    for seg, value in usable.items():
+    n_missing = 0
+    for seg in catalogue:
+        if seg not in coords:
+            continue
         x, y, hw, hh = coords[seg]
+        value = usable.get(seg)
+        if value is None:
+            n_missing += 1
+            ax.add_patch(Rectangle(
+                (x - hw, y - hh), 2 * hw, 2 * hh, facecolor="none",
+                edgecolor="#b4531f", lw=1.2, ls="--", zorder=2,
+            ))
+            ax.text(
+                x, y, f"{seg}\n{status.get(seg, 'no value')}", ha="center",
+                va="center", fontsize=6.5, color="#b4531f", zorder=3,
+            )
+            continue
+        doubtful = (
+            seg in uncertain
+            or (quality is not None and quality.get(seg, 1.0) < good_cut)
+        )
         ax.add_patch(Rectangle(
             (x - hw, y - hh), 2 * hw, 2 * hh,
             facecolor=colours(norm(value)), edgecolor="white", lw=1.2, zorder=2,
-            hatch="///" if seg in uncertain else None,
+            alpha=0.45 if doubtful else 1.0,
+            hatch="///" if doubtful else None,
         ))
         ax.text(
             x, y, f"{seg}\n{value:.3g}", ha="center", va="center",
-            fontsize=7.5, color="white", fontweight="bold", zorder=3,
+            fontsize=7.5, color="white" if not doubtful else "#222",
+            fontweight="bold", zorder=3,
         )
 
     sm = plt.cm.ScalarMappable(cmap=colours, norm=norm); sm.set_array([])
@@ -157,7 +223,15 @@ def plot_plate(
     ax.set_xlim(-0.2, cfg.geometry.plate_w_cm + 0.2)
     ax.set_ylim(-0.2, cfg.geometry.plate_h_cm + 0.2)
     ax.set_aspect("equal"); ax.axis("off")
-    subtitle = "  (hatched = poorly determined)" if uncertain else ""
+    marks = []
+    if any(
+        seg in uncertain or (quality is not None and quality.get(seg, 1.0) < good_cut)
+        for seg in usable
+    ):
+        marks.append("hatched = poorly determined")
+    if n_missing:
+        marks.append(f"{n_missing} dashed = no usable value")
+    subtitle = f"  ({'; '.join(marks)})" if marks else ""
     ax.set_title(title + subtitle, fontsize=12, fontweight="bold")
     fig.tight_layout()
     return fig
@@ -232,12 +306,84 @@ def plot_kk(result, max_segments: int = 8):
 # Report
 # ---------------------------------------------------------------------------
 
+def plot_plate_over_frequency(
+    result, cfg, key: str = "z_mod@f", n_panels: int = 6, cmap: str = "viridis"
+):
+    """Small multiples of one frequency-resolved map across the band.
+
+    This is the figure that separates the loss mechanisms by eye: an ohmic term
+    is spatially smooth and barely changes from panel to panel, while a kinetic
+    or transport term appears in a band and follows the flow field.  It is only
+    possible because the coherence gate marks rather than deletes, so every
+    segment still has a value at every frequency.
+    """
+    from eis.pipeline.gold import map_label, scalar_map
+
+    frequencies = np.asarray(result.frequencies, float)
+    if frequencies.size < 2:
+        return None
+    picks = np.unique(np.geomspace(
+        max(frequencies.min(), 1e-6), frequencies.max(),
+        min(n_panels, frequencies.size)
+    ))
+    coords = cfg.geometry.segment_coords or default_segment_grid(
+        sorted(result.segments), cfg.geometry.plate_w_cm, cfg.geometry.plate_h_cm
+    )
+    area = cfg.geometry.segment_area_cm2
+    panels = [
+        (f, scalar_map(result, key, area, frequency_hz=float(f))) for f in picks
+    ]
+    panels = [(f, m) for f, m in panels if m]
+    if not panels:
+        return None
+
+    everything = np.array([v for _, m in panels for v in m.values()], float)
+    norm = Normalize(vmin=float(np.nanpercentile(everything, 2)),
+                     vmax=float(np.nanpercentile(everything, 98)))
+    colours = plt.get_cmap(cmap)
+    title, unit = map_label(key)
+
+    rows = int(np.ceil(len(panels) / 2))
+    fig, axes = plt.subplots(rows, 2, figsize=(13, 2.6 * rows), squeeze=False)
+    for ax, (frequency, values) in zip(axes.ravel(), panels):
+        ax.add_patch(Rectangle(
+            (0, 0), cfg.geometry.plate_w_cm, cfg.geometry.plate_h_cm,
+            facecolor="#EEE8DC", edgecolor="#7a6a4a", lw=1.0, zorder=0,
+        ))
+        for seg, value in values.items():
+            if seg not in coords:
+                continue
+            x, y, hw, hh = coords[seg]
+            ax.add_patch(Rectangle(
+                (x - hw, y - hh), 2 * hw, 2 * hh, facecolor=colours(norm(value)),
+                edgecolor="white", lw=0.5, zorder=2,
+            ))
+        ax.set_xlim(-0.2, cfg.geometry.plate_w_cm + 0.2)
+        ax.set_ylim(-0.2, cfg.geometry.plate_h_cm + 0.2)
+        ax.set_aspect("equal"); ax.axis("off")
+        ax.set_title(f"{frequency:.4g} Hz", fontsize=10)
+    for ax in axes.ravel()[len(panels):]:
+        ax.axis("off")
+
+    sm = plt.cm.ScalarMappable(cmap=colours, norm=norm); sm.set_array([])
+    cbar = fig.colorbar(sm, ax=axes.ravel().tolist(), fraction=0.02, pad=0.02)
+    cbar.set_label(unit or title)
+    fig.suptitle(f"{result.condition}: {title} across the band", fontsize=12,
+                 fontweight="bold")
+    return fig
+
+
 def write_report_figures(result, cfg, out_dir: str | Path) -> list[Path]:
     """Write the standard figure set for one condition."""
+    from eis.pipeline.gold import map_label, scalar_map
+
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
-    asr = cfg.geometry.segment_area_cm2 * 1e3
+    area = cfg.geometry.segment_area_cm2
+    catalogue = sorted(result.segments)
+    status = {s: r.status for s, r in result.segments.items()}
+    quality = {s: r.quality for s, r in result.segments.items()}
 
     def save(fig, name: str) -> None:
         if fig is None:
@@ -251,29 +397,31 @@ def write_report_figures(result, cfg, out_dir: str | Path) -> list[Path]:
     save(plot_sync(result), "synchronisation.png")
     save(plot_kk(result), "kramers_kronig.png")
 
-    rs = {s: r.rs_hf_ohm * asr for s, r in result.segments.items()}
-    save(plot_plate(rs, cfg, f"{result.condition}: high-frequency resistance",
-                    r"$R_s$ [m$\Omega\cdot$cm$^2$]"), "plate_rs.png")
-
-    if any(r.ecm for r in result.segments.values()):
-        ecm_rs, ecm_rp, poor = {}, {}, set()
-        for seg, r in result.segments.items():
-            if r.ecm is None:
-                continue
-            ecm_rs[seg] = r.ecm.params["Rs"] * asr
-            ecm_rp[seg] = r.ecm.r_polarisation * asr
-            if r.ecm.poorly_determined:
-                poor.add(seg)
-        save(plot_plate(ecm_rs, cfg, f"{result.condition}: ECM $R_s$",
-                        r"$R_s$ [m$\Omega\cdot$cm$^2$]", uncertain=poor),
-             "plate_ecm_rs.png")
-        save(plot_plate(ecm_rp, cfg, f"{result.condition}: polarisation resistance",
-                        r"$R_p$ [m$\Omega\cdot$cm$^2$]", uncertain=poor, cmap="magma"),
-             "plate_ecm_rp.png")
-
-    coherence = {
-        s: float(np.median(r.spectrum.coherence)) for s, r in result.segments.items()
+    # One code path, N maps: everything the configuration asks for.
+    poor = {
+        s for s, r in result.segments.items()
+        if r.ecm is not None and r.ecm.poorly_determined
     }
-    save(plot_plate(coherence, cfg, f"{result.condition}: median coherence",
-                    r"$\gamma^2$", cmap="cividis"), "plate_coherence.png")
+    for key in cfg.report.heatmap_parameters:
+        if key.endswith("@f"):
+            continue
+        values = scalar_map(result, key, area)
+        if not values:
+            continue
+        title, unit = map_label(key)
+        save(
+            plot_plate(
+                values, cfg, f"{result.condition}: {title}", unit,
+                uncertain=poor if key in ("rp", "ecm_rs", "chi2_reduced") else None,
+                cmap="magma" if key == "rp" else
+                     "cividis" if key in ("coherence", "quality") else "viridis",
+                all_segments=catalogue, status=status, quality=quality,
+            ),
+            f"plate_{key}.png",
+        )
+
+    for key in cfg.report.heatmap_parameters:
+        if key.endswith("@f"):
+            save(plot_plate_over_frequency(result, cfg, key),
+                 f"plate_over_frequency_{key.replace('@', '_at_')}.png")
     return written

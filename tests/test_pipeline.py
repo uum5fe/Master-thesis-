@@ -1,13 +1,13 @@
-"""End-to-end: FAMOS files with imposed timing faults -> correct impedances."""
+"""End-to-end: FAMOS files with imposed faults -> correct impedances."""
 
 from __future__ import annotations
 
 import numpy as np
 import pytest
 
-from eis.config import load_config
-from eis.io.famos import FamosFormatError, discover_files, open_famos, parse_famos_header
+from eis.io.famos import FamosFormatError, discover_files, parse_famos_header
 from eis.pipeline import inventory_card, measure_sync, run_measurement
+from eis.pipeline.config import load_config
 from tests.synthetic import simulate_measurement, write_famos
 
 
@@ -216,3 +216,208 @@ def test_output_tables_carry_provenance(measurement, tmp_path):
     other = make_config(raw, truth, tmp_path)
     other.spectral.estimator = "h1"
     assert other.param_hash != cfg.param_hash, "parameters must change the hash"
+
+
+# ---------------------------------------------------------------------------
+# High frequency: the correction that timing alone cannot make
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def inductive_shunt(tmp_path_factory):
+    """A clean measurement whose only fault is a real via-shunt inductance."""
+    raw = tmp_path_factory.mktemp("shunt")
+    truth = simulate_measurement(
+        raw, n_cards=2, segments_per_card=4, duration_s=20.0,
+        shunt_inductance_nh=0.6,
+    )
+    return raw, truth
+
+
+def _run_with_shunt_inductance(raw, truth, tmp_path, nh):
+    cfg = make_config(raw, truth, tmp_path)
+    cfg.hf.shunt_inductance_nh = nh
+    cfg.validation.run_stationarity = False
+    cfg.model.run_ecm = False
+    return run_measurement(cfg, write=False, verbose=False)["150A"]
+
+
+def _error_at_the_top_tone(result, truth) -> float:
+    errors = []
+    for segment, r in result.segments.items():
+        top = int(np.argmax(r.spectrum.f))
+        Z_true = truth.Z_at(segment, r.spectrum.f)[top]
+        errors.append(abs(r.spectrum.Z[top] - Z_true) / abs(Z_true))
+    return float(np.median(errors))
+
+
+def test_shunt_inductance_wrecks_the_high_frequency_end_if_uncorrected(
+    inductive_shunt, tmp_path
+):
+    """A 0.6 nH via shunt is 25 degrees at 4 kHz and no delay correction sees it.
+
+    The shunt is tens of microohms, so its own L/R time constant is tens of
+    microseconds - three orders of magnitude above the nanosecond timing
+    budget the synchronisation stage meets.  Treating H(T) as a real number
+    therefore costs more accuracy at the top of the band than every timing
+    error in the pipeline put together.
+    """
+    raw, truth = inductive_shunt
+    uncorrected = _run_with_shunt_inductance(raw, truth, tmp_path, nh=0.0)
+    corrected = _run_with_shunt_inductance(raw, truth, tmp_path, nh=0.6)
+
+    assert _error_at_the_top_tone(uncorrected, truth) > 0.30
+    assert _error_at_the_top_tone(corrected, truth) < 0.01
+
+    # And the sync stage is blameless: it met its budget in both runs.
+    for card, sync in corrected.sync.cards.items():
+        if sync.residual_tau_s is not None:
+            assert abs(sync.residual_tau_s) < 100e-9
+
+
+def test_the_applied_instrument_response_is_recorded_in_the_output(
+    inductive_shunt, tmp_path
+):
+    raw, truth = inductive_shunt
+    result = _run_with_shunt_inductance(raw, truth, tmp_path, nh=0.6)
+    frame = result.segment_frame(4.235)
+
+    assert (frame["instrument_terms"].str.contains("shunt_tau")).all()
+    assert (frame["instrument_phase_deg_at_fmax"].abs() > 10.0).all()
+    assert "hf_crossover_hz" in frame.columns
+
+
+# ---------------------------------------------------------------------------
+# Multi-resolution analysis
+# ---------------------------------------------------------------------------
+
+def test_multiresolution_buys_averages_at_the_top_of_the_band(
+    measurement, tmp_path
+):
+    """One window length cannot serve four decades.
+
+    A window long enough for eight periods of 1 Hz throws away almost all the
+    averaging a 40 s record offers at 3 kHz.  The multi-resolution plan spends
+    a short window there instead, and the uncertainty falls accordingly.
+    """
+    raw, truth = measurement
+    cfg = make_config(raw, truth, tmp_path)
+    cfg.spectral.base_frequency_hz = None      # force the Welch family
+    cfg.spectral.excitation_tones_hz = None
+    cfg.validation.run_lin_kk = False
+    cfg.validation.run_stationarity = False
+    cfg.model.run_ecm = False
+
+    cfg.spectral.method = "welch"
+    fixed = run_measurement(cfg, write=False, verbose=False)["150A"]
+    cfg.spectral.method = "multiresolution"
+    multi = run_measurement(cfg, write=False, verbose=False)["150A"]
+
+    segment = sorted(fixed.segments)[0]
+    a, b = fixed.segments[segment].spectrum_all, multi.segments[segment].spectrum_all
+
+    def top_decade(spectrum):
+        m = spectrum.f >= spectrum.f.max() / 10.0
+        return m
+
+    assert b.n_eff_f is not None
+    n_fixed = float(np.median(a.n_eff_f[top_decade(a)]))
+    n_multi = float(np.median(b.n_eff_f[top_decade(b)]))
+    assert n_multi > 4 * n_fixed, (
+        f"expected many more averages at the top of the band, got "
+        f"{n_multi:.0f} against {n_fixed:.0f}"
+    )
+    assert float(np.median(b.sigma_rel[top_decade(b)])) < float(
+        np.median(a.sigma_rel[top_decade(a)])
+    )
+    # Window length has to fall with frequency, which is the mechanism.
+    assert b.nperseg_f[0] > b.nperseg_f[-1]
+
+
+# ---------------------------------------------------------------------------
+# Every segment stays on the plate
+# ---------------------------------------------------------------------------
+
+def test_a_segment_without_calibration_is_classified_not_deleted(
+    measurement, tmp_path
+):
+    """Quality decisions belong in the data, not in a list of missing numbers."""
+    raw, truth = measurement
+    cfg = make_config(raw, truth, tmp_path)
+    cfg.validation.run_lin_kk = False
+    cfg.validation.run_stationarity = False
+    cfg.model.run_ecm = False
+    # Truncate the shunt file so the last four segments have no calibration.
+    cfg.calibration.shunt_csv = str(tmp_path / "short_curr.csv")
+    rows = np.column_stack([truth.shunt_c0[:12], truth.shunt_c1[:12]])
+    np.savetxt(cfg.calibration.shunt_csv, rows, delimiter=";", fmt="%.10g")
+
+    result = run_measurement(cfg, write=False, verbose=False)["150A"]
+
+    assert len(result.segments) == 16, "no segment may vanish"
+    uncalibrated = [s for s in range(13, 17)]
+    for segment in uncalibrated:
+        record = result.segments[segment]
+        assert record.status == "no_calibration"
+        assert not record.physical_units
+        assert record.active, "it still has a spectrum, just not in ohms"
+        assert len(record.spectrum.f) > 0
+    for segment in range(1, 13):
+        assert result.segments[segment].physical_units
+
+    frame = result.segment_frame(4.235)
+    assert set(frame["segment"]) == set(range(1, 17))
+    assert frame["status"].eq("no_calibration").sum() == 4
+
+
+def test_low_coherence_points_are_marked_and_kept_on_a_shared_grid(
+    measurement, tmp_path
+):
+    raw, truth = measurement
+    cfg = make_config(raw, truth, tmp_path)
+    cfg.spectral.min_coherence = 0.999999    # gate almost everything out
+    cfg.validation.run_lin_kk = False
+    cfg.validation.run_stationarity = False
+    cfg.model.run_ecm = False
+    result = run_measurement(cfg, write=False, verbose=False)["150A"]
+
+    grids = [r.spectrum_all.f for r in result.segments.values()]
+    for grid in grids[1:]:
+        assert np.array_equal(grid, grids[0]), (
+            "every segment must keep every frequency it measured, or a "
+            "frequency-resolved plate map has holes in it"
+        )
+    total = sum(len(r.spectrum_all.f) for r in result.segments.values())
+    used = sum(r.spectrum_all.n_used for r in result.segments.values())
+    assert used < total, "the gate has to have rejected something"
+
+    frame = result.impedance_frame(4.235)
+    assert len(frame) == total, "rejected points are still rows"
+    assert not frame["used"].all()
+
+
+# ---------------------------------------------------------------------------
+# The interactive plate view
+# ---------------------------------------------------------------------------
+
+def test_dashboard_is_self_contained_and_carries_every_segment(
+    measurement, tmp_path
+):
+    from eis.dashboard import write_dashboard
+
+    raw, truth = measurement
+    cfg = make_config(raw, truth, tmp_path)
+    cfg.validation.run_stationarity = False
+    cfg.model.n_starts = 2
+    results = run_measurement(cfg, write=False, verbose=False)
+
+    path = write_dashboard(results, cfg, tmp_path / "plate.html")
+    html = path.read_text(encoding="utf-8")
+
+    assert "<script src=" not in html and "<link rel=\"stylesheet\"" not in html, (
+        "the page has to open with no network and no libraries"
+    )
+    for segment in results["150A"].segments:
+        assert f'"{segment}":' in html
+    for key in ("z_mod@f", "phase@f"):
+        assert key in html, "the frequency slider needs its map keys"
+    assert "prefers-color-scheme" in html

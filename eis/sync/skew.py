@@ -55,14 +55,6 @@ class DelayEstimate:
     ok: bool = True
     note: str = ""
 
-    @property
-    def tau_ns(self) -> float:
-        return self.tau_s * 1e9
-
-    def phase_error_deg_at(self, f_hz: float) -> float:
-        """Phase error this delay would cause at ``f_hz``."""
-        return 360.0 * f_hz * self.tau_s
-
 
 # ---------------------------------------------------------------------------
 # 1. Coarse: generalised cross-correlation with phase transform

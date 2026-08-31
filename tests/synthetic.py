@@ -18,7 +18,6 @@ segment's current::
 
 from __future__ import annotations
 
-import struct
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -100,8 +99,16 @@ class SyntheticTruth:
     channel_delays_s: dict[int, dict[str, float]] = field(default_factory=dict)
     shunt_c0: np.ndarray = field(default_factory=lambda: np.array([]))
     shunt_c1: np.ndarray = field(default_factory=lambda: np.array([]))
+    shunt_inductance_nh: float = 0.0
     temperature_c: float = 60.0
     files: dict[int, str] = field(default_factory=dict)
+
+    def shunt_tau_at(self, segment: int) -> float:
+        """The L/R time constant imposed on ``segment``'s shunt [s]."""
+        H = self.shunt_c0[segment - 1] + 1e-3 * self.shunt_c1[segment - 1] * (
+            self.temperature_c
+        )
+        return shunt_tau_s(float(H), 4.235, self.shunt_inductance_nh)
 
     def Z_at(self, segment: int, f: np.ndarray) -> np.ndarray:
         p = self.segment_params[segment]
@@ -117,6 +124,33 @@ def _sample_at(x: np.ndarray, positions: np.ndarray) -> np.ndarray:
     from eis.sync.resample import resample_at
 
     return resample_at(x, positions)
+
+
+def shunt_tau_s(shunt_h: float, area_cm2: float, inductance_nh: float) -> float:
+    """``L/R`` of a via shunt whose transfer function is ``H`` [V*cm^2/A]."""
+    if inductance_nh <= 0 or shunt_h <= 0:
+        return 0.0
+    return inductance_nh * 1e-9 / (shunt_h / area_cm2)
+
+
+def _shunt_voltage(
+    current: np.ndarray, shunt_h: float, area_cm2: float,
+    inductance_nh: float, freqs: np.ndarray, n: int,
+) -> np.ndarray:
+    """Shunt voltage for a shunt that is a resistor *and* a small inductor.
+
+    ``V = I * H/A * (1 + j*w*tau)``, applied to the AC part only - the DC
+    operating point sees the resistance alone.
+    """
+    gain = shunt_h / area_cm2
+    tau = shunt_tau_s(shunt_h, area_cm2, inductance_nh)
+    if tau <= 0:
+        return current * gain
+    dc = float(np.mean(current))
+    ac = np.fft.irfft(
+        np.fft.rfft(current - dc) * (1.0 + 1j * 2 * np.pi * freqs * tau), n
+    )
+    return (ac + dc) * gain
 
 
 def simulate_measurement(
@@ -136,6 +170,7 @@ def simulate_measurement(
     voltage_amplitude_v: float = 4e-3,
     temperature_c: float = 62.0,
     dead_uc_cards: tuple[int, ...] = (),
+    shunt_inductance_nh: float = 0.0,
     seed: int = 7,
 ) -> SyntheticTruth:
     """Create a full synthetic measurement on disk and return its ground truth.
@@ -144,6 +179,13 @@ def simulate_measurement(
     trigger difference would), ``card_drift_ppm`` a clock-rate error, and
     ``channel_delays_s`` a per-channel offset *within* a card - the one that
     does not cancel in the impedance ratio.
+
+    ``shunt_inductance_nh`` imposes the loop inductance of the via shunt, so
+    that the recorded shunt voltage carries ``H*(1 + jw*L/R)`` rather than a
+    real ``H``.  It is the largest high-frequency error a segmented-cell
+    measurement has, and it is deliberately *not* a timing error: no amount of
+    synchronisation removes it, which is what the correction chain in
+    :mod:`eis.hf` exists for.
     """
     rng = np.random.default_rng(seed)
     out_dir = Path(out_dir)
@@ -172,6 +214,7 @@ def simulate_measurement(
     truth = SyntheticTruth(
         tones_hz=tones, base_frequency_hz=base_frequency_hz, fs=fs,
         duration_s=duration_s, temperature_c=temperature_c,
+        shunt_inductance_nh=shunt_inductance_nh,
     )
     area = 4.235
     shunt_c0 = np.zeros(n_segments)
@@ -228,7 +271,9 @@ def simulate_measurement(
             truth.card_of_segment[seg] = card
             name = str(seg)
             H = shunt_c0[seg - 1] + 1e-3 * shunt_c1[seg - 1] * temperature_c
-            v_shunt = currents[seg] * H / area                    # V
+            v_shunt = _shunt_voltage(
+                currents[seg], H, area, shunt_inductance_nh, freqs, n
+            )
             extra = float(channel_delays_s.get(card, {}).get(name, 0.0))
             channels[name] = delayed(v_shunt, extra) + noise_v * rng.standard_normal(n)
 

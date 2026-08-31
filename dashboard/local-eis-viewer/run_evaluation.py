@@ -48,6 +48,42 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
+#: What this script calls in the modules beside it. A partially updated copy
+#: -- a new run_evaluation.py next to an old runner.py, which is what copying
+#: files one at a time over a share produces -- fails on the first of these
+#: that is missing, and until now it failed at the CALL, which is after
+#: staging. That is 6.5 GB copied over SMB to learn that an attribute is
+#: absent. Checking the contract costs a millisecond and happens first.
+_REQUIRED = {
+    "app.services.runner": ["run_pipeline", "build_command", "preflight",
+                            "output_dir", "warnings_for", "pipeline_dir",
+                            "self_test"],
+    "app.services.staging": ["stage", "clear", "is_network_path",
+                             "staged_size_mb"],
+    "app.data.sources": ["FamosSource", "CsvLoggerSource", "famos_patterns",
+                         "_condition_sort_key", "_order_id_from_parts"],
+}
+
+
+def check_install() -> list[str]:
+    """Everything this script needs from its neighbours, verified up front."""
+    import importlib
+
+    missing: list[str] = []
+    for module_name, names in _REQUIRED.items():
+        try:
+            module = importlib.import_module(module_name)
+        except Exception as exc:                            # noqa: BLE001
+            missing.append(f"{module_name} will not import: {exc}")
+            continue
+        absent = [n for n in names if not hasattr(module, n)]
+        if absent:
+            where = getattr(module, "__file__", module_name)
+            missing.append(f"{module_name} has no {', '.join(absent)}\n"
+                           f"      {where}")
+    return missing
+
+
 def survey_roots(roots, patterns) -> list[str]:
     r"""What is in these folders that did NOT become a run, and why.
 
@@ -230,6 +266,22 @@ def main(argv=None) -> int:
     from app.services import runner, staging
     from app.settings import SETTINGS
 
+    stale = check_install()
+    if stale:
+        print("error: this copy of the app is only partly updated.\n",
+              file=sys.stderr)
+        for line in stale:
+            print(f"  {line}", file=sys.stderr)
+        print("\n  These files are updated together. Copying one at a time "
+              "leaves\n  a new script calling into an old module, which used "
+              "to surface\n  only after staging -- gigabytes copied to learn "
+              "an attribute is\n  missing.\n"
+              "\n  Update the whole folder:\n"
+              "      git pull    (if this folder is a checkout)\n"
+              "  or re-copy app\\ and run_evaluation.py together.",
+              file=sys.stderr)
+        return 2
+
     if a.self_test:
         ok, output = runner.self_test(SETTINGS)
         print(output)
@@ -410,7 +462,8 @@ def main(argv=None) -> int:
                 source = staging.stage(
                     ref, SETTINGS.stage_dir or None,
                     lambda done, total, message="": print(f"    {message}"))
-            runner.run_pipeline(
+            run = getattr(runner, "run_pipeline", None) or runner.run_famos
+            run(
                 lambda done, total, message="": print(f"  {message}"),
                 source, geom=geom, settings=SETTINGS,
                 equal_areas=a.equal_areas,

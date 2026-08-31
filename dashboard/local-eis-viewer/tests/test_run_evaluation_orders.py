@@ -124,3 +124,55 @@ def test_the_count_matches_the_folders_reported(tmp_path):
     lines = RE.survey_roots([tmp_path], _patterns())
     count = int(lines[0].split(":")[1])
     assert count == 2
+
+
+# --- the contract with the modules beside this script -----------------------
+#
+# The failure this guards against was reported from a real run: `FAILED:
+# module 'app.services.runner' has no attribute 'run_pipeline'`, printed
+# AFTER 6266 MB had been staged over SMB. The cause was a folder updated one
+# file at a time -- a new run_evaluation.py beside an old runner.py. Nothing
+# in the code was wrong; the copy was half-done, and the script found out at
+# the call site, which is the last place worth finding out.
+
+def test_the_names_this_script_calls_all_exist():
+    """The pre-flight list is only useful while it matches reality.
+
+    A renamed helper that nobody adds here reintroduces exactly the failure
+    the check exists to catch, and does it silently -- check_install() would
+    pass and the call site would raise.
+    """
+    assert RE.check_install() == []
+
+
+def test_a_half_updated_copy_is_named_before_anything_is_staged(monkeypatch):
+    from app.services import runner
+
+    monkeypatch.delattr(runner, "run_pipeline", raising=False)
+    monkeypatch.delattr(runner, "run_famos", raising=False)
+
+    stale = RE.check_install()
+    assert len(stale) == 1
+    assert "run_pipeline" in stale[0]
+    # The path matters more than the name: it says WHICH copy is old, which
+    # is the one thing the person at the keyboard cannot work out themselves.
+    assert "runner.py" in stale[0]
+
+
+def test_a_module_that_will_not_import_is_reported_not_raised(monkeypatch):
+    """An old module can fail to import outright, not just lack a name.
+
+    Letting that propagate buries the answer in a traceback whose last frame
+    is importlib, pointing at this script rather than at the stale file.
+    """
+    import importlib
+
+    def refuse(name):
+        if name == "app.services.staging":
+            raise ImportError("cannot import name 'staged_size_mb'")
+        return importlib.import_module(name)
+
+    monkeypatch.setattr(importlib, "import_module", refuse)
+    stale = RE.check_install()
+    assert any("staging" in line and "will not import" in line
+               for line in stale)

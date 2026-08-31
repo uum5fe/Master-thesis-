@@ -161,6 +161,143 @@ def port_state_from_bench(state: dict, plate_t: dict | None = None) -> PortState
     return out
 
 
+
+# ---------------------------------------------------------------------------
+# 2b. Where the gases actually enter and leave
+# ---------------------------------------------------------------------------
+#
+# The plate has FOUR ports, one per corner, and two gas circuits that cross:
+#
+#        (0,0) top-left                              top-right (x_max, 0)
+#              O2 out  <------------------------------  H2 out
+#                 ^  \                              /    ^
+#                 |    \                          /      |
+#                 |      \   O2 path      H2 path       |
+#                 |        \                    /        |
+#              H2 in   ------------------------------>  O2 in
+#        bottom-left (0, y_max)                    bottom-right (x_max, y_max)
+#
+#   hydrogen : bottom-left  ->  top-right
+#   oxygen   : bottom-right ->  top-left
+#
+# Both paths run bottom-to-top, and they run in OPPOSITE directions across
+# the plate.  That is why a single "flow axis with an inlet end", which is
+# what this module used to model, cannot describe it: whichever direction
+# that axis is given, it is right for one gas and backwards for the other,
+# and every field built on it is mirrored for the gas it got wrong.
+#
+# It matters most exactly where the user is looking.  Water is produced at
+# the CATHODE, so the liquid-water gradient runs along the oxygen path --
+# right to left -- while the hydrogen along its own path runs left to right.
+# At 450 A there is an order of magnitude more product water than at 45 A,
+# so the two conditions differ most at the oxygen outlet, in the TOP-LEFT
+# corner.  Reading that map against the hydrogen coordinate puts the wet end
+# at the wrong corner.
+
+#: y increases DOWNWARD in this geometry -- the centroids have their origin
+#: at the top-left pad -- so "top" is minimum y and "bottom" is maximum y.
+CORNERS = {
+    "top-left": ("min", "min"),
+    "top-right": ("max", "min"),
+    "bottom-left": ("min", "max"),
+    "bottom-right": ("max", "max"),
+}
+
+
+@dataclass(frozen=True)
+class Port:
+    """One corner connection."""
+
+    gas: str            #: "H2" | "O2"
+    role: str           #: "in" | "out"
+    corner: str         #: a key of CORNERS
+
+    @property
+    def name(self) -> str:
+        return f"{self.gas}_{self.role}"
+
+
+#: The arrangement on this bench, looking at the plate as the maps draw it.
+DEFAULT_PORTS: tuple[Port, ...] = (
+    Port("O2", "out", "top-left"),
+    Port("H2", "in", "bottom-left"),
+    Port("H2", "out", "top-right"),
+    Port("O2", "in", "bottom-right"),
+)
+
+
+def corner_xy(centroids: dict[str, tuple[float, float]],
+              corner: str) -> tuple[float, float]:
+    """The (x, y) of a named corner of the segment field."""
+    if corner not in CORNERS:
+        raise ValueError(f"unknown corner {corner!r}; expected one of "
+                         f"{sorted(CORNERS)}")
+    xs = [c[0] for c in centroids.values()]
+    ys = [c[1] for c in centroids.values()]
+    kx, ky = CORNERS[corner]
+    return ((min(xs) if kx == "min" else max(xs)),
+            (min(ys) if ky == "min" else max(ys)))
+
+
+def gas_path(ports: tuple[Port, ...] = DEFAULT_PORTS,
+             gas: str = "O2") -> tuple[str, str]:
+    """(inlet corner, outlet corner) for one gas."""
+    try:
+        inlet = next(p.corner for p in ports if p.gas == gas and p.role == "in")
+        outlet = next(p.corner for p in ports if p.gas == gas and p.role == "out")
+    except StopIteration:
+        raise ValueError(f"no complete path for {gas!r} in {ports!r}") from None
+    return inlet, outlet
+
+
+def flow_coordinate(centroids: dict[str, tuple[float, float]],
+                    gas: str = "O2",
+                    ports: tuple[Port, ...] = DEFAULT_PORTS
+                    ) -> dict[str, float]:
+    """Position of each segment along one gas's path: 0 inlet, 1 outlet.
+
+    The path is the straight line from the inlet corner to the outlet
+    corner, and each segment is projected onto it.  For the diagonal
+    arrangement above this is the natural generalisation of the old
+    single-axis coordinate: give it two corners that differ in x only and it
+    reduces exactly to it.
+
+    Projection rather than a channel-following path length: the segments are
+    a coarse 12 x 6 grid and the serpentine inside each of them is far finer
+    than the grid, so any attempt to trace the actual channel would be
+    inventing detail the measurement cannot resolve. What the coordinate has
+    to get right is the ORDER -- which segments the gas reaches before which
+    -- and the projection does.
+    """
+    inlet, outlet = gas_path(ports, gas)
+    x0, y0 = corner_xy(centroids, inlet)
+    x1, y1 = corner_xy(centroids, outlet)
+    dx, dy = x1 - x0, y1 - y0
+    norm = dx * dx + dy * dy
+    if norm <= 0:
+        raise ValueError(f"the {gas} inlet and outlet are the same corner")
+    raw = {k: ((c[0] - x0) * dx + (c[1] - y0) * dy) / norm
+           for k, c in centroids.items()}
+    lo, hi = min(raw.values()), max(raw.values())
+    span = (hi - lo) or 1.0
+    return {k: (v - lo) / span for k, v in raw.items()}
+
+
+def port_layout(centroids: dict[str, tuple[float, float]],
+                ports: tuple[Port, ...] = DEFAULT_PORTS) -> dict:
+    """The port map in a form a figure or a manifest can use directly."""
+    return {
+        "ports": [{"gas": p.gas, "role": p.role, "corner": p.corner,
+                   "x_mm": corner_xy(centroids, p.corner)[0],
+                   "y_mm": corner_xy(centroids, p.corner)[1]}
+                  for p in ports],
+        "paths": {gas: {"inlet": gas_path(ports, gas)[0],
+                        "outlet": gas_path(ports, gas)[1]}
+                  for gas in sorted({p.gas for p in ports})},
+        "note": "y increases downward; 'top' is minimum y",
+    }
+
+
 # ---------------------------------------------------------------------------
 # 3. The fields
 # ---------------------------------------------------------------------------
@@ -245,10 +382,33 @@ def condition_fields(centroids: dict[str, tuple[float, float]],
                      ports: PortState,
                      temp_sensor_x_mm: dict[str, float] | None = None,
                      j_dc: dict[str, float] | None = None,
-                     axis: str = "x", inlet: str = "min") -> dict[str, Field]:
-    """Per-segment temperature, pressure and relative humidity."""
-    xi = _flow_coordinate(centroids, axis, inlet)
-    i = 0 if axis == "x" else 1
+                     axis: str = "x", inlet: str = "min",
+                     gas: str | None = "O2",
+                     port_map: tuple[Port, ...] = DEFAULT_PORTS
+                     ) -> dict[str, Field]:
+    """Per-segment temperature, pressure and relative humidity.
+
+    `gas` selects which circuit the fields run along.  The default is the
+    OXYGEN path, because the fields this builds are about the cathode: water
+    is produced there, so the humidity gradient -- the reason the whole
+    module exists -- develops from the oxygen inlet to the oxygen outlet.
+    Passing gas=None falls back to the old single-axis coordinate, which is
+    kept for plates whose ports really are on opposite edges rather than at
+    the corners.
+    """
+    if gas is not None:
+        xi = flow_coordinate(centroids, gas, port_map)
+        inlet_corner, outlet_corner = gas_path(port_map, gas)
+        # The projection axis for the sensor interpolation: whichever of x
+        # or y the path travels further along.
+        x0, y0 = corner_xy(centroids, inlet_corner)
+        x1, y1 = corner_xy(centroids, outlet_corner)
+        i = 0 if abs(x1 - x0) >= abs(y1 - y0) else 1
+        flow_label = f"{gas}: {inlet_corner} to {outlet_corner}"
+    else:
+        xi = _flow_coordinate(centroids, axis, inlet)
+        i = 0 if axis == "x" else 1
+        flow_label = f"axis {axis}, inlet at {inlet}"
     fields: dict[str, Field] = {}
 
     # ---- temperature ------------------------------------------------------
@@ -293,6 +453,8 @@ def condition_fields(centroids: dict[str, tuple[float, float]],
     # ---- relative humidity ------------------------------------------------
     fields["humidity"] = _humidity_field(
         xi, areas, ports, t_field, p_field, j_dc)
+    for field_ in fields.values():
+        field_.notes.append(f"along the flow path {flow_label}")
     return fields
 
 
@@ -414,6 +576,15 @@ def _selftest(log=None) -> int:
     sensors = {"temp1": 0.0, "temp2": 84.0, "temp3": 168.0, "temp4": 252.0}
     f = condition_fields(cent, areas, ports, sensors)
 
+    # ORDER BY THE FLOW COORDINATE, NOT BY THE SEGMENT LABEL.  The label
+    # order only matched the flow while the model was a single left-to-right
+    # axis. With the real four-corner port map the oxygen runs right to left,
+    # so "segment 1 is the inlet" stopped being true -- and an assertion
+    # written that way fails for a model that is correct, which is the worst
+    # kind of test to leave in place.
+    order = sorted(cent, key=lambda k: flow_coordinate(cent, "O2")[k])
+    first, last = order[0], order[-1]
+
     t = f["temperature"]
     check("T uses the plate sensors", t.measured, t.provenance)
     check("T spans the sensor range",
@@ -422,15 +593,15 @@ def _selftest(log=None) -> int:
 
     p = f["pressure"]
     check("p falls from inlet to outlet",
-          p.values["1"] > p.values["10"]
-          and abs(p.values["1"] - 1.5) < 1e-6,
-          f"{p.values['1']:.3f} -> {p.values['10']:.3f} bara")
+          p.values[first] > p.values[last]
+          and abs(p.values[first] - 1.5) < 1e-6,
+          f"{p.values[first]:.3f} -> {p.values[last]:.3f} bara")
 
     h = f["humidity"]
     check("RH is modelled, and says so",
           not h.measured and h.provenance.startswith("modelled"),
           h.provenance)
-    rh = [h.values[str(i)] for i in range(1, 11)]
+    rh = [h.values[k] for k in order]
     check("RH rises along the channel", all(np.diff(rh) > 0),
           f"{rh[0]:.0f} -> {rh[-1]:.0f} %")
 

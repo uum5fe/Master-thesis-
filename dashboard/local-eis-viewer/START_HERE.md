@@ -12,6 +12,60 @@ branch `claude/impedance-frontend-viz-not3ye` of the Master-thesis repository.
 | **`run_evaluation.py`** | Turn raw FAMOS `.DAT` into results, using the bundled `local_eis/` pipeline — the one that ran on Databricks |
 | `run_pipeline.py` | The separate `eis/` pipeline. A different implementation with a different output shape; takes its paths as arguments, not from `.env`. **Not** the one you want for the Local EIS evaluation. |
 
+## Before a long run: check it will work
+
+```bash
+python run_evaluation.py --check-install     # is this copy complete?
+python local_eis/preflight.py --dat "<folder of .DAT cards>" \
+       --curr-cal cal/curr.csv --temp-cal cal/temp.csv
+```
+
+`preflight.py` reads only the headers and a few seconds of signal, so it
+finishes in seconds where a real run takes minutes per condition. It answers
+the three questions that are expensive to get wrong:
+
+1. **Are these cards one measurement, on one time base?** The cards are armed
+   by hand, one after another, so nothing about a folder of `.DAT` files
+   guarantees they recorded the same event. The cross-correlation that aligns
+   them cannot tell — it only ever sees sample indices, so handed two
+   unrelated records it returns the lag of best agreement between them and
+   the number looks like an answer. The `|NT` header stamps are the
+   independent evidence, and preflight checks the sample rates match, the
+   stagger is inside the search window, and the cards actually overlap in
+   time.
+2. **Is the calibration applied?** Not "was a file passed", but: how many
+   segments got a real coefficient and how many fell back to the plate
+   median, and whether the temperature came from the sensors or from the
+   fallback constant. Both half-done states are silent and both change the
+   numbers.
+3. **Does the analysis band reach the excitation?** It reports the search
+   ceiling against the sample rate, and warns if there is AC energy above it.
+
+`run_evaluation.py --check-install` catches the other common failure: a
+folder where `app\` and the scripts beside it came from different copies.
+That used to surface as `module 'app.services.runner' has no attribute
+'run_pipeline'` at the moment of the call — after gigabytes had been staged.
+
+## Comparing two operating points
+
+```bash
+python local_eis/compare_conditions.py --results <root>/2612025 --a 45A --b 450A
+```
+
+Also available as the **Compare conditions** tab in the dashboard. Both
+report along the gas paths rather than along x, because the four ports are at
+the corners and the two circuits cross:
+
+```
+    top-left  O2 out                       H2 out  top-right
+    bottom-left  H2 in                      O2 in  bottom-right
+```
+
+Hydrogen runs bottom-left to top-right; oxygen runs bottom-right to top-left.
+A profile against x is therefore right for one gas and mirrored for the
+other, and the corner where flooding starts — the oxygen outlet, top-left —
+would be drawn at the dry end.
+
 ## Run it in five minutes, on your own machine
 
 ```bash

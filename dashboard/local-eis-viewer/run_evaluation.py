@@ -71,6 +71,9 @@ def main(argv=None) -> int:
                    help="list the recordings found, then exit")
     p.add_argument("--self-test", action="store_true",
                    help="run the pipeline's synthetic checks, then exit")
+    p.add_argument("--check-install", action="store_true",
+                   help="report which modules this copy provides and stop; "
+                        "use it when a run fails with a missing attribute")
     p.add_argument("--plate", choices=["gen1", "gen2"], default=None,
                    help="plate generation to evaluate with (default: the "
                         "dashboard's EIS_DEFAULT_PLATE, else gen1). The areas "
@@ -108,10 +111,26 @@ def main(argv=None) -> int:
             os.environ[name] = str(Path(value).expanduser())
     os.environ.setdefault("EIS_ALLOW_INLINE_PIPELINE", "1")
 
+    # BEFORE ANYTHING IS IMPORTED FOR REAL, let alone staged. A folder
+    # holding some new files and some old ones fails at the first call into
+    # the old one -- which on this script is after gigabytes of cards have
+    # been copied to local disk. See app/version.py.
+    from app import version as _version
+    try:
+        _version.check()
+    except (_version.VersionSkew, _version.MissingDependency) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 3
+
     from app.data.sources import (CsvLoggerSource, FamosSource,
                                   _condition_sort_key)
     from app.services import runner, staging
     from app.settings import SETTINGS
+
+    if a.check_install:
+        import json
+        print(json.dumps(_version.report(), indent=2))
+        return 0
 
     if a.self_test:
         ok, output = runner.self_test(SETTINGS)

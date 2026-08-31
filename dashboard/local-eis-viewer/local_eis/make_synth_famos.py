@@ -6,7 +6,13 @@ handle: a per-channel multiplexer skew that differs from segment to segment,
 and a high-frequency arc that has not closed at f_max.
 """
 import numpy as np
+from datetime import datetime, timedelta
 from pathlib import Path
+
+#: The five cards are armed one at a time, so their |NT stamps differ by
+#: whole seconds. These are the stamps the real 45 A set carried.
+START = datetime(2025, 7, 16, 7, 45, 46)
+STAGGER_S = (0, 0, 3, 2, 2)
 
 def main(out="/tmp/famos"):
     d = Path(out); d.mkdir(parents=True, exist_ok=True)
@@ -62,7 +68,13 @@ def main(out="/tmp/famos"):
         # all names live inside ONE |CP field, comma separated: the reader
         # captures up to the first semicolon, then findall's 7,32,<name>
         cp = ",".join(f"7,32,{nm}" for nm in names)
-        hdr = (f"|CF,2,1,1;|CK,1,3,1,1;|CD,2,{1.0/fs},1;"
+        # |NT: the trigger stamp. The cards are armed by hand one after
+        # another, so the synthetic carries the same whole-second stagger the
+        # real ones do -- that is what the time-base check reads.
+        stamp = START + timedelta(seconds=int(STAGGER_S[ci % len(STAGGER_S)]))
+        nt = (f"|NT,1,{stamp.day},{stamp.month},{stamp.year},"
+              f"{stamp.hour},{stamp.minute},{stamp.second};")
+        hdr = (f"|CF,2,1,1;|CK,1,3,1,1;{nt}|CD,2,{1.0/fs},1;"
                f"|CR,1,{n_ch},1,0,1;|CP,{cp};|CS,1,{data.nbytes},"
                ).encode("latin-1")
         p = d / f"Leepa_2611976_Current_450A_Test_01_Karte_{ci+1}.DAT"

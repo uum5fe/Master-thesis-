@@ -46,7 +46,8 @@ from eis.config import PipelineConfig
 from eis.io.famos import FamosFile, classify_channel, discover_files, open_famos
 from eis.model.ecm import ECMFit, select_model
 from eis.spectra import (
-    SpectralResult, apply_notch, impedance_synchronous, impedance_welch,
+    SpectralResult, apply_notch, impedance_stepped_multisine,
+    impedance_synchronous, impedance_welch,
 )
 from eis.sync.drift import DriftEstimate, estimate_drift
 from eis.sync.resample import (
@@ -751,7 +752,15 @@ def run_condition(
     use_synchronous = scfg.method == "synchronous" or (
         scfg.method == "auto" and scfg.base_frequency_hz and scfg.excitation_tones_hz
     )
-    log(f"\n  impedance: {'synchronous DFT' if use_synchronous else 'coherence-gated Welch'}"
+    # "auto" without a configured tone list means the stepped-multisine
+    # estimator, NOT Welch. See SpectralConfig.method for why that default
+    # was worth changing.
+    use_multisine = (not use_synchronous
+                     and scfg.method in ("auto", "stepped_multisine"))
+    which = ("synchronous DFT" if use_synchronous
+             else "stepped multisine (joint tone fit per dwell)"
+             if use_multisine else "coherence-gated Welch")
+    log(f"\n  impedance: {which}"
         f", estimator={scfg.estimator}, band=[{scfg.f_min_hz}, {f_max:.0f}] Hz")
 
     polarity_table = cfg.acquisition.polarity
@@ -813,6 +822,14 @@ def run_condition(
                         amplitude_mad_k=scfg.amplitude_mad_k,
                         phase_outlier_rad=scfg.phase_outlier_rad,
                         max_rejected_fraction=scfg.max_rejected_fraction,
+                    )
+                elif use_multisine:
+                    spectrum = impedance_stepped_multisine(
+                        current, voltage, fs,
+                        tones_hz=(list(scfg.excitation_tones_hz)
+                                  if scfg.excitation_tones_hz else None),
+                        f_min=scfg.f_min_hz, f_max=f_max,
+                        peak_db=scfg.tone_peak_db, detrend=scfg.detrend,
                     )
                 else:
                     spectrum = impedance_welch(

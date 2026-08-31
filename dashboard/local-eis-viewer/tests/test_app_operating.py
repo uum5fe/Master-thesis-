@@ -103,8 +103,15 @@ def test_water_accumulates_downstream_even_when_rh_turns_over(plate, ports):
     f = PC.condition_fields(cent, areas, ports, SENSORS)
     h, t, p = f["humidity"], f["temperature"], f["pressure"]
 
+    # ORDER BY THE FLOW COORDINATE, NOT BY THE SEGMENT LABEL.  The label
+    # order matched the flow only while the model was one left-to-right
+    # axis.  The plate's ports are at the four corners and the oxygen runs
+    # bottom-right to top-left, so "segment 1 is upstream" is no longer
+    # true -- and asserting it that way fails for a model that is right.
+    xi = PC.flow_coordinate(cent, "O2")
+    order = sorted(cent, key=lambda k: xi[k])
     x_v = [h.values[k] / 100.0 * float(PC.saturation_pressure_pa(t.values[k]))
-           / (p.values[k] * 1e5) for k in sorted(cent, key=int)]
+           / (p.values[k] * 1e5) for k in order]
     assert all(np.diff(x_v) > 0), "product water must accumulate downstream"
 
     # and more current must add more water, everywhere
@@ -153,10 +160,33 @@ def test_the_measured_current_map_changes_the_humidity_field(plate, ports):
 
 
 def test_which_end_is_the_inlet_is_a_choice_that_changes_the_answer(plate, ports):
+    """Reversing the gas path mirrors the field, so the port map must be right.
+
+    This used to toggle `inlet="min"/"max"` on a single flow axis.  That
+    parameter no longer decides anything by default: the direction now comes
+    from the port map, which says where the gas actually enters and leaves.
+    The property being pinned is the same one -- getting the direction
+    backwards mirrors every field -- so it is tested on the thing that now
+    controls it.
+    """
     PC = _pc()
     cent, areas = plate
-    a = PC.condition_fields(cent, areas, ports, SENSORS, inlet="min")["humidity"]
-    b = PC.condition_fields(cent, areas, ports, SENSORS, inlet="max")["humidity"]
+    reversed_o2 = (PC.Port("O2", "in", "top-left"),
+                   PC.Port("O2", "out", "bottom-right"))
+    a = PC.condition_fields(cent, areas, ports, SENSORS)["humidity"]
+    b = PC.condition_fields(cent, areas, ports, SENSORS,
+                            port_map=reversed_o2)["humidity"]
+    assert abs(a.values["1"] - b.values["1"]) > 1.0
+
+
+def test_the_legacy_single_axis_model_still_responds_to_its_inlet(plate, ports):
+    """Kept for plates whose ports really are on opposite edges."""
+    PC = _pc()
+    cent, areas = plate
+    a = PC.condition_fields(cent, areas, ports, SENSORS, gas=None,
+                            inlet="min")["humidity"]
+    b = PC.condition_fields(cent, areas, ports, SENSORS, gas=None,
+                            inlet="max")["humidity"]
     assert abs(a.values["1"] - b.values["1"]) > 1.0
 
 
@@ -198,7 +228,7 @@ def test_the_tab_explains_itself_when_there_is_no_bench_log(tmp_path,
     assert fields is None
     assert ".mf4" in problem.lower()
 
-    fig, prof, status, ports = operating.render(sel)
+    fig, prof, status, ports, portmap = operating.render(sel)
     assert not fig.data and not prof.data
     assert ports is None
     assert "mf4" in str(status).lower()

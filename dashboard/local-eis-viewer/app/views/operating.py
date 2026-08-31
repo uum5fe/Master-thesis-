@@ -58,22 +58,34 @@ def layout():
                     "Which operating quantity to draw over the plate."),
                     style={"flex": "1 1 240px"}),
                 html.Div(ui.field(
-                    "Gas inlet",
+                    "Gas circuit",
                     dcc.RadioItems(
-                        id="op-inlet",
-                        options=[{"label": " left (x = 0)", "value": "min"},
-                                 {"label": " right (x = max)", "value": "max"}],
-                        value="min",
+                        id="op-gas",
+                        options=[
+                            {"label": " oxygen — bottom-right to top-left",
+                             "value": "O2"},
+                            {"label": " hydrogen — bottom-left to top-right",
+                             "value": "H2"}],
+                        value="O2",
                         labelStyle={"display": "block", "marginBottom": "2px"}),
-                    "Nothing in the drawing or the bench log states which end "
-                    "the gas enters. Getting it backwards mirrors every field, "
-                    "so it is a choice you make rather than one inferred for "
-                    "you."),
-                    style={"flex": "1 1 200px"}),
+                    "The four ports sit at the corners and the two gases "
+                    "cross, so there is no single flow direction for the "
+                    "plate. Water is produced at the cathode, which is why "
+                    "the oxygen path is the default: the humidity gradient "
+                    "develops from the oxygen inlet to the oxygen outlet."),
+                    style={"flex": "1 1 260px"}),
             ], style={"display": "flex", "gap": "16px", "flexWrap": "wrap"}),
             html.Div(id="op-status", style={"marginTop": "10px"}),
         ]),
         ui.panel([ui.graph("op-map", height="520px")]),
+        ui.panel([
+            ui.section_title("Where the gases enter and leave"),
+            ui.note("Top-left O2 out · bottom-left H2 in · top-right H2 out · "
+                    "bottom-right O2 in. The two circuits run in opposite "
+                    "directions across the plate, so a profile drawn against "
+                    "x is right for one gas and mirrored for the other."),
+            html.Div(id="op-portmap"),
+        ]),
         ui.panel([
             ui.section_title("Along the flow path"),
             ui.note("Every segment against its position along the gas path. "
@@ -201,7 +213,7 @@ def _bench_state(selection):
     return state, log_path, ""
 
 
-def fields_for(selection, inlet: str = "min"):
+def fields_for(selection, gas: str = "O2"):
     """The three per-segment fields for the selected run."""
     _pipeline_on_path()
     import plate_conditions as PC
@@ -235,8 +247,7 @@ def fields_for(selection, inlet: str = "min"):
     ports = PC.port_state_from_bench(state, plate_t)
     fields = PC.condition_fields(
         geom.centroids(), geom.areas(), ports,
-        geom.temp_sensor_x_mm, j_dc=j_dc,
-        axis=geom.flow_axis, inlet=inlet)
+        geom.temp_sensor_x_mm, j_dc=j_dc, gas=gas)
     return fields, (state, log_path), ""
 
 
@@ -254,29 +265,32 @@ def register(app):
 
     @app.callback(Output("op-map", "figure"), Output("op-profile", "figure"),
                   Output("op-status", "children"), Output("op-ports", "children"),
+                  Output("op-portmap", "children"),
                   Input("selection", "data"), Input("op-field", "value"),
-                  Input("op-inlet", "value"))
-    def _draw(selection, which, inlet):
+                  Input("op-gas", "value"))
+    def _draw(selection, which, gas):
         blank = empty_figure("nothing to draw")
         if not selection:
-            return blank, blank, ui.note(""), None
-        return render(selection, which or "temperature", inlet or "min")
+            return blank, blank, ui.note(""), None, None
+        return render(selection, which or "temperature", gas or "O2")
 
 
-def render(selection, which="temperature", inlet="min"):
+def render(selection, which="temperature", gas="O2"):
     import plotly.graph_objects as go
 
     blank = empty_figure("nothing to draw")
-    fields, meta, problem = fields_for(selection, inlet)
+    fields, meta, problem = fields_for(selection, gas)
     if fields is None:
-        return blank, blank, ui.warnings_block([problem], "No operating data"), None
+        return (blank, blank, ui.warnings_block([problem], "No operating data"),
+                None, _port_map_table())
 
     field = fields[which]
     geom = registry.get(selection.get("plate_key") or registry.default_key())
 
     if field.provenance == "unavailable":
         return (empty_figure(f"{field.name} is not available for this run"),
-                blank, _provenance_block(field), _ports_table(meta))
+                blank, _provenance_block(field), _ports_table(meta),
+                _port_map_table())
 
     label = {"temperature": "T", "pressure": "p", "humidity": "RH"}[which]
     fig = plate_heatmap(
@@ -284,12 +298,16 @@ def render(selection, which="temperature", inlet="min"):
         title=f"{field.name.capitalize()} across the plate "
               f"[{field.unit}] — {field.provenance}")
 
-    # profile along the flow path
-    i = 0 if geom.flow_axis == "x" else 1
+    # PROFILE ALONG THE CHOSEN GAS PATH, not along x. The ports are at the
+    # corners and the two gases cross, so an x profile puts one of them
+    # backwards -- and the corner where flooding starts, the oxygen outlet
+    # at top-left, then lands at the dry end of the plot.
+    _pipeline_on_path()
+    import plate_conditions as PC
     cent = geom.centroids()
-    pos = {k: c[i] for k, c in cent.items()}
-    lo, hi = min(pos.values()), max(pos.values())
-    xs = [(pos[k] - lo) if inlet == "min" else (hi - pos[k]) for k in field.values]
+    xi = PC.flow_coordinate(cent, gas)
+    inlet_corner, outlet_corner = PC.gas_path(gas=gas)
+    xs = [100.0 * xi[k] for k in field.values]
     ys = [field.values[k] for k in field.values]
     # Same ramp as the map above, so a colour means the same thing in both
     # panels and the eye can carry a segment from one to the other. A
@@ -301,17 +319,53 @@ def render(selection, which="temperature", inlet="min"):
         marker=dict(size=8, color=ys, colorscale=scale,
                     line=dict(width=.6, color="rgba(255,255,255,.9)")),
         text=[f"segment {k}" for k in field.values],
-        hovertemplate="%{text}<br>%{x:.0f} mm from inlet<br>"
+        hovertemplate="%{text}<br>%{x:.0f} % along the " + gas + " path<br>"
                       "%{y:.4g} " + field.unit + "<extra></extra>"))
     if which == "humidity":
         prof.add_hline(y=100, line=dict(color="#c0392b", width=1, dash="dot"),
                        annotation_text="saturation", annotation_position="top left")
     prof.update_layout(
-        xaxis_title="distance from the gas inlet [mm]",
+        xaxis_title=(f"along the {gas} path [%] — 0 at the {inlet_corner} "
+                     f"inlet, 100 at the {outlet_corner} outlet"),
         yaxis_title=f"{label} [{field.unit}]",
         margin=dict(l=60, r=20, t=30, b=50), showlegend=False)
 
-    return fig, prof, _provenance_block(field), _ports_table(meta)
+    return (fig, prof, _provenance_block(field), _ports_table(meta),
+            _port_map_table())
+
+
+def _port_map_table():
+    """The four corners, as a 2x2 laid out like the plate."""
+    _pipeline_on_path()
+    import plate_conditions as PC
+
+    by_corner = {p.corner: p for p in PC.DEFAULT_PORTS}
+
+    def cell(corner):
+        port = by_corner.get(corner)
+        if port is None:
+            return html.Div("—", style={"padding": "10px"})
+        colour = "#2c7fb8" if port.gas == "H2" else "#d95f02"
+        return html.Div([
+            html.Div(f"{port.gas} {port.role}",
+                     style={"fontWeight": 600, "color": colour}),
+            html.Div(corner, style={"fontSize": "11px",
+                                    "color": ui.COLOURS["muted"]}),
+        ], style={"padding": "10px 12px", "border":
+                  f"1px solid {ui.COLOURS['line']}", "borderRadius": "6px",
+                  "textAlign": "center"})
+
+    return html.Div([
+        html.Div([cell("top-left"), cell("top-right")],
+                 style={"display": "grid",
+                        "gridTemplateColumns": "1fr 1fr", "gap": "8px"}),
+        html.Div("plate", style={"textAlign": "center", "padding": "8px",
+                                 "color": ui.COLOURS["muted"],
+                                 "fontSize": "12px"}),
+        html.Div([cell("bottom-left"), cell("bottom-right")],
+                 style={"display": "grid",
+                        "gridTemplateColumns": "1fr 1fr", "gap": "8px"}),
+    ], style={"maxWidth": "480px"})
 
 
 def _ports_table(meta):

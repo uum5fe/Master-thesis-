@@ -63,7 +63,14 @@ def build_parser() -> argparse.ArgumentParser:
     cal.add_argument("--cell-area", type=float, help="active cell area [cm^2]")
 
     sp = p.add_argument_group("spectral estimation")
-    sp.add_argument("--method", choices=["auto", "welch", "synchronous"])
+    sp.add_argument("--method",
+                    choices=["auto", "welch", "synchronous",
+                             "stepped_multisine"],
+                    help="impedance estimator. 'auto' (the default) uses the "
+                         "synchronous DFT when a tone list is configured and "
+                         "the stepped-multisine joint fit otherwise; it no "
+                         "longer falls back to Welch, which dilutes every "
+                         "tone of a stepped excitation")
     sp.add_argument("--nperseg", type=int, help="Welch window length")
     sp.add_argument("--estimator", choices=["hv", "h1", "h2"])
     sp.add_argument("--f-min", type=float)

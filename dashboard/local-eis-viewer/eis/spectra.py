@@ -289,6 +289,289 @@ def relative_uncertainty(gamma2: np.ndarray, n_eff: float) -> np.ndarray:
     return np.sqrt((1.0 - g) / (2.0 * g * max(n_eff, 1.0)))
 
 
+
+# ---------------------------------------------------------------------------
+# Stepped multisine
+# ---------------------------------------------------------------------------
+#
+# WHY WELCH IS THE WRONG DEFAULT FOR THIS MEASUREMENT
+# ---------------------------------------------------
+# Welch averages periodograms over the WHOLE record.  That is the right thing
+# for a stationary broadband excitation and the wrong thing for one that
+# steps: each tone is present for its own slice of the record and absent for
+# the rest, so
+#
+#   * its estimate is diluted by the fraction of the record it was off for,
+#     and the dilution is worst for the tones with the shortest dwells --
+#     which, on a sweep that dwells a fixed number of CYCLES, are the
+#     high-frequency ones; and
+#   * the coherence that is supposed to GATE the result is diluted by the
+#     same factor, so the gate discards the tones that were on for the
+#     shortest time rather than the ones that are least trustworthy.
+#
+# Both effects push the same way and both worsen with frequency, which is
+# what turns "the spectrum stops around a kilohertz" into something that
+# looks like a property of the cell rather than of the estimator.
+#
+# The estimator below fits the tones of each dwell jointly, over that dwell
+# only.  Nothing is averaged across a stretch where the tone was not applied,
+# and the residual left by the joint fit is noise rather than the other tones
+# of the group.
+
+
+def detect_dwells(x: np.ndarray, fs: float, frame_s: float = 0.02,
+                  change_tol: float = 0.25, silence_factor: float = 0.15,
+                  min_dwell_s: float = 0.01, trim_frac: float = 0.08
+                  ) -> list[tuple[int, int]]:
+    """Intervals of constant excitation content, found without a tone list.
+
+    Segmenting on SILENCE does not work: consecutive steps often abut with
+    no gap, and a record that is mostly excitation offers no quiet stretch
+    from which to estimate what quiet looks like.  So the primary signal is
+    a change of CONTENT -- normalised frame spectra are direction vectors,
+    and a step change rotates them.  Normalising also means that a change of
+    level alone, which is what the amplitude taper of a designed multisine
+    produces, is not mistaken for a change of content.
+
+    The comparison is between the mean of several frames either side of a
+    candidate boundary rather than between adjacent frames: a step change is
+    sustained and survives the averaging, while frame-to-frame jitter does
+    not.
+    """
+    x = np.asarray(x, float)
+    n = len(x)
+    nper = max(64, 1 << int(np.round(np.log2(max(frame_s * fs, 64)))))
+    if n < 4 * nper:
+        return [(0, n)]
+    step = nper // 2
+    starts = np.arange(0, n - nper + 1, step)
+    win = np.hanning(nper)
+
+    spectra = np.empty((len(starts), nper // 2 + 1))
+    rms = np.empty(len(starts))
+    for i, a in enumerate(starts):
+        seg = x[a:a + nper] - x[a:a + nper].mean()
+        rms[i] = np.sqrt(np.mean(seg ** 2))
+        spectra[i] = np.abs(np.fft.rfft(seg * win))
+
+    norm = np.linalg.norm(spectra, axis=1)
+    unit = spectra / np.where(norm > 0, norm, 1.0)[:, None]
+    W = max(2, min(int(round(0.05 / (step / fs))) or 2, max(2, len(starts) // 8)))
+    dist = np.zeros(len(starts))
+    for i in range(W, len(starts) - W):
+        before, after = unit[i - W:i].mean(axis=0), unit[i:i + W].mean(axis=0)
+        nb, na = np.linalg.norm(before), np.linalg.norm(after)
+        if nb > 0 and na > 0:
+            dist[i] = 1.0 - float(np.dot(before, after) / (nb * na))
+
+    cuts = [0]
+    for i in range(1, len(dist) - 1):
+        if (dist[i] >= change_tol and dist[i] >= dist[i - 1]
+                and dist[i] >= dist[i + 1] and i - cuts[-1] >= W):
+            cuts.append(i)
+    cuts.append(len(starts))
+
+    spans = []
+    for lo, hi in zip(cuts[:-1], cuts[1:]):
+        s0, s1 = int(starts[lo]), int(min(n, starts[hi - 1] + nper))
+        if s1 - s0 >= max(min_dwell_s * fs, 2 * nper):
+            spans.append((s0, s1, float(np.median(rms[lo:hi]))))
+    if not spans:
+        return [(0, n)]
+
+    loud = float(np.median([lvl for _a, _b, lvl in spans]))
+    out = []
+    for s0, s1, lvl in spans:
+        if lvl < silence_factor * loud:
+            continue                        # a gap between steps, not a dwell
+        cut = int(trim_frac * (s1 - s0))
+        out.append((s0 + cut, s1 - cut))
+    return out or [(0, n)]
+
+
+def _local_floor(mag: np.ndarray, n_bands: int = 160) -> np.ndarray:
+    """Band medians as a local noise floor, interpolated back.
+
+    Uniform bands, not logarithmic: a log grid's low-frequency bands are only
+    a few hertz wide, so a band can hold one tone and nothing else, its
+    median becomes that tone, and the tone is then not detected.
+    """
+    n = len(mag)
+    if n < 16:
+        return np.full(n, float(np.median(mag)) if n else 0.0)
+    n_bands = int(max(4, min(n_bands, n // 16)))
+    edges = np.linspace(0, n, n_bands + 1).astype(int)
+    centres = 0.5 * (edges[:-1] + edges[1:])
+    values = np.array([np.median(mag[a:b]) if b > a else np.nan
+                       for a, b in zip(edges[:-1], edges[1:])])
+    ok = np.isfinite(values)
+    if ok.sum() < 2:
+        return np.full(n, float(np.median(mag)))
+    return np.interp(np.arange(n), centres[ok], values[ok])
+
+
+def tones_in_window(y: np.ndarray, fs: float, f_lo: float, f_hi: float,
+                    peak_db: float = 12.0, max_tones: int = 96,
+                    oversample: int = 8) -> np.ndarray:
+    """Frequencies standing clear of the local noise floor in one window.
+
+    The threshold also scales with the window's cell count: the magnitude of
+    a white-noise spectrum is Rayleigh, so a fixed "12 dB over the floor" is
+    a false-alarm rate per bin, and a long window has a great many bins.
+    """
+    y = np.asarray(y, float)
+    n = len(y)
+    if n < 64:
+        return np.empty(0)
+    y = y - y.mean()
+    m = 1 << int(np.ceil(np.log2(max(n * oversample, 256))))
+    spec = np.abs(np.fft.rfft(y * np.hanning(n), m))
+    freqs = np.fft.rfftfreq(m, 1.0 / fs)
+    band = (freqs >= f_lo) & (freqs <= min(f_hi, 0.5 * fs))
+    if band.sum() < 8:
+        return np.empty(0)
+    s, f = spec[band], freqs[band]
+
+    n_cells = max(8, n // 2)
+    p_fa = min(0.5, 0.01 / n_cells)
+    auto_db = 20.0 * np.log10(np.sqrt(-2.0 * np.log(p_fa))
+                              / np.sqrt(2.0 * np.log(2.0)))
+    thr = _local_floor(s) * 10 ** (max(peak_db, auto_db) / 20.0)
+
+    guard_hz = 6.0 * fs / n                 # ~1.5 Hann main lobes
+    idx = [k for k in range(1, len(s) - 1)
+           if s[k] >= thr[k] and s[k] >= s[k - 1] and s[k] >= s[k + 1]]
+    idx.sort(key=lambda k: -s[k])
+    kept: list[int] = []
+    for k in idx:
+        if all(abs(f[k] - f[j]) > guard_hz for j in kept):
+            kept.append(k)
+        if len(kept) >= max_tones:
+            break
+    if not kept:
+        return np.empty(0)
+    out = []
+    for k in kept:                          # sub-bin parabolic interpolation
+        y0, y1, y2 = float(s[k - 1]), float(s[k]), float(s[k + 1])
+        den = y0 - 2.0 * y1 + y2
+        d = float(np.clip(0.5 * (y0 - y2) / den, -0.5, 0.5)) if den else 0.0
+        out.append(float(f[k] + d * (f[1] - f[0])))
+    return np.sort(np.array(out))
+
+
+def _tone_phasors(y: np.ndarray, fs: float, freqs: np.ndarray,
+                  detrend: str = "linear") -> tuple[np.ndarray, float]:
+    """Least-squares phasors of several SIMULTANEOUS tones, and the residual.
+
+    Fitted together.  One at a time leaves the other tones of the group in
+    each one's residual, which makes the apparent noise a count of the group
+    size, -10*log10(N-1) dB, rather than a measurement of anything.
+    """
+    y = np.asarray(y, float)
+    n = len(y)
+    t = np.arange(n) / fs
+    cols: list[np.ndarray] = []
+    for f in freqs:
+        w = 2 * np.pi * f
+        cols += [np.cos(w * t), np.sin(w * t)]
+    cols.append(np.ones(n))
+    if detrend == "linear":
+        cols.append(t - t.mean())
+    D = np.column_stack(cols)
+    p, *_ = np.linalg.lstsq(D, y, rcond=None)
+    resid = y - D @ p
+    dof = max(n - D.shape[1], 1)
+    sigma = float(np.sqrt(float(np.dot(resid, resid)) / dof))
+    phasors = np.array([complex(p[2 * i], -p[2 * i + 1])
+                        for i in range(len(freqs))], dtype=complex)
+    return phasors, sigma
+
+
+def impedance_stepped_multisine(
+    current: np.ndarray, voltage: np.ndarray, fs: float,
+    dwells: list[tuple[int, int]] | None = None,
+    tones_hz: list[float] | None = None,
+    f_min: float = 1.0, f_max: float = 4000.0,
+    peak_db: float = 12.0, detrend: str = "linear",
+) -> SpectralResult:
+    """Z = U/I at the tones of each dwell, fitted per dwell.
+
+    `dwells` and `tones_hz` are optional: when they are not given the
+    schedule is read off the excitation itself.  For this measurement that
+    is a property of the data, and requiring it to be restated in a config
+    file is how a correct answer comes to depend on a setting nobody
+    remembers to change.
+
+    UNCERTAINTY.  A stepped multisine gives one window per dwell, so there
+    is no ensemble to take a variance over.  It is propagated from the two
+    joint-fit residuals instead, which is a better basis anyway: it is the
+    noise on THIS tone in THIS dwell rather than the scatter of a quantity
+    across windows in which different tones were present.
+
+    The reported "coherence" is the equivalent quantity for a single fit --
+    1 / (1 + 1/SNR) per channel, combined -- so a caller that gates on
+    coherence keeps working and gates on something meaningful.
+    """
+    current = np.asarray(current, float)
+    voltage = np.asarray(voltage, float)
+    n = min(len(current), len(voltage))
+    current, voltage = current[:n], voltage[:n]
+
+    spans = dwells if dwells is not None else detect_dwells(voltage, fs)
+    f_hi = min(f_max, 0.45 * fs)
+
+    fs_out: list[float] = []
+    zs: list[complex] = []
+    coh: list[float] = []
+    sig: list[float] = []
+    for a, b in spans:
+        yv, yi = voltage[a:b], current[a:b]
+        if len(yv) < 64:
+            continue
+        freqs = (np.asarray(tones_hz, float) if tones_hz is not None
+                 else tones_in_window(yv, fs, f_min, f_hi, peak_db=peak_db))
+        freqs = freqs[(freqs >= f_min) & (freqs <= f_hi)] if freqs.size else freqs
+        if freqs.size == 0:
+            continue
+        if 2 * len(freqs) + 2 > len(yv) // 2:
+            continue                        # window too short for the group
+        ph_v, sigma_v = _tone_phasors(yv, fs, freqs, detrend)
+        ph_i, sigma_i = _tone_phasors(yi, fs, freqs, detrend)
+        for k, f in enumerate(freqs):
+            Av, Ai = ph_v[k], ph_i[k]
+            if not (np.isfinite(Av) and np.isfinite(Ai)) or Ai == 0:
+                continue
+            # Per-tone SNR against the noise the JOINT fit left behind.
+            snr_v = (abs(Av) ** 2 / 2.0) / max(sigma_v ** 2, 1e-300)
+            snr_i = (abs(Ai) ** 2 / 2.0) / max(sigma_i ** 2, 1e-300)
+            gamma = 1.0 / ((1.0 + 1.0 / snr_v) * (1.0 + 1.0 / snr_i))
+            # Relative error on a ratio adds in quadrature.
+            rel = float(np.sqrt(1.0 / max(snr_v, 1e-300)
+                                + 1.0 / max(snr_i, 1e-300)))
+            fs_out.append(float(f))
+            zs.append(complex(Av / Ai))
+            coh.append(float(np.clip(gamma, 0.0, 1.0)))
+            sig.append(rel)
+
+    if not fs_out:
+        return SpectralResult(
+            f=np.empty(0), Z=np.empty(0, complex), coherence=np.empty(0),
+            sigma_rel=np.empty(0), n_windows_total=len(spans),
+            n_windows_used=0, method="stepped_multisine",
+            note="no tones stood clear of the noise in any dwell")
+
+    order = np.argsort(np.asarray(fs_out))
+    return SpectralResult(
+        f=np.asarray(fs_out)[order],
+        Z=np.asarray(zs, complex)[order],
+        coherence=np.asarray(coh)[order],
+        sigma_rel=np.asarray(sig)[order],
+        n_windows_total=len(spans), n_windows_used=len(spans),
+        n_eff=float(len(spans)), estimator="joint-tone-fit",
+        method="stepped_multisine",
+        note=f"{len(spans)} dwell(s); tones fitted jointly within each")
+
+
 # ---------------------------------------------------------------------------
 # Welch path
 # ---------------------------------------------------------------------------

@@ -176,10 +176,24 @@ class SyncConfig:
 class SpectralConfig:
     """Impedance estimation parameters."""
 
-    #: ``welch``        - coherence-gated Welch over the whole band.
-    #: ``synchronous``  - leakage-free DFT at designed multisine tones.
-    #: ``auto``         - synchronous when ``excitation_tones_hz`` and
-    #:                    ``base_frequency_hz`` are given, else welch.
+    #: ``welch``              - coherence-gated Welch over the whole band.
+    #: ``synchronous``        - leakage-free DFT at designed multisine tones.
+    #: ``stepped_multisine``  - tones of each dwell fitted jointly, per dwell.
+    #: ``auto``               - synchronous when ``excitation_tones_hz`` and
+    #:                          ``base_frequency_hz`` are given, else
+    #:                          stepped_multisine.
+    #:
+    #: AUTO NO LONGER FALLS BACK TO WELCH.  It used to, whenever the tone
+    #: list was not configured -- which is the normal case, because the
+    #: schedule is a property of the recording and not something anybody
+    #: restates in a config file.  So the default estimator for a stepped
+    #: excitation was the one estimator that assumes a stationary one:
+    #: Welch averages over the whole record, and a tone that was applied for
+    #: a tenth of it is diluted by that factor, along with the coherence
+    #: that is supposed to gate it. Both effects worsen with frequency on a
+    #: constant-cycles sweep, which is exactly how "the spectrum stops
+    #: around a kilohertz" comes to look like a property of the cell.
+    #: Welch is still available; it is no longer what you get by accident.
     method: str = "auto"
 
     nperseg: int = 8192
@@ -200,6 +214,11 @@ class SpectralConfig:
 
     f_min_hz: float = 1.0
     f_max_hz: float = 4000.0
+
+    #: dB above the local noise floor for a tone to be claimed inside a
+    #: dwell, when the tone list is discovered rather than configured. The
+    #: window length imposes a stricter floor automatically.
+    tone_peak_db: float = 12.0
 
     # --- coherence-gated Welch (ensemble-level rejection) ---
     gate_windows: bool = True

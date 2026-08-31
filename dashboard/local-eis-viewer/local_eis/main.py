@@ -72,6 +72,17 @@ from config import Config, DEFAULT
 # ---------------------------------------------------------------------------
 
 
+#: --f-max not given at all. Distinct from None, which is the real value
+#: meaning "derive the ceiling from fs" and which the user may ask for.
+_F_MAX_UNSET = object()
+
+
+def _f_max_arg(value: str):
+    """--f-max: a number, or 'auto' for 0.45*fs."""
+    text = str(value).strip().lower()
+    return None if text in ("auto", "none", "fs", "") else float(text)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="main.py", description=__doc__,
@@ -120,8 +131,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     g = p.add_argument_group("band")
     g.add_argument("--f-min", type=float, default=None)
-    g.add_argument("--f-max", type=float, default=None)
+    g.add_argument("--f-max", type=_f_max_arg, default=_F_MAX_UNSET,
+                   help="detection ceiling in Hz; 'auto' (the default) is "
+                        "0.45*fs, so recording faster actually searches "
+                        "higher")
     g.add_argument("--ppd", type=int, default=None)
+    g.add_argument("--excitation", choices=["auto", "stepped", "multisine"],
+                   default=None,
+                   help="excitation type; 'auto' (the default) counts the "
+                        "tones per dwell and decides")
 
     g = p.add_argument_group("algorithm")
     g.add_argument("--skew", choices=["structural", "per_card", "none"],
@@ -191,10 +209,15 @@ def config_from_args(a) -> Config:
         kw["i_setpoint_a"] = a.current
     if a.f_min is not None:
         kw["f_min_hz"] = a.f_min
-    if a.f_max is not None:
+    # "auto" arrives as the sentinel below rather than as None, because None
+    # is itself a meaningful value for f_max_hz (derive it from fs) and an
+    # absent flag must leave the config's own default alone.
+    if a.f_max is not _F_MAX_UNSET:
         kw["f_max_hz"] = a.f_max
     if a.ppd is not None:
         kw["ppd"] = a.ppd
+    if getattr(a, "excitation", None):
+        kw["excitation"] = a.excitation
     if a.skew:
         kw["skew_model"] = a.skew
     if a.phasor:

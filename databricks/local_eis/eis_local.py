@@ -69,6 +69,7 @@ import argparse
 import json
 import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -84,6 +85,32 @@ T_FALLBACK_C = 58.4          # used only if the temperature channels are unusabl
 # ===========================================================================
 
 
+def parse_start_time(text: str) -> datetime | None:
+    """Absolute trigger time from the ``|NT`` key: ``|NT,len,d,m,y,h,m,s;``.
+
+    This is the only statement a card makes about WHEN it started, and it is
+    what makes "were these five cards recording the same event?" answerable
+    before anything is evaluated.  Its resolution is one second and its
+    accuracy is the operator pressing start, so it is never precise enough to
+    ALIGN with -- that is measured from the shared reference channel.  What it
+    is good for is the sanity check the measured alignment cannot make on its
+    own: cross-correlation happily returns a confident lag for two cards that
+    recorded different runs an hour apart, because it only ever sees sample
+    indices.  The header stamps are what catch that.
+    """
+    match = re.search(
+        r"\|NT,\d+,(\d+),(\d+),(\d+),(\d+),(\d+),([\d.]+)\s*;", text)
+    if match is None:
+        return None
+    day, month, year, hour, minute = (int(match.group(i)) for i in range(1, 6))
+    seconds = float(match.group(6))
+    try:
+        return datetime(year, month, day, hour, minute,
+                        int(seconds), int(round((seconds % 1) * 1e6)))
+    except ValueError:
+        return None
+
+
 @dataclass
 class FamosFile:
     """imc FAMOS binary reader.
@@ -95,6 +122,12 @@ class FamosFile:
       second half of the measurement -- which is where the low-frequency steps
       live.  The sample count is derived from the real file size instead.
     * The header must be decoded as latin-1; channel names contain umlauts.
+
+    ``start_time`` is the ``|NT`` trigger stamp, or None when the dialect does
+    not carry one.  Nothing downstream aligns on it -- see
+    :func:`parse_start_time` for why -- but bronze compares it against the
+    measured lags, which is what turns "these cards disagree" from a silent
+    wrong answer into a refusal.
     """
 
     path: Path
@@ -103,10 +136,12 @@ class FamosFile:
     n_ch: int = field(init=False)
     n_samples: int = field(init=False)
     offset: int = field(init=False)
+    start_time: "datetime | None" = field(init=False)
 
     def __post_init__(self):
         self.path = Path(self.path)
         raw = self.path.open("rb").read(8192).decode("latin-1", errors="replace")
+        self.start_time = parse_start_time(raw)
 
         m_cd = re.search(r"\|CD,\d+,([\d.eE+-]+)", raw)
         m_cr = re.search(r"\|CR,\d+,(\d+)", raw)
@@ -336,6 +371,141 @@ def fit4(y: np.ndarray, fs: float, f0: float, n_iter: int = 12
     return float(f_hat), A, r_rms, snr
 
 
+def dominant_frequency(y: np.ndarray, fs: float, f_lo: float, f_hi: float,
+                       oversample: int = 16) -> float:
+    """Frequency of the largest spectral peak of ``y`` inside [f_lo, f_hi].
+
+    WHY THE SINE FIT NEEDS THIS IN FRONT OF IT
+    ------------------------------------------
+    :func:`fit4` is a Gauss-Newton iteration on the frequency, so it finds
+    the nearest optimum, not the best one.  Its basin is about the width of
+    the DFT main lobe -- roughly +/- 1/(2*N) in relative frequency for a
+    window holding N cycles, so +/- 2.6 % on a twenty-cycle dwell.  The
+    detection grid is twelve points per decade, which is 21 % apart, so a
+    true tone can sit 10 % from every grid point.  Outside the basin the
+    iteration does not fail: it converges on a sidelobe near where it
+    started and reports a confident frequency that is wrong by several
+    percent, with an SNR of about -14 dB.  Measured on a 100 kHz synthetic
+    sweep, that is what happened to every step above 1 kHz that the scan had
+    already located correctly -- the window was right, sitting on the right
+    dwell with 19 cycles in it, and the fit still came back with noise.
+
+    A periodogram peak has no basin.  One zero-padded FFT over the window
+    puts the seed inside the main lobe by construction, and fit4 then does
+    what it is good at: refining a start value that is already close.
+
+    The Hann window matters here: whatever the dwell finder leaves of the
+    neighbouring steps sits 20-30 % away in frequency, and a rectangular
+    window's sidelobes at that distance are comparable to a weak tone's main
+    lobe.
+    """
+    y = np.asarray(y, float)
+    n = len(y)
+    if n < 16:
+        return float("nan")
+    y = y - y.mean()
+    m = 1 << int(np.ceil(np.log2(max(n * oversample, 64))))
+    spec = np.abs(np.fft.rfft(y * np.hanning(n), m))
+    freqs = np.fft.rfftfreq(m, 1.0 / fs)
+    band = (freqs >= f_lo) & (freqs <= f_hi)
+    if not band.any():
+        return float("nan")
+    return float(freqs[band][int(np.argmax(spec[band]))])
+
+
+def fit_multitone(y: np.ndarray, fs: float, freqs, drift: bool = True
+                  ) -> tuple[np.ndarray, float, np.ndarray, dict]:
+    """Fit every tone that is present AT THE SAME TIME, in one least squares.
+
+    WHY A STEPPED MULTISINE CANNOT USE THE SINGLE-TONE FIT
+    -----------------------------------------------------
+    :func:`fit3` fits one sinusoid and calls everything left over "residual".
+    That is the right reading when one frequency is applied at a time.  When
+    a dwell carries a GROUP of tones together, the other tones of the group
+    are in that residual, and the SNR it reports is not a measurement of
+    noise -- it is a measurement of how many tones are in the group:
+
+        SNR_reported  ~  -10 * log10(N - 1)   dB
+
+    for N equal-amplitude tones, whatever the actual noise.  Eight tones
+    gives -8.5 dB, twenty gives -12.8, forty gives -15.9.  Measured on a
+    synthetic eight-tone dwell whose true noise floor is -40 dB, fit3
+    reports -8.5 dB on every tone.
+
+    Two consequences, and the second is the expensive one:
+
+    * A quality gate set against that number is not gating on quality.
+      Lowering it to -30 dB does not "let the weak high-frequency tones in";
+      it lets everything in, because the number never described the tones in
+      the first place.
+    * The SNR is used downstream as a WEIGHT.  Every tone in a group gets
+      the same fictitious value, so the genuinely good points and the
+      genuinely bad ones are weighted identically in the KK fit and in the
+      aggregate.
+
+    The amplitudes themselves come out right -- the tones are near-orthogonal
+    over a long window -- which is why this hides so well: the spectrum looks
+    reasonable and only the uncertainties are wrong.
+
+    Fitting the group jointly puts the other tones in the model where they
+    belong, so what is left really is noise.
+
+    Returns ``(phasors, resid_rms, snr_db, info)`` with phasors under the
+    same exp(+j w t) convention as :func:`fit3`.
+    """
+    y = np.asarray(y, float)
+    freqs = np.asarray(list(freqs), float)
+    n = len(y)
+    n_par = 2 * len(freqs) + (2 if drift else 1)
+    if n < max(16, 2 * n_par) or len(freqs) == 0:
+        nan = np.full(len(freqs), np.nan)
+        return (nan.astype(complex), np.nan, nan,
+                {"ok": False, "note": "window too short for the group"})
+
+    t = np.arange(n) / fs
+    cols = []
+    for f in freqs:
+        w = 2 * np.pi * f
+        cols += [np.cos(w * t), np.sin(w * t)]
+    cols.append(np.ones(n))
+    if drift:
+        # A slow baseline wander inside a dwell is otherwise absorbed by the
+        # lowest tone of the group, which is where it does the most harm.
+        cols.append(t - t.mean())
+    D = np.column_stack(cols)
+
+    # RESOLVABILITY.  Two tones closer than about 1/T are not separable over
+    # this window: the fit will still return numbers, and they will be a
+    # near-arbitrary split of one peak between two columns. Say so rather
+    # than reporting the split as two measurements.
+    T = n / fs
+    order = np.sort(freqs)
+    min_gap = float(np.min(np.diff(order))) if len(order) > 1 else np.inf
+    resolvable = bool(min_gap * T >= 1.0)
+
+    p, *_ = np.linalg.lstsq(D, y, rcond=None)
+    resid = y - D @ p
+    ssr = float(np.dot(resid, resid))
+    r_rms = float(np.sqrt(ssr / n))
+    # Unbiased noise variance: the fit has already spent n_par degrees of
+    # freedom, and with a large group that correction is not cosmetic.
+    dof = max(n - n_par, 1)
+    sigma2 = ssr / dof
+
+    phasors = np.array([complex(p[2 * i], -p[2 * i + 1])
+                        for i in range(len(freqs))], dtype=complex)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        # Power SNR of each tone against the noise the joint fit actually
+        # left behind, rather than against its neighbours.
+        snr = 10.0 * np.log10((np.abs(phasors) ** 2 / 2.0) / sigma2)
+    cond = float(np.linalg.cond(D))
+    return phasors, r_rms, snr, {
+        "ok": True, "resolvable": resolvable, "min_gap_hz": min_gap,
+        "window_s": T, "cond": cond, "n_par": n_par,
+        "sigma": float(np.sqrt(sigma2)),
+    }
+
+
 def harmonic_distortion(y: np.ndarray, fs: float, f: float) -> float:
     """THD from the 2nd and 3rd harmonic; the linearity check.
 
@@ -370,16 +540,49 @@ def _moving_mean(x: np.ndarray, win: int) -> np.ndarray:
 
 
 def demod_envelope(x: np.ndarray, fs: float, f: float, n_cyc: float = 5.0,
-                   min_win_s: float = 0.04, max_win_s: float = 6.0):
+                   min_win_s: float = 0.0, max_win_s: float = 6.0,
+                   min_win_samples: int = 16):
     """|complex amplitude at f| as a function of window start time.
 
     The window is rounded to a whole number of cycles so that DC and the
     neighbouring steps fall into the nulls of the rectangular window.
+
+    THE FLOOR IS IN SAMPLES, NOT IN SECONDS
+    ---------------------------------------
+    `min_win_s` used to be 0.04 s, and that one number is why this detector
+    stopped finding tones somewhere around a kilohertz.
+
+    A sweep generator dwells for a fixed number of CYCLES, so the dwell is
+    n/f seconds and shrinks as the frequency rises: twenty cycles is 200 ms
+    at 100 Hz and 5 ms at 4 kHz.  A 40 ms floor on the analysis window is
+    therefore harmless at the bottom of the band and, above about 500 Hz,
+    makes the window LONGER THAN THE DWELL IT IS MEASURING.  Past that point
+    the window averages the tone together with the silence and the
+    neighbouring steps on either side of it, so the demodulated amplitude
+    falls off as dwell/window -- about -9 dB at 1 kHz and -18 dB at 4 kHz on
+    a twenty-cycle sweep -- and the `peak >= 4*floor` test that locates the
+    dwell stops firing.
+
+    Nothing about that failure looks like a windowing problem from the
+    outside.  It looks like weak high-frequency excitation, which is why the
+    natural response is to turn the SNR gate down; and turning it down does
+    not help, because the dilution scales the peak and the background
+    together.  Measured on a 16-step synthetic sweep at 100 kHz with the
+    gate already at -30 dB: 5 of 16 steps missed, every one of them above
+    900 Hz, every one of them a frequency where the floor exceeded the dwell.
+
+    What the floor was protecting against is a window of too few SAMPLES to
+    average, and that is what it now says: `min_win_samples`.  The window
+    stays n_cyc periods long at every frequency, which is what the docstring
+    above always claimed it was.
     """
     n = len(x)
     spc = fs / f                                   # samples per cycle
-    win = int(round(np.clip(n_cyc / f, min_win_s, max_win_s) * fs))
-    win = int(max(8, min(win, n // 3)))
+    want_s = n_cyc / f
+    if min_win_s > 0:
+        want_s = max(want_s, min_win_s)
+    win = int(round(min(want_s, max_win_s) * fs))
+    win = int(max(min_win_samples, min(win, n // 3)))
     # snap to a whole number of cycles so that DC and the neighbouring steps
     # land in the nulls of the rectangular window.  Rounding samples-per-cycle
     # to an integer first would ruin this near the top of the band, where spc
@@ -401,7 +604,12 @@ def dwell_window(x: np.ndarray, fs: float, f: float, centre: int,
     keeps the low-frequency steps -- where the Gamry dwells for tens of
     seconds -- from being evaluated over a fraction of their data.
     """
-    env, win = demod_envelope(x, fs, f, n_cyc=6.0, min_win_s=0.02, max_win_s=6.0)
+    # Six cycles, and no floor in seconds -- see demod_envelope. A 20 ms
+    # floor here is the same bug one step smaller: above ~300 Hz on a
+    # twenty-cycle sweep it makes the interval-finding window wider than the
+    # interval it is trying to find, so the dwell comes back stretched into
+    # its neighbours and polish_window has to claw it back.
+    env, win = demod_envelope(x, fs, f, n_cyc=6.0, max_win_s=6.0)
     if len(env) < 4:
         return 0, len(x)
     k = int(np.clip(centre - win // 2, 0, len(env) - 1))
@@ -601,6 +809,10 @@ def detect_schedule(ref: np.ndarray, fs: float, ppd: int = 12,
         return []
     n_grid = int(np.ceil(ppd * np.log10(f_hi / f_lo))) + 1
     grid = np.logspace(np.log10(f_lo), np.log10(f_hi), max(n_grid, 4))
+    #: One grid step, as a ratio. The spectral seed is bracketed by it: a
+    #: candidate found by this grid point belongs to it or to a neighbour,
+    #: and the neighbours have their own turn.
+    grid_ratio = float(grid[1] / grid[0]) if len(grid) > 1 else 1.3
 
     raw: list[Step] = []
     for f in grid:
@@ -619,7 +831,15 @@ def detect_schedule(ref: np.ndarray, fs: float, ppd: int = 12,
         a, b = dwell_window(ref, fs, f, k)
         if b - a < 32:
             continue
-        f1, A1, _r1, snr1 = fit4(ref[a:b], fs, f)
+        # SEED THE SINE FIT SPECTRALLY, NOT FROM THE GRID POINT.  The grid is
+        # 21 % coarse and fit4's basin is a couple of percent; see
+        # dominant_frequency for what that cost above 1 kHz.  The bracket is
+        # one grid step either side, which is the range this candidate could
+        # legitimately belong to.
+        f_seed = dominant_frequency(ref[a:b], fs, f / grid_ratio, f * grid_ratio)
+        if not np.isfinite(f_seed):
+            f_seed = f
+        f1, A1, _r1, snr1 = fit4(ref[a:b], fs, f_seed)
         if not np.isfinite(f1) or not (0.80 * f <= f1 <= 1.25 * f):
             continue                       # ran away to a different step
         a, b = dwell_window(ref, fs, f1, (a + b) // 2)
@@ -647,6 +867,407 @@ def detect_schedule(ref: np.ndarray, fs: float, ppd: int = 12,
               f"({steps[0].freq:.3f} .. {steps[-1].freq:.1f} Hz), "
               f"{len(good)} pass QC" if steps else "  schedule: nothing found")
     return steps
+
+
+# ===========================================================================
+# 4b. Stepped multisine
+# ===========================================================================
+#
+# A stepped multisine applies a GROUP of frequencies at once and steps from
+# group to group.  Neither of the two estimators usually reached for suits
+# it, and both fail quietly:
+#
+#   Welch over the whole record   averages every group together.  Each tone
+#                                 is present for its own slice of the record,
+#                                 so its estimate is diluted by the fraction
+#                                 of time it was off, and the coherence that
+#                                 is supposed to gate the result is diluted
+#                                 with it.
+#
+#   stepped-sine dwell detection  assumes one frequency per dwell.  Its
+#                                 window finder maximises a SINGLE-tone fit,
+#                                 and inside a multisine that never improves,
+#                                 so the window collapses to its floor of a
+#                                 few periods.  Measured on a 15-tone
+#                                 synthetic in three groups: 4 of 15 tones
+#                                 found, with windows a millisecond long.
+#
+# What the excitation actually is decides the estimator, so this module
+# derives it from the record: segment the record in TIME first, without
+# reference to any frequency, then ask each segment which tones it contains,
+# then fit those tones together.
+
+
+def detect_dwells(x: np.ndarray, fs: float, frame_s: float = 0.02,
+                  change_tol: float = 0.25, silence_factor: float = 0.15,
+                  min_dwell_s: float = 0.01, trim_frac: float = 0.08
+                  ) -> list[tuple[int, int]]:
+    """Segment the record into intervals of constant excitation content.
+
+    THE SEGMENTATION IS SPECTRAL, NOT ENERGETIC
+    -------------------------------------------
+    The obvious way to find the steps is to look for the silence between
+    them, and it does not work.  Consecutive steps of a sweep frequently
+    abut with no gap at all, and even when there is one it can be shorter
+    than the analysis frame.  Worse, a silence-first design has to estimate
+    "what does quiet look like" from the record, and a record that is mostly
+    excitation has no quiet to measure: a low percentile of the frame RMS
+    then lands inside the signal, every frame falls below the threshold, and
+    the whole record comes back as a single dwell -- which is the one answer
+    that looks plausible and loses every step boundary.
+
+    So the primary signal is a CHANGE OF CONTENT.  Normalised frame spectra
+    are direction vectors; two frames of the same group are nearly parallel
+    and a step change rotates them.  This works whether or not there is a
+    gap, and it uses no assumption about how much of the record is silent.
+    Normalising also means a change of LEVEL alone -- the amplitude taper a
+    designed multisine usually has -- is not mistaken for a change of
+    content.
+
+    Silence is then just a segment like any other, dropped afterwards by
+    comparing its level against the median of the segments.  That comparison
+    is well posed however little silence there is.
+
+    Trimming the ends of each interval matters more than it looks.  The
+    first and last frames of a dwell straddle the transition and hold both
+    groups; left in, they put a full-amplitude tone from the neighbour into
+    the residual of the joint fit, which is exactly the noise estimate the
+    whole approach exists to get right.
+    """
+    x = np.asarray(x, float)
+    n = len(x)
+    nper = max(64, 1 << int(np.round(np.log2(max(frame_s * fs, 64)))))
+    if n < 4 * nper:
+        return [(0, n)]
+    step = nper // 2
+    starts = np.arange(0, n - nper + 1, step)
+    win = np.hanning(nper)
+
+    spectra = np.empty((len(starts), nper // 2 + 1))
+    rms = np.empty(len(starts))
+    for i, a in enumerate(starts):
+        seg = x[a:a + nper]
+        seg = seg - seg.mean()
+        rms[i] = np.sqrt(np.mean(seg ** 2))
+        spectra[i] = np.abs(np.fft.rfft(seg * win))
+
+    norm = np.linalg.norm(spectra, axis=1)
+    unit = spectra / np.where(norm > 0, norm, 1.0)[:, None]
+
+    # BEFORE-AND-AFTER, NOT FRAME-TO-FRAME.  Comparing each frame with its
+    # predecessor makes the statistic as noisy as one frame, and a threshold
+    # low enough to catch a real step then also fires on the jitter inside
+    # one: a three-group record came back as twelve dwells. Averaging W
+    # frames either side of the candidate boundary is the standard
+    # change-point form and suppresses that jitter by sqrt(W) while leaving
+    # a genuine step change untouched -- a step is sustained, which is
+    # exactly what the average is sensitive to and the jitter is not.
+    W = max(2, int(round(0.05 / (step / fs))) if step > 0 else 2)
+    W = min(W, max(2, len(starts) // 8))
+    dist = np.zeros(len(starts))
+    for i in range(W, len(starts) - W):
+        before = unit[i - W:i].mean(axis=0)
+        after = unit[i:i + W].mean(axis=0)
+        nb, na = np.linalg.norm(before), np.linalg.norm(after)
+        if nb > 0 and na > 0:
+            dist[i] = 1.0 - float(np.dot(before, after) / (nb * na))
+
+    # Local maxima of the rotation, not every frame above the threshold: a
+    # transition spans several overlapping frames and would otherwise be
+    # reported as several boundaries a frame apart.
+    cuts = [0]
+    for i in range(1, len(dist) - 1):
+        if dist[i] >= change_tol and dist[i] >= dist[i - 1] \
+                and dist[i] >= dist[i + 1] and i - cuts[-1] >= W:
+            cuts.append(i)
+    cuts.append(len(starts))
+
+    spans = []
+    for lo, hi in zip(cuts[:-1], cuts[1:]):
+        s0 = int(starts[lo])
+        s1 = int(min(n, starts[hi - 1] + nper))
+        if s1 - s0 >= max(min_dwell_s * fs, 2 * nper):
+            spans.append((s0, s1, float(np.median(rms[lo:hi]))))
+    if not spans:
+        return [(0, n)]
+
+    loud = float(np.median([lvl for _s0, _s1, lvl in spans]))
+    out = []
+    for s0, s1, lvl in spans:
+        if lvl < silence_factor * loud:
+            continue                       # a gap between steps, not a dwell
+        cut = int(trim_frac * (s1 - s0))
+        out.append((s0 + cut, s1 - cut))
+    return out or [(0, n)]
+
+
+def _local_floor(mag: np.ndarray, n_bands: int = 160) -> np.ndarray:
+    """A local noise floor: band medians, interpolated back over the band.
+
+    A single global median is the wrong reference when the spectrum spans
+    decades of level.  On a stepped multisine the quiet high-frequency end
+    drags the global median far below the skirts of the strong low-frequency
+    tones, so those skirts clear any fixed threshold and are reported as
+    tones -- 81 spurious ones out of 96 on a 15-tone synthetic, all of them
+    sidebands hugging a real peak.
+
+    THE BANDS ARE UNIFORM IN BIN INDEX, NOT LOGARITHMIC.  A log grid sounds
+    right for a spectrum read on a log axis, and it is wrong here: its bands
+    at the bottom of the range are only a few hertz wide, so a band can
+    contain one tone and nothing else.  Its median is then the tone, the
+    threshold sits 12 dB above the tone, and the tone is not detected --
+    which is precisely what happened to the 10 Hz and 20 Hz members of a
+    low-frequency group.  A noise floor has to be estimated from a
+    neighbourhood that is mostly noise, and uniform bands guarantee every
+    band holds many resolution cells.
+
+    Band medians rather than a sliding window: the zero-padded spectrum runs
+    to hundreds of thousands of bins, and a sliding view over it at the width
+    a noise floor needs is tens of gigabytes.  A floor is smooth by
+    construction, so it needs a value per neighbourhood, not per bin.
+    """
+    n = len(mag)
+    if n < 16:
+        return np.full(n, float(np.median(mag)) if n else 0.0)
+    n_bands = int(max(4, min(n_bands, n // 16)))
+    edges = np.linspace(0, n, n_bands + 1).astype(int)
+    centres = 0.5 * (edges[:-1] + edges[1:])
+    values = np.array([np.median(mag[a:b]) if b > a else np.nan
+                       for a, b in zip(edges[:-1], edges[1:])])
+    ok = np.isfinite(values)
+    if ok.sum() < 2:
+        return np.full(n, float(np.median(mag)))
+    return np.interp(np.arange(n), centres[ok], values[ok])
+
+
+def _false_alarm_db(n_cells: int, p_total: float = 0.01) -> float:
+    """Threshold over the noise median that expects `p_total` false peaks.
+
+    The magnitude of a white-noise spectrum is Rayleigh, so a fixed "12 dB
+    over the floor" is not a fixed false-alarm rate -- it is a rate per bin,
+    and a long window has a lot of bins.  A two-second dwell at 100 kHz
+    holds ~10^5 independent cells, at which 12 dB expects one or two noise
+    peaks to be promoted to tones, and that is exactly what showed up: a
+    lone spurious 42.7 kHz "tone" in a dwell whose real content stopped at
+    80 Hz.  Scaling the threshold with the cell count keeps the expected
+    number of those near zero however long the window is.
+    """
+    n_cells = max(8, int(n_cells))
+    p = min(0.5, p_total / n_cells)
+    sigma = float(np.sqrt(-2.0 * np.log(p)))       # Rayleigh tail
+    median = float(np.sqrt(2.0 * np.log(2.0)))     # Rayleigh median / sigma
+    return float(20.0 * np.log10(sigma / median))
+
+
+def tones_in_window(y: np.ndarray, fs: float, f_lo: float, f_hi: float,
+                    peak_db: float = 12.0, max_tones: int = 96,
+                    oversample: int = 8) -> np.ndarray:
+    """Every frequency standing clear of its LOCAL noise floor in a window.
+
+    Peaks are thinned to one per main lobe -- two maxima closer than the
+    window's own resolution are one tone -- and returned off the zero-padded
+    grid, because a tone need not sit on a DFT bin.
+    """
+    y = np.asarray(y, float)
+    n = len(y)
+    if n < 64:
+        return np.empty(0)
+    y = y - y.mean()
+    m = 1 << int(np.ceil(np.log2(max(n * oversample, 256))))
+    spec = np.abs(np.fft.rfft(y * np.hanning(n), m))
+    freqs = np.fft.rfftfreq(m, 1.0 / fs)
+
+    band = (freqs >= f_lo) & (freqs <= min(f_hi, 0.5 * fs))
+    if band.sum() < 8:
+        return np.empty(0)
+    s, f = spec[band], freqs[band]
+
+    floor = _local_floor(s)
+    # The stricter of the caller's floor and what the window length demands.
+    db = max(peak_db, _false_alarm_db(max(8, n // 2)))
+    thr = floor * 10 ** (db / 20.0)
+
+    # ONE AND A HALF HANN MAIN LOBES.  At exactly one lobe (4*fs/n) the
+    # shoulders of a strong tone sit just outside the guard and each becomes
+    # its own "tone": a four-tone group came back as twelve, every extra one
+    # a sideband at the main-lobe edge of a real peak.
+    guard_hz = 6.0 * fs / n
+    idx = [k for k in range(1, len(s) - 1)
+           if s[k] >= thr[k] and s[k] >= s[k - 1] and s[k] >= s[k + 1]]
+    idx.sort(key=lambda k: -s[k])
+    kept: list[int] = []
+    for k in idx:
+        if all(abs(f[k] - f[j]) > guard_hz for j in kept):
+            kept.append(k)
+        if len(kept) >= max_tones:
+            break
+    if not kept:
+        return np.empty(0)
+
+    # SUB-BIN INTERPOLATION.  The zero-padded grid still quantises the peak,
+    # and the leftover frequency error does not stay in the frequency: the
+    # joint fit models each tone at the frequency it is given, so a tone
+    # offset by df sheds about 2*pi*df*T/sqrt(3) of its own amplitude into
+    # the residual -- which is the noise estimate. On a 0.28 s dwell a 0.2 Hz
+    # error costs ~5 dB of apparent SNR, so the tones look worse than they
+    # are and the weights that follow are wrong. A parabola through the peak
+    # and its two neighbours removes most of it for three multiplications.
+    out = []
+    for k in kept:
+        y0, y1, y2 = float(s[k - 1]), float(s[k]), float(s[k + 1])
+        denom = y0 - 2.0 * y1 + y2
+        delta = 0.5 * (y0 - y2) / denom if denom != 0 else 0.0
+        delta = float(np.clip(delta, -0.5, 0.5))
+        out.append(float(f[k] + delta * (f[1] - f[0])))
+    return np.sort(np.array(out))
+
+
+def tone_occupancy(ref: np.ndarray, fs: float, f_lo: float, f_hi: float,
+                   max_tones: int = 24, n_grid: int = 240,
+                   on_frac: float = 0.4) -> dict:
+    """When is each strong tone on, and how many are on at once?
+
+    The defining difference between a sweep and a multisine is SIMULTANEITY,
+    so that is what this measures, rather than anything that stands in for
+    it.  For each strong tone in the record, its demodulated envelope says
+    when it was present; laying those on a common time grid says how many
+    were present together.
+
+    Measuring it directly matters because the obvious proxy -- segment the
+    record, then count the tones in a segment -- inherits every weakness of
+    the segmentation.  On a 1 Hz-to-3 kHz sweep the segmenter's frames are
+    far too short to resolve the low-frequency steps, so it merged eighteen
+    dwells into two and the tone count then reported a plain stepped sine as
+    a multisine with four tones per dwell.  Co-occurrence needs no
+    segmentation and is not fooled by that.
+    """
+    x = np.asarray(ref, float)
+    x = x - x.mean()
+    n = len(x)
+    if n < 256:
+        return {"ok": False, "tones_at_once": 0.0, "n_tones": 0}
+
+    freqs = tones_in_window(x, fs, f_lo, f_hi, max_tones=max_tones)
+    if freqs.size == 0:
+        return {"ok": False, "tones_at_once": 0.0, "n_tones": 0}
+
+    grid = np.linspace(0, n - 1, min(n_grid, n)).astype(int)
+    on = np.zeros((len(freqs), len(grid)), bool)
+    for i, f in enumerate(freqs):
+        env, win = demod_envelope(x, fs, float(f))
+        if len(env) < 4:
+            continue
+        centres = np.clip(grid - win // 2, 0, len(env) - 1)
+        e = env[centres]
+        peak = float(np.max(e)) if e.size else 0.0
+        if peak <= 0:
+            continue
+        on[i] = e >= on_frac * peak
+
+    live = on.sum(axis=0)
+    busy = live[live > 0]
+    at_once = float(np.median(busy)) if busy.size else 0.0
+    return {"ok": True, "tones_at_once": at_once, "n_tones": int(freqs.size),
+            "freqs": freqs}
+
+
+def classify_excitation(ref: np.ndarray, fs: float, f_lo: float = 0.15,
+                        f_hi: float | None = None) -> dict:
+    """Stepped sine or stepped multisine?  Decided from the record.
+
+    This is not a stylistic choice between two estimators -- they answer
+    different questions and each is badly wrong about the other's data:
+
+    * The stepped-sine detector maximises a SINGLE-tone fit to find each
+      dwell.  Inside a multisine that fit never improves, because what
+      limits it is the other tones, so the window shrinks to its floor of a
+      few periods.  Measured on a 15-tone synthetic in three groups: 4 of 15
+      tones found, with windows about a millisecond long.
+    * The multisine path fits a whole group at once.  Handed a stepped sine
+      it is not merely wasteful: if the segmentation then merges several
+      steps into one "dwell", it will fit tones jointly that were never on
+      together, over a window most of them were absent for.
+
+    So the test is on SIMULTANEITY itself (:func:`tone_occupancy`): how many
+    strong tones are on at the same time.  One is a sweep.  Several is a
+    multisine.
+    """
+    f_hi = float(f_hi or 0.45 * fs)
+    occ = tone_occupancy(ref, fs, f_lo, f_hi)
+    at_once = float(occ.get("tones_at_once", 0.0))
+    kind = "multisine" if at_once >= 1.5 else "stepped"
+    dwells = detect_dwells(ref, fs) if kind == "multisine" else []
+    return {"kind": kind, "tones_at_once": at_once,
+            "n_tones": int(occ.get("n_tones", 0)),
+            "n_dwells": len(dwells)}
+
+
+def detect_multisine_schedule(ref: np.ndarray, fs: float,
+                              f_lo: float = 0.15, f_hi: float | None = None,
+                              peak_db: float = 12.0,
+                              verbose: bool = True) -> list[Step]:
+    """Blind schedule for a stepped multisine.
+
+    Returns one :class:`Step` per (dwell, tone) pair, so several Steps share
+    a start/stop when they were applied together.  That overlap is the record
+    of simultaneity, and :func:`group_simultaneous` reads it back so the
+    group can be fitted jointly rather than one tone at a time.
+    """
+    f_hi = float(f_hi or 0.45 * fs)
+    dwells = detect_dwells(ref, fs)
+    steps: list[Step] = []
+    for a, b in dwells:
+        y = ref[a:b]
+        freqs = tones_in_window(y, fs, f_lo, f_hi, peak_db=peak_db)
+        if freqs.size == 0:
+            continue
+        phasors, _r, snr, info = fit_multitone(y, fs, freqs)
+        if not info.get("ok"):
+            continue
+        for f, A, sn in zip(freqs, phasors, snr):
+            if not np.isfinite(A):
+                continue
+            steps.append(Step(
+                freq=float(f), start=int(a), stop=int(b), amp=float(abs(A)),
+                snr_db=float(sn),
+                thd=harmonic_distortion(y, fs, float(f)),
+                stationarity=_stationarity(ref, fs, float(f), a, b)))
+    steps.sort(key=lambda s: s.freq)
+    if verbose:
+        print(f"  multisine schedule: {len(dwells)} dwell(s), "
+              f"{len(steps)} tone(s) "
+              + (f"({steps[0].freq:.3f} .. {steps[-1].freq:.1f} Hz)"
+                 if steps else "(none)"))
+    return steps
+
+
+def group_simultaneous(steps: list[Step], overlap: float = 0.5
+                       ) -> list[list[int]]:
+    """Indices of steps that share a dwell, i.e. were applied together.
+
+    Simultaneity is not something to configure -- it is already in the
+    windows.  Two tones whose dwell windows coincide were on at the same
+    time; two tones from different steps of a sweep were not.  Grouping on
+    the windows therefore handles a stepped sine (every group of size one),
+    a single multisine over the whole record (one group of everything) and a
+    stepped multisine (the general case) without being told which it is.
+    """
+    groups: list[list[int]] = []
+    for i, st in enumerate(steps):
+        placed = False
+        for g in groups:
+            ref = steps[g[0]]
+            lo = max(ref.start, st.start)
+            hi = min(ref.stop, st.stop)
+            shared = max(0, hi - lo)
+            shortest = min(ref.stop - ref.start, st.stop - st.start)
+            if shortest > 0 and shared / shortest >= overlap:
+                g.append(i)
+                placed = True
+                break
+        if not placed:
+            groups.append([i])
+    return groups
 
 
 # ===========================================================================

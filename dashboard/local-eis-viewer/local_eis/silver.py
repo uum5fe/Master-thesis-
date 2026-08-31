@@ -1074,7 +1074,7 @@ def extrapolate_hf(drt: dict, f_hi: float, n: int = 40) -> dict:
 #: the counts add up to the number dropped instead of double-counting.
 REJECT_REASONS = {
     "not_finite": "the phasor fit did not return a finite Z",
-    "outside_band": "outside cfg.f_min_hz .. cfg.f_max_hz",
+    "outside_band": "outside cfg.f_min_hz .. cfg.f_hi(fs)",
     "snr": "SNR below the gate for this point",
     "thd": "harmonic distortion above cfg.max_thd",
     "drift": "amplitude drifted during the dwell, above cfg.max_drift",
@@ -1111,7 +1111,12 @@ def process_segment(sp: BronzeSpectrum, skew: SkewModel, cfg: Config,
 
     keep = gate(np.isfinite(freq) & (freq > 0)
                 & np.isfinite(Z.real) & np.isfinite(Z.imag), "not_finite")
-    keep &= gate((freq >= cfg.f_min_hz) & (freq <= cfg.f_max_hz),
+    # cfg.f_hi(sp.fs), not cfg.f_max_hz: the ceiling follows the rate this
+    # segment was recorded at. Reading the raw field here would have thrown
+    # away every point bronze newly finds above 4.5 kHz on a fast card, and
+    # charged them to "outside_band" -- a gate the operator cannot act on,
+    # because the band it names is not the band that was searched.
+    keep &= gate((freq >= cfg.f_min_hz) & (freq <= cfg.f_hi(sp.fs)),
                  "outside_band")
 
     # Point-level gates.  An ON-GRID step is a real step -- a geometric

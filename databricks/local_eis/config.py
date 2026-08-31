@@ -129,6 +129,14 @@ FAMOS_TEST_ID = "01"
 # ===========================================================================
 
 
+def _f_max(value: str) -> float | None:
+    """--f-max: a number, or 'auto'/'none' for 0.45*fs."""
+    text = str(value).strip().lower()
+    if text in ("auto", "none", "", "fs"):
+        return None
+    return float(text)
+
+
 @dataclass(frozen=True)
 class Config:
     """One run of the pipeline.
@@ -216,9 +224,31 @@ class Config:
     # bronze.py now finds the schedule once, globally, and silver.py only ever
     # fits at known frequencies, the usable ceiling is set by signal amplitude
     # rather than by the search.
+    #
+    # THAT DEFAULT IS NOW ACTUALLY 0.45*fs.  It used to read 4500.0, which is
+    # 0.45 * 10 kHz -- the rate the plate was recorded at when the number was
+    # written down.  Frozen as an absolute it stopped being a function of the
+    # sampling rate, so raising the rate to gain bandwidth gained none: at
+    # 100 kHz the ceiling stayed at 4.5 kHz, `min(4500, 45000)` picked 4500,
+    # and every tone above it was simply never looked for.  Nothing reported
+    # this, because "no steps found up there" and "never searched up there"
+    # produce the same empty result.  None means "derive it from fs"; a
+    # number still pins it, and is still capped at f_hi_frac_fs*fs.
     f_min_hz: float = 0.15
-    f_max_hz: float = 4500.0
+    f_max_hz: float | None = None
     f_hi_frac_fs: float = 0.45       # detection ceiling as a fraction of fs
+
+    # WHICH EXCITATION THIS IS.  "auto" counts the tones in each dwell and
+    # decides; "stepped" forces the one-tone-at-a-time detector; "multisine"
+    # forces the joint one.  This is not cosmetic -- handing a stepped
+    # multisine to the single-tone estimator does not fail, it returns a
+    # spectrum whose every SNR is a count of the tones in the group rather
+    # than a measurement of noise, so every downstream weight is wrong.
+    excitation: str = "auto"        # auto | stepped | multisine
+    #: dB above the local noise floor for a tone to be claimed inside a
+    #: dwell. The window length sets a stricter floor automatically; this is
+    #: the minimum, not the whole test.
+    tone_peak_db: float = 12.0
     ppd: int = 12                    # points per decade of the detection grid
 
     # ---- schedule detection (bronze) --------------------------------------
@@ -251,6 +281,34 @@ class Config:
     # the real signal, so it is not a close call in either direction.
     align_min_corr: float = 0.05        # absolute floor against pure garbage
     align_min_prominence: float = 25.0  # robust sigma above the background
+
+    # THE BAND THE ALIGNMENT CORRELATES OVER.  These are CLAMPS on a band
+    # that bronze measures from the reference channels themselves, not the
+    # band itself.  It used to be the literal 0.5 .. 300 Hz, which is right
+    # for a sweep that stops at 250 Hz and catastrophic for one that starts
+    # above 300: the filter removes the whole excitation, and the
+    # cross-correlation of what is left returns a confident lag between two
+    # noise records.  The ceiling is additionally capped at 0.4*fs.
+    align_band_lo_hz: float = 0.5
+    align_band_hi_hz: float = 45_000.0
+    #: Energy quantile trimmed from each end when reading the band off the
+    #: pooled spectrum.  2 % keeps the sweep and drops the tails.
+    align_band_quantile: float = 0.02
+
+    # THE HEADER CROSS-CHECK.  |NT stamps resolve to one second and, on the
+    # 45 A set, understated the true stagger by up to 2.7 s (stamps 3 s
+    # apart where the measured offset was 5.712 s).  So they are checked for
+    # ORDER and for gross disagreement only.  `resolution` is the separation
+    # below which a pair of stamps says nothing about order at all;
+    # `tol` is how far a measured lag may sit from the stamp before the lag
+    # is treated as a different correlation peak rather than a coarse stamp.
+    align_header_resolution_s: float = 1.5
+    align_header_tol_s: float = 10.0
+    #: Correlation peaks within this fraction of the winner are treated as
+    #: ties. A periodic excitation -- which is what a designed multisine is
+    #: -- produces exact ties one base period apart, and picking the largest
+    #: then picks among equals by noise.
+    align_peak_tie_ratio: float = 0.8
 
     # ---- per-step quality gates -------------------------------------------
     # A step that lies on the sweep's own geometric grid is a real step: a
@@ -536,8 +594,16 @@ class Config:
         raise ValueError(f"unknown preset {name!r}")
 
     def f_hi(self, fs: float) -> float:
-        """Detection ceiling for a given sampling rate."""
-        return min(self.f_max_hz, self.f_hi_frac_fs * fs)
+        """Detection ceiling for a given sampling rate.
+
+        With `f_max_hz` unset this is `f_hi_frac_fs * fs` -- the ceiling
+        follows the rate the data was actually recorded at, which is the
+        whole point of recording faster.  An explicit `f_max_hz` pins it
+        lower, and is still capped at the same fraction of fs, because no
+        setting can make a blind search above Nyquist mean anything.
+        """
+        by_rate = self.f_hi_frac_fs * fs
+        return by_rate if self.f_max_hz is None else min(self.f_max_hz, by_rate)
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -654,8 +720,15 @@ class Config:
 
         g = p.add_argument_group("band")
         g.add_argument("--f-min", dest="f_min_hz", type=float, default=0.15)
-        g.add_argument("--f-max", dest="f_max_hz", type=float, default=4500.0)
+        g.add_argument("--f-max", dest="f_max_hz", type=_f_max, default=None,
+                       help="detection ceiling in Hz. Default 'auto' = "
+                            "0.45*fs, so a faster recording is actually "
+                            "searched to a higher frequency")
         g.add_argument("--ppd", type=int, default=12)
+        g.add_argument("--excitation", choices=["auto", "stepped", "multisine"],
+                       default="auto",
+                       help="excitation type. Default 'auto' counts the tones "
+                            "per dwell and decides")
 
         g = p.add_argument_group("estimation")
         g.add_argument("--phasor", dest="phasor_method",
@@ -768,7 +841,9 @@ if __name__ == "__main__":
     print(f"  acquisition : {N_CARDS} cards x {CHANNELS_PER_CARD} ch @ "
           f"{NOMINAL_FS_HZ:.0f} Hz")
     print(f"  known bad   : {', '.join(sorted(KNOWN_BAD_SEGMENTS))}")
-    print(f"  band        : {cfg.f_min_hz} .. {cfg.f_max_hz} Hz, ppd={cfg.ppd}")
+    ceiling = ("auto (0.45*fs)" if cfg.f_max_hz is None
+               else f"{cfg.f_max_hz} Hz")
+    print(f"  band        : {cfg.f_min_hz} .. {ceiling}, ppd={cfg.ppd}")
     print(f"  phasor      : {cfg.phasor_method}   skew: {cfg.skew_model}   "
           f"uncertainty: {cfg.uncertainty_model}")
     print(f"  gold        : drt={cfg.drt_method if cfg.drt_enable else 'off'}, "

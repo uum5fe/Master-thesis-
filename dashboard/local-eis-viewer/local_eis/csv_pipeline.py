@@ -191,7 +191,7 @@ def detect_tones(m: csv_source.CsvMeasurement, cfg, log) -> dict:
                 "reference": "u_cell" if m.u_cell is not None else "segment"}
 
     f_lo = max(cfg.f_min_hz, 3.0 / max(t[-1] - t[0], 1e-9))
-    f_hi = min(cfg.f_max_hz, 0.45 * fs)
+    f_hi = cfg.f_hi(fs)
     if not np.isfinite(f_hi) or f_hi <= f_lo:
         raise ValueError(
             f"empty analysis band: f_min={f_lo:.4g} Hz, f_max={f_hi:.4g} Hz, "
@@ -425,7 +425,7 @@ def r2d2_point(m, cfg, log, f_true: float | None = None) -> dict:
     # On the delivered file that turns a wrong answer into the right one and
     # costs one FFT per channel.
     f_lo = max(cfg.f_min_hz, 3.0 / max(t[-1] - t[0], 1e-9))
-    f_hi = min(cfg.f_max_hz, 0.45 * fs)
+    f_hi = cfg.f_hi(fs)
 
     n_fft = t.size
     win = np.hanning(n_fft)

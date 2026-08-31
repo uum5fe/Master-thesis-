@@ -59,6 +59,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, field, asdict
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -68,7 +69,9 @@ try:                      # package layout: core/ holds the science modules
 except ImportError:       # flat layout (Databricks, notebooks): already there
     pass
 import r2d2_geometry as geom
-from eis_local import FamosFile, PlateCalibration, detect_schedule, Step
+from eis_local import (FamosFile, PlateCalibration, Step, detect_schedule,
+                       detect_multisine_schedule, fit_multitone,
+                       group_simultaneous, classify_excitation)
 
 import utils
 from config import Config, DEFAULT, KNOWN_BAD_SEGMENTS, T_FALLBACK_C
@@ -162,6 +165,9 @@ class CardInfo:
     ref_slot: int
     n_segments: int
     sensor_T: dict[str, float] = field(default_factory=dict)
+    #: |NT trigger stamp, or None if the dialect carries none.  Used to
+    #: CHECK the measured alignment, never to perform it.
+    start_time: "datetime | None" = None
 
 
 @dataclass
@@ -178,6 +184,10 @@ class BronzeRun:
     n_files: int
     lags: dict = field(default_factory=dict)
     sensor_T: dict = field(default_factory=dict)
+    #: TimebaseReport.summary() -- what the headers said before alignment.
+    timebase: dict = field(default_factory=dict)
+    #: CalibrationReport.summary() -- what was calibrated vs substituted.
+    calibration: dict = field(default_factory=dict)
 
     def segments_measured(self) -> list[str]:
         return sorted(self.spectra, key=int)
@@ -201,11 +211,20 @@ class BronzeRun:
                      if k in ("ok", "ppd", "f0", "n_on_grid", "n_total")},
             "config_digest": self.config_digest,
             "input_digest": self.input_digest,
-            "card_lag_s": {k: round(v["lag"] / 10000.0, 6)
-                           for k, v in self.lags.items()},
+            # The card's OWN sample rate, not a constant.  This divided by a
+            # hard-coded 10000.0, so every lag reported for a plate recorded
+            # at any other rate was wrong by exactly that ratio -- silently,
+            # and in the one number a reader would use to sanity-check the
+            # alignment against the header stamps.
+            "card_lag_s": {k: round(v["lag"] / self.cards[k].fs, 6)
+                           for k, v in self.lags.items() if k in self.cards},
             "card_lag_corr": {k: round(v["corr"], 4)
                               for k, v in self.lags.items()},
+            "card_lag_applied": {k: bool(v.get("applied"))
+                                 for k, v in self.lags.items()},
             "sensor_T_degC": {k: round(v, 3) for k, v in self.sensor_T.items()},
+            "timebase": self.timebase,
+            "calibration": self.calibration,
         }
 
 
@@ -328,10 +347,13 @@ def inventory_channels(files: list[Path], cfg: Config,
             n_samples=fam.n_samples, duration_s=fam.n_samples / fam.fs,
             ref_name=ref, ref_slot=ref_slot,
             n_segments=len(fam.segment_names),
+            start_time=fam.start_time,
         )
+        stamp = (fam.start_time.strftime("%Y-%m-%d %H:%M:%S")
+                 if fam.start_time else "no |NT stamp")
         log.info(f"  {fp.name}: {fam.fs:.0f} Hz, {fam.n_ch} ch, "
                  f"{fam.n_samples/fam.fs:.1f} s, ref={ref} (slot {ref_slot}), "
-                 f"{len(fam.segment_names)} segments")
+                 f"{len(fam.segment_names)} segments, started {stamp}")
     if not cards:
         raise SystemExit("bronze: no card carried a usable reference channel")
     return channels, cards
@@ -343,12 +365,303 @@ def cfg_stride(cfg: Config) -> int:
 
 
 # ===========================================================================
+# 2a. Time base  (ARE THESE FIVE CARDS EVEN THE SAME RUN?)
+# ===========================================================================
+
+
+@dataclass
+class TimebaseReport:
+    """What the headers say about when each card was recording.
+
+    WHY THIS RUNS BEFORE ANYTHING IS EVALUATED
+    ------------------------------------------
+    The alignment in `estimate_card_lags` is a cross-correlation, and a
+    cross-correlation only ever sees sample indices.  Hand it two cards that
+    recorded DIFFERENT runs an hour apart and it does not fail: it returns
+    the lag of best agreement between two unrelated records, with a
+    prominence score computed against that same unrelated background.  The
+    number looks like an answer.  Nothing downstream can tell it is not one,
+    because by the time silver sees the result the only symptom is segments
+    failing an SNR gate -- which is what a wrong lag always looks like.
+
+    The `|NT` header stamps are the independent statement that catches this.
+    They are coarse (see `header_offsets_s` below) and are never used to
+    align anything.  They are used to answer three questions the correlation
+    cannot answer about itself:
+
+      1. Do the cards even share a sample rate?  A lag in SAMPLES is
+         meaningless between two cards clocked differently, and the search
+         window is sized from one card's fs for all of them.
+      2. Is the stagger within reach of the search window?  Arming five
+         cards by hand puts seconds between them; `align_max_lag_s` bounds
+         what the correlation may return.  A true offset outside that bound
+         cannot be found, and the peak inside it is noise.
+      3. Were all five cards recording at the same time at all?  Started one
+         by one, an early card can stop before a late one starts.  Their
+         common window is where the excitation must live, and if it is
+         empty there is nothing to align.
+
+    HOW COARSE ARE THE STAMPS
+    -------------------------
+    Coarse enough that this must not gate on small disagreements.  On the
+    45 A set the stamps read 07:45:46 / 46 / 49 / 48 / 48 while the measured
+    offsets were 0 / 0.0002 / 5.7120 / 2.5358 / 2.5491 s: the stamp spacing
+    understates the true one by up to 2.7 s.  So the stamps are checked for
+    ORDER and for gross disagreement, never for agreement to the second.
+    """
+
+    fs: dict[str, float]
+    stamps: dict[str, "datetime | None"]
+    #: Start of each card relative to the earliest stamped card, in seconds.
+    header_offsets_s: dict[str, float]
+    #: Seconds during which every card was recording simultaneously, from the
+    #: stamps and durations.  NaN when the stamps do not support the sum.
+    overlap_s: float
+    problems: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not self.problems
+
+    @property
+    def stamped(self) -> dict[str, "datetime"]:
+        return {k: v for k, v in self.stamps.items() if v is not None}
+
+    @property
+    def header_spread_s(self) -> float:
+        """Seconds between the first and last card being armed."""
+        off = list(self.header_offsets_s.values())
+        return (max(off) - min(off)) if len(off) >= 2 else 0.0
+
+    def summary(self) -> dict:
+        return {
+            "fs_hz": dict(self.fs),
+            "start_times": {k: (v.isoformat() if v else None)
+                            for k, v in self.stamps.items()},
+            "header_offsets_s": dict(self.header_offsets_s),
+            "header_spread_s": self.header_spread_s,
+            "overlap_s": self.overlap_s,
+            "ok": self.ok,
+            "problems": list(self.problems),
+            "notes": list(self.notes),
+        }
+
+
+def timebase_report(cards: dict[str, CardInfo], cfg: Config,
+                    log=None) -> TimebaseReport:
+    """Check, from the headers alone, that these cards belong to one run."""
+    log = log or utils.get_logger(cfg.verbose)
+    utils.section("time base (header stamps, before any alignment)", log)
+
+    fs = {stem: c.fs for stem, c in cards.items()}
+    stamps = {stem: c.start_time for stem, c in cards.items()}
+    problems: list[str] = []
+    notes: list[str] = []
+
+    # ---- 1. one sample rate -------------------------------------------
+    rates = sorted(set(round(v, 6) for v in fs.values()))
+    if len(rates) > 1:
+        # Not a warning.  estimate_card_lags sizes its search window from
+        # one card's fs and returns a lag in SAMPLES that process_card then
+        # applies to a different card; if the rates differ, that lag means a
+        # different amount of time on each card and every dwell window it
+        # places is wrong by a factor.
+        per_rate = {r: [s for s, v in fs.items() if round(v, 6) == r]
+                    for r in rates}
+        detail = "; ".join(f"{r:.0f} Hz: {', '.join(sorted(c))}"
+                           for r, c in per_rate.items())
+        problems.append(
+            f"the cards do not share a sample rate ({detail}). A lag measured "
+            f"in samples is not the same amount of time on two cards clocked "
+            f"differently, so the alignment cannot be applied. Re-record with "
+            f"one rate, or split the run per rate.")
+    else:
+        log.info(f"  sample rate: {rates[0]:.0f} Hz on all "
+                 f"{len(fs)} card(s)  OK")
+
+    # ---- 2. stamps present --------------------------------------------
+    stamped = {k: v for k, v in stamps.items() if v is not None}
+    if not stamped:
+        notes.append(
+            "no card carries a |NT trigger stamp, so the measured alignment "
+            "cannot be cross-checked against anything. It will be applied on "
+            "its own evidence.")
+        log.warning("  no |NT stamps: alignment will not be cross-checked")
+        return TimebaseReport(fs=fs, stamps=stamps, header_offsets_s={},
+                              overlap_s=float("nan"), problems=problems,
+                              notes=notes)
+    if len(stamped) < len(stamps):
+        missing = sorted(set(stamps) - set(stamped))
+        notes.append(f"no |NT stamp on: {', '.join(missing)} — those cards "
+                     f"are not covered by the time-base check")
+
+    t0 = min(stamped.values())
+    offsets = {k: (v - t0).total_seconds() for k, v in stamped.items()}
+    for stem in sorted(offsets, key=lambda s: offsets[s]):
+        log.info(f"  {stem[-8:]}: armed {stamps[stem]:%Y-%m-%d %H:%M:%S}  "
+                 f"{offsets[stem]:+8.1f} s   "
+                 f"{cards[stem].duration_s:7.1f} s long")
+
+    # ---- 3. same run at all --------------------------------------------
+    spread = max(offsets.values()) - min(offsets.values())
+    longest = max(cards[s].duration_s for s in stamped)
+    if spread > longest:
+        problems.append(
+            f"the cards were armed {spread:.0f} s apart but the longest "
+            f"recording is only {longest:.0f} s. These files cannot be one "
+            f"event — check that every card in this folder belongs to the "
+            f"same measurement.")
+
+    # ---- 4. within reach of the search window --------------------------
+    if spread > cfg.align_max_lag_s:
+        problems.append(
+            f"the header stamps put {spread:.1f} s between the first and last "
+            f"card, but align_max_lag_s is {cfg.align_max_lag_s:.1f} s. The "
+            f"true offset lies outside the search window, so the correlation "
+            f"peak found inside it is not it. Raise align_max_lag_s above "
+            f"{spread + 5:.0f} and re-run.")
+    elif spread > 0.5 * cfg.align_max_lag_s:
+        notes.append(
+            f"the stamps span {spread:.1f} s against a search window of "
+            f"±{cfg.align_max_lag_s:.1f} s. The stamps understate the true "
+            f"stagger (by up to 2.7 s on the 45 A set), so this is close "
+            f"enough to the limit to be worth raising align_max_lag_s.")
+
+    # ---- 5. the window they share --------------------------------------
+    starts = {k: offsets[k] for k in stamped}
+    ends = {k: offsets[k] + cards[k].duration_s for k in stamped}
+    overlap = min(ends.values()) - max(starts.values())
+    if overlap <= 0:
+        first_out = min(ends, key=lambda k: ends[k])
+        last_in = max(starts, key=lambda k: starts[k])
+        problems.append(
+            f"the cards were never all recording at once: {first_out} stopped "
+            f"{-overlap:.1f} s before {last_in} started. Started one by one, "
+            f"an early card can finish before a late one is armed — there is "
+            f"no common window for the excitation to sit in.")
+    else:
+        log.info(f"  common window: {overlap:.1f} s of the "
+                 f"{longest:.1f} s longest recording")
+        if overlap < 0.5 * longest:
+            notes.append(
+                f"only {overlap:.1f} s of {longest:.1f} s is common to every "
+                f"card. Any step of the sweep outside that window is measured "
+                f"on some cards and not others, and will be carried by fewer "
+                f"votes in the consensus schedule.")
+
+    for problem in problems:
+        log.error(f"  REFUSED: {problem}")
+    for note in notes:
+        log.warning(f"  note: {note}")
+    if not problems:
+        log.info("  time base consistent with one run  OK")
+
+    return TimebaseReport(fs=fs, stamps=stamps, header_offsets_s=offsets,
+                          overlap_s=float(overlap) if stamped else float("nan"),
+                          problems=problems, notes=notes)
+
+# ===========================================================================
 # 2b. Card alignment  (THE CARDS ARE ARMED SEPARATELY)
 # ===========================================================================
 
 
+def _energy_band(traces: dict[str, np.ndarray], fs: float, cfg: Config,
+                 log=None) -> tuple[float, float]:
+    """The band the excitation actually occupies, pooled over every card.
+
+    WHY THIS IS MEASURED RATHER THAN FIXED
+    --------------------------------------
+    This used to be the literal band 0.5 .. 300 Hz, which is the right answer
+    for a sweep that ends at 250 Hz and the wrong one for anything else.  A
+    campaign whose tones live above 300 Hz has its ENTIRE excitation removed
+    by that filter, and what then goes into the cross-correlation is the
+    noise that survived it.  The correlation does not fail: it returns the
+    best agreement between two noise records, and its prominence is scored
+    against that same noise, so a run can come back "aligned" with lags that
+    are pure chance.  Downstream this is indistinguishable from a card whose
+    dwell windows are simply on the wrong tone, which is how it hides.
+
+    The band is derived from the data instead: pool the cards' reference
+    spectra and keep the span that carries the bulk of the AC energy.
+
+    ONE BAND FOR EVERY CARD, NOT ONE PER CARD
+    -----------------------------------------
+    A cross-correlation between two differently filtered signals has its peak
+    displaced by the difference of the two filters' group delays.  The whole
+    measurement is that peak's position, so both traces must go through the
+    identical filter.  Pooling the spectra gives one band that every card is
+    then filtered with.
+    """
+    lo_floor = float(cfg.align_band_lo_hz)
+    hi_ceil = min(float(cfg.align_band_hi_hz), 0.4 * fs)
+    if hi_ceil <= lo_floor:
+        return lo_floor, max(lo_floor * 2.0, 0.4 * fs)
+
+    # A Welch-style average over a bounded number of frames: the full-record
+    # spectrum of a 100 kHz card is tens of millions of bins, and the band
+    # edges do not need that resolution.
+    nper = 1 << int(np.ceil(np.log2(max(1024.0, fs))))   # ~1 s frames
+    acc = None
+    n_frames = 0
+    for x in traces.values():
+        if len(x) < nper:
+            continue
+        step = max(nper, (len(x) - nper) // 24 or nper)
+        win = np.hanning(nper)
+        for a in range(0, len(x) - nper + 1, step):
+            spec = np.abs(np.fft.rfft((x[a:a + nper] - x[a:a + nper].mean())
+                                      * win)) ** 2
+            acc = spec if acc is None else acc + spec
+            n_frames += 1
+    if acc is None or n_frames == 0:
+        return lo_floor, hi_ceil
+
+    freqs = np.fft.rfftfreq(nper, 1.0 / fs)
+    inside = (freqs >= lo_floor) & (freqs <= hi_ceil)
+    if not inside.any() or acc[inside].sum() <= 0:
+        return lo_floor, hi_ceil
+
+    power = acc[inside]
+    f_in = freqs[inside]
+    cum = np.cumsum(power) / power.sum()
+    lo = float(f_in[int(np.searchsorted(cum, cfg.align_band_quantile))])
+    hi = float(f_in[int(min(len(f_in) - 1,
+                            np.searchsorted(cum, 1.0 - cfg.align_band_quantile)))])
+    # A band narrower than a factor of two makes a broad, ambiguous
+    # correlation peak; widen it around the energy it did find.
+    if hi < 2.0 * lo:
+        centre = np.sqrt(max(lo, 1e-9) * max(hi, 1e-9))
+        lo, hi = centre / 2.0, centre * 2.0
+    lo = max(lo_floor, lo)
+    hi = min(hi_ceil, max(hi, lo * 2.0))
+    if log is not None:
+        log.info(f"  alignment band: {lo:.2f} .. {hi:.1f} Hz "
+                 f"(measured from the reference channels, not assumed)")
+    return lo, hi
+
+
+def _decimation(fs: float, band_hi: float) -> int:
+    """Search stride: enough rate to keep the band, no more.
+
+    The coarse lag places a dwell window that is tenths of a second long, so
+    it needs to be right to about a millisecond -- not to one sample of a
+    100 kHz record.  Searching at the full rate costs an FFT over twice the
+    record for every ORDERED PAIR of cards (the anchor vote alone is
+    n*(n-1) of them), which at 100 kHz over two minutes is tens of millions
+    of points, twenty times over.  Decimating to just above Nyquist for the
+    band that survives the filter changes no answer and is what makes a
+    high-rate run finish.  The lag is refined at the full rate afterwards.
+    """
+    usable = max(band_hi, 1.0)
+    q = int(max(1, np.floor(fs / (4.0 * usable))))
+    return max(1, min(q, 64))
+
+
 def estimate_card_lags(files: list[Path], cards: dict[str, CardInfo],
-                       cfg: Config, log=None) -> dict[str, dict]:
+                       cfg: Config, log=None,
+                       timebase: "TimebaseReport | None" = None
+                       ) -> dict[str, dict]:
     """Sample offset of every card relative to the first, from the reference.
 
     WHY THIS EXISTS
@@ -369,7 +682,9 @@ def estimate_card_lags(files: list[Path], cards: dict[str, CardInfo],
     Every card carries a copy of the same cell-voltage reference, so a plain
     cross-correlation of the band-passed reference gives the offset directly.
     The correlation is dominated by the excitation window, which is where the
-    signal is, so the estimate is well determined.
+    signal is, so the estimate is well determined.  The band is measured from
+    the data (`_energy_band`) rather than fixed, because a fixed band that
+    misses the excitation turns this into a correlation of noise.
 
     WHICH CARD IS THE ANCHOR
     ------------------------
@@ -394,6 +709,15 @@ def estimate_card_lags(files: list[Path], cards: dict[str, CardInfo],
     ragged 0.5 is not.  `align_min_corr` stays only as an absolute floor
     against pure garbage.
 
+    THE HEADER CROSS-CHECK
+    ----------------------
+    Prominence says the peak is sharp; it does not say the peak is the right
+    one.  When `timebase` carries |NT stamps, the ORDER the cards were armed
+    in is compared against the order the measured lags imply.  Order rather
+    than value, because the stamps understate the true stagger by seconds
+    (above) -- but they cannot get the sequence wrong, and a measured lag
+    that contradicts it is not a small error, it is a different peak.
+
     Returns {stem: {"lag", "corr", "prominence", "applied"}}.
     """
     log = log or utils.get_logger(cfg.verbose)
@@ -403,23 +727,42 @@ def estimate_card_lags(files: list[Path], cards: dict[str, CardInfo],
     if not stems:
         return {}
 
-    def _ac(stem):
+    # One rate for the whole plate. timebase_report has already refused a
+    # mixed-rate run; this is the assertion that the refusal was honoured,
+    # because every lag below is a sample count applied to another card.
+    rates = sorted(set(round(cards[s].fs, 6) for s in stems))
+    if len(rates) > 1:
+        raise SystemExit(
+            "bronze: the cards do not share a sample rate "
+            f"({', '.join(f'{r:.0f} Hz' for r in rates)}); a lag in samples "
+            "cannot be carried between them. See the time base section above.")
+    fs = float(rates[0])
+
+    raw = {}
+    for stem in stems:
         c = cards[stem]
-        fam = FamosFile(c.path)
-        x = np.asarray(fam.channel(c.ref_name), float)
-        x = x - x.mean()
-        # keep the band that carries the sweep; kills DC drift and the top
-        # of the band where the two cards genuinely differ in phase
+        x = np.asarray(FamosFile(c.path).channel(c.ref_name), float)
+        raw[stem] = x - x.mean()
+
+    lo, hi = _energy_band(raw, fs, cfg, log)
+
+    def _bandpass(x: np.ndarray) -> np.ndarray:
         n = len(x)
         X = np.fft.rfft(x)
-        fr = np.fft.rfftfreq(n, 1.0 / c.fs)
-        X[(fr < 0.5) | (fr > 300.0)] = 0.0
+        fr = np.fft.rfftfreq(n, 1.0 / fs)
+        X[(fr < lo) | (fr > hi)] = 0.0
         return np.fft.irfft(X, n)
 
-    traces = {stem: _ac(stem) for stem in stems}
-    max_lag = int(cfg.align_max_lag_s * cards[stems[0]].fs)
+    traces = {stem: _bandpass(x) for stem, x in raw.items()}
+    del raw
 
-    base = _pick_anchor(stems, traces, max_lag, log)
+    max_lag = int(cfg.align_max_lag_s * fs)
+    decim = _decimation(fs, hi)
+    if decim > 1:
+        log.info(f"  searching at 1/{decim} rate ({fs / decim:.0f} Hz); "
+                 f"the lag is refined at the full rate")
+
+    base = _pick_anchor(stems, traces, max_lag, log, decim=decim)
     ref = traces[base]
     out = {base: {"lag": 0, "corr": 1.0, "prominence": float("inf"),
                   "applied": True}}
@@ -428,7 +771,10 @@ def estimate_card_lags(files: list[Path], cards: dict[str, CardInfo],
     for stem in stems:
         if stem == base:
             continue
-        lag, corr, prom = _best_lag(traces[stem], ref, max_lag)
+        lag, corr, prom = _best_lag(traces[stem], ref, max_lag, decim=decim)
+        lag, corr = _disambiguate(
+            stem, base, lag, corr, traces[stem], ref, max_lag, decim,
+            cards, fs, timebase, cfg, log)
         # lag < 0 means this card's record RUNS AHEAD of the reference's,
         # i.e. it was armed later; the schedule index must be shifted by
         # +lag to read the same instant.
@@ -441,7 +787,7 @@ def estimate_card_lags(files: list[Path], cards: dict[str, CardInfo],
                "   REFUSED (peak not prominent)" if not strong else
                "   REFUSED (below the absolute floor)")
         log.info(f"  {stem[-8:]}: lag {lag:+8d} samples = "
-                 f"{lag / cards[stem].fs:+8.4f} s   peak corr {corr:+.3f}"
+                 f"{lag / fs:+8.4f} s   peak corr {corr:+.3f}"
                  f"   prominence {prom:5.1f}" + why)
         if not applied:
             log.warning(f"    {stem[-8:]} stays on its own clock. If its true "
@@ -455,12 +801,203 @@ def estimate_card_lags(files: list[Path], cards: dict[str, CardInfo],
         log.warning("  align_cards is off: schedule windows will be applied "
                     "to every card unshifted, which is only correct if the "
                     "cards were hardware-triggered together")
+
+    _check_against_headers(out, base, cards, fs, timebase, cfg, log)
     return out
 
 
+def _disambiguate(stem: str, base: str, lag: int, corr: float,
+                  x: np.ndarray, ref: np.ndarray, max_lag: int, decim: int,
+                  cards: dict[str, CardInfo], fs: float,
+                  timebase: "TimebaseReport | None", cfg: Config, log
+                  ) -> tuple[int, float]:
+    """Choose between correlation peaks of comparable height, using the stamps.
+
+    Only does anything when there IS a choice: peaks within
+    `align_peak_tie_ratio` of the winner.  For a stepped sine there is one
+    peak and this returns it unchanged.  For a periodic multisine there are
+    several, equally good, one base period apart -- see
+    :func:`_lag_candidates`.
+
+    WHEN THE STAMPS CAN SETTLE IT, AND WHEN THEY CANNOT
+    ---------------------------------------------------
+    The |NT stamps resolve to about a second.  So they can pick between
+    candidates a base period apart only when that PERIOD IS LONGER THAN
+    THEIR RESOLUTION.  A 0.5 Hz multisine repeats every 2 s and the stamps
+    settle it; a 5 Hz multisine repeats every 0.2 s and they cannot -- ten
+    candidates fit inside one tick of the stamp, and snapping to the nearest
+    would be picking one of them by rounding error and calling it measured.
+
+    In that second case the honest output is the residual ambiguity itself.
+    A lag that is right to within +/- one base period is still enough to
+    place a dwell window when the period is short compared with the dwell,
+    and the caller is told the number so it can judge that rather than
+    assume it.
+    """
+    cands = _lag_candidates(x, ref, max_lag, decim=decim,
+                            ratio=cfg.align_peak_tie_ratio)
+    if len(cands) < 2:
+        return lag, corr
+
+    positions = np.array(sorted(c[0] for c in cands), float)
+    gaps = np.diff(positions)
+    period = float(np.median(gaps)) if gaps.size else 0.0
+    consistent = bool(gaps.size and np.all(np.abs(gaps - period)
+                                           <= 0.25 * max(period, 1.0)))
+    note = ""
+    if consistent and period > 0:
+        note = (f", peaks {period / fs:.3f} s apart (a base frequency of "
+                f"{fs / period:.2f} Hz repeats at exactly that interval)")
+
+    offsets = timebase.header_offsets_s if timebase else {}
+    have_stamps = base in offsets and stem in offsets
+
+    if not have_stamps:
+        log.warning(
+            f"    {stem[-8:]}: {len(cands)} correlation peaks within "
+            f"{100 * cfg.align_peak_tie_ratio:.0f} % of each other{note}. A "
+            f"periodic excitation makes the lag ambiguous by whole periods "
+            f"and there is no |NT stamp to break the tie; taking the "
+            f"largest, which may be wrong by a multiple of that interval.")
+        return lag, corr
+
+    if consistent and period / fs <= cfg.align_header_resolution_s:
+        log.warning(
+            f"    {stem[-8:]}: the lag is ambiguous by +/- {period / fs:.3f} s"
+            f"{note}, and the |NT stamps resolve only to about "
+            f"{cfg.align_header_resolution_s:.1f} s, so they cannot choose "
+            f"between them. Taking the largest peak and carrying the "
+            f"ambiguity: dwell windows are placed to within one base period. "
+            f"To remove it, trigger the cards from one hardware signal, or "
+            f"put a non-periodic marker at the start of the recording.")
+        return lag, corr
+
+    want = offsets[base] - offsets[stem]              # seconds, coarse
+    if consistent and period > 0:
+        # Snap along the period rather than only among the peaks that were
+        # returned: the true lag can be many periods out, and enumerating
+        # the strongest handful need not reach it.
+        k = round((want * fs - lag) / period)
+        snapped = int(lag + k * period)
+        if abs(snapped) <= max_lag and snapped != lag:
+            log.warning(
+                f"    {stem[-8:]}: the largest correlation peak is "
+                f"{lag / fs:+.3f} s{note}. The |NT stamps put this card "
+                f"{want:+.1f} s from the anchor, so {snapped / fs:+.3f} s "
+                f"is taken instead -- {k:+d} base period(s) along.")
+            return snapped, corr
+        return lag, corr
+
+    best = min(cands, key=lambda c: abs(c[0] / fs - want))
+    if best[0] != lag:
+        log.warning(
+            f"    {stem[-8:]}: {len(cands)} correlation peaks within "
+            f"{100 * cfg.align_peak_tie_ratio:.0f} % of the largest"
+            f"{note}; the |NT stamps ({want:+.1f} s) select "
+            f"{best[0] / fs:+.3f} s rather than {lag / fs:+.3f} s.")
+    return best[0], best[1]
+
+
+def _check_against_headers(lags: dict[str, dict], base: str,
+                           cards: dict[str, CardInfo], fs: float,
+                           timebase: "TimebaseReport | None",
+                           cfg: Config, log) -> None:
+    """Does the arming order the headers record match the measured lags?
+
+    A measured lag of `k` samples means this card's copy of the event sits
+    `k` samples later in its own array than the anchor's does, which happens
+    when this card was armed EARLIER by k/fs seconds.  So
+
+        measured (t_anchor - t_card)  =  lag / fs
+
+    and the headers say the same quantity to about a second.  Their VALUES
+    are too coarse to compare -- on the 45 A set the stamps put card 3 three
+    seconds from the anchor where the truth was 5.712 -- but their ORDER is
+    not coarse at all, and a lag whose sign contradicts the stamps is not a
+    small error.  It is the correlation having locked onto a different step
+    of the sweep, which is precisely the failure prominence cannot see: a
+    periodic-looking excitation gives a sharp, confident peak one dwell
+    over.
+    """
+    if timebase is None or not timebase.header_offsets_s:
+        return
+    offsets = timebase.header_offsets_s
+    if base not in offsets:
+        return
+
+    disagreements = []
+    for stem, info in lags.items():
+        if stem == base or stem not in offsets or not info.get("applied"):
+            continue
+        header = offsets[base] - offsets[stem]          # seconds, coarse
+        measured = info["lag"] / fs
+        info["header_offset_s"] = header
+        info["measured_offset_s"] = measured
+        # Only pairs the stamps actually separate can testify about order.
+        if abs(header) <= cfg.align_header_resolution_s:
+            continue
+        if np.sign(header) != np.sign(measured) or \
+                abs(measured - header) > cfg.align_header_tol_s:
+            disagreements.append((stem, header, measured))
+
+    if not disagreements:
+        if any("header_offset_s" in i for i in lags.values()):
+            log.info("  header cross-check: measured lags agree with the "
+                     "arming order in the |NT stamps  OK")
+        return
+
+    for stem, header, measured in disagreements:
+        log.error(
+            f"  {stem[-8:]}: the |NT stamps put it {header:+.1f} s from the "
+            f"anchor but the correlation measured {measured:+.1f} s. The "
+            f"stamps are coarse, so a small difference would mean nothing — "
+            f"this one is not small.")
+        lags[stem]["applied"] = False
+        lags[stem]["refused_reason"] = "contradicts the |NT arming order"
+    log.error("  those cards stay on their own clock rather than being "
+              "shifted onto a lag the headers contradict. Check that every "
+              ".DAT in this folder belongs to this measurement, then raise "
+              "align_max_lag_s if the true stagger is larger than the search "
+              "window.")
+
+
 def _best_lag(x: np.ndarray, ref: np.ndarray,
-              max_lag: int) -> tuple[int, float, float]:
-    """The lag of best agreement, its correlation, and its prominence."""
+              max_lag: int, decim: int = 1) -> tuple[int, float, float]:
+    """The lag of best agreement, its correlation, and its prominence.
+
+    With ``decim > 1`` the search runs on every ``decim``-th sample and the
+    winner is then refined at the full rate over the one decimated bin it
+    fell in, so the returned lag is still a full-rate sample count.
+    """
+    if decim > 1:
+        n_d = min(len(x), len(ref)) // decim
+        if n_d >= 256:
+            k, _corr, prom = _best_lag(x[:n_d * decim:decim],
+                                       ref[:n_d * decim:decim],
+                                       max(1, max_lag // decim))
+            centre = k * decim
+            span = 2 * decim
+            lo = max(0, centre - span)
+            # Refine on the full-rate records, restricted to the neighbourhood
+            # the coarse pass chose. Prominence stays the coarse figure: it is
+            # a statement about the peak against the WHOLE curve, and a window
+            # a few samples wide has no background to measure it against.
+            best_k, best_v = centre, -np.inf
+            n = min(len(x), len(ref))
+            a = x[:n]
+            b = ref[:n]
+            denom = np.sqrt(float(np.dot(a, a)) * float(np.dot(b, b)))
+            for cand in range(centre - span, centre + span + 1):
+                if abs(cand) > max_lag:
+                    continue
+                if cand >= 0:
+                    v = float(np.dot(a[cand:], b[:n - cand]))
+                else:
+                    v = float(np.dot(a[:n + cand], b[-cand:]))
+                if abs(v) > abs(best_v):
+                    best_k, best_v = cand, v
+            corr = best_v / denom if denom > 0 else 0.0
+            return int(best_k), float(corr), prom
     n = min(len(x), len(ref))
     a, b = x[:n], ref[:n]
     m = 1 << int(np.ceil(np.log2(2 * n)))
@@ -475,14 +1012,87 @@ def _best_lag(x: np.ndarray, ref: np.ndarray,
     return int(lag_sel[k]), corr, _prominence(np.abs(cc_sel), k)
 
 
-def _prominence(mag: np.ndarray, k: int, guard: int = 5000) -> float:
+def _lag_candidates(x: np.ndarray, ref: np.ndarray, max_lag: int,
+                    decim: int = 1, n_cand: int = 5,
+                    ratio: float = 0.8) -> list[tuple[int, float]]:
+    """The competing correlation peaks, best first, as (lag, corr).
+
+    WHY THE WINNER ALONE IS NOT ENOUGH FOR A MULTISINE
+    --------------------------------------------------
+    A designed multisine is PERIODIC: every tone is an integer multiple of a
+    base frequency f0, so the excitation repeats every 1/f0 seconds.  The
+    cross-correlation of a periodic signal is periodic too, and every lag
+    differing by a whole period scores identically -- not approximately,
+    identically.  Picking the largest peak then picks among equals by noise,
+    and the answer is wrong by an integer number of base periods.
+
+    That is not a small error.  The cards are armed by hand seconds apart,
+    and with f0 = 1 Hz the ambiguity is one second, so the wrong period is
+    entirely capable of looking like the right stagger.  Nothing downstream
+    can see it: prominence is high (the peak really is sharp), the
+    correlation is high, and what silver eventually reports is segments
+    failing an SNR gate on a card whose dwell windows sit one period off.
+
+    So the competing peaks are returned and the caller disambiguates with
+    the header stamps, which are coarse but have no periodicity at all.
+    """
+    n = min(len(x), len(ref))
+    a, b = x[:n], ref[:n]
+    q = max(1, int(decim))
+    n_d = n // q
+    if q > 1 and n_d < 256:
+        q, n_d = 1, n
+    aa, bb = a[:n_d * q:q], b[:n_d * q:q]
+    lag_cap = max(1, max_lag // q)
+
+    m = 1 << int(np.ceil(np.log2(2 * n_d)))
+    cc = np.fft.irfft(np.fft.rfft(aa, m) * np.conj(np.fft.rfft(bb, m)), m)
+    cc = np.concatenate([cc[-(n_d - 1):], cc[:n_d]])
+    lags = np.arange(-(n_d - 1), n_d)
+    sel = np.abs(lags) <= lag_cap
+    mag, lag_sel = np.abs(cc[sel]), lags[sel]
+    denom = np.sqrt(float(np.dot(a, a)) * float(np.dot(b, b)))
+
+    best = float(np.max(mag)) if mag.size else 0.0
+    if best <= 0:
+        return []
+    # One guard band per candidate, so the same peak is not returned twice.
+    guard = max(8, int(0.005 * mag.size))
+    taken: list[int] = []
+    order = np.argsort(-mag)
+    for k in order:
+        if mag[k] < ratio * best:
+            break
+        if all(abs(int(k) - t) > guard for t in taken):
+            taken.append(int(k))
+        if len(taken) >= n_cand:
+            break
+    out = []
+    for k in taken:
+        lag_full = int(lag_sel[k]) * q
+        corr = float(cc[sel][k] / denom) if denom > 0 else 0.0
+        out.append((lag_full, corr))
+    return out
+
+
+def _prominence(mag: np.ndarray, k: int, guard: int | None = None) -> float:
     """How many robust sigma the peak stands above the rest of the curve.
 
     Median and MAD rather than mean and sd, because the correlation of a
     stepped sweep against itself is not flat -- it has broad structure that
     a mean-based score would read as signal.  The guard band excludes the
     peak's own shoulders, which are part of the peak, not of the background.
+
+    The guard is a FRACTION OF THE CURVE, not a fixed sample count.  It was
+    5000 samples, which is half a second of shoulder at 10 kHz and fifty
+    milliseconds of it at 100 kHz -- so on a fast card most of the peak's own
+    skirt stayed in the "background", inflating the MAD and pushing the
+    prominence of a perfectly good lag below the gate.  A refused lag is not
+    a warning downstream: the card keeps its own clock, its dwell windows sit
+    on the wrong tone, and every segment on it fails silver's SNR gate.
     """
+    if guard is None:
+        guard = max(64, int(0.02 * mag.size))
     lo, hi = max(0, k - guard), min(mag.size, k + guard + 1)
     background = np.concatenate([mag[:lo], mag[hi:]])
     if background.size < 64:
@@ -495,7 +1105,7 @@ def _prominence(mag: np.ndarray, k: int, guard: int = 5000) -> float:
 
 
 def _pick_anchor(stems: list[str], traces: dict[str, np.ndarray],
-                 max_lag: int, log) -> str:
+                 max_lag: int, log, decim: int = 1) -> str:
     """The card the others agree with best.
 
     Anchoring on whichever card happens to be first is a coin flip, and it
@@ -509,7 +1119,8 @@ def _pick_anchor(stems: list[str], traces: dict[str, np.ndarray],
         return stems[0]
     scores: dict[str, float] = {}
     for cand in stems:
-        others = [abs(_best_lag(traces[s], traces[cand], max_lag)[1])
+        others = [abs(_best_lag(traces[s], traces[cand], max_lag,
+                                decim=decim)[1])
                   for s in stems if s != cand]
         scores[cand] = float(np.median(others))
     best = max(scores, key=lambda s: scores[s])
@@ -523,6 +1134,52 @@ def _pick_anchor(stems: list[str], traces: dict[str, np.ndarray],
 # ===========================================================================
 # 3. Consensus schedule
 # ===========================================================================
+
+
+def excitation_above_ceiling(ref: np.ndarray, fs: float, f_hi: float,
+                             min_fraction: float = 0.05) -> dict:
+    """Is there excitation the detection ceiling is excluding?
+
+    The blind search only ever looks below `f_hi`, so "no steps up there" and
+    "never looked up there" produce the identical empty result.  That is the
+    whole reason a ceiling frozen at 4500 Hz could survive a move to 100 kHz
+    sampling without anybody seeing it: the operator raised the rate to buy
+    bandwidth, the detector kept searching the same 4.5 kHz, and the output
+    was a spectrum that simply stopped where it always had.
+
+    This measures the AC energy between the ceiling and Nyquist and names the
+    strongest peak found there, so the two cases can be told apart.
+    """
+    x = np.asarray(ref, float)
+    x = x - x.mean()
+    nper = 1 << int(np.ceil(np.log2(max(1024.0, fs))))
+    if len(x) < nper:
+        nper = 1 << int(np.floor(np.log2(max(256, len(x)))))
+    if len(x) < nper or nper < 256:
+        return {"ok": False}
+
+    win = np.hanning(nper)
+    step = max(nper, (len(x) - nper) // 16 or nper)
+    acc = None
+    for a in range(0, len(x) - nper + 1, step):
+        seg = x[a:a + nper]
+        spec = np.abs(np.fft.rfft((seg - seg.mean()) * win)) ** 2
+        acc = spec if acc is None else acc + spec
+    if acc is None:
+        return {"ok": False}
+
+    freqs = np.fft.rfftfreq(nper, 1.0 / fs)
+    ac = freqs > 0.5
+    above = ac & (freqs > f_hi)
+    total = float(acc[ac].sum())
+    if total <= 0:
+        return {"ok": False}
+    fraction = float(acc[above].sum() / total)
+    peak_hz = float(freqs[above][int(np.argmax(acc[above]))]) if above.any() \
+        else float("nan")
+    return {"ok": True, "fraction": fraction, "peak_hz": peak_hz,
+            "f_hi": float(f_hi), "nyquist_hz": float(fs / 2),
+            "significant": bool(fraction >= min_fraction)}
 
 
 def consensus_schedule(files: list[Path], cards: dict[str, CardInfo],
@@ -556,10 +1213,36 @@ def consensus_schedule(files: list[Path], cards: dict[str, CardInfo],
         fam = FamosFile(fp)
         ref = fam.channel(cards[stem].ref_name)
         f_hi = cfg.f_hi(fam.fs)
-        steps = detect_schedule(ref, fam.fs, ppd=cfg.ppd,
-                                f_lo=cfg.f_min_hz, f_hi=f_hi,
-                                min_snr_db=cfg.min_snr_db,
-                                verbose=False)
+        headroom = excitation_above_ceiling(ref, fam.fs, f_hi)
+        if headroom.get("significant"):
+            log.warning(
+                f"  {stem[-8:]}: {100 * headroom['fraction']:.0f} % of the AC "
+                f"energy on the reference sits ABOVE the {f_hi:.0f} Hz search "
+                f"ceiling, strongest at {headroom['peak_hz']:.0f} Hz "
+                f"(Nyquist {headroom['nyquist_hz']:.0f} Hz). Those tones are "
+                f"not being looked for. Raise --f-max, or leave it at 'auto' "
+                f"so the ceiling follows the sample rate.")
+        # WHICH DETECTOR.  Decided per card from the record, because a
+        # stepped multisine handed to the single-tone detector does not fail
+        # loudly -- it returns a few tones with windows a millisecond long.
+        kind = cfg.excitation
+        if kind == "auto":
+            verdict = classify_excitation(ref, fam.fs, cfg.f_min_hz, f_hi)
+            kind = verdict["kind"]
+            log.info(f"  {stem[-8:]}: excitation looks {kind} "
+                     f"({verdict['n_tones']} strong tone(s), median "
+                     f"{verdict['tones_at_once']:.1f} on at once"
+                     + (f", {verdict['n_dwells']} dwell(s)"
+                        if verdict['n_dwells'] else "") + ")")
+        if kind == "multisine":
+            steps = detect_multisine_schedule(
+                ref, fam.fs, f_lo=cfg.f_min_hz, f_hi=f_hi,
+                peak_db=cfg.tone_peak_db, verbose=False)
+        else:
+            steps = detect_schedule(ref, fam.fs, ppd=cfg.ppd,
+                                    f_lo=cfg.f_min_hz, f_hi=f_hi,
+                                    min_snr_db=cfg.min_snr_db,
+                                    verbose=False)
         # PUT THE WINDOWS ON THE COMMON TIME BASE BEFORE THEY ARE POOLED.
         # Detection runs in each card's own sample index; the consensus that
         # follows mixes windows from different cards, so they have to mean
@@ -705,6 +1388,178 @@ def _on_grid(f: float, grid: dict, tol: float) -> bool:
     return abs(f / (f0 * r ** -k) - 1.0) <= tol
 
 
+
+# ===========================================================================
+# 3b. Calibration status  (WAS IT ACTUALLY APPLIED?)
+# ===========================================================================
+
+
+@dataclass
+class CalibrationReport:
+    """Whether the current and temperature calibrations really were used.
+
+    "Is the calibration done?" is not answerable from the fact that a file
+    was passed on the command line, and each of the ways it can be half-done
+    is silent:
+
+    * `--curr-cal` names a file that exists, but with fewer rows than the
+      plate has segments.  The segments it does not cover are carried on the
+      PLATE MEDIAN coefficient (`_K_for`), which keeps the shape of their
+      spectrum right and puts the absolute level off by whatever the real
+      coefficient was.  Every map is then a mix of measured and imputed
+      levels with nothing on the figure to say which is which.
+    * `--temp-cal` is omitted, or its rows do not match the channel names.
+      The temperature falls back to a single constant for the whole plate
+      (`T_FALLBACK_C`), which discards the inlet-to-outlet gradient -- the
+      one thing the sensors exist to measure -- and biases K on every
+      segment, since K = c0 + 1e-3*c1*T.
+    * The temperature channels are read but their values are implausible, so
+      the sensors are dropped one by one until the fallback takes over
+      anyway.
+
+    None of these stops a run.  All of them change the numbers.  So the
+    answer is computed and written into the manifest, in the same terms the
+    question is asked in.
+    """
+
+    curr_path: str | None
+    temp_path: str | None
+    n_seg_rows: int
+    n_seg_expected: int
+    n_temp_rows: int
+    #: Sensors that produced a usable reading, name -> degrees C.
+    sensors_used: dict[str, float] = field(default_factory=dict)
+    #: Sensors present on a card but rejected, name -> why.
+    sensors_rejected: dict[str, str] = field(default_factory=dict)
+    temperature_source: str = "unknown"
+    t_min_c: float = float("nan")
+    t_max_c: float = float("nan")
+    problems: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+
+    @property
+    def current_ok(self) -> bool:
+        return self.n_seg_rows >= self.n_seg_expected
+
+    @property
+    def temperature_ok(self) -> bool:
+        return self.temperature_source == "measured"
+
+    def summary(self) -> dict:
+        return {
+            "current": {
+                "file": self.curr_path,
+                "rows": self.n_seg_rows,
+                "expected": self.n_seg_expected,
+                "complete": self.current_ok,
+                "segments_on_plate_median": max(
+                    0, self.n_seg_expected - self.n_seg_rows),
+            },
+            "temperature": {
+                "file": self.temp_path,
+                "rows": self.n_temp_rows,
+                "source": self.temperature_source,
+                "sensors_used": {k: round(v, 3)
+                                 for k, v in self.sensors_used.items()},
+                "sensors_rejected": dict(self.sensors_rejected),
+                "segment_t_min_c": self.t_min_c,
+                "segment_t_max_c": self.t_max_c,
+                "measured": self.temperature_ok,
+            },
+            "problems": list(self.problems),
+            "notes": list(self.notes),
+        }
+
+
+def calibration_report(cal: PlateCalibration, cfg: Config,
+                       sensor_T: dict[str, float],
+                       T_seg: dict[str, float],
+                       rejected: dict[str, str] | None = None,
+                       log=None) -> CalibrationReport:
+    """State plainly what was calibrated and what was substituted."""
+    log = log or utils.get_logger(cfg.verbose)
+    utils.section("calibration status", log)
+
+    temps = [v for v in T_seg.values() if np.isfinite(v)]
+    measured = bool(sensor_T)
+    rep = CalibrationReport(
+        curr_path=str(cfg.curr_cal) if cfg.curr_cal else None,
+        temp_path=str(cfg.temp_cal) if cfg.temp_cal else None,
+        n_seg_rows=len(cal.seg_c0), n_seg_expected=geom.N_SEGMENTS,
+        n_temp_rows=len(cal.temp_c0),
+        sensors_used=dict(sensor_T),
+        sensors_rejected=dict(rejected or {}),
+        temperature_source="measured" if measured else "fallback constant",
+        t_min_c=float(min(temps)) if temps else float("nan"),
+        t_max_c=float(max(temps)) if temps else float("nan"),
+    )
+
+    # ---- current -------------------------------------------------------
+    if not cal.seg_c0:
+        rep.problems.append(
+            "NO current calibration. j_s = u_s / K is the only absolute "
+            "scale left once the potentiostat is gone, so without it the "
+            "impedance is in shunt volts per amp, not ohms.")
+        log.error("  current (Abgleich): MISSING")
+    elif not rep.current_ok:
+        missing = geom.N_SEGMENTS - len(cal.seg_c0)
+        rep.problems.append(
+            f"current calibration covers {len(cal.seg_c0)} of "
+            f"{geom.N_SEGMENTS} segments; the other {missing} are carried on "
+            f"the plate-median coefficient. Their spectrum SHAPE is "
+            f"unaffected -- K is a scalar -- but their absolute level is off "
+            f"by however far their true coefficient sits from the median, "
+            f"and they are marked K_imputed in the output.")
+        log.warning(f"  current (Abgleich): {len(cal.seg_c0)}/"
+                    f"{geom.N_SEGMENTS} segment rows from "
+                    f"{rep.curr_path}  -- {missing} imputed")
+    else:
+        c0 = np.array(list(cal.seg_c0.values()), float)
+        log.info(f"  current (Abgleich): APPLIED, {len(cal.seg_c0)}/"
+                 f"{geom.N_SEGMENTS} segment rows from {rep.curr_path}")
+        log.info(f"    c0 spans {c0.min():.4g} .. {c0.max():.4g} "
+                 f"(median {np.median(c0):.4g}) V/(A/cm^2)")
+
+    # ---- temperature ---------------------------------------------------
+    if not cfg.temp_cal:
+        rep.notes.append(
+            "no temperature calibration file: the plate temperature is the "
+            f"fallback constant {T_FALLBACK_C} C for every segment. K = c0 + "
+            f"1e-3*c1*T, so this biases every segment's scale, and it "
+            f"discards the inlet-to-outlet gradient the sensors exist to "
+            f"measure.")
+        log.warning(f"  temperature: NOT CALIBRATED - falling back to "
+                    f"{T_FALLBACK_C} C everywhere")
+    elif not cal.temp_c0:
+        rep.problems.append(
+            f"temperature calibration {rep.temp_path} produced no usable "
+            f"rows; expected lines of 'c0;c1', one per sensor.")
+        log.error(f"  temperature: {rep.temp_path} has no usable rows")
+    elif not measured:
+        rep.problems.append(
+            f"temperature calibration was loaded ({len(cal.temp_c0)} sensor "
+            f"rows) but NO sensor produced a plausible reading, so the "
+            f"fallback constant {T_FALLBACK_C} C is in use anyway. Check "
+            f"that the temp channel names match the calibration rows and "
+            f"that the sensors were connected.")
+        log.error("  temperature: calibration loaded but every sensor was "
+                  "rejected - fallback constant in use")
+    else:
+        log.info(f"  temperature: APPLIED, {len(cal.temp_c0)} sensor rows "
+                 f"from {rep.temp_path}")
+        pretty = ", ".join(f"{k}={v:.2f} C"
+                           for k, v in sorted(rep.sensors_used.items()))
+        log.info(f"    {len(sensor_T)} sensor(s) used: {pretty}")
+        log.info(f"    segments interpolated over "
+                 f"{rep.t_min_c:.2f} .. {rep.t_max_c:.2f} C")
+    for name, why in (rejected or {}).items():
+        log.warning(f"    {name} rejected: {why}")
+
+    if not rep.problems and rep.current_ok and rep.temperature_ok:
+        log.info("  both calibrations applied in full  OK")
+    return rep
+
+
 # ===========================================================================
 # 4. Per-card extraction
 # ===========================================================================
@@ -723,8 +1578,9 @@ def _sensor_key(channel_name: str) -> str:
 
 
 def plate_temperatures(files: list[Path], cards: dict[str, CardInfo],
-                       cal: PlateCalibration, cfg: Config,
-                       log=None) -> tuple[dict[str, float], dict]:
+                       cal: PlateCalibration, cfg: Config, log=None,
+                       rejected: dict[str, str] | None = None
+                       ) -> tuple[dict[str, float], dict]:
     """One temperature field for the whole plate, from every sensor on every
     card.
 
@@ -744,6 +1600,8 @@ def plate_temperatures(files: list[Path], cards: dict[str, CardInfo],
             key = _sensor_key(tn)
             if key not in cal.temp_c0:
                 log.warning(f"  {tn}: no calibration row for {key!r} - skipped")
+                if rejected is not None:
+                    rejected[tn] = f"no calibration row for {key!r}"
                 continue
             u = float(np.mean(fam.channel(tn)[::cfg_stride(cfg)]))
             T = cal.temperature(key, u)
@@ -752,6 +1610,9 @@ def plate_temperatures(files: list[Path], cards: dict[str, CardInfo],
             else:
                 log.warning(f"  {tn}: u={u:.4f} V -> T={T:.1f} C implausible "
                             f"- sensor ignored")
+                if rejected is not None:
+                    rejected[tn] = (f"u={u:.4f} V gives T={T:.1f} C, outside "
+                                    f"0..120 C")
     if sensor_T:
         pretty = ", ".join(f"{k}={v:.2f} C" for k, v in sorted(sensor_T.items()))
         log.info(f"  plate temperature from {len(sensor_T)} sensor(s): {pretty}")
@@ -837,6 +1698,11 @@ def process_card(fp: Path, cal: PlateCalibration, schedule: list[Step],
 
     freqs = np.array([s.freq for s in schedule], float)
     on_grid = np.array([_on_grid(f, grid, cfg.grid_tol) for f in freqs], bool)
+    groups = group_simultaneous(schedule)
+    n_multi = sum(1 for g in groups if len(g) > 1)
+    if n_multi:
+        log.info(f"    {len(groups)} dwell group(s), {n_multi} carrying "
+                 f"several tones at once - fitted jointly")
 
     out: dict[str, BronzeSpectrum] = {}
     n_excluded = 0
@@ -859,14 +1725,60 @@ def process_card(fp: Path, cal: PlateCalibration, schedule: list[Step],
         n_per = np.zeros(n_st, int)
 
         n_skip = 0
-        for i, st in enumerate(schedule):
-            a, b = st.start + lag, st.stop + lag
+        # TONES THAT WERE ON TOGETHER ARE FITTED TOGETHER.  For a stepped
+        # sine every group has one member and this is the loop it always
+        # was; for a stepped multisine the group is the dwell's whole tone
+        # set, and fitting them one at a time would put each tone's
+        # neighbours into its own residual -- which is the SNR, and
+        # therefore the weight. See eis_local.fit_multitone.
+        for g in groups:
+            head = schedule[g[0]]
+            a = max(st.start for st in (schedule[i] for i in g)) + lag
+            b = min(st.stop for st in (schedule[i] for i in g)) + lag
             if b <= a or a < 0 or b > len(x) or b > len(ref):
-                n_skip += 1
+                n_skip += len(g)
                 continue
             yr, ys = ref[a:b], x[a:b]
-            n_per[i] = b - a
+            for i in g:
+                n_per[i] = b - a
 
+            if len(g) > 1:
+                fg = [schedule[i].freq for i in g]
+                ph_r, _rr, snr_gr, info = fit_multitone(yr, fam.fs, fg)
+                ph_s, _rs, snr_gs, _info2 = fit_multitone(ys, fam.fs, fg)
+                if not info.get("ok"):
+                    n_skip += len(g)
+                    continue
+                if not info.get("resolvable", True):
+                    log.warning(
+                        f"    {a / fam.fs:.3f}-{b / fam.fs:.3f} s: tones "
+                        f"{info['min_gap_hz']:.3f} Hz apart in a "
+                        f"{info['window_s']:.3f} s window are not resolvable "
+                        f"(need > 1/T); their split between neighbours is "
+                        f"arbitrary")
+                tone_set = np.asarray(fg, float)
+                for j, i in enumerate(g):
+                    A_ref, A_seg = ph_r[j], ph_s[j]
+                    snr_r[i], snr_s[i] = snr_gr[j], snr_gs[j]
+                    Z[i] = (K * A_ref / A_seg if A_seg not in (0, np.nan)
+                            and np.isfinite(A_seg) and A_seg != 0
+                            else complex("nan"))
+                    f_used = float(schedule[i].freq)
+                    # THD IS NOT MEASURABLE WHEN THE HARMONIC IS ITSELF A
+                    # TONE.  Designed multisines are routinely built on
+                    # small-integer ratios (1,2,3,5,8,...), so 2f or 3f is
+                    # very often another member of the same group. Reporting
+                    # the energy there as distortion would charge the
+                    # excitation to the cell's non-linearity and fail the
+                    # linearity gate on a perfectly linear measurement.
+                    clash = np.any(np.abs(tone_set / (2 * f_used) - 1) < 0.02) \
+                        or np.any(np.abs(tone_set / (3 * f_used) - 1) < 0.02)
+                    thd[i] = (np.nan if clash else
+                              utils.harmonic_distortion(ys, fam.fs, f_used))
+                    drift[i] = utils.stationarity(ys, fam.fs, f_used)
+                continue
+
+            i, st = g[0], head
             if cfg.phasor_method == "joint7":
                 jf = utils.fit7_joint(yr, ys, fam.fs, st.freq,
                                       n_iter=cfg.joint7_max_iter,
@@ -956,10 +1868,26 @@ def run(cfg: Config = DEFAULT, log=None) -> BronzeRun:
     log.info(f"  calibration: {len(cal.seg_c0)}/{geom.N_SEGMENTS} segment rows, "
              f"{len(cal.temp_c0)} temperature sensors")
 
-    lags = estimate_card_lags(files, cards, cfg, log)
+    # BEFORE ANY ALIGNMENT.  The correlation that follows cannot tell that
+    # two cards recorded different runs; the headers can, and it is far
+    # cheaper to refuse here than to explain a plate of failed SNR gates.
+    timebase = timebase_report(cards, cfg, log)
+    if not timebase.ok and cfg.require_timebase:
+        raise SystemExit(
+            "bronze: the cards do not form one consistent measurement:\n  - "
+            + "\n  - ".join(timebase.problems)
+            + "\n\nFix the selection, or pass --no-require-timebase to "
+              "evaluate anyway and read every result as provisional.")
+
+    lags = estimate_card_lags(files, cards, cfg, log, timebase=timebase)
 
     utils.section("plate temperature", log)
-    T_seg, sensor_T = plate_temperatures(files, cards, cal, cfg, log)
+    rejected_sensors: dict[str, str] = {}
+    T_seg, sensor_T = plate_temperatures(files, cards, cal, cfg, log,
+                                         rejected=rejected_sensors)
+
+    cal_report = calibration_report(cal, cfg, sensor_T, T_seg,
+                                    rejected_sensors, log)
 
     schedule, grid = consensus_schedule(files, cards, cfg, log, lags=lags)
 
@@ -990,6 +1918,7 @@ def run(cfg: Config = DEFAULT, log=None) -> BronzeRun:
         config_digest=_digest([json.dumps(cfg.to_dict(), sort_keys=True)]),
         input_digest=_digest([f"{p.name}:{p.stat().st_size}" for p in files]),
         n_files=len(files), lags=lags, sensor_T=sensor_T,
+        timebase=timebase.summary(), calibration=cal_report.summary(),
     )
 
     miss = run_obj.segments_missing()

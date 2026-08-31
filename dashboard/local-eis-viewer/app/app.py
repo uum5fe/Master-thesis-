@@ -29,7 +29,7 @@ from app.services import store
 from app.settings import DOTENV_LOADED as SETTINGS_DOTENV
 from app.settings import SETTINGS
 from app.views import common as ui
-from app.views import (coverage, ecm, heatmap, operating, overview,
+from app.views import (compare, coverage, ecm, heatmap, operating, overview,
                        reference, signals, spectra)
 
 def location_options() -> list[dict]:
@@ -174,6 +174,7 @@ def build_app() -> Dash:
                 dcc.Tab(label="Plate map", value="tab-heatmap"),
                 dcc.Tab(label="Operating map", value="tab-operating"),
                 dcc.Tab(label="Spectra", value="tab-spectra"),
+                dcc.Tab(label="Compare conditions", value="tab-compare"),
                 dcc.Tab(label="Coverage", value="tab-coverage"),
                 dcc.Tab(label="ECM fitting", value="tab-ecm"),
                 dcc.Tab(label="Signals", value="tab-signals"),
@@ -186,8 +187,8 @@ def build_app() -> Dash:
               "color": ui.COLOURS["text"], "margin": 0})
 
     register_selection(app)
-    for view in (overview, heatmap, operating, spectra, coverage, ecm,
-                 signals, reference):
+    for view in (overview, heatmap, operating, spectra, compare, coverage,
+                 ecm, signals, reference):
         view.register(app)
 
     @app.callback(Output("tab-body", "children"), Input("tabs", "value"))
@@ -197,6 +198,7 @@ def build_app() -> Dash:
             "tab-heatmap": heatmap.layout,
             "tab-operating": operating.layout,
             "tab-spectra": spectra.layout,
+            "tab-compare": compare.layout,
             "tab-coverage": coverage.layout,
             "tab-ecm": ecm.layout,
             "tab-signals": signals.layout,

@@ -1,0 +1,159 @@
+"""Do these five cards belong to one measurement?
+
+The cards are armed by hand, one after another, so nothing about a folder of
+.DAT files guarantees they recorded the same event.  The cross-correlation
+that aligns them cannot answer this: it only ever sees sample indices, so
+handed two unrelated records it returns the lag of best agreement between
+them, scored against that same unrelated background.  The answer looks like
+an answer.  The |NT header stamps are the independent evidence.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+import bronze as B
+import eis_local as E
+from config import DEFAULT
+
+
+def card(stem, start, duration_s=120.0, fs=10_000.0):
+    return B.CardInfo(
+        path=Path(f"{stem}.DAT"), stem=stem, fs=fs, n_ch=16,
+        n_samples=int(duration_s * fs), duration_s=duration_s,
+        ref_name="UC1", ref_slot=0, n_segments=15, start_time=start)
+
+
+T0 = datetime(2025, 7, 16, 7, 45, 46)
+
+
+def five_cards(offsets_s, duration_s=120.0, fs=10_000.0):
+    return {f"card{i+1}": card(f"card{i+1}", T0 + timedelta(seconds=o),
+                               duration_s, fs)
+            for i, o in enumerate(offsets_s)}
+
+
+# ---------------------------------------------------------------------------
+# the |NT stamp
+# ---------------------------------------------------------------------------
+
+def test_the_trigger_stamp_is_read() -> None:
+    assert E.parse_start_time("|NT,20,16,7,2025,7,45,46;") == T0
+
+
+def test_a_missing_stamp_is_none_rather_than_a_guess() -> None:
+    assert E.parse_start_time("|CD,8,0.0001;") is None
+
+
+# ---------------------------------------------------------------------------
+# what the check is for
+# ---------------------------------------------------------------------------
+
+def test_the_real_45a_stagger_passes() -> None:
+    """The stamps that shipped with the 45 A set: 07:45:46/46/49/48/48."""
+    report = B.timebase_report(five_cards([0, 0, 3, 2, 2]), DEFAULT)
+    assert report.ok, report.problems
+    assert report.header_spread_s == pytest.approx(3.0)
+
+
+def test_cards_from_different_runs_are_refused() -> None:
+    """An hour apart is not a stagger, it is two measurements."""
+    report = B.timebase_report(five_cards([0, 0, 3, 3600, 2]), DEFAULT)
+    assert not report.ok
+    assert any("cannot be one event" in p for p in report.problems)
+
+
+def test_a_stagger_beyond_the_search_window_is_refused() -> None:
+    """A true offset outside align_max_lag_s cannot be found.
+
+    The peak the correlation does return in that case is inside the window
+    by construction, so it is not the offset -- and it is reported with the
+    same confidence as a correct one.
+    """
+    cfg = DEFAULT.replace(align_max_lag_s=12.0)
+    report = B.timebase_report(five_cards([0, 0, 3, 40, 2], duration_s=600.0),
+                               cfg)
+    assert not report.ok
+    assert any("align_max_lag_s" in p for p in report.problems)
+
+
+def test_cards_that_never_overlap_are_refused() -> None:
+    """Started one by one, an early card can stop before a late one starts."""
+    report = B.timebase_report(
+        five_cards([0, 100, 200, 300, 400], duration_s=60.0), DEFAULT)
+    assert not report.ok
+    assert any("never all recording at once" in p for p in report.problems)
+
+
+def test_a_mixed_sample_rate_is_refused() -> None:
+    """A lag in SAMPLES is not the same amount of time on two rates.
+
+    estimate_card_lags measures the lag on one card and process_card applies
+    it to another; if the rates differ that lag means a different duration
+    on each, and every dwell window it places is wrong by the ratio.
+    """
+    cards = five_cards([0, 0, 1, 1, 1])
+    cards["card3"] = card("card3", T0 + timedelta(seconds=1), fs=100_000.0)
+    report = B.timebase_report(cards, DEFAULT)
+    assert not report.ok
+    assert any("share a sample rate" in p for p in report.problems)
+
+
+def test_no_stamps_is_a_note_not_a_refusal() -> None:
+    """Some dialects carry no |NT. That is a loss of evidence, not a fault."""
+    cards = {k: card(k, None) for k in ("a", "b")}
+    report = B.timebase_report(cards, DEFAULT)
+    assert report.ok
+    assert any("cannot be cross-checked" in n for n in report.notes)
+
+
+def test_the_report_survives_a_round_trip_to_the_manifest() -> None:
+    import json
+    report = B.timebase_report(five_cards([0, 0, 3, 2, 2]), DEFAULT)
+    assert json.loads(json.dumps(report.summary()))["ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# the measured lag is cross-checked against the arming ORDER
+# ---------------------------------------------------------------------------
+
+def test_a_lag_that_contradicts_the_arming_order_is_refused() -> None:
+    """Prominence says the peak is sharp, not that it is the right peak.
+
+    A sweep looks periodic enough that the correlation can lock one dwell
+    over and report it confidently.  The stamps are far too coarse to check
+    a lag's VALUE -- on the 45 A set they understated the true stagger by
+    2.7 s -- but they cannot get the ORDER wrong.
+    """
+    cards = five_cards([0, 5])                    # card2 armed 5 s later
+    fs = 10_000.0
+    tb = B.timebase_report(cards, DEFAULT)
+    lags = {"card1": {"lag": 0, "corr": 1.0, "prominence": np.inf,
+                      "applied": True},
+            # armed later means a NEGATIVE lag; +5 s has the wrong sign
+            "card2": {"lag": int(5 * fs), "corr": 0.3, "prominence": 100.0,
+                      "applied": True}}
+    B._check_against_headers(lags, "card1", cards, fs, tb, DEFAULT,
+                             B.utils.get_logger(False))
+    assert not lags["card2"]["applied"]
+    assert "contradicts" in lags["card2"]["refused_reason"]
+
+
+def test_a_lag_the_coarse_stamps_merely_understate_is_kept() -> None:
+    """The 45 A case: stamps 3 s apart, truth 5.712 s. That must NOT refuse."""
+    cards = five_cards([0, 3])
+    fs = 10_000.0
+    tb = B.timebase_report(cards, DEFAULT)
+    lags = {"card1": {"lag": 0, "corr": 1.0, "prominence": np.inf,
+                      "applied": True},
+            "card2": {"lag": int(-5.712 * fs), "corr": 0.276,
+                      "prominence": 250.0, "applied": True}}
+    B._check_against_headers(lags, "card1", cards, fs, tb, DEFAULT,
+                             B.utils.get_logger(False))
+    assert lags["card2"]["applied"], (
+        "a 2.7 s disagreement is what the coarse stamps do; refusing it "
+        "would throw away the correct lag the 45 A set depends on")

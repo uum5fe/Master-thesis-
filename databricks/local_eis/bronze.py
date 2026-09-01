@@ -1227,13 +1227,30 @@ def consensus_schedule(files: list[Path], cards: dict[str, CardInfo],
         f_hi = cfg.f_hi(fam.fs)
         headroom = excitation_above_ceiling(ref, fam.fs, f_hi)
         if headroom.get("significant"):
+            peak = headroom["peak_hz"]
+            nyquist = headroom["nyquist_hz"]
             log.warning(
                 f"  {stem[-8:]}: {100 * headroom['fraction']:.0f} % of the AC "
                 f"energy on the reference sits ABOVE the {f_hi:.0f} Hz search "
-                f"ceiling, strongest at {headroom['peak_hz']:.0f} Hz "
-                f"(Nyquist {headroom['nyquist_hz']:.0f} Hz). Those tones are "
-                f"not being looked for. Raise --f-max, or leave it at 'auto' "
-                f"so the ceiling follows the sample rate.")
+                f"ceiling, strongest at {peak:.0f} Hz (Nyquist "
+                f"{nyquist:.0f} Hz).")
+            # TWO READINGS, AND THEY NEED OPPOSITE RESPONSES.  Saying only
+            # "raise --f-max" assumes the energy is excitation, and for a
+            # PEM cell a tone in the tens of kHz usually is not: a load
+            # bank's switching frequency lands there, and chasing it wastes
+            # the run at best and fits noise at worst.
+            log.warning(
+                f"    If those are excitation tones, raise --f-max to reach "
+                f"them. If they are not -- a load-bank switching frequency "
+                f"or pickup, which is what energy in the tens of kHz usually "
+                f"is on a fuel cell -- then raising the ceiling makes the "
+                f"detector chase interference, and what the interference "
+                f"needs is a notch.")
+            if peak > 0.85 * nyquist:
+                log.warning(
+                    f"    {peak:.0f} Hz is within 15 % of this card's "
+                    f"Nyquist, so it may itself be an alias of something "
+                    f"higher that the anti-alias filter did not stop.")
         # WHICH DETECTOR.  Decided per card from the record, because a
         # stepped multisine handed to the single-tone detector does not fail
         # loudly -- it returns a few tones with windows a millisecond long.

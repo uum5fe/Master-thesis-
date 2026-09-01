@@ -91,12 +91,73 @@ def excitation_survey(files, cards, cfg, log, seconds: float = 20.0) -> dict:
                  + f"; search ceiling {f_hi:.0f} Hz of "
                    f"{fam.fs / 2:.0f} Hz Nyquist")
         if head.get("significant"):
+            peak, nyquist = head["peak_hz"], head["nyquist_hz"]
             log.warning(
                 f"    {100 * head['fraction']:.0f} % of the AC energy is "
                 f"ABOVE the {f_hi:.0f} Hz ceiling, strongest at "
-                f"{head['peak_hz']:.0f} Hz. Those tones are not being "
-                f"searched for -- raise --f-max, or leave it at 'auto' so "
-                f"the ceiling follows the sample rate.")
+                f"{peak:.0f} Hz.")
+            # TWO READINGS THAT NEED OPPOSITE RESPONSES. Saying only "raise
+            # --f-max" assumes it is excitation, and on a fuel cell a tone in
+            # the tens of kHz usually is not -- a load bank's switching
+            # frequency lands there. Chasing it wastes the run; what it
+            # needs is a notch.
+            log.warning(
+                f"    If those are excitation tones, raise --f-max. If they "
+                f"are interference -- which is what energy in the tens of "
+                f"kHz usually is on a cell -- a wider band makes the "
+                f"detector chase it, and a notch is what removes it.")
+            if peak > 0.85 * nyquist:
+                log.warning(
+                    f"    {peak:.0f} Hz is within 15 % of this card's "
+                    f"Nyquist, so it may itself be an alias of something "
+                    f"higher the anti-alias filter did not stop.")
+    return out
+
+
+def alias_report(excitation: dict, cards, log) -> list[dict]:
+    """Where a fast card's high-frequency content lands on a slower one.
+
+    WHY THIS IS WORTH CHECKING ACROSS CARDS
+    ---------------------------------------
+    Content above a card's Nyquist does not disappear: it folds back into
+    the band, and it folds to a DIFFERENT place on every sample rate. So a
+    plate recorded at two rates can carry the same physical interference at
+    46 kHz on the fast cards -- where it is visible, above the analysis
+    band, and obviously not electrochemistry -- and at 4 kHz on the slow
+    ones, where it is indistinguishable from a real excitation tone and
+    sits in the middle of the measurement.
+
+    Neither card can see this on its own. The fast card cannot know another
+    card sampled slower; the slow card cannot know the 4 kHz peak was ever
+    at 46 kHz. It is only visible by comparing them, which is why it is
+    checked here rather than in the per-card survey.
+    """
+    rates = {info["nyquist_hz"] * 2 for info in excitation.values()}
+    peaks = [(stem, info["above_ceiling"]["peak_hz"])
+             for stem, info in excitation.items()
+             if info["above_ceiling"].get("significant")]
+    if len(rates) < 2 or not peaks:
+        return []
+
+    utils.section("aliasing across the sample rates on this plate", log)
+    slower = sorted(rates)[:-1]
+    out = []
+    for stem, peak in peaks:
+        for fs in slower:
+            folded = abs(peak - round(peak / fs) * fs)
+            entry = {"seen_on": stem, "peak_hz": peak, "at_rate_hz": fs,
+                     "folds_to_hz": folded}
+            out.append(entry)
+            log.warning(
+                f"  {peak:.0f} Hz (strong on {stem[-8:]}) folds to "
+                f"{folded:.0f} Hz on a card sampled at {fs:.0f} Hz.")
+            if folded < 5000.0:
+                log.error(
+                    f"    That is inside the analysis band, where it is "
+                    f"indistinguishable from an excitation tone. The slower "
+                    f"cards will carry it as a peak that is not "
+                    f"electrochemistry, and no per-card check can see that.")
+                entry["in_band"] = True
     return out
 
 
@@ -151,8 +212,11 @@ def main(argv=None) -> int:
 
     excitation = excitation_survey(files, cards, cfg, log, a.seconds)
 
+    aliases = alias_report(excitation, cards, log)
+
     report = {
         "files": [str(f) for f in files],
+        "aliasing": aliases,
         "leepa": a.leepa,
         "timebase": timebase.summary(),
         "calibration": calrep.summary(),
@@ -169,8 +233,16 @@ def main(argv=None) -> int:
                if e["above_ceiling"].get("significant")]
     if ceiling:
         problems.append(
-            f"excitation above the search ceiling on {len(ceiling)} card(s); "
-            f"those tones will not be found")
+            f"energy above the search ceiling on {len(ceiling)} card(s). If "
+            f"it is excitation, raise --f-max; if it is interference, it "
+            f"needs a notch rather than a wider band")
+    in_band = [a for a in aliases if a.get("in_band")]
+    if in_band:
+        problems.append(
+            f"{in_band[0]['peak_hz']:.0f} Hz, strong on the faster cards, "
+            f"folds to {in_band[0]['folds_to_hz']:.0f} Hz on the "
+            f"{in_band[0]['at_rate_hz']:.0f} Hz cards -- inside the analysis "
+            f"band, where it cannot be told from a real tone")
 
     utils.section("verdict", log)
     if problems:

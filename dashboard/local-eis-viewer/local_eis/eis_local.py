@@ -292,6 +292,89 @@ class FamosFile:
         return [n for n in self.names if n.lower().startswith("temp")]
 
 
+def plausible_header(fam) -> list[str]:
+    """Reasons to disbelieve a header that parsed without raising.
+
+    THIS IS THE POINT OF THE WHOLE DISPATCH.
+    The simplified reader's patterns MATCH a standard-layout header -- they
+    just match the wrong fields, because there every key's third field is a
+    byte count and the value it wants sits one place further along.  So
+    "v1 did not raise" is not evidence that the file is v1: on a standard
+    100 kHz card it returns 1/21 Hz, a channel count taken from |CR's length,
+    and no channel names at all.
+
+    Choosing the reader by which one does not raise would therefore pick the
+    wrong one and evaluate the plate at 0.048 Hz.  Choosing it by which one
+    produces a self-consistent answer picks the right one.
+    """
+    problems: list[str] = []
+    fs = getattr(fam, "fs", float("nan"))
+    if not np.isfinite(fs) or not (0.1 <= fs <= 10e6):
+        problems.append(f"sample rate {fs!r} is outside 0.1 Hz .. 10 MHz")
+    n_ch = getattr(fam, "n_ch", 0)
+    if not (1 <= n_ch <= 512):
+        problems.append(f"channel count {n_ch!r} is not plausible")
+    names = [n for n in getattr(fam, "names", []) if n]
+    if len(names) != n_ch:
+        problems.append(f"{len(names)} channel name(s) for {n_ch} channels")
+    if getattr(fam, "n_samples", 0) <= 0:
+        problems.append(f"{getattr(fam, 'n_samples', 0)} samples")
+    if names and not any(n.upper().startswith("UC") for n in names):
+        problems.append("no UC reference channel among the names")
+    return problems
+
+
+def open_famos(path):
+    """Open a card, whichever FAMOS layout it uses.
+
+    Tries the simplified reader first, because that is what most of the
+    existing recordings are, but ACCEPTS it only if what it produced is
+    self-consistent (:func:`plausible_header`).  A standard-layout file makes
+    it return numbers rather than fail, so "it did not raise" decides
+    nothing.
+    """
+    from famos_v2 import FamosFileV2
+
+    import contextlib
+    import io
+
+    first_problem = ""
+    try:
+        # The simplified reader narrates what it finds, which is useful when
+        # it is the right reader and pure noise while it is being tried on
+        # spec. Its warnings are replayed below only if it is the one chosen.
+        chatter = io.StringIO()
+        with contextlib.redirect_stdout(chatter):
+            fam = FamosFile(path)
+        problems = plausible_header(fam)
+        if not problems:
+            if chatter.getvalue():
+                print(chatter.getvalue(), end="")
+            return fam
+        first_problem = ("the simplified reader parsed it but the result is "
+                         "not self-consistent: " + "; ".join(problems))
+    except (ValueError, KeyError, IndexError) as exc:
+        first_problem = str(exc)
+
+    try:
+        fam = FamosFileV2(path)
+    except Exception as exc:                                # noqa: BLE001
+        raise ValueError(
+            f"{Path(path).name}: neither FAMOS layout could read this file.\n"
+            f"  simplified layout: {first_problem}\n"
+            f"  standard layout  : {exc}\n"
+            f"  To see what is actually in it:\n"
+            f'      python famos_keys.py "{path}"') from None
+
+    problems = plausible_header(fam)
+    if problems:
+        raise ValueError(
+            f"{Path(path).name}: read as a standard-layout FAMOS file, but "
+            f"the result is not self-consistent: {'; '.join(problems)}.\n"
+            f'  Run:  python famos_keys.py "{path}"')
+    return fam
+
+
 # ===========================================================================
 # 2. Plate calibration  (the "Abgleich")
 # ===========================================================================

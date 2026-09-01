@@ -191,8 +191,8 @@ def report(r: dict) -> None:
 
 
 def run_file(path: str, channel: str | None) -> int:
-    from eis_local import FamosFile
-    fam = FamosFile(Path(path))
+    from eis_local import open_famos
+    fam = open_famos(Path(path))
     print(f"\n  file               {Path(path).name}")
     print(f"  channels           {fam.n_ch}  "
           f"(segments {len(fam.segment_names)}, refs {fam.uc_names})")

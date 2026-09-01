@@ -69,7 +69,7 @@ try:                      # package layout: core/ holds the science modules
 except ImportError:       # flat layout (Databricks, notebooks): already there
     pass
 import r2d2_geometry as geom
-from eis_local import (FamosFile, PlateCalibration, Step, detect_schedule,
+from eis_local import (open_famos, PlateCalibration, Step, detect_schedule,
                        detect_multisine_schedule, fit_multitone,
                        group_simultaneous, classify_excitation)
 
@@ -325,7 +325,7 @@ def inventory_channels(files: list[Path], cfg: Config, log=None,
     cards: dict[str, CardInfo] = {}
 
     for fp in files:
-        fam = FamosFile(fp)
+        fam = open_famos(fp)
         stem = fp.stem
         if not fam.uc_names:
             log.warning(f"  {fp.name}: no UC reference channel - card skipped")
@@ -520,8 +520,8 @@ def timebase_report(cards: dict[str, CardInfo], cfg: Config,
     longest = max(cards[s].duration_s for s in stamped)
     if spread > longest:
         problems.append(
-            f"the cards were armed {spread:.0f} s apart but the longest "
-            f"recording is only {longest:.0f} s. These files cannot be one "
+            f"the cards were armed {spread:.1f} s apart but the longest "
+            f"recording is only {longest:.1f} s. These files cannot be one "
             f"event — check that every card in this folder belongs to the "
             f"same measurement.")
 
@@ -753,7 +753,7 @@ def estimate_card_lags(files: list[Path], cards: dict[str, CardInfo],
     raw = {}
     for stem in stems:
         c = cards[stem]
-        x = np.asarray(FamosFile(c.path).channel(c.ref_name), float)
+        x = np.asarray(open_famos(c.path).channel(c.ref_name), float)
         raw[stem] = x - x.mean()
 
     lo, hi = _energy_band(raw, fs, cfg, log)
@@ -1222,7 +1222,7 @@ def consensus_schedule(files: list[Path], cards: dict[str, CardInfo],
         stem = fp.stem
         if stem not in cards:
             continue
-        fam = FamosFile(fp)
+        fam = open_famos(fp)
         ref = fam.channel(cards[stem].ref_name)
         f_hi = cfg.f_hi(fam.fs)
         headroom = excitation_above_ceiling(ref, fam.fs, f_hi)
@@ -1608,7 +1608,7 @@ def plate_temperatures(files: list[Path], cards: dict[str, CardInfo],
     for fp in files:
         if fp.stem not in cards:
             continue
-        fam = FamosFile(fp)
+        fam = open_famos(fp)
         for tn in fam.temp_names:
             key = _sensor_key(tn)
             if key not in cal.temp_c0:
@@ -1693,7 +1693,7 @@ def process_card(fp: Path, cal: PlateCalibration, schedule: list[Step],
     (start + lag, stop + lag).
     """
     log = log or utils.get_logger(cfg.verbose)
-    fam = FamosFile(fp)
+    fam = open_famos(fp)
     stem = fp.stem
     if not fam.uc_names:
         return {}

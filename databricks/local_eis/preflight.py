@@ -45,7 +45,7 @@ import bronze as B                                          # noqa: E402
 import r2d2_geometry as geom                                # noqa: E402
 import utils                                                # noqa: E402
 from config import DEFAULT                                  # noqa: E402
-from eis_local import (FamosFile, PlateCalibration,          # noqa: E402
+from eis_local import (open_famos, PlateCalibration,          # noqa: E402
                        classify_excitation)
 
 
@@ -68,7 +68,7 @@ def excitation_survey(files, cards, cfg, log, seconds: float = 20.0) -> dict:
         stem = fp.stem
         if stem not in cards:
             continue
-        fam = FamosFile(fp)
+        fam = open_famos(fp)
         n = min(fam.n_samples, int(seconds * fam.fs))
         # Bounded at the memmap, not after it: see FamosFile.channel. Slicing
         # a materialised column reads the whole recording first, which over

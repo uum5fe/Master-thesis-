@@ -197,8 +197,13 @@ def main(argv=None) -> int:
     for ref in refs:
         what = ("card file(s)" if ref.kind == "famos" else "CSV point file(s)")
         print(f"  [{ref.kind:<6}] {ref.measurement_id} / "
-              f"{ref.condition:<{width}}  {len(ref.files)} {what}  ->  "
-              f"{runner.output_dir(ref, SETTINGS)}")
+              f"{ref.condition:<{width}}  {len(ref.files)} {what}")
+        # BOTH PATHS, not just the destination. Every check that runs before
+        # a run -- preflight, famos_keys, identify_file -- takes the folder
+        # the recordings are IN, and printing only where the results will go
+        # meant that path had to be reassembled by hand from .env.
+        print(f"  {'':<8}   from  {ref.path}")
+        print(f"  {'':<8}   to    {runner.output_dir(ref, SETTINGS)}")
     if a.list:
         return 0
 

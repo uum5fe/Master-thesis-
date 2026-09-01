@@ -73,6 +73,9 @@ class Component:
     n_bytes: int = 0
     number_format: int = -1
     buffer_ref: int = 0
+    byte_offset: int = 0           #: |CP offset of this channel inside a row
+    buffer_length: int = 0         #: |Cb length of this component's samples
+    transform: int = 0             #: |CR transform flag; 0 means "not calibrated"
     factor: float = 1.0
     offset: float = 0.0
     unit: str = ""
@@ -95,6 +98,13 @@ class Component:
 
     @property
     def identity_calibration(self) -> bool:
+        # THE TRANSFORM FLAG DECIDES.  DASYLab writes |CR,1,10,0,0,0,1,0 --
+        # transform 0, and the factor and offset fields are then both 0 and
+        # mean nothing. Reading them as a scaling reports "factor 0" on every
+        # channel of a perfectly ordinary file, and applying it would zero
+        # the plate.
+        if self.transform == 0:
+            return True
         return abs(self.factor - 1.0) < 1e-12 and abs(self.offset) < 1e-12
 
 
@@ -183,13 +193,35 @@ class FamosFileV2:
                     current.buffer_ref = nums[0]
                     current.n_bytes = nums[1]
                     current.number_format = nums[2]
+                # BufferReference, Bytes, NumberFormat, SignificantBits,
+                # Mask, Offset, ... -- field 5 is where this channel sits
+                # inside an interleaved row. Taken from the file rather than
+                # assumed to be index*itemsize, because that assumption is
+                # only right while the components are in order.
+                if len(nums) >= 6:
+                    current.byte_offset = nums[5]
+            elif key == "Cb" and current is not None:
+                # NumBuffers, UserInfo, BufferRef, SamplesKeyIndex,
+                # OffsetInKey, BufferLengthBytes, ...
+                nums = _ints(fields)
+                if len(nums) >= 6:
+                    current.buffer_length = nums[5]
             elif key == "CR" and current is not None:
                 _apply_cr(current, fields)
             elif key == "CS":
+                # |CS content is "<samples-key index>,<raw bytes>", so the
+                # payload does not start at the content offset. On the
+                # 150 A cards that prefix is exactly the two bytes by which
+                # the declared |CS length exceeds the |Cb buffer length --
+                # and two bytes of skew shifts every sample of every channel
+                # by a fraction of a value, which is noise, not an error.
+                skip = _index_prefix(entry["content"])
+                start = entry["content_offset"] + skip
+                length = max(0, entry["length"] - skip)
                 if current is not None and current.data_offset < 0:
-                    current.data_offset = entry["content_offset"]
-                    current.data_length = entry["length"]
-                payloads.append((entry["content_offset"], entry["length"]))
+                    current.data_offset = start
+                    current.data_length = length
+                payloads.append((start, length))
 
         comps = [c for c in comps if c.name or c.n_bytes]
         if not comps:
@@ -234,17 +266,37 @@ class FamosFileV2:
         itemsize = np.dtype(self.components[0].dtype).itemsize
 
         if self.interleaved:
-            declared = payloads[0][1]
-            available = self.path.stat().st_size - self.offset
-            usable = declared if 0 < declared <= available else available
+            # THE ROW LAYOUT COMES FROM |CP, NOT FROM THE COMPONENT ORDER.
+            # Each component states its byte offset inside the row; assuming
+            # index*itemsize is right only while the components happen to be
+            # in order, and wrong silently when they are not -- every channel
+            # would be read as its neighbour.
+            offsets = [c.byte_offset for c in self.components]
+            expected = {i * itemsize for i in range(self.n_ch)}
+            if set(offsets) != expected:
+                raise FamosStructureError(
+                    f"{self.path.name}: the |CP byte offsets are "
+                    f"{sorted(set(offsets))}, which is not one slot per "
+                    f"channel in a row of {self.n_ch} x {itemsize} bytes. "
+                    f"This reader cannot place the channels from that.")
             per_row = itemsize * self.n_ch
+
+            declared = payloads[0][1]
+            # |Cb states the buffer length directly; prefer it over the |CS
+            # length, which also counts the samples-key index prefix.
+            buffers = {c.buffer_length for c in self.components
+                       if c.buffer_length > 0}
+            usable = min(buffers) if len(buffers) == 1 else declared
+            available = self.path.stat().st_size - self.offset
+            if not (0 < usable <= available):
+                usable = min(declared, available) if declared else available
             self.n_samples = usable // per_row
-            if declared and declared % per_row:
+            if usable % per_row:
                 self.notes.append(
-                    f"the |CS block declares {declared} bytes, which is not a "
-                    f"whole number of {self.n_ch}-channel rows of {itemsize} "
-                    f"bytes ({declared % per_row} left over). Either the "
-                    f"channel count or the sample width is wrong.")
+                    f"the payload is {usable} bytes, which is not a whole "
+                    f"number of {self.n_ch}-channel rows of {itemsize} bytes "
+                    f"({usable % per_row} left over). Either the channel "
+                    f"count or the sample width is wrong.")
         else:
             if len(payloads) != self.n_ch:
                 raise FamosStructureError(
@@ -291,10 +343,11 @@ class FamosFileV2:
         comp = self.components[index]
         dtype = comp.dtype
         if self.interleaved:
+            column = comp.byte_offset // np.dtype(dtype).itemsize
             mm = np.memmap(self.path, dtype=dtype, mode="r",
                            offset=self.offset,
                            shape=(self.n_samples, self.n_ch))
-            return np.asarray(mm[start:stop, index], dtype=np.float64)
+            return np.asarray(mm[start:stop, column], dtype=np.float64)
         # Contiguous: this channel has its own block, so the range is a
         # straight slice of it rather than a stride through every channel.
         mm = np.memmap(self.path, dtype=dtype, mode="r",
@@ -347,13 +400,27 @@ def _ints(fields: list[str]) -> list[int]:
 
 
 def _channel_name(fields: list[str]) -> str:
-    """The name out of a |CN block, by declared length.
+    """The name out of a |CN block.
 
-    The field index differs between writers, so the name is found by the
-    property that identifies it: a length field followed by exactly that many
-    characters. Hard-coding an index is what breaks when a writer adds a
-    field, and it breaks silently -- into a neighbouring number.
+    Layout is GroupIndex, BitIndex, GroupType, NameLength, Name,
+    CommentLength, Comment -- so the name is field 4 and its length field 3.
+    That is checked rather than trusted: if the declared length matches, it
+    is the name.
+
+    THE FALLBACK TAKES THE LAST MATCH, NOT THE FIRST.
+    Scanning for "an integer followed by a string of that length" finds
+    |CN,1,0,0,3,UC2,0 at field 0 as well -- "1" followed by "0", which is
+    one character long -- and returns "0". Every channel then comes back
+    named "0". The name pair is the last such pair in the block, because
+    what follows it is the comment length and the comment.
     """
+    if len(fields) > 4:
+        try:
+            if int(fields[3]) == len(fields[4]):
+                return fields[4]
+        except ValueError:
+            pass
+    best = ""
     for i, token in enumerate(fields[:-1]):
         try:
             want = int(token)
@@ -362,11 +429,10 @@ def _channel_name(fields: list[str]) -> str:
         if want <= 0:
             continue
         text, _ = _famos_string(fields, i)
-        if len(text) == want and not re.fullmatch(r"\d+", text or "x") is None:
-            return text
-        if len(text) == want and text:
-            return text
-    # Nothing self-consistent: fall back to the last non-numeric field.
+        if text and len(text) == want:
+            best = text
+    if best:
+        return best
     for token in reversed(fields):
         token = token.strip()
         if token and not re.fullmatch(r"[\d.\-+eE]+", token):
@@ -374,13 +440,21 @@ def _channel_name(fields: list[str]) -> str:
     return ""
 
 
+def _index_prefix(content: str) -> int:
+    """Bytes of the leading "<index>," in a |CS content, or 0 if absent."""
+    match = re.match(r"\d+,", content)
+    return len(match.group(0)) if match else 0
+
+
 def _apply_cr(comp: Component, fields: list[str]) -> None:
-    """Factor and offset out of |CR, without assuming they are safe."""
+    """Transform flag, factor and offset out of |CR."""
     nums = []
     for token in fields:
         try:
             nums.append(float(token))
         except ValueError:
             break
+    if nums:
+        comp.transform = int(nums[0])
     if len(nums) >= 3:
         comp.factor, comp.offset = nums[1], nums[2]

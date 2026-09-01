@@ -54,7 +54,9 @@ def interleaved(path, channels=("UC1", "1", "2"), n=500, fs=100_000.0,
         parts += [key("CC", 1, 1, 1), b"\r\n",
                   key("CD", 2, 1.0 / fs, 1, 0, "s", 0, 0), b"\r\n",
                   key("CN", 1, 0, 0, 0, len(name), name), b"\r\n",
-                  key("CP", 1, 1, width, fmt, 0, 0, 0, 0), b"\r\n"]
+                  # field 5 is this channel's byte offset inside the row
+                  key("CP", 1, i + 1, width, fmt, 0, 0, i * width, 0, 0),
+                  b"\r\n"]
     block = np.zeros((n, len(channels)), dtype=dtype)
     for i in range(len(channels)):
         block[:, i] = np.arange(n) + i * 1000
@@ -219,3 +221,133 @@ def test_the_reader_describes_what_it_decided(tmp_path) -> None:
     """A layout decision the operator cannot see is one they cannot check."""
     text = FamosFileV2(contiguous(tmp_path / "c.DAT")).describe()
     assert "100000 Hz" in text and "contiguous" in text
+
+
+# ---------------------------------------------------------------------------
+# the DASYLab 14.2 layout the 2612025 cards actually use
+# ---------------------------------------------------------------------------
+
+def dasylab(path, names=("UC2", "UC1", "1", "2"), n=400, fs=100_000.0):
+    """A byte-faithful replica of the header dumped from a 150 A card.
+
+        |NO,1,27,0,7,DASYLab,12,V 14.2.0.889
+        |CD,1,25,1.000000e-005,1,1,s,0,0,0
+        |CP,1,18,1,8,8,64,0,0,1,120        <- offset 0, then 8, then 16
+        |Cb,1,40,1,0,1,1,0,3946840064,0,3946840064,1,0,0,
+        |CR,1,10,0,0,0,1,0,                <- transform flag 0
+        |CN,1,14,1,0,0,3,UC2,0,
+        |CS,1,3946840066,1,<raw>           <- note the "1," before the data
+    """
+    def k(name, ver, body):
+        b = body.encode("latin-1")
+        return f"|{name},{ver},{len(b)},".encode("latin-1") + b + b";"
+
+    itemsize, n_ch = 8, len(names)
+    row, buf = n_ch * itemsize, n * n_ch * itemsize
+    parts = [k("CF", 2, "1"), k("CK", 1, "1,1"),
+             k("NO", 1, "0,7,DASYLab,12,V 14.2.0.889"),
+             k("CB", 1, "1,7,Messung,0,")]
+    for i, nm in enumerate(names):
+        parts += [k("CG", 1, "1,1,1"),
+                  k("CD", 1, "1.000000e-005,1,1,s,0,0,0"),
+                  k("NT", 1, "27, 8,2026,11,36,19.00"),
+                  k("CC", 1, "1,1"),
+                  k("CP", 1, f"{i+1},8,8,64,0,{i*itemsize},1,{row-itemsize}"),
+                  k("Cb", 1, f"1,0,{i+1},1,0,{buf},0,{buf},1,0,0,"),
+                  k("CR", 1, "0,0,0,1,0,"),
+                  k("CN", 1, f"1,0,0,{len(nm)},{nm},0,")]
+    block = np.zeros((n, n_ch), dtype="<f8")
+    for i in range(n_ch):
+        block[:, i] = np.arange(n) + i * 1000
+    payload = b"1," + block.tobytes()
+    parts += [f"|CS,1,{len(payload)},".encode("latin-1"), payload, b";"]
+    path.write_bytes(b"".join(parts))
+    return path
+
+
+def test_the_dasylab_card_reads_correctly(tmp_path) -> None:
+    fam = FamosFileV2(dasylab(tmp_path / "d.DAT"))
+    assert fam.fs == pytest.approx(100_000.0)
+    assert fam.names == ["UC2", "UC1", "1", "2"]
+    assert fam.n_samples == 400
+    assert fam.interleaved
+    assert fam.start_time.year == 2026 and fam.start_time.day == 27
+    for i, name in enumerate(fam.names):
+        assert np.allclose(fam.channel(name, 0, 4), np.arange(4) + i * 1000), (
+            f"{name} did not read its own samples")
+
+
+def test_the_samples_key_index_prefix_is_skipped(tmp_path) -> None:
+    """|CS content is "<index>,<raw>", so the payload is not at its start.
+
+    On the real cards that prefix is exactly the two bytes by which the
+    declared |CS length exceeds the |Cb buffer length. Two bytes of skew on
+    a float64 stream is not an error -- it shifts every sample of every
+    channel by a fraction of a value and returns noise.
+    """
+    fam = FamosFileV2(dasylab(tmp_path / "d.DAT"))
+    assert fam.channel("UC2", 0, 1)[0] == pytest.approx(0.0)
+    assert not any("left over" in n for n in fam.notes), fam.notes
+
+
+def test_the_channel_name_is_not_the_first_number_that_fits(tmp_path) -> None:
+    """|CN,1,0,0,3,UC2,0 also contains "1" followed by "0", one char long.
+
+    A scan that takes the first such pair names every channel "0".
+    """
+    fam = FamosFileV2(dasylab(tmp_path / "d.DAT"))
+    assert "0" not in fam.names
+    assert fam.names[0] == "UC2"
+
+
+def test_a_transform_flag_of_zero_is_not_a_calibration(tmp_path) -> None:
+    """DASYLab writes |CR,1,10,0,0,0,1,0 -- flag 0, factor and offset unused.
+
+    Reading those as a scaling reports "factor 0" on every channel of an
+    ordinary file, and applying it would zero the plate.
+    """
+    fam = FamosFileV2(dasylab(tmp_path / "d.DAT"))
+    assert all(c.identity_calibration for c in fam.components)
+    assert not any("NOT APPLIED" in n for n in fam.notes), fam.notes
+
+
+def test_the_column_comes_from_the_cp_offset(tmp_path) -> None:
+    """Assuming index*itemsize is right only while the components are ordered.
+
+    Here they are not: the file lists UC2 first but gives it the second slot
+    in the row. Reading by list position returns its neighbour's samples --
+    silently, because both are perfectly ordinary numbers.
+    """
+    def k(name, ver, body):
+        b = body.encode("latin-1")
+        return f"|{name},{ver},{len(b)},".encode("latin-1") + b + b";"
+
+    names, n, itemsize = ["UC2", "UC1"], 64, 8
+    row = len(names) * itemsize
+    slot = {"UC2": 1, "UC1": 0}            # deliberately not list order
+    parts = [k("CF", 2, "1"), k("CK", 1, "1,1")]
+    for i, nm in enumerate(names):
+        parts += [k("CG", 1, "1,1,1"),
+                  k("CD", 1, "1.000000e-005,1,1,s,0,0,0"),
+                  k("CC", 1, "1,1"),
+                  k("CP", 1, f"{i+1},8,8,64,0,{slot[nm] * itemsize},1,0"),
+                  k("Cb", 1, f"1,0,{i+1},1,0,{n * row},0,{n * row},1,0,0,"),
+                  k("CR", 1, "0,0,0,1,0,"),
+                  k("CN", 1, f"1,0,0,{len(nm)},{nm},0,")]
+    block = np.zeros((n, len(names)), dtype="<f8")
+    for column in range(len(names)):
+        block[:, column] = np.arange(n) + column * 1000
+    payload = b"1," + block.tobytes()
+    parts += [f"|CS,1,{len(payload)},".encode("latin-1"), payload, b";"]
+    (tmp_path / "shuffled.DAT").write_bytes(b"".join(parts))
+
+    fam = FamosFileV2(tmp_path / "shuffled.DAT")
+    assert np.allclose(fam.channel("UC2", 0, 2), [1000, 1001]), (
+        "UC2 holds the second slot and must read it")
+    assert np.allclose(fam.channel("UC1", 0, 2), [0, 1])
+
+
+def test_the_dispatch_routes_a_dasylab_card_to_v2(tmp_path) -> None:
+    fam = E.open_famos(dasylab(tmp_path / "d.DAT"))
+    assert isinstance(fam, FamosFileV2)
+    assert fam.fs == pytest.approx(100_000.0) and fam.names[1] == "UC1"

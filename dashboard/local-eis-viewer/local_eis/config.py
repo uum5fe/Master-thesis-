@@ -310,6 +310,13 @@ class Config:
     #: then picks among equals by noise.
     align_peak_tie_ratio: float = 0.8
 
+    # WHETHER A BROKEN TIME BASE STOPS THE RUN.  On by default: cards from
+    # two different runs, or clocked at two different rates, do not produce a
+    # worse plate -- they produce a confident one built from windows that
+    # mean different instants on different cards. Turn it off only to look at
+    # what such a set contains, and read nothing quantitative from the result.
+    require_timebase: bool = True
+
     # ---- per-step quality gates -------------------------------------------
     # A step that lies on the sweep's own geometric grid is a real step: a
     # geometric progression is not something noise produces.  For those, SNR

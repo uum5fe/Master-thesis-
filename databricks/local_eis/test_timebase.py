@@ -157,3 +157,37 @@ def test_a_lag_the_coarse_stamps_merely_understate_is_kept() -> None:
     assert lags["card2"]["applied"], (
         "a 2.7 s disagreement is what the coarse stamps do; refusing it "
         "would throw away the correct lag the 45 A set depends on")
+
+
+# ---------------------------------------------------------------------------
+# the refusal itself
+# ---------------------------------------------------------------------------
+
+def test_the_gate_is_readable_when_the_time_base_is_bad() -> None:
+    """`cfg.require_timebase` is only reached when the check has FAILED.
+
+    `if not timebase.ok and cfg.require_timebase:` short-circuits while the
+    time base is fine, so a missing setting stays invisible through every
+    run on consistent cards and raises AttributeError on the first run that
+    the check was written to stop -- replacing the explanation with a
+    traceback exactly when the explanation is the point.
+    """
+    assert DEFAULT.require_timebase is True
+    assert DEFAULT.replace(require_timebase=False).require_timebase is False
+
+
+def test_the_override_exists_on_the_command_line() -> None:
+    """The refusal names --no-require-timebase; it has to be a real flag."""
+    import main
+    parser = main.build_parser()
+    args = parser.parse_args(["--dat", ".", "--no-require-timebase"])
+    assert args.require_timebase is False
+    assert parser.parse_args(["--dat", "."]).require_timebase is None
+
+
+def test_a_bad_time_base_stops_the_run_by_default() -> None:
+    cards = five_cards([0, 100, 200, 300, 400], duration_s=60.0)
+    report = B.timebase_report(cards, DEFAULT)
+    assert not report.ok
+    assert not report.ok and DEFAULT.require_timebase, (
+        "both halves of the gate must be true for the run to stop")

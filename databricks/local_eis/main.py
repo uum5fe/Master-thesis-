@@ -136,6 +136,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "0.45*fs, so recording faster actually searches "
                         "higher")
     g.add_argument("--ppd", type=int, default=None)
+    g.add_argument("--no-require-timebase", dest="require_timebase",
+                   action="store_false", default=None,
+                   help="evaluate even when the cards are not one consistent "
+                        "measurement. The result is then diagnostic only: "
+                        "windows that mean different instants on different "
+                        "cards produce a confident plate, not a worse one")
     g.add_argument("--excitation", choices=["auto", "stepped", "multisine"],
                    default=None,
                    help="excitation type; 'auto' (the default) counts the "
@@ -218,6 +224,8 @@ def config_from_args(a) -> Config:
         kw["ppd"] = a.ppd
     if getattr(a, "excitation", None):
         kw["excitation"] = a.excitation
+    if getattr(a, "require_timebase", None) is False:
+        kw["require_timebase"] = False
     if a.skew:
         kw["skew_model"] = a.skew
     if a.phasor:

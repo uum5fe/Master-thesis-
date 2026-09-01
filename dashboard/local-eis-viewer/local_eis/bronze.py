@@ -1455,12 +1455,28 @@ def consensus_schedule(files: list[Path], cards: dict[str, CardInfo],
                     grid["ok"] = False
 
     # ---- accept ------------------------------------------------------------
+    # A STEP CANNOT BE SEEN BY MORE CARDS THAN THERE ARE.  min_ref_channels
+    # asks for agreement between reference channels, which is the right test
+    # when there are several. Evaluating ONE card -- which is what happens
+    # when the cards cannot be evaluated together, and what makes bulk card
+    # skew cancel in the U/I ratio rather than needing to be measured -- the
+    # threshold of 2 can never be met, so every step would depend on being
+    # rescued by grid membership and a run with no recoverable grid would
+    # find nothing at all. The vote is clamped to what is available and the
+    # weaker evidence is stated rather than hidden.
+    min_votes = min(cfg.min_ref_channels, len(per_card))
+    if min_votes < cfg.min_ref_channels:
+        log.warning(
+            f"  only {len(per_card)} card(s) in this run, so a step is kept "
+            f"on {min_votes} reference channel(s) rather than "
+            f"{cfg.min_ref_channels}. Cross-card agreement is not available "
+            f"as evidence here; the SNR and grid tests still apply.")
     kept: list[Step] = []
     n_votes_kept, n_grid_rescued = 0, 0
     for cl, f_hat in zip(clusters, prov):
         cards_seen = {c for c, _ in cl}
         on_grid = bool(grid.get("ok")) and _on_grid(f_hat, grid, cfg.grid_tol)
-        enough = len(cards_seen) >= cfg.min_ref_channels
+        enough = len(cards_seen) >= min_votes
         if not (enough or on_grid):
             continue
         # representative window: the longest dwell in the cluster, which is

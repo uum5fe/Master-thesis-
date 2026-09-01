@@ -136,6 +136,17 @@ def build_parser() -> argparse.ArgumentParser:
                         "0.45*fs, so recording faster actually searches "
                         "higher")
     g.add_argument("--ppd", type=int, default=None)
+    g.add_argument("--label", default=None,
+                   help="what to call the result, when that differs from the "
+                        "condition used to FIND the files. Evaluating a "
+                        "subset of a folder is still discovered as its "
+                        "condition and is not that condition's plate")
+    g.add_argument("--cards", default=None,
+                   help="evaluate only these cards: a comma-separated list of "
+                        "substrings of the file names, e.g. "
+                        "'Karte_2,Karte_3'. Use it when a folder holds more "
+                        "than one measurement, or cards at more than one "
+                        "sample rate")
     g.add_argument("--no-require-timebase", dest="require_timebase",
                    action="store_false", default=None,
                    help="evaluate even when the cards are not one consistent "
@@ -226,6 +237,11 @@ def config_from_args(a) -> Config:
         kw["excitation"] = a.excitation
     if getattr(a, "require_timebase", None) is False:
         kw["require_timebase"] = False
+    if getattr(a, "label", None):
+        kw["label"] = a.label
+    if getattr(a, "cards", None):
+        kw["only_cards"] = frozenset(
+            c.strip() for c in a.cards.split(",") if c.strip())
     if a.skew:
         kw["skew_model"] = a.skew
     if a.phasor:
@@ -288,7 +304,7 @@ def run_pipeline(cfg: Config, stop_after: str = "gold") -> dict:
     t0 = time.time()
     utils.banner("R2-D2 LOCAL EIS PIPELINE", log)
     log.info(f"  plate: {plate.title}   source: FAMOS")
-    log.info(f"  {cfg.leepa or '-'} / {cfg.condition}   "
+    log.info(f"  {cfg.leepa or '-'} / {cfg.result_name}   "
              f"phasor={cfg.phasor_method}  skew={cfg.skew_model}  "
              f"drt={'on' if cfg.drt_enable else 'off'}  "
              f"spatial={'on' if cfg.spatial_enable else 'off'}")

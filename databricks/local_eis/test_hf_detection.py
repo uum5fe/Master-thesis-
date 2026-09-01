@@ -279,3 +279,64 @@ def test_a_famos_file_with_an_odd_layout_is_told_apart(tmp_path) -> None:
     assert "identify_file.py" not in message, (
         "a file that clearly IS FAMOS should not be sent to the "
         "what-format-is-this tool")
+
+
+# ---------------------------------------------------------------------------
+# evaluating a subset of a folder
+# ---------------------------------------------------------------------------
+
+def _famos_v1_card(path, n_ch=6, n=200, fs=10_000.0):
+    names = ["UC1"] + [str(i) for i in range(1, n_ch)]
+    cp = ",".join(f"7,32,{nm}" for nm in names)
+    data = np.zeros((n, n_ch), dtype="<f4")
+    path.write_bytes(
+        (f"|CF,2,1,1;|CK,1,3,1,1;|CD,2,{1.0 / fs},1;|CR,1,{n_ch},1,0,1;"
+         f"|CP,{cp};|CS,1,{data.nbytes},").encode("latin-1") + data.tobytes())
+
+
+def test_only_the_named_cards_are_discovered(tmp_path) -> None:
+    """A folder can hold more than one measurement, or more than one rate.
+
+    Copying gigabytes to build a folder that holds only the subset is the
+    alternative, so the subset is named instead.
+    """
+    import bronze as B
+    from config import DEFAULT
+    for card in range(1, 6):
+        _famos_v1_card(
+            tmp_path / f"Leepa_2612025_Current_45A_Test_01_Karte_{card}.DAT")
+
+    cfg = DEFAULT.replace(dat_dir=tmp_path, leepa="2612025", condition="45A")
+    assert len(B.discover_files(cfg)) == 5
+
+    picked = B.discover_files(
+        cfg.replace(only_cards=frozenset({"Karte_2", "Karte_3"})))
+    assert [p.name[-5] for p in picked] == ["2", "3"]
+
+
+def test_a_card_filter_that_matches_nothing_says_so(tmp_path) -> None:
+    """Silently evaluating all five when two were asked for is worse."""
+    import bronze as B
+    from config import DEFAULT
+    for card in (1, 2):
+        _famos_v1_card(
+            tmp_path / f"Leepa_2612025_Current_45A_Test_01_Karte_{card}.DAT")
+    cfg = DEFAULT.replace(dat_dir=tmp_path, leepa="2612025", condition="45A",
+                          only_cards=frozenset({"Karte_9"}))
+    with pytest.raises(SystemExit) as excinfo:
+        B.discover_files(cfg)
+    assert "matched none" in str(excinfo.value)
+
+
+def test_the_result_name_is_separate_from_the_condition() -> None:
+    """--condition FINDS the files; --label NAMES what was produced.
+
+    A subset of a five-card 45 A folder is still discovered as "45A" and is
+    not the 45 A plate, so the two cannot be the same string.
+    """
+    from config import DEFAULT
+    cfg = DEFAULT.replace(condition="45A")
+    assert cfg.result_name == "45A"
+    assert cfg.replace(label="45A_g1_50kHz").result_name == "45A_g1_50kHz"
+    assert cfg.replace(label="45A_g1_50kHz").condition == "45A", (
+        "the label must not change what the file discovery looks for")

@@ -21,11 +21,12 @@ import eis_local as E
 from config import DEFAULT
 
 
-def card(stem, start, duration_s=120.0, fs=10_000.0):
+def card(stem, start, duration_s=120.0, fs=10_000.0, n_segments=15):
     return B.CardInfo(
         path=Path(f"{stem}.DAT"), stem=stem, fs=fs, n_ch=16,
         n_samples=int(duration_s * fs), duration_s=duration_s,
-        ref_name="UC1", ref_slot=0, n_segments=15, start_time=start)
+        ref_name="UC1", ref_slot=0, n_segments=n_segments,
+        start_time=start)
 
 
 T0 = datetime(2025, 7, 16, 7, 45, 46)
@@ -191,3 +192,73 @@ def test_a_bad_time_base_stops_the_run_by_default() -> None:
     assert not report.ok
     assert not report.ok and DEFAULT.require_timebase, (
         "both halves of the gate must be true for the run to stop")
+
+
+# ---------------------------------------------------------------------------
+# evaluating the part of a folder that CAN be evaluated
+# ---------------------------------------------------------------------------
+
+def test_the_45a_shape_splits_into_three_groups() -> None:
+    """A folder is not a measurement.
+
+    The 45 A set: Karte_1 at 100 kHz armed 15 min early, Karte_2/3 at
+    100 kHz, Karte_4/5 at 50 kHz, all four of the latter armed together.
+    Three evaluable subsets, and no way to make one plate of them.
+    """
+    cards = {
+        "Karte_1": card("Karte_1", T0, 177.8, fs=100_000.0),
+        "Karte_2": card("Karte_2", T0 + timedelta(seconds=899), 538.4,
+                        fs=100_000.0),
+        "Karte_3": card("Karte_3", T0 + timedelta(seconds=899), 538.4,
+                        fs=100_000.0),
+        "Karte_4": card("Karte_4", T0 + timedelta(seconds=899), 538.4,
+                        fs=50_000.0),
+        "Karte_5": card("Karte_5", T0 + timedelta(seconds=899), 538.4,
+                        fs=50_000.0),
+    }
+    groups = B.consistent_groups(cards)
+    assert len(groups) == 3
+    sets = sorted(tuple(g["cards"]) for g in groups)
+    assert sets == [("Karte_1",), ("Karte_2", "Karte_3"),
+                    ("Karte_4", "Karte_5")]
+
+
+def test_grouping_by_rate_alone_would_be_wrong() -> None:
+    """Karte_1 shares 100 kHz with Karte_2 and Karte_3 and is not with them.
+
+    Both conditions are needed and neither implies the other, which is the
+    whole reason this is not a one-line filter on the sample rate.
+    """
+    cards = {
+        "Karte_1": card("Karte_1", T0, 177.8, fs=100_000.0),
+        "Karte_2": card("Karte_2", T0 + timedelta(seconds=899), 538.4,
+                        fs=100_000.0),
+    }
+    groups = B.consistent_groups(cards)
+    assert len(groups) == 2, "same rate, different runs -> different groups"
+
+
+def test_cards_recorded_together_at_one_rate_stay_one_group() -> None:
+    cards = {f"Karte_{i}": card(f"Karte_{i}", T0 + timedelta(seconds=i * 2),
+                                300.0, fs=100_000.0) for i in range(1, 6)}
+    groups = B.consistent_groups(cards)
+    assert len(groups) == 1 and groups[0]["n_cards"] == 5
+
+
+def test_a_group_reports_how_much_of_the_plate_it_covers() -> None:
+    """Each group is a partial plate, and the number is the point."""
+    cards = {
+        "Karte_4": card("Karte_4", T0, 538.4, fs=50_000.0),
+        "Karte_5": card("Karte_5", T0, 538.4, fs=50_000.0),
+    }
+    group = B.consistent_groups(cards)[0]
+    assert group["n_segments"] == 30          # 15 per card in this fixture
+    assert group["overlap_s"] == pytest.approx(538.4)
+
+
+def test_unstamped_cards_are_grouped_by_rate_and_marked() -> None:
+    """Without |NT there is no way to place them in time, and it says so."""
+    cards = {"a": card("a", None, 100.0, fs=100_000.0),
+             "b": card("b", None, 100.0, fs=100_000.0)}
+    group = B.consistent_groups(cards)[0]
+    assert group["timed"] is False and group["n_cards"] == 2

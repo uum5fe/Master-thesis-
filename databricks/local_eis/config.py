@@ -317,6 +317,26 @@ class Config:
     # what such a set contains, and read nothing quantitative from the result.
     require_timebase: bool = True
 
+    # EVALUATE ONLY THESE CARDS.  Substrings matched against the file name,
+    # so "Karte_2,Karte_3" selects two of five. It exists because a folder
+    # is not always one measurement: when some cards were armed for a
+    # different run, or clocked at a different rate, the evaluable thing is
+    # a SUBSET of the folder, and the alternative is copying gigabytes to
+    # build a folder that holds only the subset.
+    only_cards: frozenset[str] = frozenset()
+
+    # WHAT TO CALL THE RESULT, when that differs from what to look for.
+    # `condition` selects the files -- it is matched against their names --
+    # so it cannot also be the name of an output that covers only part of a
+    # condition. Evaluating two cards of a five-card 45 A folder is still
+    # discovered as "45A" and is not the 45 A plate; `label` is what it is
+    # called once written, so the two do not have to be the same string.
+    label: str = ""
+
+    @property
+    def result_name(self) -> str:
+        return self.label or self.condition
+
     # ---- per-step quality gates -------------------------------------------
     # A step that lies on the sweep's own geometric grid is a real step: a
     # geometric progression is not something noise produces.  For those, SNR

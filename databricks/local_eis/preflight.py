@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -161,6 +162,111 @@ def alias_report(excitation: dict, cards, log) -> list[dict]:
     return out
 
 
+def safe_ceiling(fs: float, interferers, default_hi: float) -> tuple[float, str]:
+    """The highest analysis ceiling that stays below any aliased interference.
+
+    An interferer above a card's Nyquist folds INTO the band, and there is
+    nothing about the folded peak that marks it as an alias -- it is a
+    perfectly ordinary tone at a perfectly ordinary frequency. It cannot be
+    removed after sampling and it cannot be told from signal.
+
+    What CAN be done is to stop the analysis below it. That does not recover
+    the band above; it keeps the part below honest, which is the difference
+    between a spectrum with a fabricated point in it and a shorter spectrum.
+    """
+    folded = []
+    for peak in interferers:
+        alias = abs(peak - round(peak / fs) * fs)
+        if 0 < alias < default_hi:
+            folded.append((alias, peak))
+    if not folded:
+        return default_hi, "auto"
+    alias, source = min(folded)
+    ceiling = 0.8 * alias
+    return ceiling, (f"{source:.0f} Hz folds to {alias:.0f} Hz at this rate; "
+                     f"stopping at {ceiling:.0f} Hz keeps the band below it")
+
+
+def _card_tag(stem: str) -> str:
+    """The shortest substring of a card's name that still identifies it."""
+    match = re.search(r"(Karte[_-]?\w+)", stem, re.IGNORECASE)
+    return match.group(1) if match else stem
+
+
+def group_plan(cards, excitation, cfg, log, a_condition: str = "COND"
+               ) -> list[dict]:
+    """Which subsets of this folder can be evaluated, and how.
+
+    A folder is not a measurement. When part of it is evaluable the useful
+    answer is which part and what command runs it -- not a refusal of the
+    whole folder, and not an evaluation that treats cards from two runs as
+    one event.
+    """
+    groups = B.consistent_groups(cards)
+    utils.section("what CAN be evaluated from this folder", log)
+
+    # Only peaks seen on the FASTEST cards are true frequencies. A peak on a
+    # slower card may itself already be folded, and folding a fold again
+    # would put the ceiling in an arbitrary place.
+    fastest = max((info["nyquist_hz"] * 2 for info in excitation.values()),
+                  default=0.0)
+    interferers = [info["above_ceiling"]["peak_hz"]
+                   for info in excitation.values()
+                   if info["above_ceiling"].get("significant")
+                   and info["nyquist_hz"] * 2 >= fastest]
+
+    total = sum(g.get("n_segments", 0) for g in groups)
+    out = []
+    for index, group in enumerate(groups, 1):
+        fs = group["fs_hz"]
+        ceiling, why = safe_ceiling(fs, interferers, cfg.f_hi(fs))
+        group["f_max_hz"] = ceiling
+        group["f_max_reason"] = why
+        out.append(group)
+
+        log.info(f"\n  group {index}: {group['n_cards']} card(s) at "
+                 f"{fs:.0f} Hz, {group.get('n_segments', 0)} of 72 segments")
+        log.info(f"    cards   : {', '.join(c[-8:] for c in group['cards'])}")
+        if group.get("timed"):
+            log.info(f"    together: {group['overlap_s']:.1f} s")
+        else:
+            log.warning("    no |NT stamps: grouped by sample rate alone, so "
+                        "whether these were recorded together is unverified")
+        log.info(f"    ceiling : {ceiling:.0f} Hz  ({why})")
+        if group["n_cards"] == 1:
+            log.warning("    one card only -- there is no second reference to "
+                        "measure its timing against, so its alignment is "
+                        "assumed rather than verified")
+
+    utils.section("the commands", log)
+    for index, group in enumerate(out, 1):
+        cards_arg = ",".join(_card_tag(c) for c in group["cards"])
+        suffix = f"{a_condition}_g{index}_{group['fs_hz'] / 1000:.0f}kHz"
+        log.info(f"\n  group {index}  ->  condition {suffix}")
+        log.info(f'    python main.py --dat "<folder>" --leepa <id> \\')
+        # --condition FINDS the files, --label NAMES the result. They differ
+        # here: this is a subset of the condition, not the condition.
+        log.info(f'        --condition {a_condition} --cards {cards_arg} \\')
+        log.info(f'        --label {suffix} \\')
+        log.info(f'        --f-max {group["f_max_hz"]:.0f} \\')
+        log.info(f'        --curr-cal "<curr.csv>" --temp-cal "<temp.csv>" \\')
+        log.info(f'        --out "<results root>/<id>/{suffix}"')
+    log.info("\n  Each writes its own condition folder, so the dashboard "
+             "lists them side by side and the Compare tab can put two of "
+             "them together.")
+
+    if len(groups) > 1:
+        log.warning(
+            f"\n  These groups CANNOT be combined into one plate: they differ "
+            f"in sample rate or in when they were recorded, which is what "
+            f"makes them separate groups. Each is a partial plate -- "
+            f"{total} of 72 segments across all of them, and fewer in any "
+            f"one. Every plate-wide number (current closure, area-weighted "
+            f"aggregate, the parallel R_s) is computed over the segments "
+            f"present, so read those as partial too.")
+    return out
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(
         description=__doc__,
@@ -175,6 +281,9 @@ def main(argv=None) -> int:
     p.add_argument("--seconds", type=float, default=20.0,
                    help="how much of each card to read for the excitation "
                         "survey (default 20 s)")
+    p.add_argument("--groups", action="store_true",
+                   help="report which subsets of this folder can be evaluated "
+                        "together, and print the command for each")
     p.add_argument("-q", "--quiet", action="store_true")
     a = p.parse_args(argv)
 
@@ -213,10 +322,14 @@ def main(argv=None) -> int:
     excitation = excitation_survey(files, cards, cfg, log, a.seconds)
 
     aliases = alias_report(excitation, cards, log)
+    plan = (group_plan(cards, excitation, cfg, log,
+                       a.condition if a.condition != 'ALL' else 'COND')
+            if a.groups else [])
 
     report = {
         "files": [str(f) for f in files],
         "aliasing": aliases,
+        "groups": plan,
         "leepa": a.leepa,
         "timebase": timebase.summary(),
         "calibration": calrep.summary(),

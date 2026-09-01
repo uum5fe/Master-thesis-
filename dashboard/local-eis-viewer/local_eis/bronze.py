@@ -257,12 +257,25 @@ def discover_files(cfg: Config) -> list[Path]:
     if not d.exists():
         raise SystemExit(f"bronze: --dat directory does not exist: {d}")
 
+    def _selected(found: list[Path]) -> list[Path]:
+        """Keep only the cards asked for, if any were."""
+        if not cfg.only_cards:
+            return found
+        kept = [f for f in found
+                if any(want.lower() in f.name.lower() for want in cfg.only_cards)]
+        if not kept:
+            raise SystemExit(
+                f"bronze: --cards {','.join(sorted(cfg.only_cards))} matched "
+                f"none of the {len(found)} file(s) in {d}:\n  "
+                + "\n  ".join(f.name for f in found))
+        return kept
+
     patterns = cfg.famos_patterns()
     files: list[Path] = []
     for pattern in patterns:
         files = sorted(d.glob(pattern))
         if files:
-            return files
+            return _selected(files)
 
     # Nothing matched a known convention. Take what is there, but keep the
     # condition: the run was asked for one.
@@ -272,6 +285,7 @@ def discover_files(cfg: Config) -> list[Path]:
             f"bronze: no FAMOS files in {d}\n"
             f"  tried: {', '.join(patterns)}")
 
+    every = _selected(every)
     cond = cfg.condition
     if not cond or cond == "ALL":
         return every
@@ -572,6 +586,79 @@ def timebase_report(cards: dict[str, CardInfo], cfg: Config,
     return TimebaseReport(fs=fs, stamps=stamps, header_offsets_s=offsets,
                           overlap_s=float(overlap) if stamped else float("nan"),
                           problems=problems, notes=notes)
+
+def consistent_groups(cards: dict[str, CardInfo],
+                      min_overlap_s: float = 1.0) -> list[dict]:
+    """Partition the cards into sets that CAN be evaluated together.
+
+    A set is evaluable when its cards share a sample rate and were all
+    recording at the same time.  Both are required and neither implies the
+    other, which is why splitting on one alone is not enough: on the 45 A
+    set, grouping by rate puts Karte_1 with Karte_2 and Karte_3 because all
+    three ran at 100 kHz -- and Karte_1 was armed fifteen minutes earlier
+    and had already stopped before the others began.
+
+    This exists because a folder is not a measurement.  When part of it is
+    evaluable, the honest thing is to say which part, rather than to refuse
+    the whole folder or to evaluate it as though it were one event.  Each
+    group covers fewer segments than the plate has; that is a real loss and
+    it is reported, not hidden.
+
+    Cards with no |NT stamp cannot be placed in time, so they are grouped by
+    rate alone and the group is marked `timed=False`.
+    """
+    by_rate: dict[float, list[str]] = {}
+    for stem, card in cards.items():
+        by_rate.setdefault(round(card.fs, 6), []).append(stem)
+
+    groups: list[dict] = []
+    for fs in sorted(by_rate):
+        stems = by_rate[fs]
+        stamped = [s for s in stems if cards[s].start_time is not None]
+        unstamped = [s for s in stems if cards[s].start_time is None]
+
+        if unstamped:
+            groups.append({
+                "cards": sorted(unstamped), "fs_hz": fs, "timed": False,
+                "overlap_s": float("nan"),
+                "n_segments": sum(cards[s].n_segments for s in unstamped),
+            })
+
+        # Greedy on start time: a card joins the open group while it still
+        # overlaps every member, otherwise it starts a new one.
+        for stem in sorted(stamped, key=lambda s: cards[s].start_time):
+            card = cards[stem]
+            start = card.start_time
+            stop_offset = card.duration_s
+            begin, end = start.timestamp(), start.timestamp() + stop_offset
+            placed = False
+            for group in groups:
+                if group.get("fs_hz") != fs or not group.get("timed"):
+                    continue
+                # The group's window is the intersection of its members', so
+                # a card joins only while it still overlaps every one of them.
+                overlap = min(group["_stop"], end) - max(group["_start"], begin)
+                if overlap >= min_overlap_s:
+                    group["cards"].append(stem)
+                    group["_start"] = max(group["_start"], begin)
+                    group["_stop"] = min(group["_stop"], end)
+                    placed = True
+                    break
+            if not placed:
+                groups.append({"cards": [stem], "fs_hz": fs, "timed": True,
+                               "_start": begin, "_stop": end})
+
+    out = []
+    for group in groups:
+        if group.get("timed"):
+            group["overlap_s"] = max(0.0, group.pop("_stop") - group.pop("_start"))
+            group["n_segments"] = sum(cards[s].n_segments
+                                      for s in group["cards"])
+        group["cards"] = sorted(group["cards"])
+        group["n_cards"] = len(group["cards"])
+        out.append(group)
+    out.sort(key=lambda g: (-g["n_cards"], -g.get("n_segments", 0)))
+    return out
 
 # ===========================================================================
 # 2b. Card alignment  (THE CARDS ARE ARMED SEPARATELY)

@@ -388,7 +388,11 @@ def merge(out_dir: Path, tags: list[str], target: Path) -> dict:
         # answer that question and silver's own table has to. Falling back to
         # the run tag keeps the column populated for a single-card run, where
         # the two are the same thing anyway.
-        wiring = {r["segment"]: r.get("card", "")
+        # silver records the card as its FILE STEM
+        # ("RO2612025-01_Current_45A_Test_01_Karte_3"), which is unreadable
+        # in a plot legend and in a table column. The tag says the same
+        # thing in eight characters.
+        wiring = {r["segment"]: card_tag(Path(r.get("card", "") or tag))
                   for r in _read(out_dir / tag / "silver"
                                  / "segments_summary.csv")}
 
@@ -519,7 +523,7 @@ def _cell_aggregate(spectra: list[dict], summary: list[dict]) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def plot(target: Path, title: str, f_min: float | None = None,
-         f_max: float | None = None) -> Path | None:
+         f_max: float | None = None, how: str = "") -> Path | None:
     """One Nyquist and one Bode over every segment of every card.
 
     `f_min`/`f_max` restrict what is DRAWN, not what was computed. The CSVs
@@ -624,8 +628,8 @@ def plot(target: Path, title: str, f_min: float | None = None,
         fig.text(0.5, 0.005, f"not in this band: {note}", ha="center",
                  fontsize=9, color="#b03030")
         print(f"  NOT in the band: {note}")
-    fig.suptitle(f"{title} — {len(by_seg)} segments, evaluated card by card"
-                 + band_text)
+    fig.suptitle(f"{title} — {len(by_seg)} segments"
+                 + (f", {how}" if how else "") + band_text)
     fig.tight_layout()
     path = target / "spectra_all_cards.png"
     fig.savefig(path, dpi=140)
@@ -718,7 +722,12 @@ def evaluate(condition: str, env: dict, a) -> int:
               f"more than one card; the first card kept them: "
               f"{', '.join(stats['duplicates'][:8])}")
 
-    image = plot(target, f"{leepa} / {label}", a.plot_f_min, a.plot_f_max)
+    how = (f"evaluated in {len(groups)} rate group(s): "
+           + ", ".join(f"{g.tag} ({len(g.cards)} card"
+                       f"{'s' if len(g.cards) > 1 else ''})" for g in groups)
+           if a.group == "rate" else "evaluated card by card")
+    image = plot(target, f"{leepa} / {label}", a.plot_f_min, a.plot_f_max,
+                 how)
     if image:
         print(f"  plot   : {image}")
     (target / "per_card_manifest.json").write_text(

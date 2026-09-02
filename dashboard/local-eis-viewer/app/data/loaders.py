@@ -144,7 +144,10 @@ def load_gold_silver(
             "zmodel_im_mohm_cm2": "z_im_model_mohm_cm2",
         })
         sp["segment"] = sp["segment"].astype(str)
-        run.spectra = _numeric(sp, {"segment"})
+        # "card" is written by the per-card evaluator (evaluate_per_card.py),
+        # which concatenates one silver table per acquisition card; it is a
+        # label such as "Karte_3", so it must not be coerced to a number.
+        run.spectra = _numeric(sp, {"segment", "card"})
     else:
         run.warnings.append("no silver/spectra_clean.csv - Nyquist and ECM unavailable")
 
@@ -157,7 +160,8 @@ def load_gold_silver(
         for col in ("seg_class", "tier", "fault", "flags"):
             if col in seg.columns:
                 seg[col] = seg[col].fillna("").astype(str)
-        run.segments = _numeric(seg, {"segment", "seg_class", "tier", "fault", "flags"})
+        run.segments = _numeric(
+            seg, {"segment", "seg_class", "tier", "fault", "flags", "card"})
     else:
         run.warnings.append("no gold/plate_summary.csv - heat maps unavailable")
 

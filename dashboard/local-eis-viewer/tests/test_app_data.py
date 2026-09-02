@@ -308,3 +308,62 @@ def test_a_case_sensitive_file_system_keeps_both_spellings(tmp_path):
     (tmp_path / "Leepa_2611976_Current_45A_Test_01_Karte_2.dat").touch()
     refs = FamosSource([tmp_path]).scan()
     assert len(refs[0].files) == 2
+
+
+# ---------------------------------------------------------------------------
+# per-card merged results
+# ---------------------------------------------------------------------------
+
+def _write_csv(path, fields, rows):
+    import csv
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _percard_condition(root):
+    """A condition folder as ``evaluate_per_card.py`` merges one.
+
+    The distinguishing feature is the extra ``card`` column: the merged tables
+    are a concatenation of one silver/gold pair per acquisition card, and the
+    column records which card each segment came from.
+    """
+    spectra_fields = ["segment", "freq_hz", "z_re_mohm_cm2", "z_im_mohm_cm2",
+                      "zmodel_re_mohm_cm2", "zmodel_im_mohm_cm2",
+                      "zmodel_sd_mohm_cm2", "sigma_rel", "card"]
+    gold_fields = ["segment", "class", "tier", "area_cm2", "cx_mm", "cy_mm",
+                   "R_ohmic_mohm_cm2", "R_pol_mohm_cm2", "card"]
+    spectra, gold = [], []
+    for segment, card in (("1", "Karte_1"), ("40", "Karte_3")):
+        for i, f in enumerate((10.0, 100.0, 1000.0, 4000.0)):
+            spectra.append(dict(zip(spectra_fields,
+                                    [segment, f, 100.0 + i, -20.0 - i,
+                                     100.0 + i, -20.0 - i, 1.0, 0.02, card])))
+        gold.append(dict(zip(gold_fields,
+                             [segment, "measured", "A", 8.0, 10.0, 5.0,
+                              100.0, 40.0, card])))
+    _write_csv(root / "silver" / "spectra_clean.csv", spectra_fields, spectra)
+    _write_csv(root / "gold" / "plate_summary.csv", gold_fields, gold)
+    return root
+
+
+def test_gold_silver_reads_a_per_card_merge(tmp_path):
+    d = _percard_condition(tmp_path / "2612025" / "45A_percard")
+    assert loaders.detect_layout(d) == "gold_silver"
+
+    run = loaders.load_gold_silver(d, "2612025", "45A_percard")
+    assert run.warnings == []
+    assert len(run.spectra) == 8
+    assert sorted(run.spectra["segment"].unique()) == ["1", "40"]
+    # the card label is a name, not a number: coercing it would blank the column
+    assert sorted(run.spectra["card"].unique()) == ["Karte_1", "Karte_3"]
+    assert sorted(run.segments["card"].unique()) == ["Karte_1", "Karte_3"]
+
+
+def test_per_card_condition_is_discovered(tmp_path):
+    _percard_condition(tmp_path / "2612025" / "45A_percard")
+    refs = ResultsSource([str(tmp_path)]).scan()
+    assert [(r.measurement_id, r.condition) for r in refs] \
+        == [("2612025", "45A_percard")]

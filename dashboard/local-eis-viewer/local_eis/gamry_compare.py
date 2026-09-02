@@ -79,6 +79,12 @@ import utils
 
 #: Current setpoint in the file name, e.g. "..._HFR_102_CurrVal_60.dta".
 _CURRENT_RE = re.compile(r"CurrVal[_-]?(\d+(?:[.,]\d+)?)", re.I)
+#: A bare setpoint used as the whole name or the TITLE label: "45A.DTA",
+#: "TITLE LABEL 450A". Not anchored to the start, so "RO2612025_150A.DTA"
+#: is read too, but the A must not be followed by more letters or digits or
+#: "45Amps_2" would read as 45 and "1A5" as 1.
+_BARE_CURRENT_RE = re.compile(r"(?:^|[^0-9A-Za-z])(\d+(?:[.,]\d+)?)\s*A"
+                              r"(?![0-9A-Za-z])", re.I)
 #: Absolute start time in the Gamry header.
 _START_RE = re.compile(r"STARTTIME\s+LABEL\s+([\d.]+\s+[\d:]+)")
 #: The order number as it appears in a bench file name, e.g. "RO2611976-01".
@@ -186,13 +192,43 @@ def _hf_extrapolated(freq: np.ndarray, Z: np.ndarray, n_top: int = 5) -> float:
     return float(a)
 
 
+def _setpoint(name: str, meta: dict) -> float | None:
+    """The DC current this sweep was taken at, in amperes.
+
+    Three sources, most specific first, because no single one is always
+    present:
+
+      1. ``CurrVal_150`` in the file name -- the bench's own convention.
+      2. A bare setpoint in the name, which is how a sweep saved by hand
+         gets called: "45A.DTA", "RO2612025_150A.DTA".
+      3. The Gamry ``TITLE`` label, which the operator types into the Test
+         Identifier box and which the framework stores in the header.
+
+    ``IDCREQ`` is deliberately NOT used even though it looks like the right
+    field. On a galvanostatic sweep driven through a booster it reads
+    0,00000E+000 -- the DC comes from the load bank, not the potentiostat,
+    so the potentiostat records that it requested none. Trusting it would
+    label every one of these sweeps 0 A.
+    """
+    for text, pattern in ((name, _CURRENT_RE),
+                          (name, _BARE_CURRENT_RE),
+                          (str(meta.get("TITLE", "")), _CURRENT_RE),
+                          (str(meta.get("TITLE", "")), _BARE_CURRENT_RE)):
+        m = pattern.search(text)
+        if m:
+            try:
+                return float(m.group(1).replace(",", "."))
+            except ValueError:
+                continue
+    return None
+
+
 def read_cell_sweep(path) -> CellSweep:
     path = Path(path)
     sweep = gamry_dta.read_dta(path).sorted()
     text = path.read_text(encoding="latin-1", errors="ignore")
 
-    m = _CURRENT_RE.search(path.name)
-    current = float(m.group(1).replace(",", ".")) if m else None
+    current = _setpoint(path.name, sweep.meta)
 
     started = None
     m = _START_RE.search(text)

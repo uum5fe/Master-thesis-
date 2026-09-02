@@ -144,10 +144,13 @@ def load_gold_silver(
             "zmodel_im_mohm_cm2": "z_im_model_mohm_cm2",
         })
         sp["segment"] = sp["segment"].astype(str)
-        # "card" is written by the per-card evaluator (evaluate_per_card.py),
-        # which concatenates one silver table per acquisition card; it is a
-        # label such as "Karte_3", so it must not be coerced to a number.
-        run.spectra = _numeric(sp, {"segment", "card"})
+        # Both are written by the split evaluator (evaluate_per_card.py),
+        # which concatenates one silver table per group of cards: "card" is
+        # the acquisition card a segment was wired to ("Karte_3") and "run"
+        # is the sub-run that produced it ("100kHz", or a card tag under
+        # --group card). Labels, both of them, so neither may be coerced to
+        # a number -- doing so blanks the column silently.
+        run.spectra = _numeric(sp, {"segment", "card", "run"})
     else:
         run.warnings.append("no silver/spectra_clean.csv - Nyquist and ECM unavailable")
 
@@ -161,7 +164,8 @@ def load_gold_silver(
             if col in seg.columns:
                 seg[col] = seg[col].fillna("").astype(str)
         run.segments = _numeric(
-            seg, {"segment", "seg_class", "tier", "fault", "flags", "card"})
+            seg, {"segment", "seg_class", "tier", "fault", "flags", "card",
+                  "run"})
     else:
         run.warnings.append("no gold/plate_summary.csv - heat maps unavailable")
 
@@ -171,7 +175,7 @@ def load_gold_silver(
     if sil_path.is_file():
         sil = _read_table(sil_path)
         sil["segment"] = sil["segment"].astype(str)
-        sil = _numeric(sil, {"segment", "card", "tier", "flags"})
+        sil = _numeric(sil, {"segment", "card", "run", "tier", "flags"})
         if run.segments.empty:
             run.segments = sil.rename(columns={"R_ohmic_mohm_cm2": "R_ohmic",
                                                "R_pol_mohm_cm2": "R_pol"})

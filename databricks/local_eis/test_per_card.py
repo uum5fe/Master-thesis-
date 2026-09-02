@@ -183,3 +183,76 @@ def test_inferred_segments_are_not_merged_in(tmp_path) -> None:
              "z_im_mohm_cm2": "-5"}])
     stats = P.merge(tmp_path, ["Karte_1"], tmp_path / "merged")
     assert stats["n_segments"] == 1, "the inferred segment must not be kept"
+
+
+# ---------------------------------------------------------------------------
+# the plotted band
+# ---------------------------------------------------------------------------
+
+def _spectra(path: Path, rows) -> None:
+    import csv
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(
+            fh, fieldnames=["segment", "freq_hz", "z_re_mohm_cm2",
+                            "z_im_mohm_cm2", "card"])
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def test_the_band_restricts_the_plot_and_not_the_data(tmp_path) -> None:
+    """Narrowing the view must be reversible; narrowing the analysis is not.
+
+    Filtering at plot time means a different band is one more command, not
+    another pass over the cards.
+    """
+    pytest.importorskip("matplotlib")
+    rows = [{"segment": "1", "freq_hz": f, "z_re_mohm_cm2": 60.0,
+             "z_im_mohm_cm2": -5.0, "card": "Karte_1"}
+            for f in (10.0, 100.0, 1000.0, 4500.0, 20000.0)]
+    _spectra(tmp_path / "silver" / "spectra_clean.csv", rows)
+
+    image = P.plot(tmp_path, "test", None, 5000.0)
+    assert image is not None and image.is_file()
+    # the source table is untouched
+    kept = _read_csv(tmp_path / "silver" / "spectra_clean.csv")
+    assert len(kept) == 5
+
+
+def _read_csv(path):
+    import csv
+    with path.open(newline="", encoding="utf-8-sig") as fh:
+        return list(csv.DictReader(fh))
+
+
+def test_a_band_with_nothing_in_it_reports_what_the_cards_reach(tmp_path,
+                                                                capsys):
+    """Silence is not an answer; how far each card got is.
+
+    A card whose ceiling sits below the window has nothing to draw, and the
+    reason is its ceiling -- on this plate, set beneath where an interferer
+    folds into its band.
+    """
+    pytest.importorskip("matplotlib")
+    rows = [{"segment": "1", "freq_hz": 100.0, "z_re_mohm_cm2": 60.0,
+             "z_im_mohm_cm2": -5.0, "card": "Karte_4"}]
+    _spectra(tmp_path / "silver" / "spectra_clean.csv", rows)
+
+    assert P.plot(tmp_path, "test", 4000.0, 5000.0) is None
+    out = capsys.readouterr().out
+    assert "no point falls inside" in out
+    assert "Karte_4 to 100 Hz" in out
+
+
+def test_a_card_absent_from_the_band_is_named_on_the_figure(tmp_path, capsys):
+    """A legend that simply lacks a card looks like a card that was not run."""
+    pytest.importorskip("matplotlib")
+    rows = [{"segment": "1", "freq_hz": 4500.0, "z_re_mohm_cm2": 60.0,
+             "z_im_mohm_cm2": -5.0, "card": "Karte_2"},
+            {"segment": "9", "freq_hz": 900.0, "z_re_mohm_cm2": 61.0,
+             "z_im_mohm_cm2": -6.0, "card": "Karte_4"}]
+    _spectra(tmp_path / "silver" / "spectra_clean.csv", rows)
+
+    assert P.plot(tmp_path, "test", 4000.0, 5000.0) is not None
+    out = capsys.readouterr().out
+    assert "NOT in the band" in out and "Karte_4 reaches only 900 Hz" in out

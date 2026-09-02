@@ -306,8 +306,20 @@ def merge(out_dir: Path, tags: list[str], target: Path) -> dict:
 # the plot
 # ---------------------------------------------------------------------------
 
-def plot(target: Path, title: str) -> Path | None:
-    """One Nyquist and one Bode over every segment of every card."""
+def plot(target: Path, title: str, f_min: float | None = None,
+         f_max: float | None = None) -> Path | None:
+    """One Nyquist and one Bode over every segment of every card.
+
+    `f_min`/`f_max` restrict what is DRAWN, not what was computed. The CSVs
+    keep every point either way, so narrowing the view is reversible and
+    costs nothing -- as against narrowing the analysis, which means running
+    the cards again.
+
+    A band also makes the Nyquist honest about what it is: with a ceiling of
+    a few kHz the arc is a partial arc, and drawing it against an axis that
+    stops there says so, where an autoscaled full-band plot invites the eye
+    to complete a semicircle that was never measured.
+    """
     rows = _read(target / "silver" / "spectra_clean.csv")
     if not rows:
         return None
@@ -323,6 +335,8 @@ def plot(target: Path, title: str) -> Path | None:
 
     by_seg: dict[str, list[tuple[float, float, float]]] = {}
     card_of: dict[str, str] = {}
+    reach: dict[str, float] = {}          # highest frequency each card has
+    dropped = 0
     for row in rows:
         try:
             f = float(row["freq_hz"])
@@ -331,11 +345,23 @@ def plot(target: Path, title: str) -> Path | None:
         except (KeyError, ValueError):
             continue
         seg = row["segment"]
+        card = row.get("card", "")
+        reach[card] = max(reach.get(card, 0.0), f)
+        if (f_min is not None and f < f_min) or (f_max is not None and f > f_max):
+            dropped += 1
+            continue
         by_seg.setdefault(seg, []).append((f, re_, im))
-        card_of[seg] = row.get("card", "")
+        card_of[seg] = card
 
     if not by_seg:
+        band = f"{f_min or 0:.0f}-{f_max or 0:.0f} Hz"
+        print(f"  no point falls inside {band}. The cards reach: "
+              + ", ".join(f"{c} to {r:.0f} Hz" for c, r in sorted(reach.items())))
         return None
+    if dropped:
+        print(f"  plotting {sum(len(v) for v in by_seg.values())} of "
+              f"{sum(len(v) for v in by_seg.values()) + dropped} points "
+              f"({dropped} outside the band; the CSVs keep all of them)")
     cards = sorted(set(card_of.values()))
     # One colour per CARD, not per segment: seventy-two colours are not
     # distinguishable, and the question this plot answers is whether the
@@ -367,7 +393,27 @@ def plot(target: Path, title: str) -> Path | None:
                           label=f"{c}  ({sum(1 for s in card_of if card_of[s] == c)} seg)")
                for c in cards]
     ax[0].legend(handles=handles, fontsize=8, loc="best")
-    fig.suptitle(f"{title} — {len(by_seg)} segments, evaluated card by card")
+
+    # A CARD WITH NOTHING IN THE BAND IS A RESULT, NOT AN OMISSION. It means
+    # that card's analysis stopped below the window -- on this plate because
+    # an interferer folds into its band and its ceiling was set beneath the
+    # fold -- and a legend that simply lacks it looks like a card that was
+    # not run.
+    absent = [c for c in sorted(reach) if c and c not in cards]
+    band_text = ""
+    if f_min is not None and f_max is not None:
+        band_text = f"  |  {f_min:.0f}-{f_max:.0f} Hz"
+    elif f_max is not None:
+        band_text = f"  |  up to {f_max:.0f} Hz"
+    elif f_min is not None:
+        band_text = f"  |  from {f_min:.0f} Hz"
+    if absent:
+        note = "; ".join(f"{c} reaches only {reach[c]:.0f} Hz" for c in absent)
+        fig.text(0.5, 0.005, f"not in this band: {note}", ha="center",
+                 fontsize=9, color="#b03030")
+        print(f"  NOT in the band: {note}")
+    fig.suptitle(f"{title} — {len(by_seg)} segments, evaluated card by card"
+                 + band_text)
     fig.tight_layout()
     path = target / "spectra_all_cards.png"
     fig.savefig(path, dpi=140)
@@ -438,7 +484,7 @@ def evaluate(condition: str, env: dict, a) -> int:
               f"more than one card; the first card kept them: "
               f"{', '.join(stats['duplicates'][:8])}")
 
-    image = plot(target, f"{leepa} / {label}")
+    image = plot(target, f"{leepa} / {label}", a.plot_f_min, a.plot_f_max)
     if image:
         print(f"  plot   : {image}")
     (target / "per_card_manifest.json").write_text(
@@ -469,6 +515,12 @@ def main(argv=None) -> int:
     p.add_argument("--f-max", type=float, default=None,
                    help="one analysis ceiling in Hz for EVERY card. Leave "
                         "unset and each card uses 0.45 * its own rate")
+    p.add_argument("--plot-f-min", type=float, default=None,
+                   help="lowest frequency to DRAW. The CSVs keep every point "
+                        "regardless, so this is a view and not a re-run")
+    p.add_argument("--plot-f-max", type=float, default=None,
+                   help="highest frequency to DRAW, e.g. 5000 for a Nyquist "
+                        "that stops at 5 kHz")
     p.add_argument("--interferer-hz", type=float, default=None,
                    help="a known interference frequency, e.g. 45996. Each "
                         "card's ceiling is then set below where that "

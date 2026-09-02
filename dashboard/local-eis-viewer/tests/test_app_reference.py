@@ -388,3 +388,48 @@ def test_the_selected_plate_is_the_one_actually_used(tmp_path, monkeypatch):
     assert seen == ["gen2_r2d2_naboo_72"], (
         "the plate the sidebar selected must be the one looked up, not "
         "always the registry default")
+
+
+# ---------------------------------------------------------------------------
+# matching a run to its reference sweep
+# ---------------------------------------------------------------------------
+
+class _Sweep:
+    def __init__(self, current_a: float) -> None:
+        self.current_a = float(current_a)
+
+    @property
+    def condition(self) -> str:
+        i = int(round(self.current_a))
+        return (f"{i}A" if abs(self.current_a - i) < 1e-9
+                else f"{self.current_a:g}A")
+
+
+SWEEPS = [_Sweep(45), _Sweep(60), _Sweep(150), _Sweep(450)]
+
+
+def test_the_exact_condition_still_matches():
+    assert reference.match_sweep(SWEEPS, "150A").current_a == 150.0
+
+
+def test_a_processing_suffix_does_not_hide_the_setpoint():
+    """Splitting a mixed-rate plate names the folder 45A_percard.
+
+    It is the same cell at the same 45 A; the suffix records how the LOCAL
+    data was processed, which the reference instrument knows nothing about.
+    """
+    for label in ("45A_percard", "45A_g1_50kHz", "45A_100kHz", "45 A"):
+        match = reference.match_sweep(SWEEPS, label)
+        assert match is not None and match.current_a == 45.0, label
+
+
+def test_450A_is_not_matched_to_the_45A_sweep():
+    """The setpoint is parsed as a number, never compared as a prefix."""
+    assert reference.match_sweep(SWEEPS, "450A_percard").current_a == 450.0
+    assert reference.match_sweep([_Sweep(45)], "450A_percard") is None
+
+
+def test_a_setpoint_with_no_sweep_is_refused_not_approximated():
+    assert reference.match_sweep(SWEEPS, "300A_10kHz") is None
+    assert reference.match_sweep(SWEEPS, "OCV") is None
+    assert reference.match_sweep([], "45A") is None

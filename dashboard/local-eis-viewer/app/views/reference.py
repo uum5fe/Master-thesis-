@@ -16,6 +16,7 @@ What agreement means is that the local map is correctly SCALED.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import numpy as np
@@ -149,6 +150,48 @@ _HINT = (
 # for a RunRef field that does not exist; every test passed, because the only
 # code that could raise was unreachable from outside the Dash app.
 
+#: A run label that begins with a current setpoint: "45A", "45A_percard",
+#: "150A_g1_50kHz". The setpoint is the part a reference sweep can be
+#: matched on; everything after it names how the run was PROCESSED.
+#: `\b` would NOT do here: "_" is a word character, so "45A_percard" has no
+#: boundary after the A and the setpoint would go unrecognised in exactly the
+#: labels this exists to read.
+_SETPOINT = re.compile(r"^(\d+(?:[.,]\d+)?)\s*A(?![A-Za-z0-9])",
+                       re.IGNORECASE)
+
+
+def match_sweep(sweeps, condition: str):
+    """The reference sweep for this run, exactly or by its setpoint.
+
+    A run folder is not always named for the setpoint alone. Splitting a
+    mixed-rate plate writes "45A_percard"; a run limited to one card group
+    may be labelled "45A_g1_50kHz". Those are all the SAME cell at the SAME
+    45 A, so the same Gamry sweep is the right reference for each -- the
+    suffix records how the local data was processed, which is nothing the
+    reference instrument knows or cares about.
+
+    Matching is still on the setpoint and never on a prefix: "45A_percard"
+    resolves to 45 A, and "450A" does not match the 45 A sweep, because the
+    setpoint is parsed as a NUMBER terminated by the A rather than compared
+    as text.
+    """
+    exact = next((sw for sw in sweeps if sw.condition == condition), None)
+    if exact is not None:
+        return exact
+    m = _SETPOINT.match(str(condition).strip())
+    if m is None:
+        return None
+    try:
+        want = float(m.group(1).replace(",", "."))
+    except ValueError:
+        return None
+    for sw in sweeps:
+        current = getattr(sw, "current_a", None)
+        if current is not None and abs(float(current) - want) < 1e-6:
+            return sw
+    return None
+
+
 def _live_comparison(selection):
     """Compute the comparison now, from what is already on disk.
 
@@ -196,7 +239,7 @@ def _live_comparison(selection):
                         "EIS_GAMRY_ROOT to the folder holding them.")
 
     condition = selection.get("condition", "")
-    match = next((sw for sw in sweeps if sw.condition == condition), None)
+    match = match_sweep(sweeps, condition)
     if match is None:
         have = ", ".join(sorted({sw.condition for sw in sweeps})) or "none"
         return [], {}, (f"No sweep at {condition}. The sweeps found cover: "

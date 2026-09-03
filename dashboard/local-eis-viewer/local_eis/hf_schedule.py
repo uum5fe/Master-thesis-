@@ -806,6 +806,8 @@ class HFSchedule:
     stack: dict = field(default_factory=dict)
     n_rejected: int = 0
     n_off_ladder: int = 0
+    pruned_hz: list = field(default_factory=list)
+    rejected_hz: list = field(default_factory=list)
 
     def as_steps(self) -> list:
         return list(self.steps)
@@ -818,6 +820,12 @@ class HFSchedule:
             "n_predicted_verified": len(self.predicted),
             "n_predicted_rejected": self.n_rejected,
             "n_off_ladder_pruned": self.n_off_ladder,
+            # the frequencies themselves, so "why does the band stop here"
+            # can be answered from the manifest instead of another run
+            "off_ladder_hz": [round(v, 4) for v in self.pruned_hz],
+            "predicted_verified_hz": sorted(round(s.freq, 4)
+                                            for s in self.predicted),
+            "predicted_rejected_hz": [round(v, 4) for v in self.rejected_hz],
             "f_min_hz": float(min(f)) if f else None,
             "f_max_hz": float(max(f)) if f else None,
             "ladder_ok": bool(self.ladder.ok),
@@ -862,7 +870,8 @@ def recover_schedule(chans, fs: float, f_lo: float | None = None,
                      f_hi: float | None = None, ppd: int = 12,
                      min_snr_db: float = 5.0, sigma_rel_max: float = 0.60,
                      extend: bool = True, snap_ppd: bool = True,
-                     ladder_tol: float = 0.02, uc_ref: np.ndarray | None = None,
+                     ladder_tol: float = 0.02, prune: bool = False,
+                     uc_ref: np.ndarray | None = None,
                      verbose: bool = False, log=None) -> HFSchedule:
     """Recover one card's excitation schedule from its segment channels.
 
@@ -947,13 +956,35 @@ def recover_schedule(chans, fs: float, f_lo: float | None = None,
          + f", f0={lad.f0:.4g} Hz, fitted on {lad.n_fitted_on} confident "
            f"step(s), median residual {100 * lad.resid:.3f} %")
 
-    # ---- prune off-ladder detections ------------------------------------
+    # ---- prune off-ladder detections, only if asked ----------------------
+    # OFF BY DEFAULT, AND THAT IS DELIBERATE.
+    # Pruning is the one thing in this module that can REMOVE a step the
+    # shipped pipeline would have kept, so it is the one thing that can make
+    # a run worse.  It did, on real 45 A data: a band that reached 550 Hz
+    # came back reaching 375 Hz.  A detection is a measurement; the ladder is
+    # a model fitted to a handful of low-frequency steps and extrapolated
+    # upward, and where the two disagree at the top of the band the model is
+    # usually the one that is wrong -- that is exactly where its extrapolation
+    # error is largest.
+    #
+    # Left off, this module is purely additive: it can only find steps the
+    # old path missed, never lose one it found.  Turn it on (config
+    # `hf_ladder_prune`) when the record carries a continuous interferer that
+    # the detector keeps latching onto -- that is the case ladder membership
+    # handles and an SNR gate provably cannot -- and check
+    # `pruned_hz` in the summary to see what it took.
     on = prune_off_ladder([s.freq for s in detected], lad, tol=ladder_tol)
-    if not np.all(on):
-        dropped = [s.freq for s, k in zip(detected, on) if not k]
+    dropped = [s.freq for s, k in zip(detected, on) if not k]
+    out.pruned_hz = [float(v) for v in dropped]
+    if dropped and prune:
         out.n_off_ladder = len(dropped)
         out.steps = [s for s, k in zip(detected, on) if k]
         _say(f"    ladder pruned {len(dropped)} off-ladder detection(s): "
+             + ", ".join(f"{v:.1f} Hz" for v in dropped[:6])
+             + (" ..." if len(dropped) > 6 else ""))
+    elif dropped:
+        _say(f"    {len(dropped)} detection(s) sit off the fitted ladder and "
+             f"were KEPT (hf_ladder_prune is off): "
              + ", ".join(f"{v:.1f} Hz" for v in dropped[:6])
              + (" ..." if len(dropped) > 6 else ""))
 
@@ -1002,6 +1033,7 @@ def recover_schedule(chans, fs: float, f_lo: float | None = None,
                           _stationarity)
         if st is None:
             out.n_rejected += 1
+            out.rejected_hz.append(float(f_pred))
             continue
         out.predicted.append(st)
         out.steps.append(st)

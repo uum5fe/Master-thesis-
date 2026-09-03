@@ -310,9 +310,52 @@ def test_the_ensemble_reaches_higher_than_the_cell_voltage_channel():
     new = hits(H.recover_schedule(chans, fs, f_lo=1.0, f_hi=0.45 * fs,
                                   ppd=12, min_snr_db=5.0).as_steps())
 
+    # THE GUARANTEE, with pruning off: never fewer true steps, never a lower
+    # top.  This is the contract that matters, because the failure that set
+    # the default was a REGRESSION -- a real 45 A band that reached 550 Hz
+    # coming back at 375 Hz.  Anything that can only add cannot do that.
     assert new[0] >= old[0]          # at least as many true steps ...
-    assert new[2] >= old[2]          # ... reaching at least as high ...
-    assert new[1] <= old[1]          # ... and no more spurious ones
+    assert new[2] >= old[2]          # ... reaching at least as high
+
+
+def test_pruning_trades_reach_for_purity_and_is_therefore_opt_in():
+    """What `hf_ladder_prune` buys, and what it costs, in one place.
+
+    Detecting on the ensemble finds more of the sweep AND more junk, because
+    a more sensitive detector is more sensitive to everything.  Ladder
+    membership removes the junk -- it is the only test that rejects a
+    continuous interferer STRONGER than a real rung, which no SNR gate can
+    do.  But it is a model extrapolated upward from low-frequency steps, so
+    at the top of the band it also removes real ones.
+
+    Off is the right default: silver still has to gate every point per
+    segment, so a spurious SCHEDULE step is a point that gets rejected later,
+    whereas a pruned real step is a measurement that never happens at all.
+    """
+    from eis_local import detect_schedule
+
+    freqs, uc, chans, fs = _galvanostatic_card()
+
+    def hits(steps):
+        got = [s.freq for s in steps]
+        return (sum(1 for ft in freqs
+                    if any(abs(v / ft - 1) < 0.02 for v in got)),
+                sum(1 for v in got
+                    if not any(abs(v / ft - 1) < 0.02 for ft in freqs)),
+                max(got) if got else 0.0)
+
+    kw = dict(f_lo=1.0, f_hi=0.45 * fs, ppd=12, min_snr_db=5.0, uc_ref=uc)
+    keep = H.recover_schedule(chans, fs, prune=False, **kw)
+    cut = H.recover_schedule(chans, fs, prune=True, **kw)
+
+    h_keep, h_cut = hits(keep.as_steps()), hits(cut.as_steps())
+    assert h_cut[1] < h_keep[1]                  # pruning removes junk ...
+    assert h_cut[0] <= h_keep[0]                 # ... and can cost real steps
+
+    # off by default, and it still reports what it WOULD have taken, so the
+    # decision can be made from a run rather than from a guess
+    assert keep.n_off_ladder == 0
+    assert keep.summary()["off_ladder_hz"]
 
 
 def test_the_extension_invents_nothing_outside_the_recorded_band():

@@ -580,6 +580,7 @@ def consensus_schedule(files: list[Path], cards: dict[str, CardInfo],
                 extend=getattr(cfg, "hf_ladder_extend", True),
                 snap_ppd=getattr(cfg, "hf_ladder_snap_ppd", True),
                 ladder_tol=getattr(cfg, "hf_ladder_tol", 0.02),
+                prune=getattr(cfg, "hf_ladder_prune", False),
                 # the old path's trace is pooled in, not replaced: nothing
                 # the shipped pipeline would have found can be lost
                 uc_ref=fam.channel(cards[stem].ref_name),

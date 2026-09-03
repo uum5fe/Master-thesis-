@@ -177,7 +177,18 @@ try:
     dbutils.widgets.dropdown('leepa_id', _default, AVAILABLE_ORDERS, 'Order ID (Leepa)')
     dbutils.widgets.dropdown('condition', 'ALL', ['ALL'] + CONDITIONS, 'Condition')
     dbutils.widgets.text('f_min_hz', '0.15', 'F min (Hz)')
-    dbutils.widgets.text('f_max_hz', '4500.0', 'F max (Hz)')
+    # THE WIDGET OVERRIDES config.f_max_hz, SO IT HAS TO MOVE TOO.
+    # A saved widget keeps its old value forever, so raising the default
+    # alone would leave every existing copy of this notebook capped at
+    # 4500 Hz -- which is the constant the whole high-frequency recovery
+    # exists to get past, and the run would look unchanged.  Drop the stale
+    # widget first so the new default takes.  f_hi_frac_fs * fs then binds,
+    # as intended: 22.5 kHz at fs = 50 kHz, 45 kHz at 100 kHz.
+    try:
+        dbutils.widgets.remove('f_max_hz')
+    except Exception:
+        pass
+    dbutils.widgets.text('f_max_hz', '30000.0', 'F max (Hz)')
     dbutils.widgets.dropdown('stop_after', 'gold', ['bronze', 'silver', 'gold'], 'Stop after')
     dbutils.widgets.text('gain_file', '', 'Chain-response CSV (optional)')
     dbutils.widgets.text('gamry_dir', str(GAMRY_ROOT),
@@ -208,7 +219,7 @@ BENCH_LOG = _w('bench_log').strip()
 LEEPA = _w('leepa_id', _default)
 COND_FILTER = _w('condition', 'ALL')
 F_MIN = float(_w('f_min_hz', '0.15'))
-F_MAX = float(_w('f_max_hz', '4500.0'))
+F_MAX = float(_w('f_max_hz', '30000.0'))
 STOP_AFTER = _w('stop_after', 'gold')
 
 # Select the plate for the whole session BEFORE anything reads geom.SEGMENTS.

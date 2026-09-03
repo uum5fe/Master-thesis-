@@ -299,6 +299,18 @@ class Config:
     # rungs then verify.
     hf_ladder_snap_ppd: bool = True  # snap the fitted spacing to an integer
     hf_ladder_tol: float = 0.02      # relative window for ladder membership
+    # OFF BY DEFAULT.  Pruning is the only part of the ensemble path that can
+    # REMOVE a step the old pipeline would have kept, so it is the only part
+    # that can make a run worse -- and it did, on real 45 A data: a band that
+    # reached 550 Hz came back reaching 375 Hz.  A detection is a measurement;
+    # the ladder is a model fitted on a handful of low-frequency steps and
+    # extrapolated upward, and at the top of the band, where its extrapolation
+    # error is largest, the model is the one more likely to be wrong.  Left
+    # off, the ensemble path is purely additive.  Turn it on for a record with
+    # a continuous interferer the detector keeps latching onto -- the one case
+    # ladder membership handles and an SNR gate provably cannot -- and read
+    # off_ladder_hz in the manifest to see what it took.
+    hf_ladder_prune: bool = False    # drop detections that miss the ladder
     # Averaging SEGMENT impedances across cards is wrong -- they are
     # different segments.  Averaging the five UC channels is not: they are
     # five measurements of one cell voltage, with uncorrelated front-end

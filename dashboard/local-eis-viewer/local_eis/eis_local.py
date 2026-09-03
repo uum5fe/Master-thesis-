@@ -74,7 +74,15 @@ from pathlib import Path
 import numpy as np
 
 import r2d2_geometry as geom
+# hf_schedule is imported at module level; it imports eis_local only inside
+# its own functions, so the cycle never closes at import time.
+import hf_schedule
 from eis_validation import estimate_delay, lin_kk, z_hit
+
+# A step whose tone is genuinely absent must fail whatever its dwell length,
+# because sigma_rel alone would accept pure noise given enough samples.  This
+# is that backstop, not a quality gate; the quality gate is sigma_rel_max.
+SNR_ABSOLUTE_FLOOR_DB = -20.0
 
 T_FALLBACK_C = 58.4          # used only if the temperature channels are unusable
 
@@ -553,8 +561,35 @@ class Step:
     thd: float
     stationarity: float  # spread of the phasor over three sub-windows
 
-    def valid(self, min_snr=8.0, max_thd=0.10, max_drift=0.15) -> bool:
-        return (np.isfinite(self.snr_db) and self.snr_db >= min_snr
+    def valid(self, min_snr=8.0, max_thd=0.10, max_drift=0.15,
+              sigma_rel_max: float = 0.60) -> bool:
+        """Is this step usable?
+
+        A PHASOR'S PRECISION IS N*gamma, NOT gamma.  `snr_db` here is the one
+        `fit3` reports: the tone amplitude over the residual rms across the
+        whole Nyquist band.  That number says nothing about how well the
+        phasor is determined, because a long dwell beats the noise down and a
+        short one does not.  Rife & Boorstyn give sigma_A/A >= sqrt(1/(N
+        gamma)), so the criterion has to fold in the dwell length -- which is
+        exactly what config.py already argues in its comment above
+        `sigma_rel_max`.  The criterion was simply being applied in silver,
+        after bronze had already thrown the step away in `detect_schedule`.
+
+        Measured on RO2612025-01 card 4 at 45 A: of 23 rungs located above
+        100 Hz, 10 pass the flat 5 dB gate and all 23 pass sigma_rel_max =
+        0.60, with sigma_rel between 0.3 % and 23 %.  The 11.95 kHz step
+        reports -1.5 dB and has N*gamma = 2459 -- a 2.0 % phasor, discarded
+        by a gate that was never meant to decide this.
+
+        `min_snr` is kept as a floor against pure garbage, an order of
+        magnitude below where it used to sit, so that a step with no tone at
+        all still fails: sigma_rel alone would accept it if the dwell were
+        long enough.
+        """
+        floor = min(min_snr, SNR_ABSOLUTE_FLOOR_DB)
+        n = int(self.stop - self.start)
+        return (np.isfinite(self.snr_db) and self.snr_db >= floor
+                and hf_schedule.crlb_usable(self.snr_db, n, sigma_rel_max)
                 and (not np.isfinite(self.thd) or self.thd <= max_thd)
                 and (not np.isfinite(self.stationarity)
                      or self.stationarity <= max_drift))

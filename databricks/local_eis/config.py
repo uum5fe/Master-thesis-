@@ -216,8 +216,19 @@ class Config:
     # bronze.py now finds the schedule once, globally, and silver.py only ever
     # fits at known frequencies, the usable ceiling is set by signal amplitude
     # rather than by the search.
+    #
+    # THE CEILING WAS THE CONFIG CONSTANT, NOT NYQUIST.  A real card header
+    # from the campaign reads dx = 1.0e-5 s, i.e. fs = 100 kHz on 16
+    # channels, so f_hi(fs) = min(f_max_hz, 0.45*fs) = min(4500, 45000) =
+    # 4500 Hz: the converter had 45 kHz of headroom it was never asked for.
+    # On RO2612025-01 card 4 (fs = 50 kHz) the Gamry band recorded in the
+    # file runs to 23.9 kHz while the pipeline stopped at 7.47 Hz.  Raising
+    # this is NECESSARY BUT NOT SUFFICIENT -- on its own it took that card
+    # from 11 recovered steps to 13, with the same 7.47 Hz top.  What
+    # recovers the band is hf_schedule (see hf_use_ensemble below); this
+    # constant only stops binding before it gets the chance.
     f_min_hz: float = 0.15
-    f_max_hz: float = 4500.0
+    f_max_hz: float = 30000.0
     f_hi_frac_fs: float = 0.45       # detection ceiling as a fraction of fs
     ppd: int = 12                    # points per decade of the detection grid
 
@@ -251,6 +262,49 @@ class Config:
     # the real signal, so it is not a close call in either direction.
     align_min_corr: float = 0.05        # absolute floor against pure garbage
     align_min_prominence: float = 25.0  # robust sigma above the background
+
+    # ---- high-frequency schedule recovery (bronze, hf_schedule.py) --------
+    # The blind detector used to be run on the card's REFERENCE channel, the
+    # UC* cell-voltage channel with the largest standard deviation.  The
+    # sweep is galvanostatic, so the amplitude arriving there is
+    # |i_ac| * |Z_cell(f)|, and |Z_cell| falls by an order of magnitude from
+    # the bottom of the band to its ~45 mOhm*cm2 minimum near 8 kHz.  The
+    # detector was being asked to find a tone exactly where the cell had
+    # removed it -- which no value of min_snr_db can undo.
+    #
+    # The SEGMENT channels measure current density, and current is what the
+    # sweep imposes, so their tone amplitude is flat in frequency.  Stacking
+    # the ~14 of them on a card adds the tone coherently and the noise in
+    # power.  Measured on RO2612025-01 card 4 at 45 A: +11.2 dB narrowband
+    # over UC2 above 1 kHz, and the recovered band went 11 -> 21 steps
+    # (0.478 .. 189 Hz) on the stack alone, 42 steps (0.478 .. 18.9 kHz)
+    # with the ladder extension below.
+    #
+    # STACK PER CARD, NOT ACROSS THE PLATE.  Pooling all five cards scored
+    # WORSE than one card on the synthetic (23/26 against 26/26): the cards
+    # are not on a common time base until estimate_card_lags has run, and
+    # the residual sub-sample offsets plus the per-slot multiplexer skew make
+    # the sum partially destructive at the top of the band.  Each card gets
+    # its own stack and consensus_schedule does the cross-card vote it
+    # already does.
+    hf_use_ensemble: bool = True     # detect on the stacked segment ensemble
+    hf_ladder_extend: bool = True    # predict-and-verify the missing rungs
+    # Generators are asked for round numbers of points per decade; a free fit
+    # is not.  On card 4 a ladder fitted on the fifteen steps below 12 Hz
+    # returned 10.059 points/decade, and that 0.13 % error in r compounds
+    # with the rung index: checked blind against fifteen tones observed
+    # between 946 Hz and 24 kHz, the prediction error grew monotonically from
+    # +3.4 % to +5.8 %, so the extension found noise.  Snapping to 10 brings
+    # the same blind prediction to -0.9 .. +1.0 %, and 27 of 32 predicted
+    # rungs then verify.
+    hf_ladder_snap_ppd: bool = True  # snap the fitted spacing to an integer
+    hf_ladder_tol: float = 0.02      # relative window for ladder membership
+    # Averaging SEGMENT impedances across cards is wrong -- they are
+    # different segments.  Averaging the five UC channels is not: they are
+    # five measurements of one cell voltage, with uncorrelated front-end
+    # noise, and the reference is the weak phasor now that detection has
+    # moved off it.  Worth ~7 dB exactly where it is weakest.
+    hf_pool_reference: bool = True   # inverse-variance mean of A_uc across cards
 
     # ---- per-step quality gates -------------------------------------------
     # A step that lies on the sweep's own geometric grid is a real step: a
@@ -654,7 +708,8 @@ class Config:
 
         g = p.add_argument_group("band")
         g.add_argument("--f-min", dest="f_min_hz", type=float, default=0.15)
-        g.add_argument("--f-max", dest="f_max_hz", type=float, default=4500.0)
+        g.add_argument("--f-max", dest="f_max_hz", type=float,
+                       default=30000.0)
         g.add_argument("--ppd", type=int, default=12)
 
         g = p.add_argument_group("estimation")

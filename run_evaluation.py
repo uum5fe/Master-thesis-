@@ -88,6 +88,13 @@ def main(argv=None) -> int:
                         "its own and never reads them")
     p.add_argument("--stop-after", choices=["bronze", "silver", "gold"],
                    default="gold")
+    p.add_argument("--prune-ladder", action="store_true",
+                   help="drop detections that miss the sweep's fitted "
+                        "geometric ladder. Off by default: it is the only "
+                        "step that can REMOVE a step, and it cuts both ways "
+                        "-- on one campaign it cost a decade of band, on "
+                        "another it takes 13 spurious steps to 0. Worth an "
+                        "A/B on a campaign you have not run it on")
     p.add_argument("--stage-local", action="store_true",
                    help="copy the cards to local disk before processing. "
                         "Strongly advised when the recordings live on a "
@@ -228,7 +235,8 @@ def main(argv=None) -> int:
 
         if a.dry_run:
             argv_ = runner.build_command(ref, out, SETTINGS, a.equal_areas,
-                                         a.no_png, a.stop_after)
+                                         a.no_png, a.stop_after,
+                                         prune_ladder=a.prune_ladder)
             print("  would run, in " + str(runner.pipeline_dir(SETTINGS)) + ":")
             print("    " + " ".join(argv_))
             continue
@@ -254,7 +262,8 @@ def main(argv=None) -> int:
                 lambda done, total, message="": print(f"  {message}"),
                 source, geom=geom, settings=SETTINGS,
                 equal_areas=a.equal_areas,
-                no_png=a.no_png, stop_after=a.stop_after)
+                no_png=a.no_png, stop_after=a.stop_after,
+                prune_ladder=a.prune_ladder)
         except Exception as exc:
             print(f"  FAILED: {exc}")
             failures += 1

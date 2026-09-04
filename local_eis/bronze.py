@@ -202,8 +202,14 @@ class BronzeRun:
                      if k in ("ok", "ppd", "f0", "n_on_grid", "n_total")},
             "config_digest": self.config_digest,
             "input_digest": self.input_digest,
-            "card_lag_s": {k: round(v["lag"] / 10000.0, 6)
-                           for k, v in self.lags.items()},
+            # EACH CARD'S OWN fs, NOT A CONSTANT.  A lag is measured in
+            # SAMPLES; dividing by a hardcoded 10 kHz reports the right
+            # number of seconds only on a 10 kHz card.  This campaign mixes
+            # 50 kHz and 100 kHz cards, where the same constant understates
+            # a lag by 5x and 10x -- and the lag is the number a reader uses
+            # to decide whether the cards were aligned at all.
+            "card_lag_s": {k: round(v["lag"] / self.cards[k].fs, 6)
+                           for k, v in self.lags.items() if k in self.cards},
             "card_lag_corr": {k: round(v["corr"], 4)
                               for k, v in self.lags.items()},
             "sensor_T_degC": {k: round(v, 3) for k, v in self.sensor_T.items()},

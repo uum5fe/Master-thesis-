@@ -521,6 +521,53 @@ def fill_gaps(ref: np.ndarray, fs: float, steps: list[Step],
     return steps
 
 
+def _collapse_overlapping(steps: list[Step], min_overlap: float = 0.5
+                          ) -> list[Step]:
+    """Two steps cannot occupy the same stretch of the record.
+
+    A stepped sweep holds ONE frequency at a time, so its dwells are disjoint
+    in time BY CONSTRUCTION.  Two candidates whose windows overlap are two
+    readings of one stretch, and at most one of them can be the tone that was
+    actually playing there.
+
+    Nothing enforced that.  `_dedupe` collapses candidates whose FREQUENCIES
+    agree, which is a different question: the grid scan calls `dwell_window`
+    for every trial frequency, and on a record where most trials find their
+    envelope maximum in the same unclaimed stretch, dozens of different
+    frequencies come back with the same window.  `fill_gaps` then treats what
+    is left as more unclaimed stretches and does it again.
+
+    Measured on RO2611976-01 at 45 A: 142 reported steps sat on 41 distinct
+    windows, 111 of them (78 %) sharing.  One 118-SECOND window carried 57
+    "steps" from 0.157 Hz to 3.9 kHz -- a fifth of the record, reported as a
+    fifth of the sweep.  All but one of those is an artefact, and silver spent
+    its gates rejecting them one at a time, which is why 56 % of its points
+    came back `not_finite` and the band looked like a gating problem.
+
+    Keeping the strongest candidate per stretch is the whole rule.  It cannot
+    remove a real dwell, because a real dwell does not overlap another one.
+    """
+    if len(steps) < 2:
+        return list(steps)
+    order = sorted(steps, key=lambda s: (-(s.snr_db if np.isfinite(s.snr_db)
+                                           else -np.inf), s.start))
+    kept: list[Step] = []
+    for st in order:
+        span = max(st.stop - st.start, 1)
+        clash = False
+        for k in kept:
+            lo, hi = max(st.start, k.start), min(st.stop, k.stop)
+            if hi <= lo:
+                continue
+            shorter = max(min(span, k.stop - k.start), 1)
+            if (hi - lo) / shorter > min_overlap:
+                clash = True
+                break
+        if not clash:
+            kept.append(st)
+    return sorted(kept, key=lambda s: s.freq)
+
+
 def _dedupe(steps: list[Step], rel_tol: float = 0.02,
             overlap_tol: float = 0.5) -> list[Step]:
     """One physical step must yield one entry.
@@ -674,6 +721,9 @@ def detect_schedule(ref: np.ndarray, fs: float, ppd: int = 12,
     # second pass: anything the grid stepped over shows up as an unclaimed
     # stretch of the record
     steps = _dedupe(fill_gaps(ref, fs, steps, min_snr_db))
+    # ... and then the invariant BOTH passes can violate: one stretch of the
+    # record cannot be two steps of the sweep.  See `_collapse_overlapping`.
+    steps = _collapse_overlapping(steps)
     steps = [s for s in steps if f_lo * 0.8 <= s.freq <= f_hi]
 
     if verbose:

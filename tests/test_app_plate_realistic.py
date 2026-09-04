@@ -113,7 +113,8 @@ def test_the_tab_is_registered_and_renders():
 
     app = build_app()
     labels = [t.label for t in app.layout.children[3].children[0].children]
-    assert "Plate (realistic)" in labels
+    # the lattice view is gone; this one IS the plate map now
+    assert "Plate map" in labels
 
     from app.views import plate_realistic
     assert plate_realistic.layout() is not None

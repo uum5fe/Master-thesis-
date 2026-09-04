@@ -29,7 +29,7 @@ from app.services import store
 from app.settings import DOTENV_LOADED as SETTINGS_DOTENV
 from app.settings import SETTINGS
 from app.views import common as ui
-from app.views import (coverage, ecm, heatmap, operating, overview,
+from app.views import (anomalies, coverage, ecm, operating, overview,
                        plate_realistic, reference, signals, spectra)
 
 def location_options() -> list[dict]:
@@ -171,8 +171,8 @@ def build_app() -> Dash:
         html.Div([
             dcc.Tabs(id="tabs", value="tab-overview", children=[
                 dcc.Tab(label="Overview", value="tab-overview"),
-                dcc.Tab(label="Plate map", value="tab-heatmap"),
-                dcc.Tab(label="Plate (realistic)", value="tab-plate3d"),
+                dcc.Tab(label="Plate map", value="tab-plate3d"),
+                dcc.Tab(label="Neighbour anomalies", value="tab-anomalies"),
                 dcc.Tab(label="Operating map", value="tab-operating"),
                 dcc.Tab(label="Spectra", value="tab-spectra"),
                 dcc.Tab(label="Coverage", value="tab-coverage"),
@@ -187,7 +187,7 @@ def build_app() -> Dash:
               "color": ui.COLOURS["text"], "margin": 0})
 
     register_selection(app)
-    for view in (overview, heatmap, plate_realistic, operating, spectra,
+    for view in (overview, plate_realistic, anomalies, operating, spectra,
                  coverage, ecm, signals, reference):
         view.register(app)
 
@@ -195,8 +195,8 @@ def build_app() -> Dash:
     def _render_tab(tab):
         return {
             "tab-overview": overview.layout,
-            "tab-heatmap": heatmap.layout,
             "tab-plate3d": plate_realistic.layout,
+            "tab-anomalies": anomalies.layout,
             "tab-operating": operating.layout,
             "tab-spectra": spectra.layout,
             "tab-coverage": coverage.layout,

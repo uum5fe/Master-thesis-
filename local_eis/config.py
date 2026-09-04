@@ -287,7 +287,22 @@ class Config:
     # the sum partially destructive at the top of the band.  Each card gets
     # its own stack and consensus_schedule does the cross-card vote it
     # already does.
-    hf_use_ensemble: bool = True     # detect on the stacked segment ensemble
+    # OFF BY DEFAULT, AND THIS IS A REVERSAL.
+    # It was on. On RO2612025-01 at 150 A, where the cell voltage really has
+    # collapsed, detecting on the ensemble is the difference between a band
+    # and no band. On RO2611976-01 at 45 A and 60 A it made a working result
+    # WORSE: the stack is a more sensitive detector, so on a record that is
+    # mostly not swept -- and that one is 252 s carrying about 23 s of sweep
+    # -- it finds more candidates in the idle stretches too, and the schedule
+    # inflates. Silver then has more junk to gate than signal to keep, and
+    # the Nyquist that came out was a zigzag where the old path drew clean
+    # arcs.
+    #
+    # A change that can make a good result bad has to be opted into, not out
+    # of. Off, this whole module is inert and the pipeline is exactly the one
+    # that produced those arcs. Turn it on per campaign, with --ensemble, and
+    # compare.
+    hf_use_ensemble: bool = False    # detect on the stacked segment ensemble
     hf_ladder_extend: bool = True    # predict-and-verify the missing rungs
     # Generators are asked for round numbers of points per decade; a free fit
     # is not.  On card 4 a ladder fitted on the fifteen steps below 12 Hz
@@ -316,7 +331,10 @@ class Config:
     # five measurements of one cell voltage, with uncorrelated front-end
     # noise, and the reference is the weak phasor now that detection has
     # moved off it.  Worth ~7 dB exactly where it is weakest.
-    hf_pool_reference: bool = True   # inverse-variance mean of A_uc across cards
+    # Off for the same reason: it replaces each card's own reference phasor,
+    # and it reports ref_slot = 0 to silver's skew model on the strength of a
+    # rotation this has not been validated against field data.
+    hf_pool_reference: bool = False  # inverse-variance mean of A_uc across cards
 
     # ---- per-step quality gates -------------------------------------------
     # A step that lies on the sweep's own geometric grid is a real step: a

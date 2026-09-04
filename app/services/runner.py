@@ -127,7 +127,8 @@ def build_command(ref: RunRef, out: Path, settings: Settings = SETTINGS,
                   equal_areas: bool = False, no_png: bool = False,
                   stop_after: str = "gold",
                   geom: PlateGeometry | None = None,
-                  prune_ladder: bool = False) -> list[str]:
+                  prune_ladder: bool = False,
+                  ensemble: bool = False) -> list[str]:
     """The exact command line, so it can be shown, logged and reproduced."""
     # WHICH READER. A csvlog selection is not a folder of FAMOS cards, and
     # sending it through --dat hands the CSV path to the FAMOS reader, which
@@ -151,6 +152,8 @@ def build_command(ref: RunRef, out: Path, settings: Settings = SETTINGS,
     ]
     if prune_ladder:
         argv.append("--prune-ladder")
+    if ensemble:
+        argv.append("--ensemble")
     # FAMOS always carries the flag when one is configured, even if the file
     # is missing: it is mandatory there, and main.py naming the unreadable
     # path beats this quietly dropping the argument. A CSV run only carries
@@ -186,7 +189,8 @@ def run_pipeline(progress, ref: RunRef, geom: PlateGeometry | None = None,
                  settings: Settings = SETTINGS, equal_areas: bool = False,
                  no_png: bool = False, stop_after: str = "gold",
                  log_lines: list[str] | None = None,
-                 prune_ladder: bool = False) -> str:
+                 prune_ladder: bool = False,
+                 ensemble: bool = False) -> str:
     """Process one condition, whatever kind of recording it is.
 
     build_command dispatches FAMOS vs CSV, so nothing here is format-specific
@@ -200,7 +204,8 @@ def run_pipeline(progress, ref: RunRef, geom: PlateGeometry | None = None,
     out = output_dir(ref, settings)
     out.mkdir(parents=True, exist_ok=True)
     argv = build_command(ref, out, settings, equal_areas, no_png, stop_after,
-                         geom=geom, prune_ladder=prune_ladder)
+                         geom=geom, prune_ladder=prune_ladder,
+                         ensemble=ensemble)
     directory = pipeline_dir(settings)
 
     progress(0, len(STAGES), f"starting: {' '.join(argv[1:])}")

@@ -140,10 +140,17 @@ def build_parser() -> argparse.ArgumentParser:
                         "and on one campaign it cost a decade of band; on "
                         "another it takes 13 spurious steps to 0. Read "
                         "off_ladder_hz in the manifest to see what it took")
-    g.add_argument("--no-ensemble", action="store_true",
-                   help="detect the schedule on the cell-voltage channel "
-                        "alone, as the pipeline did before hf_schedule; for "
-                        "an A/B against it")
+    g.add_argument("--ensemble", action="store_true",
+                   help="detect the schedule on the stacked segment ensemble "
+                        "instead of the cell-voltage channel. Worth it where "
+                        "the cell voltage has collapsed and the band is short "
+                        "(RO2612025 at 150 A); it made a working result WORSE "
+                        "on RO2611976, where the record is mostly not swept "
+                        "and the extra sensitivity fills the idle stretches "
+                        "with candidates. A/B it per campaign")
+    g.add_argument("--pool-reference", action="store_true",
+                   help="average the cards' UC channels into one reference "
+                        "phasor. Not validated against field data")
     g.add_argument("--no-drt", action="store_true",
                    help="skip the DRT; loses the process split and tau maps")
     g.add_argument("--no-spatial", action="store_true",
@@ -212,8 +219,10 @@ def config_from_args(a) -> Config:
         kw["phasor_method"] = a.phasor
     if a.prune_ladder:
         kw["hf_ladder_prune"] = True
-    if a.no_ensemble:
-        kw["hf_use_ensemble"] = False
+    if a.ensemble:
+        kw["hf_use_ensemble"] = True
+    if a.pool_reference:
+        kw["hf_pool_reference"] = True
     if a.no_drt:
         kw["drt_enable"] = False
     if a.no_spatial:

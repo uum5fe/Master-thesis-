@@ -88,6 +88,13 @@ def main(argv=None) -> int:
                         "its own and never reads them")
     p.add_argument("--stop-after", choices=["bronze", "silver", "gold"],
                    default="gold")
+    p.add_argument("--ensemble", action="store_true",
+                   help="detect the schedule on the stacked segment ensemble "
+                        "rather than the cell-voltage channel. OFF by "
+                        "default: it recovers a band where the cell voltage "
+                        "has collapsed, and it made a working result worse on "
+                        "a record that is mostly not swept. A/B it per "
+                        "campaign before adopting it")
     p.add_argument("--prune-ladder", action="store_true",
                    help="drop detections that miss the sweep's fitted "
                         "geometric ladder. Off by default: it is the only "
@@ -236,7 +243,7 @@ def main(argv=None) -> int:
         if a.dry_run:
             argv_ = runner.build_command(ref, out, SETTINGS, a.equal_areas,
                                          a.no_png, a.stop_after,
-                                         prune_ladder=a.prune_ladder)
+                                         prune_ladder=a.prune_ladder, ensemble=a.ensemble)
             print("  would run, in " + str(runner.pipeline_dir(SETTINGS)) + ":")
             print("    " + " ".join(argv_))
             continue
@@ -263,7 +270,7 @@ def main(argv=None) -> int:
                 source, geom=geom, settings=SETTINGS,
                 equal_areas=a.equal_areas,
                 no_png=a.no_png, stop_after=a.stop_after,
-                prune_ladder=a.prune_ladder)
+                prune_ladder=a.prune_ladder, ensemble=a.ensemble)
         except Exception as exc:
             print(f"  FAILED: {exc}")
             failures += 1

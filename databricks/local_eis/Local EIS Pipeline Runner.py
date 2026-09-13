@@ -585,6 +585,423 @@ print('  FAMOS v1/v2 handled by eis_local.FamosFile (no patch needed)')
 
 # COMMAND ----------
 
+# DBTITLE 1,Run Dashboard: Volume cache inventory + run plan (cache vs fresh rerun)
+# ═══════════════════════════════════════════════════════════════════════════════
+# RUN DASHBOARD — decide, and SHOW, where each condition's numbers come from
+#
+# A pipeline run costs 5-10 minutes per condition, so results are copied to a
+# UC Volume and reused.  That reuse used to be governed by
+#
+#       FORCE_RERUN = True      # set True to ignore cache and re-run
+#
+# a bare literal two hundred lines into the run cell.  Left at True it threw
+# away a good cache on every execution; flipped to False and forgotten, it
+# quietly served month-old numbers from a superseded pipeline while the
+# notebook printed plots as if they were fresh.  Neither state is visible
+# from the output, which is the actual problem: you cannot tell, from a
+# Nyquist plot, whether the spectrum behind it was computed today.
+#
+# So the choice is a widget, the consequence is printed before anything runs,
+# and the cache is inventoried: what is stored, how old it is, which stages
+# it holds, and which pipeline version wrote it.
+#
+#   Run mode         cache      reuse a cached condition, run the rest
+#                    rerun      ignore the cache and recompute everything
+#                    cache-only reuse what is cached, SKIP the rest
+#                               (no cluster time, no source files needed)
+#   Write to cache   yes        a fresh run overwrites its cache entry
+#                    no         a fresh run leaves the cache untouched
+#                               -- a trial run that cannot clobber good data
+#
+# Everything below reads these two widgets.  cache_plan() is the single place
+# the decision is made; the run cell calls the same function, so the plan on
+# screen is the plan that executes.
+# ═══════════════════════════════════════════════════════════════════════════════
+import os, shutil, tempfile, json, time
+import numpy as np
+import pandas as pd
+from pathlib import Path
+
+_CACHE_VOL = Path('/Volumes/ps_xplatform_dev/rvadvtec_dev/ev_rvadvtec_dev/EIS_Results')
+
+# Use a user-specific temp base to avoid permission conflicts on shared cluster
+_TMP_BASE = Path(tempfile.gettempdir()) / f'eis_{os.getuid()}'
+_TMP_BASE.mkdir(parents=True, exist_ok=True)
+
+try:
+    dbutils.widgets.dropdown('run_mode', 'cache',
+                             ['cache', 'rerun', 'cache-only'],
+                             'Run mode')
+    dbutils.widgets.dropdown('cache_write', 'yes', ['yes', 'no'],
+                             'Write results to cache')
+except Exception:
+    pass
+
+RUN_MODE = _w('run_mode', 'cache')
+CACHE_WRITE = _w('cache_write', 'yes') == 'yes'
+
+# Kept as a name because older cells and notes refer to it; it is now derived
+# rather than typed, and nothing reads it that does not go through
+# cache_plan() first.
+FORCE_RERUN = (RUN_MODE == 'rerun')
+
+
+# ─── Cache paths ───
+def _cache_dir(leepa, cond, snr=None):
+    base = _CACHE_VOL / leepa / cond
+    if snr is not None:
+        return base / f'snr_{snr}'
+    return base
+
+
+def _cache_exists(leepa, cond, snr=None):
+    """True if usable cached results exist on the Volume.
+
+    "Usable" means silver spectra, the minimum any display cell needs.  A
+    directory holding only a manifest is a failed run, not a cache hit.
+    """
+    cd = _cache_dir(leepa, cond, snr)
+    if not cd.exists():
+        return False
+    for sub in ('silver', 'csv'):
+        if (cd / sub / 'spectra_clean.csv').exists():
+            return True
+    return False
+
+
+def _save_to_cache(out_dir, leepa, cond, snr=None):
+    """Copy pipeline output to Volume for persistence across sessions."""
+    src = Path(out_dir)
+    dst = _cache_dir(leepa, cond, snr)
+    dst.mkdir(parents=True, exist_ok=True)
+    n_copied = 0
+    for stage in ('bronze', 'silver', 'gold', 'csv'):
+        stage_src = src / stage
+        if not stage_src.exists():
+            continue
+        stage_dst = dst / stage
+        stage_dst.mkdir(parents=True, exist_ok=True)
+        for f in stage_src.iterdir():
+            if f.is_file():
+                shutil.copy2(str(f), str(stage_dst / f.name))
+                n_copied += 1
+    for f in src.iterdir():
+        if f.is_file():
+            shutil.copy2(str(f), str(dst / f.name))
+            n_copied += 1
+    return n_copied
+
+
+def _load_from_cache(leepa, cond, snr=None):
+    """Return a PIPELINE_RESULTS-compatible dict pointing to the cached dir.
+
+    The manifest is read back off the Volume rather than left empty, so a
+    cached condition reports the same summary numbers as a fresh one and the
+    summary cells below do not have to special-case it.
+    """
+    cd = _cache_dir(leepa, cond, snr)
+    man = {}
+    mp = cd / 'run_manifest.json'
+    if mp.exists():
+        try:
+            man = json.loads(mp.read_text())
+        except Exception:                                  # noqa: BLE001
+            man = {}
+    return {'manifest': man, 'cfg': None, 'out_dir': cd, 'cached': True}
+
+
+# ─── The decision, in one place ───
+def cache_plan(leepa, cond, snr=None, mode=None):
+    """What happens to this condition: ('load'|'run'|'skip', why)."""
+    mode = RUN_MODE if mode is None else mode
+    have = _cache_exists(leepa, cond, snr)
+    if mode == 'rerun':
+        return 'run', ('recompute (cache present, will be '
+                       + ('overwritten)' if CACHE_WRITE else 'left alone)')
+                       if have else 'recompute (nothing cached)')
+    if have:
+        return 'load', 'cached'
+    if mode == 'cache-only':
+        return 'skip', 'nothing cached, and mode is cache-only'
+    return 'run', 'nothing cached'
+
+
+# ─── What is actually in a cache entry ───
+def _entry_info(cd: Path) -> dict:
+    """Describe one cache directory without trusting it to be complete."""
+    info = {'stages': [], 'n_segments': None, 'n_freq': None,
+            'n_ecm_ok': None, 'age_days': None, 'size_mb': 0.0,
+            'source': None, 'elapsed_s': None, 'f_lo': None, 'f_hi': None}
+    if not cd.exists():
+        return info
+
+    newest = 0.0
+    for f in cd.rglob('*'):
+        if f.is_file():
+            try:
+                st = f.stat()
+            except OSError:
+                continue
+            info['size_mb'] += st.st_size / 1e6
+            newest = max(newest, st.st_mtime)
+    if newest:
+        info['age_days'] = (time.time() - newest) / 86400.0
+
+    for stage in ('bronze', 'silver', 'gold', 'csv'):
+        if (cd / stage).exists() and any((cd / stage).iterdir()):
+            info['stages'].append(stage)
+
+    for sub in ('silver', 'csv'):
+        sp = cd / sub / 'spectra_clean.csv'
+        if sp.exists():
+            try:
+                d = pd.read_csv(sp, usecols=['segment', 'freq_hz'])
+                info['n_segments'] = int(d['segment'].nunique())
+                info['n_freq'] = int(d['freq_hz'].nunique())
+                info['f_lo'] = float(d['freq_hz'].min())
+                info['f_hi'] = float(d['freq_hz'].max())
+            except Exception:                              # noqa: BLE001
+                pass
+            break
+
+    ep = cd / 'csv' / 'ecm_parameters.csv'
+    if ep.exists():
+        try:
+            de = pd.read_csv(ep)
+            info['n_ecm_ok'] = int(de['ok'].astype(str).str.lower()
+                                   .isin(['true', '1']).sum())
+        except Exception:                                  # noqa: BLE001
+            pass
+
+    mp = cd / 'run_manifest.json'
+    if mp.exists():
+        try:
+            m = json.loads(mp.read_text())
+            info['source'] = m.get('source', 'famos')
+            info['elapsed_s'] = m.get('elapsed_s')
+            if info['n_ecm_ok'] is None:
+                info['n_ecm_ok'] = m.get('n_ecm_ok')
+            g = m.get('stages', {}).get('gold', {})
+            if info['n_segments'] is None and g:
+                info['n_segments'] = g.get('n_measured')
+        except Exception:                                  # noqa: BLE001
+            pass
+    return info
+
+
+def _cache_conditions(leepa) -> list:
+    """Every (condition, snr_tag, dir) cached under this Leepa."""
+    root = _CACHE_VOL / leepa
+    out = []
+    if not root.exists():
+        return out
+    for cdir in sorted(root.iterdir()):
+        if not cdir.is_dir():
+            continue
+        snr_subs = [d for d in sorted(cdir.iterdir())
+                    if d.is_dir() and d.name.startswith('snr_')]
+        if snr_subs:
+            for d in snr_subs:
+                out.append((cdir.name, d.name[4:], d))
+        else:
+            out.append((cdir.name, None, cdir))
+    return out
+
+
+# ─── Which conditions this execution covers ───
+# A CSV measurement is one file, so it is one "condition" -- named after the
+# file rather than after a current setpoint, because the file is what
+# identifies it.
+if SOURCE_FORMAT == 'csv':
+    _conditions_to_run = [Path(CSV_PATH).stem or 'csv']
+elif COND_FILTER == 'ALL':
+    _conditions_to_run = CONDITIONS          # e.g. ['150A', '450A', '45A', '60A']
+else:
+    _conditions_to_run = [COND_FILTER]
+
+RUN_PLAN = {c: cache_plan(LEEPA, c, MIN_SNR_DB) for c in _conditions_to_run}
+
+
+# ─── Render ───
+def _esc(x):
+    return (str(x).replace('&', '&amp;').replace('<', '&lt;')
+            .replace('>', '&gt;'))
+
+
+def _fmt(v, spec='', dash='—'):
+    if v is None or (isinstance(v, float) and not np.isfinite(v)):
+        return dash
+    return format(v, spec) if spec else str(v)
+
+
+def _age_cell(days):
+    """Age, coloured.  Stale cache is the failure mode this panel exists for."""
+    if days is None:
+        return f'<td style="{_TD}color:#999">—</td>'
+    if days < 1:
+        txt, col = f'{days*24:.1f} h', '#1a7f37'
+    elif days < 30:
+        txt, col = f'{days:.0f} d', '#1a7f37' if days < 7 else '#9a6700'
+    else:
+        txt, col = f'{days:.0f} d', '#cf222e'
+    return f'<td style="{_TD}color:{col};font-weight:600">{txt}</td>'
+
+
+_TD = ('padding:6px 10px;border-bottom:1px solid #eaeef2;'
+       'font-variant-numeric:tabular-nums;')
+_TH = ('padding:7px 10px;text-align:left;font-size:11px;'
+       'text-transform:uppercase;letter-spacing:.04em;color:#57606a;'
+       'border-bottom:2px solid #d0d7de;font-weight:600;')
+_BADGE = ('display:inline-block;padding:2px 9px;border-radius:10px;'
+          'font-size:11px;font-weight:700;letter-spacing:.02em;')
+_ACTION_STYLE = {
+    'load': (_BADGE + 'background:#dafbe1;color:#0a5c26', 'LOAD FROM CACHE'),
+    'run':  (_BADGE + 'background:#fff1e5;color:#9a4f00', 'RUN PIPELINE'),
+    'skip': (_BADGE + 'background:#f0f1f3;color:#57606a', 'SKIP'),
+}
+
+_n_load = sum(1 for a, _ in RUN_PLAN.values() if a == 'load')
+_n_run = sum(1 for a, _ in RUN_PLAN.values() if a == 'run')
+_n_skip = sum(1 for a, _ in RUN_PLAN.values() if a == 'skip')
+
+_mode_note = {
+    'cache': 'cached conditions are reused; the rest are computed',
+    'rerun': 'the cache is ignored and every condition is recomputed',
+    'cache-only': 'only cached conditions are shown; nothing is computed',
+}.get(RUN_MODE, '')
+
+_h = [f'''
+<div style="font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;
+            max-width:1180px;color:#1f2328">
+  <div style="display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;
+              border-bottom:2px solid #1f2328;padding-bottom:8px;margin-bottom:4px">
+    <span style="font-size:19px;font-weight:700">Run plan</span>
+    <span style="font-size:13px;color:#57606a">
+      Leepa <b>{_esc(LEEPA)}</b> &middot; {_esc(COND_FILTER)} &middot;
+      {_esc(SOURCE_FORMAT)} &middot; {F_MIN:g}&ndash;{F_MAX:g} Hz &middot;
+      SNR &ge; {MIN_SNR_DB:g} dB &middot; stop after {_esc(STOP_AFTER)}
+    </span>
+  </div>
+  <div style="margin:10px 0 14px;font-size:13px">
+    <span style="{_BADGE}background:#ddf4ff;color:#0550ae">MODE: {_esc(RUN_MODE.upper())}</span>
+    <span style="color:#57606a;margin-left:8px">{_esc(_mode_note)}</span>
+    <span style="margin-left:14px;color:#57606a">write to cache:
+      <b style="color:{'#1a7f37' if CACHE_WRITE else '#cf222e'}">
+      {'yes' if CACHE_WRITE else 'no'}</b></span>
+  </div>
+  <div style="font-size:13px;margin-bottom:10px">
+    <b>{_n_load}</b> to load &middot; <b>{_n_run}</b> to run
+    {f'&middot; <b>{_n_skip}</b> skipped' if _n_skip else ''}
+    &middot; est. cluster time
+    <b>{'~0 min' if not _n_run else f'~{5*_n_run}&ndash;{10*_n_run} min'}</b>
+  </div>
+  <table style="border-collapse:collapse;width:100%;font-size:13px">
+    <tr>
+      <th style="{_TH}">Condition</th><th style="{_TH}">Action</th>
+      <th style="{_TH}">Why</th><th style="{_TH}">Age</th>
+      <th style="{_TH}">Seg</th><th style="{_TH}">Freq</th>
+      <th style="{_TH}">Band [Hz]</th><th style="{_TH}">ECM ok</th>
+      <th style="{_TH}">Stages</th><th style="{_TH}">MB</th>
+    </tr>''']
+
+for cond in _conditions_to_run:
+    action, why = RUN_PLAN[cond]
+    style, label = _ACTION_STYLE[action]
+    cd = _cache_dir(LEEPA, cond, MIN_SNR_DB)
+    inf = _entry_info(cd) if cd.exists() else _entry_info(Path('/nonexistent'))
+    band = ('—' if inf['f_lo'] is None
+            else f"{inf['f_lo']:.2f}&ndash;{inf['f_hi']:.0f}")
+    _h.append(f'''
+    <tr>
+      <td style="{_TD}font-weight:600">{_esc(cond)}</td>
+      <td style="{_TD}"><span style="{style}">{label}</span></td>
+      <td style="{_TD}color:#57606a">{_esc(why)}</td>
+      {_age_cell(inf['age_days'])}
+      <td style="{_TD}">{_fmt(inf['n_segments'])}</td>
+      <td style="{_TD}">{_fmt(inf['n_freq'])}</td>
+      <td style="{_TD}">{band}</td>
+      <td style="{_TD}">{_fmt(inf['n_ecm_ok'])}</td>
+      <td style="{_TD}color:#57606a">{'&middot;'.join(inf['stages']) or '—'}</td>
+      <td style="{_TD}">{inf['size_mb']:.1f}</td>
+    </tr>''')
+
+_h.append('</table>')
+
+# ─── Everything else cached under this Leepa (other SNR gates, other bands) ───
+_others = [(c, s, d) for c, s, d in _cache_conditions(LEEPA)
+           if not (c in _conditions_to_run
+                   and s == (str(MIN_SNR_DB) if MIN_SNR_DB is not None else None))]
+if _others:
+    _h.append(f'''
+  <div style="margin-top:22px;font-size:14px;font-weight:700">
+    Also cached under Leepa {_esc(LEEPA)}
+    <span style="font-weight:400;color:#57606a;font-size:12px">
+      &mdash; other SNR gates and conditions this run does not touch.
+      The SNR gate is part of the cache key: change it and you get a
+      different entry, not a stale one.</span>
+  </div>
+  <table style="border-collapse:collapse;width:100%;font-size:13px;margin-top:6px">
+    <tr><th style="{_TH}">Condition</th><th style="{_TH}">SNR gate</th>
+        <th style="{_TH}">Age</th><th style="{_TH}">Seg</th>
+        <th style="{_TH}">Stages</th><th style="{_TH}">MB</th></tr>''')
+    for c, s, d in _others:
+        inf = _entry_info(d)
+        _h.append(f'''
+    <tr><td style="{_TD}">{_esc(c)}</td>
+        <td style="{_TD}">{_esc(s) if s is not None else '—'}</td>
+        {_age_cell(inf['age_days'])}
+        <td style="{_TD}">{_fmt(inf['n_segments'])}</td>
+        <td style="{_TD}color:#57606a">{'&middot;'.join(inf['stages']) or '—'}</td>
+        <td style="{_TD}">{inf['size_mb']:.1f}</td></tr>''')
+    _h.append('</table>')
+
+# ─── Other Leepa IDs on the Volume ───
+try:
+    _other_leepa = sorted(d.name for d in _CACHE_VOL.iterdir()
+                          if d.is_dir() and d.name != LEEPA)
+except Exception:                                          # noqa: BLE001
+    _other_leepa = []
+if _other_leepa:
+    _h.append(f'''
+  <div style="margin-top:18px;font-size:12px;color:#57606a">
+    Other Leepa IDs cached on the Volume:
+    {_esc(', '.join(_other_leepa))}
+    &mdash; switch the Order ID widget to load one without re-running.
+  </div>''')
+
+_h.append(f'''
+  <div style="margin-top:16px;font-size:12px;color:#57606a">
+    Cache root: <code>{_esc(_CACHE_VOL)}</code><br>
+    Scratch:&nbsp;&nbsp;&nbsp;&nbsp; <code>{_esc(_TMP_BASE)}</code>
+    (per-user, cleared when the cluster restarts)
+  </div>
+</div>''')
+
+try:
+    displayHTML('\n'.join(_h))
+except Exception:                                          # noqa: BLE001
+    # No displayHTML (plain python, or a job run): the plan still has to be
+    # legible, because it is what decides whether anything runs at all.
+    print(f"\n  RUN PLAN — Leepa {LEEPA}, mode={RUN_MODE}, "
+          f"write_cache={CACHE_WRITE}")
+    for cond in _conditions_to_run:
+        action, why = RUN_PLAN[cond]
+        print(f"    {cond:>12s}  {action.upper():<5s}  {why}")
+
+# Count the entries that actually exist, not the conditions being run: a
+# condition with nothing cached overwrites nothing.
+_n_clobber = sum(1 for c in _conditions_to_run
+                 if RUN_PLAN[c][0] == 'run' and _cache_exists(LEEPA, c, MIN_SNR_DB))
+if _n_clobber and RUN_MODE == 'rerun' and CACHE_WRITE:
+    print(f"  ⚠ rerun + write: {_n_clobber} existing cache entr"
+          f"{'y' if _n_clobber == 1 else 'ies'} for Leepa {LEEPA} will be "
+          f"overwritten.  Set 'Write results to cache' to no for a trial run.")
+if RUN_MODE == 'cache-only' and _n_skip:
+    print(f"  ⚠ cache-only: {_n_skip} condition(s) have nothing cached and "
+          f"will be missing from every plot below.")
+
+# COMMAND ----------
+
 # DBTITLE 1,Build Config + Run Pipeline (with persistent Volume cache)
 # ═══════════════════════════════════════════════════════════════════════════════
 # RUN PIPELINE PER CONDITION (fixes the cross-condition deduplication bug)
@@ -595,6 +1012,8 @@ print('  FAMOS v1/v2 handled by eis_local.FamosFile (no patch needed)')
 #
 # Fix: iterate conditions individually, producing separate results per condition.
 # ═══════════════════════════════════════════════════════════════════════════════
+# Re-imported rather than inherited from the dashboard cell, so this cell
+# still runs on its own after a "Clear state".
 import os, shutil, tempfile, gc
 
 
@@ -624,80 +1043,11 @@ _DAT_DIR = FAMOS_ROOT
 _CURR_CAL = Path('/Workspace/Users/uum5fe@bosch.com/curr.csv')
 _TEMP_CAL = Path('/Workspace/Users/uum5fe@bosch.com/temp.csv')
 
-# Use a user-specific temp base to avoid permission conflicts on shared cluster
-_TMP_BASE = Path(tempfile.gettempdir()) / f'eis_{os.getuid()}'
-_TMP_BASE.mkdir(parents=True, exist_ok=True)
-
-# ─── Persistent Volume cache ───
-# Pipeline results are expensive (5-10 min per condition).  After a successful
-# run the bronze/silver/gold CSVs are copied to a UC Volume so that every
-# future session can skip the pipeline and go straight to plotting.
-_CACHE_VOL = Path('/Volumes/ps_xplatform_dev/rvadvtec_dev/ev_rvadvtec_dev/EIS_Results')
-FORCE_RERUN = True          # set True to ignore cache and re-run from scratch
-
-
-def _cache_dir(leepa, cond, snr=None):
-    base = _CACHE_VOL / leepa / cond
-    if snr is not None:
-        return base / f'snr_{snr}'
-    return base
-
-
-def _cache_exists(leepa, cond, snr=None):
-    """True if usable cached results exist on the Volume."""
-    cd = _cache_dir(leepa, cond, snr)
-    if not cd.exists():
-        return False
-    # Check for silver spectra (the minimum needed for Nyquist plots)
-    for sub in ('silver', 'csv'):
-        if (cd / sub / 'spectra_clean.csv').exists():
-            return True
-    return False
-
-
-def _save_to_cache(out_dir, leepa, cond, snr=None):
-    """Copy pipeline output to Volume for persistence across sessions."""
-    src = Path(out_dir)
-    dst = _cache_dir(leepa, cond, snr)
-    dst.mkdir(parents=True, exist_ok=True)
-    n_copied = 0
-    for stage in ('bronze', 'silver', 'gold', 'csv'):
-        stage_src = src / stage
-        if not stage_src.exists():
-            continue
-        stage_dst = dst / stage
-        stage_dst.mkdir(parents=True, exist_ok=True)
-        for f in stage_src.iterdir():
-            if f.is_file():
-                shutil.copy2(str(f), str(stage_dst / f.name))
-                n_copied += 1
-    # Also copy any top-level files (manifests, PNGs)
-    for f in src.iterdir():
-        if f.is_file():
-            shutil.copy2(str(f), str(dst / f.name))
-            n_copied += 1
-    return n_copied
-
-
-def _load_from_cache(leepa, cond, snr=None):
-    """Return a PIPELINE_RESULTS-compatible dict pointing to the cached dir."""
-    cd = _cache_dir(leepa, cond, snr)
-    return {
-        'manifest': {},    # no live manifest, but plots only need out_dir
-        'cfg': None,
-        'out_dir': cd,
-        'cached': True,
-    }
-
-# Determine which conditions to run.  A CSV measurement is one file, so it is
-# one "condition" -- named after the file rather than after a current
-# setpoint, because the file is what identifies it.
-if SOURCE_FORMAT == 'csv':
-    _conditions_to_run = [Path(CSV_PATH).stem or 'csv']
-elif COND_FILTER == 'ALL':
-    _conditions_to_run = CONDITIONS  # e.g. ['150A', '450A', '45A', '60A']
-else:
-    _conditions_to_run = [COND_FILTER]
+# _CACHE_VOL, _TMP_BASE, _cache_dir, _cache_exists, _save_to_cache,
+# _load_from_cache, cache_plan, RUN_MODE, CACHE_WRITE, RUN_PLAN and
+# _conditions_to_run all come from the Run Dashboard cell above.  They live
+# there so that the cache policy is decided and DISPLAYED in one place
+# instead of being a literal buried in this cell.
 
 print(f"  DAT dir:    {_DAT_DIR}")
 print(f"  Curr cal:   {_CURR_CAL}")
@@ -710,8 +1060,16 @@ print(f"  Stop after: {STOP_AFTER}\n")
 PIPELINE_RESULTS = {}  # {condition_str: manifest_dict}
 
 for cond in _conditions_to_run:
-    # ── Check cache first ──
-    if not FORCE_RERUN and _cache_exists(LEEPA, cond, MIN_SNR_DB):
+    # ── Same decision the dashboard displayed, taken from the same function
+    #    so the two cannot drift apart ──
+    _action, _why = cache_plan(LEEPA, cond, MIN_SNR_DB)
+
+    if _action == 'skip':
+        print(f"  – {cond}: SKIPPED ({_why})")
+        PIPELINE_RESULTS[cond] = None
+        continue
+
+    if _action == 'load':
         PIPELINE_RESULTS[cond] = _load_from_cache(LEEPA, cond, MIN_SNR_DB)
         _cd = _cache_dir(LEEPA, cond, MIN_SNR_DB)
         _sp = spectra_csv(_cd)
@@ -719,7 +1077,14 @@ for cond in _conditions_to_run:
         if _sp and _sp.exists():
             import pandas as _pd
             _n = _pd.read_csv(_sp)['segment'].nunique()
-        print(f"  ✓ {cond}: CACHED on Volume ({_n} segments) — skipping pipeline")
+        _inf = _entry_info(_cd)
+        _age = ('unknown age' if _inf['age_days'] is None
+                else f"{_inf['age_days']*24:.1f} h old" if _inf['age_days'] < 1
+                else f"{_inf['age_days']:.0f} d old")
+        # Say how old it is every time.  A cached number that is not marked
+        # as cached is the whole reason this path needed a dashboard.
+        print(f"  ✓ {cond}: FROM CACHE ({_n} segments, {_age}) — "
+              f"pipeline not run")
         print(f"    {_cd}")
         continue
 
@@ -775,11 +1140,16 @@ for cond in _conditions_to_run:
             'out_dir': _out_dir,
         }
         # ── Persist to Volume ──
-        try:
-            _nc = _save_to_cache(_out_dir, LEEPA, cond, MIN_SNR_DB)
-            print(f"  💾 Saved {_nc} files to Volume cache: {_cache_dir(LEEPA, cond, MIN_SNR_DB)}")
-        except Exception as _ce:
-            print(f"  ⚠ Cache save failed (results still in /tmp): {_ce}")
+        if CACHE_WRITE:
+            try:
+                _nc = _save_to_cache(_out_dir, LEEPA, cond, MIN_SNR_DB)
+                print(f"  💾 Saved {_nc} files to Volume cache: "
+                      f"{_cache_dir(LEEPA, cond, MIN_SNR_DB)}")
+            except Exception as _ce:                       # noqa: BLE001
+                print(f"  ⚠ Cache save failed (results still in /tmp): {_ce}")
+        else:
+            print(f"  ○ Cache write disabled — results stay in {_out_dir} "
+                  f"and are lost when the cluster restarts")
         # The FAMOS manifest reports per stage; the CSV manifest is flat.
         gs = manifest.get('stages', {}).get('gold', {})
         if gs:
@@ -805,8 +1175,14 @@ for cond in _conditions_to_run:
     gc.collect()
     spark.catalog.clearCache()
 
+_n_ok = len([v for v in PIPELINE_RESULTS.values() if v])
+_n_cached = len([v for v in PIPELINE_RESULTS.values()
+                 if v and v.get('cached')])
 print(f"\n{'═'*75}")
-print(f"  PIPELINE COMPLETE — {len([v for v in PIPELINE_RESULTS.values() if v])} conditions processed")
+print(f"  PIPELINE COMPLETE — {_n_ok} condition(s) available "
+      f"({_n_cached} from cache, {_n_ok - _n_cached} freshly computed)")
+if _n_cached and RUN_MODE != 'rerun':
+    print(f"  Set the Run mode widget to 'rerun' to recompute the cached ones.")
 print(f"{'═'*75}")
 
 # COMMAND ----------

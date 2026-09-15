@@ -109,3 +109,107 @@ def test_an_empty_folder_says_what_it_looked_for(tmp_path):
     with pytest.raises(SystemExit) as excinfo:
         bronze.discover_files(cfg)
     assert "Karte" in str(excinfo.value)
+
+
+# ===========================================================================
+# Which PLATE? -- a campaign folder holds several, at the same condition
+# ===========================================================================
+
+#: The three spellings of the order id that share one folder in this campaign.
+PLATE_TEMPLATES = {
+    "2611976": "Leepa_2611976_Current_{cond}_Test_01_Karte_{card}.DAT",
+    "2612030": "Leepa_RO2612030_Current_{cond}_Test_01_Karte_{card}.DAT",
+    "2612025": "RO2612025-01_Current_{cond}_Test_01_Karte_{card}.DAT",
+}
+
+
+def _multi_plate(root: Path, conds=("150A",)) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    for template in PLATE_TEMPLATES.values():
+        for cond in conds:
+            for card in range(1, 6):
+                (root / template.format(cond=cond, card=card)).write_bytes(b"x")
+    return root
+
+
+def _plates_of(files) -> list[str]:
+    return sorted({bronze.plate_id(f.name) for f in files})
+
+
+@pytest.mark.parametrize("leepa", sorted(PLATE_TEMPLATES))
+def test_each_naming_spelling_of_the_order_id_is_matched(tmp_path, leepa):
+    """Leepa_2611976_, Leepa_RO2612030_ and RO2612025-01_ are all the same
+    field spelled three ways; missing one sent the run to the fallback."""
+    d = _multi_plate(tmp_path / "campaign")
+    got = bronze.discover_files(DEFAULT.replace(dat_dir=d, condition="150A",
+                                                leepa=leepa))
+    assert _plates_of(got) == [leepa]
+    assert len(got) == 5
+
+
+@pytest.mark.parametrize("given", ["2612030", "RO2612030", "ro2612030"])
+def test_the_order_id_may_be_given_with_or_without_the_RO(tmp_path, given):
+    d = _multi_plate(tmp_path / "campaign")
+    got = bronze.discover_files(DEFAULT.replace(dat_dir=d, condition="150A",
+                                                leepa=given))
+    assert _plates_of(got) == ["2612030"]
+
+
+def test_plates_are_never_silently_mixed(tmp_path):
+    """The failure this guards against: three plates read as one, card
+    alignment anchored on whichever sorted first, every card of the requested
+    plate refused, and another plate's R_ohmic reported under this name."""
+    d = _multi_plate(tmp_path / "campaign")
+    with pytest.raises(SystemExit) as e:
+        bronze.discover_files(DEFAULT.replace(dat_dir=d, condition="150A",
+                                              leepa=""))
+    msg = str(e.value)
+    assert "plates" in msg and "--leepa" in msg
+
+
+def test_a_requested_plate_that_is_absent_is_refused_not_substituted(tmp_path):
+    d = _multi_plate(tmp_path / "campaign")
+    with pytest.raises(SystemExit) as e:
+        bronze.discover_files(DEFAULT.replace(dat_dir=d, condition="150A",
+                                              leepa="9999999"))
+    assert "9999999" in str(e.value)
+
+
+def test_one_plate_in_the_folder_needs_no_leepa(tmp_path):
+    d = tmp_path / "one"
+    d.mkdir()
+    for card in range(1, 6):
+        (d / PLATE_TEMPLATES["2612030"].format(cond="150A",
+                                               card=card)).write_bytes(b"x")
+    got = bronze.discover_files(DEFAULT.replace(dat_dir=d, condition="150A",
+                                                leepa=""))
+    assert len(got) == 5
+
+
+def test_plate_and_condition_are_both_honoured(tmp_path):
+    d = _multi_plate(tmp_path / "campaign", conds=("45A", "150A", "450A"))
+    got = bronze.discover_files(DEFAULT.replace(dat_dir=d, condition="150A",
+                                                leepa="2612030"))
+    assert _plates_of(got) == ["2612030"]
+    assert _conditions_of(got) == ["150A"]
+    assert len(got) == 5
+
+
+@pytest.mark.parametrize("name, want", [
+    ("Leepa_2611976_Current_150A_Test_01_Karte_1.DAT", "2611976"),
+    ("Leepa_RO2612030_Current_150A_Test_01_Karte_1.DAT", "2612030"),
+    ("RO2612025-01_Current_150A_Test_01_Karte_1.DAT", "2612025"),
+    ("no_order_id_here.DAT", ""),
+])
+def test_plate_id_reads_every_spelling(name, want):
+    assert bronze.plate_id(name) == want
+
+
+def test_filenames_with_no_order_id_are_left_alone(tmp_path):
+    """A convention that carries no order id cannot be mixing plates, so
+    asking for one must not turn into a refusal."""
+    d = _campaign(tmp_path / "odd",
+                  "unknown_Current_{cond}_Test_01_Karte_{card}.DAT")
+    got = bronze.discover_files(DEFAULT.replace(dat_dir=d, condition="150A",
+                                                leepa="2612030"))
+    assert _conditions_of(got) == ["150A"]

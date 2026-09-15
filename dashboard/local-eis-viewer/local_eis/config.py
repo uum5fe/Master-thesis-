@@ -115,8 +115,21 @@ KNOWN_BAD_SEGMENTS: dict[str, str] = {}
 #: which on a campaign directory means every CONDITION, so asking for 45A read
 #: 45A, 60A, 150A and 450A, four times the data, at every stage.  A run that
 #: should take minutes never finished.
+#: THE ORDER ID IS SPELLED FOUR WAYS AND ALL FOUR ARE IN THE SAME FOLDER:
+#:   Leepa_2611976_Current_150A_...        bare
+#:   Leepa_RO2612030_Current_150A_...      RO prefix, no suffix
+#:   RO2612025-01_Current_150A_...         RO prefix, -NN suffix, no Leepa_
+#: Missing one of these is not a cosmetic gap.  When no pattern matches, the
+#: fallback keeps only the CONDITION -- and a campaign folder holds several
+#: PLATES at that condition, so asking for 2612030 quietly read 2611976,
+#: 2612030 and 2612025 together, anchored card alignment on the wrong plate,
+#: refused every card of the requested one, and reported another plate's
+#: R_ohmic under this plate's name.
 FAMOS_PATTERNS = (
     "Leepa_{leepa}_Current_{cond}_Test_{test}_Karte_*.DAT",
+    "Leepa_RO{leepa}_Current_{cond}_Test_{test}_Karte_*.DAT",
+    "Leepa_RO{leepa}-*_Current_{cond}_Test_{test}_Karte_*.DAT",
+    "RO{leepa}_Current_{cond}_Test_{test}_Karte_*.DAT",
     "RO{leepa}-*_Current_{cond}_Test_{test}_Karte_*.DAT",
     "{leepa}_Current_{cond}_Test_{test}_Karte_*.DAT",
 )

@@ -243,7 +243,10 @@ def discover_files(cfg: Config) -> list[Path]:
     for pattern in patterns:
         files = sorted(d.glob(pattern))
         if files:
-            return files
+            # With no --leepa the pattern carries "*" where the order id goes,
+            # so a MATCH is not proof of a single plate: "Leepa_*_Current_150A"
+            # happily spans 2611976 and 2612030 at once.  Narrow here too.
+            return _narrow_to_plate(files, cfg.leepa, d)
 
     # Nothing matched a known convention. Take what is there, but keep the
     # condition: the run was asked for one.
@@ -260,7 +263,7 @@ def discover_files(cfg: Config) -> list[Path]:
     wanted = [f for f in every
               if f"_Current_{cond}_".lower() in f.name.lower()]
     if wanted:
-        return wanted
+        return _narrow_to_plate(wanted, cfg.leepa, d)
 
     # Still no filter. Before widening, find out what is actually in the
     # folder: any "<number>A" in a name is a current setpoint, whatever the
@@ -269,7 +272,8 @@ def discover_files(cfg: Config) -> list[Path]:
                    for m in (_CURRENT_IN_NAME.search(f.name) for f in every)
                    if m})
     if seen == [cond.upper()]:
-        return every                       # one condition, and it is the one
+        # one condition, and it is the one -- but possibly several plates
+        return _narrow_to_plate(every, cfg.leepa, d)
     raise SystemExit(
         f"bronze: none of the known filename patterns matched in {d}, and the "
         f"files there cannot be narrowed to the requested condition.\n"
@@ -280,6 +284,63 @@ def discover_files(cfg: Config) -> list[Path]:
         f"  Processing all of them would read every condition at once, which "
         f"is four times the data and does not finish. Point --dat at one "
         f"condition's files, or set EIS_FAMOS_REGEX for this naming scheme.")
+
+
+#: The order id in a card filename, however it is spelled:
+#: "Leepa_2611976_", "Leepa_RO2612030_", "RO2612025-01_" -> 2611976 /
+#: 2612030 / 2612025.
+_LEEPA_IN_FILENAME = re.compile(r"(?:^|_)(?:RO?)?(\d{7})(?=[_\-])")
+
+
+def plate_id(name: str) -> str:
+    """The order id in a filename, or "" when it carries none."""
+    m = _LEEPA_IN_FILENAME.search(name)
+    return m.group(1) if m else ""
+
+
+def _narrow_to_plate(files: list[Path], leepa: str, d: Path) -> list[Path]:
+    """Keep only the requested plate; refuse to guess between several.
+
+    The condition filter alone is not enough.  A campaign folder holds several
+    PLATES measured at the same current, and mixing them is worse than reading
+    the wrong condition: the cards of different plates share no clock, so card
+    alignment anchors on whichever plate happens to sort first, refuses every
+    card of the others, and reports the anchor plate's numbers under the
+    requested plate's name.  That is a wrong answer that looks like a right
+    one, which is the only kind worth crashing over.
+    """
+    groups: dict[str, list[Path]] = {}
+    for f in files:
+        groups.setdefault(plate_id(f.name), []).append(f)
+
+    # Only files that actually carry an order id can be attributed to a plate.
+    # A naming convention that carries none cannot be mixing plates, so it is
+    # not this function's business -- refusing there would break every folder
+    # whose files are simply named something else.
+    identified = {k: v for k, v in groups.items() if k}
+
+    want = re.sub(r"\D", "", leepa or "")
+    if want:
+        if want in groups:
+            return groups[want]
+        if not identified:
+            return files
+        raise SystemExit(
+            f"bronze: no card files for plate {want} in {d}\n"
+            f"  folder has: "
+            f"{', '.join(k or '(no order id)' for k in sorted(groups))}\n"
+            f"  Refusing to run on a different plate than the one asked for.")
+
+    if len(identified) > 1:
+        raise SystemExit(
+            f"bronze: {len(files)} files at this condition span "
+            f"{len(groups)} plates in {d}\n"
+            f"  found: "
+            f"{', '.join(k or '(no order id)' for k in sorted(groups))}\n"
+            f"  Different plates share no clock, so aligning their cards "
+            f"together produces one plate's numbers under another's name. "
+            f"Pass --leepa to say which one.")
+    return files
 
 
 def _digest(items) -> str:

@@ -1,0 +1,9 @@
+streamlit>=1.32
+plotly>=5.18
+pandas>=2.0
+numpy>=1.24
+
+# The pipeline itself (EIS_PIPELINE_DIR) additionally needs:
+#   scipy>=1.10  matplotlib>=3.7  PyYAML>=6.0
+# Install those too if you want to LAUNCH runs from the dashboard rather than
+# only browse results somebody else produced.

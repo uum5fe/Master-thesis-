@@ -141,9 +141,27 @@ def split_processes(sp: SilverSpectrum, cfg: Config) -> dict[str, float]:
     #
     # R_ohmic therefore stays as silver measured it, from the data at the top
     # of the band, and the fast bucket is reported beside it as a diagnostic.
-    out["R_hf_extra"] = float(max(g[fast].sum(), 0.0))
-    out["R_ct"] = float(max(g[mid].sum(), 0.0))
-    out["R_mt"] = float(max(g[slow].sum(), 0.0))
+    # A BUCKET THE BAND DOES NOT REACH IS UNKNOWN, NOT ZERO.
+    # The tau grid spans 1/(2*pi*f_max) .. 1/(2*pi*f_min) and, with the
+    # default drt_tau_pad_slow = 0, stops exactly at the slowest measured
+    # point.  So the slow bucket (tau >= tau_split_kinetic_s = 10 ms) is
+    # EMPTY for any segment whose lowest surviving frequency is above
+    # 1/(2*pi*0.01) = 15.9 Hz -- and numpy sums an empty slice to 0.0, which
+    # max(..., 0.0) then launders into a confident-looking "R_mt = 0".
+    # That is a segment with no low-frequency data, reported as a segment
+    # with no mass transport.  It reads as zero for EVERY condition, because
+    # what decides it is the segment's own low-frequency SNR, which does not
+    # change with the operating point.  NaN sends it through the same
+    # missing-value path as a failed fit: inferred from neighbours if the
+    # plate can afford it, hatched on the map, flagged in the CSV.
+    out["R_hf_extra"] = (float(max(g[fast].sum(), 0.0)) if fast.any()
+                         else np.nan)
+    out["R_ct"] = float(max(g[mid].sum(), 0.0)) if mid.any() else np.nan
+    out["R_mt"] = float(max(g[slow].sum(), 0.0)) if slow.any() else np.nan
+    # Slowest tau the band actually supports, so a reader can tell a measured
+    # zero from a bucket that was never in range: R_mt is trustworthy only
+    # where tau_max >= tau_split_kinetic_s.
+    out["tau_max"] = float(tau.max()) if tau.size else np.nan
     return out
 
 
@@ -172,6 +190,7 @@ def collect_parameters(sr: SilverRun, cfg: Config
         put("R_hf_extra", s, proc.get("R_hf_extra", np.nan))
         put("R_ct", s, proc["R_ct"])
         put("R_mt", s, proc["R_mt"])
+        put("tau_max", s, proc.get("tau_max", np.nan))
         put("R_pol", s, sp.R_pol)
         put("j_dc", s, sp.j_dc)
         put("T_degC", s, sp.T_degC)

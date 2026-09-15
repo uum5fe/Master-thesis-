@@ -250,6 +250,34 @@ class Config:
     # ~250.  25 sits three times above the noise ceiling and ten times below
     # the real signal, so it is not a close call in either direction.
     align_min_corr: float = 0.05        # absolute floor against pure garbage
+    # Width of the band excluded around the correlation peak before the
+    # background is measured, IN SECONDS.  It must cover the peak itself,
+    # whose width is about 1 / f_lo of the correlation band (0.5 Hz here,
+    # so ~2 s).  The old hardcoded 5000 SAMPLES was 0.2 s on a 25 kHz card
+    # and 0.5 s on a 10 kHz one, so most of the peak's own shoulders were
+    # counted as background -- which inflates the median and MAD and
+    # UNDERSTATES the prominence of a correct lag.
+    align_guard_s: float = 2.0
+    # ---- corroboration: the way out of an unwinnable threshold -----------
+    # A degraded reference channel produces a CORRECT lag at a prominence
+    # that overlaps the noise distribution, so no value of
+    # align_min_prominence separates the two.  Measured on RO2612030 at
+    # 150 A: cards 1 and 2 scored |r| = 0.083 and prominence 7.6-7.7 --
+    # refused -- yet returned +215634 and +215687 samples, 53 samples (2.1
+    # ms) apart on an 8.63 s offset.  Independent noise peaks do not agree
+    # to 2 ms across a 600001-candidate search; those cards were armed
+    # together and both lags were right.  So a sub-threshold peak is
+    # accepted when another card independently reproduces it.
+    align_agree_tol_s: float = 0.02      # how close two lags must land
+    # The corroborating peak must still be a peak -- this stops two pieces
+    # of pure noise from vouching for each other.  The worst genuinely-bad
+    # alignment seen in this campaign scored 4.1 (RO2612025), so 5.0 sits
+    # above it while admitting the 7.6-7.7 pair above.
+    align_corroborate_min_prominence: float = 5.0
+    # A card whose lag is refused cannot have its dwell windows placed at
+    # all, so its spectra are meaningless.  Drop them instead of letting
+    # them into the plate aggregate at an unverified zero offset.
+    align_drop_refused_cards: bool = True
     align_min_prominence: float = 25.0  # robust sigma above the background
 
     # ---- per-step quality gates -------------------------------------------

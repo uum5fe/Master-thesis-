@@ -425,29 +425,65 @@ def estimate_card_lags(files: list[Path], cards: dict[str, CardInfo],
                   "applied": True}}
     log.info(f"  reference card: {base} (ref channel {cards[base].ref_name})")
 
+    # ---- pass 1: measure every card's lag, decide nothing yet -------------
+    # Deciding card-by-card throws away the one piece of evidence that
+    # settles a weak peak: whether the OTHER cards independently landed on
+    # the same lag.  So measure first, judge afterwards.
+    guard = int(round(getattr(cfg, "align_guard_s", 2.0) * cards[base].fs))
+    cand: dict[str, tuple[int, float, float]] = {}
     for stem in stems:
         if stem == base:
             continue
-        lag, corr, prom = _best_lag(traces[stem], ref, max_lag)
         # lag < 0 means this card's record RUNS AHEAD of the reference's,
         # i.e. it was armed later; the schedule index must be shifted by
         # +lag to read the same instant.
+        cand[stem] = _best_lag(traces[stem], ref, max_lag, guard=guard)
+
+    # ---- pass 2: accept on prominence OR on corroboration -----------------
+    for stem, (lag, corr, prom) in cand.items():
         strong = prom >= cfg.align_min_prominence
         above_floor = abs(corr) >= cfg.align_min_corr
-        applied = bool(cfg.align_cards and strong and above_floor)
+        partners = _agreeing_cards(stem, lag, cand, cards, cfg)
+        # A weak peak that another card INDEPENDENTLY reproduces is not a
+        # weak answer, it is a confirmed one.  See _agreeing_cards.
+        rescued = bool(partners and not strong and prom >= getattr(
+            cfg, "align_corroborate_min_prominence", 5.0))
+        applied = bool(cfg.align_cards and above_floor and (strong or rescued))
         out[stem] = {"lag": lag, "corr": corr, "prominence": prom,
-                     "applied": applied}
-        why = ("" if applied else
-               "   REFUSED (peak not prominent)" if not strong else
-               "   REFUSED (below the absolute floor)")
+                     "applied": applied, "corroborated_by": partners,
+                     "rescued": rescued}
+        if applied and rescued:
+            why = "   ACCEPTED (corroborated)"
+        elif applied:
+            why = ""
+        elif not above_floor:
+            why = "   REFUSED (below the absolute floor)"
+        else:
+            why = "   REFUSED (weak peak, uncorroborated)"
         log.info(f"  {stem[-8:]}: lag {lag:+8d} samples = "
                  f"{lag / cards[stem].fs:+8.4f} s   peak corr {corr:+.3f}"
                  f"   prominence {prom:5.1f}" + why)
-        if not applied:
-            log.warning(f"    {stem[-8:]} stays on its own clock. If its true "
-                        f"offset is not ~0 its dwell windows will land on the "
-                        f"wrong tone and EVERY segment on this card will fail "
-                        f"the SNR gate in silver.")
+        if applied and rescued:
+            names = ", ".join(p[-8:] for p in partners)
+            log.info(f"    prominence {prom:.1f} is below "
+                     f"{cfg.align_min_prominence:.0f}, but {names} "
+                     f"independently measured the same lag to within "
+                     f"{getattr(cfg, 'align_agree_tol_s', 0.02) * 1e3:.0f}"
+                     f" ms.  Two cards do "
+                     f"not agree on a spurious lag by accident -- the search "
+                     f"spans {2 * max_lag + 1} candidates -- so the lag is "
+                     f"taken as correct and APPLIED.")
+        elif not applied:
+            drop = getattr(cfg, "align_drop_refused_cards", True)
+            log.warning(
+                f"    {stem[-8:]} stays on its own clock. A refused lag "
+                f"means the dwell windows on this card cannot be placed at "
+                f"all, so its spectra are not measurements of anything."
+                + (f" Its segments are DROPPED." if drop else
+                   f" align_drop_refused_cards is OFF, so its segments "
+                   f"STILL ENTER the plate aggregate at an unverified zero "
+                   f"offset -- which is how a bad card poisons L_ser and "
+                   f"the R_ohmic smoothness check."))
         elif abs(lag) >= max_lag - 1:
             log.warning("    lag is at the search limit - raise "
                         "align_max_lag_s and re-run")
@@ -459,7 +495,7 @@ def estimate_card_lags(files: list[Path], cards: dict[str, CardInfo],
 
 
 def _best_lag(x: np.ndarray, ref: np.ndarray,
-              max_lag: int) -> tuple[int, float, float]:
+              max_lag: int, guard: int = 5000) -> tuple[int, float, float]:
     """The lag of best agreement, its correlation, and its prominence."""
     n = min(len(x), len(ref))
     a, b = x[:n], ref[:n]
@@ -472,7 +508,50 @@ def _best_lag(x: np.ndarray, ref: np.ndarray,
     k = int(np.argmax(np.abs(cc_sel)))
     denom = np.sqrt(float(np.dot(a, a)) * float(np.dot(b, b)))
     corr = float(cc_sel[k] / denom) if denom > 0 else 0.0
-    return int(lag_sel[k]), corr, _prominence(np.abs(cc_sel), k)
+    return int(lag_sel[k]), corr, _prominence(np.abs(cc_sel), k, guard)
+
+
+def _agreeing_cards(stem: str, lag: int, cand: dict, cards: dict,
+                    cfg) -> list[str]:
+    """Other cards whose INDEPENDENT lag estimate lands on the same answer.
+
+    WHY THIS IS EVIDENCE
+    --------------------
+    Absolute correlation height says nothing (that is why prominence exists)
+    and prominence itself saturates once the shared reference is degraded:
+    a card whose UC2 sense line is riding on mains hum correlates against the
+    anchor at |r| ~ 0.08 and prominence ~8 even when its lag is exactly
+    right.  There is no threshold that separates that from noise, because
+    the two distributions overlap -- lowering the gate lets garbage in and
+    raising it keeps throwing the right answer away.
+
+    What DOES separate them is agreement.  The lag search spans
+    2 * align_max_lag_s * fs + 1 candidates -- 600001 at 25 kHz with the
+    default 12 s window.  Two cards whose peaks are noise land on unrelated
+    lags; the chance that they fall within align_agree_tol_s of each other
+    is about (2 * tol * fs) / (2 * max_lag), i.e. 1.7e-3 for a 20 ms
+    tolerance.  Measured on RO2612030 at 150 A, cards 1 and 2 returned
+    +215634 and +215687 samples -- 53 samples apart, 2.1 ms, on an 8.63 s
+    offset -- while both scored prominence 7.6-7.7 and were refused.  They
+    were not both wrong in the same way by chance; they were armed together,
+    8.63 s before the anchor, and both estimates were right.
+
+    The corroborating card must itself clear the absolute correlation floor
+    and align_corroborate_min_prominence, so two pieces of pure garbage
+    cannot vouch for each other.
+    """
+    tol = int(round(getattr(cfg, "align_agree_tol_s", 0.02)
+                    * cards[stem].fs))
+    out = []
+    for other, (olag, ocorr, oprom) in cand.items():
+        if other == stem:
+            continue
+        if (abs(olag - lag) <= tol
+                and abs(ocorr) >= cfg.align_min_corr
+                and oprom >= getattr(
+                    cfg, "align_corroborate_min_prominence", 5.0)):
+            out.append(other)
+    return sorted(out)
 
 
 def _prominence(mag: np.ndarray, k: int, guard: int = 5000) -> float:
@@ -482,6 +561,15 @@ def _prominence(mag: np.ndarray, k: int, guard: int = 5000) -> float:
     stepped sweep against itself is not flat -- it has broad structure that
     a mean-based score would read as signal.  The guard band excludes the
     peak's own shoulders, which are part of the peak, not of the background.
+
+    THE GUARD IS A TIME, NOT A SAMPLE COUNT.  It has to cover the width of
+    the correlation peak, and that width is set by the lowest frequency left
+    in the band -- about 1 / f_lo.  With the 0.5 Hz lower edge used here the
+    peak is roughly 2 s wide, which is 50000 samples at 25 kHz but only
+    20000 at 10 kHz.  The old fixed 5000 counted most of the peak's own
+    shoulders as "background", which raises the median and the MAD and so
+    UNDERSTATES the prominence of a correct lag -- worst exactly on the weak
+    cards this gate is meant to judge.  Callers pass align_guard_s * fs.
     """
     lo, hi = max(0, k - guard), min(mag.size, k + guard + 1)
     background = np.concatenate([mag[:lo], mag[hi:]])
@@ -970,6 +1058,21 @@ def run(cfg: Config = DEFAULT, log=None) -> BronzeRun:
             continue
         log.info(f"  {fp.name}")
         info = lags.get(fp.stem, {})
+        # A REFUSED LAG MEANS THE CARD CANNOT BE PLACED, NOT THAT IT SITS AT
+        # ZERO.  Reading it at shift 0 puts every dwell window on whatever
+        # the card happened to be doing at that instant, and those spectra
+        # then enter `spectra` and the aggregate looking like data.  On
+        # RO2612030 at 150 A that is 29 of 67 segments, and it is what drives
+        # the band collapse (792 Hz instead of 3-4.5 kHz), the impossible
+        # +567 nH L_ser sign flip, and the R_ohmic smoothness failure.  The
+        # whole-cell reference path already skips refused cards; this is the
+        # segment path being made to agree with it.
+        if (info and not info.get("applied", True)
+                and getattr(cfg, "align_drop_refused_cards", True)):
+            log.warning(f"    SKIPPED: {fp.stem[-8:]} has no trustworthy lag; "
+                        f"its segments are excluded from the plate rather "
+                        f"than aggregated at an unverified offset")
+            continue
         shift = int(info.get("lag", 0)) if info.get("applied") else 0
         got = process_card(fp, cal, schedule, grid, cfg, log,
                            T_seg=T_seg, lag=shift)

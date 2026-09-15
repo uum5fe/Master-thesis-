@@ -25,26 +25,44 @@ from `EIS_DASHBOARD_PORT`.
 Two settings are the ones that change from machine to machine; everything else
 has a working default.
 
-| Variable | What it is |
-|---|---|
-| `EIS_DAT_DIR` | directory of FAMOS `.DAT` recordings -- the pipeline's `--dat` |
-| `EIS_OUT_DIR` | where results are written; runs land in `<root>/<leepa>/<condition>/` |
+These are the **same variable names the existing Local EIS viewer uses**, so
+one `.env` serves both applications and nothing has to be renamed.
 
-Optional: `EIS_CURR_CAL`, `EIS_TEMP_CAL`, `EIS_AREAS`, `EIS_GAIN`,
-`EIS_GAMRY_DIR`, `EIS_BENCH_LOG`, `EIS_PLATE`, `EIS_LEEPA`, `EIS_CONDITIONS`,
-`EIS_PIPELINE_DIR`, `EIS_PYTHON`, `EIS_DASHBOARD_PORT`, `EIS_READ_ONLY`.
-See `.env.example`, which documents each one.
+| Variable | Maps to | What it is |
+|---|---|---|
+| `EIS_FAMOS_ROOT` | `--dat` | directory of FAMOS `.DAT` recordings |
+| `EIS_RESULTS_ROOT` | `--out` | where results are written, as `<root>/<leepa>/<condition>/` |
+| `EIS_CSV_ROOT` | `--csv` | already-extracted CSV measurements, used when `EIS_SOURCE=csv` |
+| `EIS_GAMRY_ROOT` | `--gamry` | whole-cell Gamry `.DTA` sweeps; empty skips the check |
+| `EIS_CURR_CAL` | `--curr-cal` | per-segment current Abgleich |
+| `EIS_TEMP_CAL` | `--temp-cal` | per-sensor temperature Abgleich |
+| `EIS_ALLOW_INLINE_PIPELINE` | -- | `1` lets the Run page launch the pipeline |
+
+Also read: `EIS_AREAS_FILE`, `EIS_SOURCE`, `EIS_DEFAULT_PLATE` (accepts
+`gen1_r2d2_72`), `EIS_LEEPA`, `EIS_CONDITIONS`, `EIS_PIPELINE_DIR`,
+`EIS_PYTHON`, `EIS_DASHBOARD_PORT`, `EIS_TITLE`, `EIS_SKIP_DOTENV`.
+`.env.example` documents each one.
 
 **Anything already exported in the environment beats the file**, so a one-off
-override is `set EIS_DAT_DIR=...` rather than editing `.env` and remembering to
-change it back. `EIS_NO_DOTENV=1` ignores the file entirely, for a container
-configured purely from the environment.
+override is `set EIS_FAMOS_ROOT=...` rather than editing `.env` and remembering
+to change it back. `EIS_SKIP_DOTENV=1` ignores the file entirely.
 
-Windows paths need no escaping -- the whole rest of the line is the value:
+### Windows and UNC paths
+
+They need no escaping. The whole rest of the line after the first `=` is the
+value, and a backslash is never an escape character here:
 
 ```
-EIS_DAT_DIR=C:\Users\me\OneDrive - Bosch Group\Famos
+EIS_FAMOS_ROOT=\\bosch.com\DfsRB\DfsDE\LOC\Fe\ILM\...\Daten\2612030_07_09
 ```
+
+A UNC share is recognised as an absolute path on every platform, not just
+Windows -- `pathlib` on Linux would otherwise call `\\server\share` *relative*
+and silently join it onto this directory.
+
+A path on a share that cannot be reached is reported as **unverifiable**, not
+as an error: on a machine that is off the domain the check says nothing about
+whether the setting is right, so it does not block a run.
 
 The **Setup** page shows what every variable resolved to and what is wrong with
 it, rather than failing at import time, so a half-configured `.env` is
@@ -64,9 +82,9 @@ diagnosable in the browser.
 The dashboard never imports the pipeline; it shells out to `main.py` in
 `EIS_PIPELINE_DIR`. That keeps the two dependency sets apart (the pipeline wants
 scipy and matplotlib; this app does not) and means a run that dies takes a
-subprocess with it, not the web server. Set `EIS_READ_ONLY=1` for a
-browse-only deployment: the Run page is hidden and `EIS_PIPELINE_DIR` stops
-being required.
+subprocess with it, not the web server. Leave `EIS_ALLOW_INLINE_PIPELINE`
+unset for a browse-only deployment: the Run page stands down and
+`EIS_PIPELINE_DIR` stops being required.
 
 ## Why some segments show "band-limited" instead of a mass-transport value
 
@@ -103,5 +121,5 @@ python -m pytest tests -q
 
 ```bash
 python tests/make_fixture.py /tmp/demo
-EIS_NO_DOTENV=1 EIS_OUT_DIR=/tmp/demo EIS_READ_ONLY=1 streamlit run run.py
+EIS_SKIP_DOTENV=1 EIS_RESULTS_ROOT=/tmp/demo streamlit run run.py
 ```

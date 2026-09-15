@@ -19,9 +19,20 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from . import pipeline, results, theme
-from .settings import DOTENV_LOADED, Settings
+from . import pipeline, results, settings as settings_mod, theme
+from .settings import Settings
 from .settings import load as load_settings
+
+
+def _dotenv_path() -> str:
+    """The .env actually read.
+
+    Read off the module, never imported by value: settings.DOTENV_LOADED is
+    set when load() runs, which is after this module is imported, so a
+    `from .settings import DOTENV_LOADED` would freeze the empty startup value
+    and the page would report "no .env found" however many it had read.
+    """
+    return settings_mod.DOTENV_LOADED
 
 PAGES = ["Setup", "Run", "Plate map", "Spectra", "Diagnostics", "Files"]
 
@@ -39,7 +50,8 @@ def _mode() -> str:
 
 
 def _severity_box(sev: str, setting: str, msg: str) -> None:
-    (st.error if sev == "error" else st.warning)(f"**{setting}** -- {msg}")
+    box = {"error": st.error, "warning": st.warning}.get(sev, st.info)
+    box(f"**{setting}** -- {msg}")
 
 
 def _fmt(v, nd: int = 4) -> str:
@@ -56,7 +68,7 @@ def _fmt(v, nd: int = 4) -> str:
 def page_setup(stg: Settings) -> None:
     st.subheader("Configuration")
     st.caption(
-        f"Read from `{DOTENV_LOADED or '(no .env found -- environment only)'}`. "
+        f"Read from `{_dotenv_path() or '(no .env found -- environment only)'}`. "
         "Anything already exported in the environment wins over the file."
     )
     problems = stg.problems()
@@ -69,36 +81,38 @@ def page_setup(stg: Settings) -> None:
     if errs:
         st.info(
             "Fix these in `.env` (copy `.env.example` if you have not yet). "
-            "The two that matter are **EIS_DAT_DIR** -- where the .DAT "
-            "recordings are read from -- and **EIS_OUT_DIR** -- where results "
-            "are written."
+            "The two that matter are **EIS_FAMOS_ROOT** -- where the .DAT "
+            "recordings are read from -- and **EIS_RESULTS_ROOT** -- where "
+            "results are written. A setting marked *unverifiable* is not an "
+            "error: a network share simply cannot be checked from here."
         )
 
     st.dataframe(pd.DataFrame(stg.as_rows()), width="stretch",
                  hide_index=True)
 
     st.subheader("What is in the input directory")
-    conds = pipeline.discover_conditions(stg.dat_dir)
-    leepa = stg.leepa or pipeline.discover_leepa(stg.dat_dir)
+    conds = pipeline.discover_conditions(stg.input_root, stg.source)
+    leepa = stg.leepa or pipeline.discover_leepa(stg.input_root, stg.source)
     if conds:
         c1, c2 = st.columns(2)
         c1.metric("conditions found", len(conds), help=", ".join(conds))
         c2.metric("plate / order id", leepa or "unknown")
         st.write("Conditions: " + ", ".join(f"`{c}`" for c in conds))
     else:
-        st.info("No .DAT files with a recognisable current setpoint in the "
-                "name were found. The dashboard can still browse results "
-                "already under EIS_OUT_DIR.")
+        st.info(f"No {'CSV' if stg.source == 'csv' else '.DAT'} files with "
+                f"a recognisable current setpoint in the name were found "
+                f"under `{stg.input_root}`. The dashboard can still browse "
+                f"results already under EIS_RESULTS_ROOT.")
 
     st.subheader("Results already present")
-    runs = results.discover(stg.out_dir)
+    runs = results.discover(stg.results_root)
     if runs:
         st.dataframe(pd.DataFrame([
             {"run": r.label, "path": str(r.path),
              "gold": "yes" if r.has(results.PLATE_SUMMARY) else "no"}
             for r in runs]), width="stretch", hide_index=True)
     else:
-        st.caption(f"Nothing under `{stg.out_dir}` yet.")
+        st.caption(f"Nothing under `{stg.results_root}` yet.")
 
 
 # ---------------------------------------------------------------------------
@@ -107,8 +121,10 @@ def page_setup(stg: Settings) -> None:
 
 
 def page_run(stg: Settings) -> None:
-    if stg.read_only:
-        st.info("EIS_READ_ONLY is set -- this deployment browses results only.")
+    if not stg.allow_inline_pipeline:
+        st.info("**Browse-only.** Set `EIS_ALLOW_INLINE_PIPELINE=1` in `.env` "
+                "to launch runs from here; results already under "
+                "`EIS_RESULTS_ROOT` stay browsable either way.")
         return
     errs = [p for p in stg.problems() if p[0] == "error"]
     if errs:
@@ -117,8 +133,8 @@ def page_run(stg: Settings) -> None:
             _severity_box(sev, name, msg)
         return
 
-    found = pipeline.discover_conditions(stg.dat_dir)
-    leepa = stg.leepa or pipeline.discover_leepa(stg.dat_dir)
+    found = pipeline.discover_conditions(stg.input_root, stg.source)
+    leepa = stg.leepa or pipeline.discover_leepa(stg.input_root, stg.source)
     default = ([c for c in stg.conditions if c in found]
                or found[:1]) if "ALL" not in stg.conditions else found
 
@@ -557,15 +573,15 @@ def page_files(run: results.Run | None) -> None:
 
 
 def main() -> None:
-    st.set_page_config(page_title="Local EIS", layout="wide",
-                       page_icon="\N{HIGH VOLTAGE SIGN}")
     stg = load_settings()
+    st.set_page_config(page_title=stg.title, layout="wide",
+                       page_icon="\N{HIGH VOLTAGE SIGN}")
     mode = _mode()
 
-    st.sidebar.title("Local EIS")
+    st.sidebar.title(stg.title)
     page = st.sidebar.radio("Page", PAGES, label_visibility="collapsed")
 
-    runs = results.discover(stg.out_dir)
+    runs = results.discover(stg.results_root)
     run: results.Run | None = None
     if runs:
         labels = [f"{r.label}" for r in runs]
@@ -574,12 +590,12 @@ def main() -> None:
         run = runs[idx]
         st.sidebar.caption(str(run.path))
     else:
-        st.sidebar.caption(f"No results under {stg.out_dir}")
+        st.sidebar.caption(f"No results under {stg.results_root}")
 
     if st.sidebar.button("Rescan results"):
         st.rerun()
     st.sidebar.divider()
-    st.sidebar.caption(f".env: {DOTENV_LOADED or 'not found'}")
+    st.sidebar.caption(f".env: {_dotenv_path() or 'not found'}")
 
     st.title(f"{page}"
              + (f"  --  {run.label}" if run and page not in ("Setup", "Run")

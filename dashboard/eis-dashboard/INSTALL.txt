@@ -1,0 +1,45 @@
+Local EIS dashboard -- quick start
+==================================
+
+1. Unzip anywhere.
+
+2. Install the four packages it needs:
+
+       pip install -r requirements.txt
+
+3. Copy .env.example to .env and check the paths.  The file that ships in
+   this zip already has your shares filled in:
+
+       EIS_FAMOS_ROOT     ...\Lokale_EIS\Daten\2612030_07_09
+       EIS_RESULTS_ROOT   ...\Lokale_EIS\Daten\EIS_Results
+       EIS_CSV_ROOT       ...\Lokale_EIS\csv_files
+       EIS_GAMRY_ROOT     ...\Lokale_EIS\EIS_Daten_Gamry_Tom
+       EIS_CURR_CAL       ...\Lokale_EIS\Daten\curr.csv
+       EIS_TEMP_CAL       ...\Lokale_EIS\Daten\temp.csv
+
+   The ONE line you will probably have to change is EIS_PIPELINE_DIR -- it
+   must point at the folder holding main.py, bronze.py, silver.py, gold.py.
+   It is only needed when EIS_ALLOW_INLINE_PIPELINE=1.
+
+4. Start it:
+
+       streamlit run run.py
+
+   or just:
+
+       python run.py
+
+   then open http://localhost:8501
+
+5. The Setup page tells you what every path resolved to and what is wrong
+   with it.  Start there.  "unverifiable" is not an error -- it means a
+   network share could not be checked from this machine.
+
+Want to look at it before pointing it at real data?
+
+       python tests/make_fixture.py C:\temp\demo
+       set EIS_SKIP_DOTENV=1
+       set EIS_RESULTS_ROOT=C:\temp\demo
+       streamlit run run.py
+
+Tests:  python -m pytest tests -q        (45 tests, no data needed)

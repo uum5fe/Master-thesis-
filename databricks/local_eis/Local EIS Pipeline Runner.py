@@ -216,6 +216,27 @@ def _w(name, default=''):
         return dbutils.widgets.get(name)
     except Exception:
         return default
+
+
+def _widget(*names, default=''):
+    """First widget that exists, else a notebook global, else the default.
+
+    Written this way because widget names have differed between versions of
+    this runner and a NameError in a display cell kills the whole cell.
+    Defined HERE, once, rather than re-pasted in each display cell: the copies
+    are what let those cells drift apart about which run they were showing.
+    """
+    for n in names:
+        try:
+            v = dbutils.widgets.get(n)
+            if v not in (None, ''):
+                return v
+        except Exception:
+            pass
+        g = globals().get(n) or globals().get(n.upper())
+        if g not in (None, ''):
+            return g
+    return default
  
  
 # ─── Read widget values ───
@@ -876,6 +897,119 @@ def _cache_conditions(leepa) -> list:
     return out
  
  
+# ─── ONE PLACE THAT ANSWERS "WHERE ARE THIS RUN'S RESULTS?" ──────────────
+# Every display cell below used to answer this for itself, by pasting a path
+# shape. That is why the heat map could show 60 A while the widget said
+# 450 A: nothing it read was tied to the condition that was selected, and
+# nothing it read was tied to the cache layout that the run cell writes.
+#
+# The two functions below are the only correct answers, and each display cell
+# now calls them instead of rebuilding a path.
+
+def selected_conditions():
+    """The conditions the widgets asked for -- NOT whatever is on the Volume.
+
+    A display cell that iterates the cache directory shows every condition
+    ever run for this plate, in whatever order the filesystem returns them.
+    With one figure per condition the LAST one drawn is the one on screen,
+    which is how selecting 450 A produces a 60 A heat map: 60 A simply sorts
+    last among 150A, 450A, 45A, 60A.
+    """
+    try:
+        return list(_conditions_to_run)
+    except NameError:
+        pass
+    cond = _w('condition', 'ALL')
+    return list(CONDITIONS) if cond == 'ALL' else [cond]
+
+
+def result_dir(leepa, cond, snr=None, mode=None, prefer_live=True):
+    """(directory, provenance) for one condition, newest evidence first.
+
+    Order, and why:
+      1. What THIS kernel just computed. A fresh run's output is the most
+         recent thing there is, and it may not have reached the Volume at all
+         if cache writing is off. The old cells consulted it only when the
+         run-mode widget said 'rerun', so a normal run displayed the previous
+         run's cache.
+      2. The cache entry for the CURRENT identity -- mode and settings digest
+         included, via _cache_dir, so this cannot drift from what the run
+         cell writes.
+      3. Older layouts (snr_<v>/ then the unversioned tree), clearly marked.
+         They are readable but they are not evidence about the current
+         settings, and the provenance string says so in words the display
+         cells print.
+    """
+    snr = MIN_SNR_DB if snr is None else snr
+    mode = EVALUATION_MODE if mode is None else mode
+
+    def _usable(d):
+        d = Path(d)
+        return d.is_dir() and any((d / sub).is_dir()
+                                  for sub in ('gold', 'silver', 'csv'))
+
+    if prefer_live:
+        try:
+            pr = PIPELINE_RESULTS.get(cond)
+        except NameError:
+            pr = None
+        if pr and not pr.get('cached') and _usable(pr['out_dir']):
+            return Path(pr['out_dir']), 'this session\'s run'
+
+    d = _cache_dir(leepa, cond, snr, mode)
+    if _usable(d):
+        return d, f'cache: mode_{mode}/{Path(d).name}'
+
+    base = _CACHE_VOL / str(leepa) / str(cond)
+    for name in _legacy_snr_names(snr):
+        if _usable(base / name):
+            return base / name, (f'LEGACY cache {name}/ -- written before the '
+                                 f'cache key included the evaluation mode and '
+                                 f'the settings digest, so it may not match '
+                                 f'the settings shown above')
+    if _usable(base):
+        return base, ('LEGACY unversioned cache -- belongs to whichever run '
+                      'wrote last, at unknown settings')
+    try:
+        tmp = _TMP_BASE / str(leepa) / str(cond)
+        if _usable(tmp):
+            return tmp, 'local /tmp output from an earlier run in this session'
+    except NameError:
+        pass
+    return None, 'not found'
+
+
+def _legacy_snr_names(snr):
+    """The snr_<value> spellings the old cache layout used."""
+    out, text = [], str(snr).strip()
+    if text:
+        out.append(f'snr_{text}')
+    try:
+        f = float(text)
+        for spelling in (repr(f), f'{f:g}'):
+            if f'snr_{spelling}' not in out:
+                out.append(f'snr_{spelling}')
+    except (TypeError, ValueError):
+        pass
+    return out
+
+
+def describe_source(cond, d, prov):
+    """One line naming what is about to be plotted, and how old it is."""
+    if d is None:
+        return (f'  {cond}: NO RESULTS for the current selection '
+                f'(mode {EVALUATION_MODE}, SNR {MIN_SNR_DB:g}). '
+                f'Run the pipeline cell for this condition.')
+    newest = max((f.stat().st_mtime for f in Path(d).rglob('*.csv')),
+                 default=0.0)
+    age_h = (time.time() - newest) / 3600.0 if newest else float('nan')
+    age = ('unknown age' if not newest else
+           f'{age_h*60:.0f} min old' if age_h < 1 else
+           f'{age_h:.1f} h old' if age_h < 48 else f'{age_h/24:.0f} d old')
+    flag = '   <-- NOT the current settings' if prov.startswith('LEGACY') else ''
+    return f'  {cond}: {prov}, {age}{flag}\n    {d}'
+
+
 # ─── Which conditions this execution covers ───
 # A CSV measurement is one file, so it is one "condition" -- named after the
 # file rather than after a current setpoint, because the file is what
@@ -1610,41 +1744,56 @@ if not _gamry:
  
 # ─── 3. Load pipeline spectra from Volume cache ───
 def _load_pipeline(leepa, cond):
-    candidates = [_CACHE_VOL / leepa / cond]
-    try:
-        pr = PIPELINE_RESULTS.get(cond)
-        if pr:
-            candidates.insert(0, Path(pr['out_dir']))
-    except NameError:
-        pass
-    candidates.append(Path(f'/tmp/eis_{os.getuid()}/{leepa}/{cond}'))
-    for d in candidates:
-        for sub in ('silver', 'csv'):
-            p = d / sub / 'spectra_clean.csv'
-            if p.exists():
-                seg = pd.read_csv(p)
-                agg_p = d / 'silver' / 'cell_aggregate.csv'
-                agg = pd.read_csv(agg_p) if agg_p.exists() else None
-                if agg is not None:
-                    agg = pd.DataFrame({
-                        'freq_hz': agg['freq_hz'],
-                        'z_re': agg['z_re_mohm_cm2'],
-                        'z_im': agg['z_im_mohm_cm2'],
-                    }).sort_values('freq_hz').reset_index(drop=True)
-                    if np.nanmedian(agg['z_im']) > 0:
-                        agg['z_im'] = -agg['z_im']
-                return seg, agg, str(d)
-    return None, None, None
+    """Per-segment and aggregate spectra for ONE condition, newest first.
+
+    This used to try `<leepa>/<cond>/` on the Volume before anything else --
+    the unversioned tree, which belongs to whichever run wrote last at
+    whatever settings. It therefore drew a Gamry overlay against a run the
+    operator had not selected and could not identify. It now asks
+    result_dir(), the same resolver the heat maps and the run cell use, so
+    the overlay and the maps can never disagree about which run they show.
+    """
+    d, prov = result_dir(leepa, cond)
+    if d is None:
+        return None, None, None, prov
+    for sub in ('silver', 'csv'):
+        sp = Path(d) / sub / 'spectra_clean.csv'
+        if not sp.exists():
+            continue
+        seg = pd.read_csv(sp)
+        agg_p = Path(d) / 'silver' / 'cell_aggregate.csv'
+        agg = pd.read_csv(agg_p) if agg_p.exists() else None
+        if agg is not None:
+            agg = pd.DataFrame({
+                'freq_hz': agg['freq_hz'],
+                'z_re': agg['z_re_mohm_cm2'],
+                'z_im': agg['z_im_mohm_cm2'],
+            }).sort_values('freq_hz').reset_index(drop=True)
+            if np.nanmedian(agg['z_im']) > 0:
+                agg['z_im'] = -agg['z_im']
+        return seg, agg, str(d), prov
+    return None, None, None, f'{prov} (no spectra_clean.csv in it)'
  
  
 # ─── 4. Plot overlay for each condition ───
-_conds = [_COND] if _COND != 'ALL' else ['45A', '60A', '150A', '450A']
+# The condition list comes from the widgets, through the same function the
+# heat maps use, rather than from a literal list of every condition ever
+# measured -- which is how a cell "for the selected condition" ended up
+# drawing four.
+try:
+    _conds = selected_conditions()
+except NameError:
+    _conds = [_COND] if _COND != 'ALL' else ['45A', '60A', '150A', '450A']
  
 for cond in _conds:
-    seg_df, agg_df, src = _load_pipeline(_LEEPA, cond)
+    seg_df, agg_df, src, _prov = _load_pipeline(_LEEPA, cond)
     if seg_df is None:
-        print(f"  {cond}: no pipeline results found")
+        print(f"  {cond}: no pipeline results found ({_prov})")
         continue
+    try:
+        print(describe_source(cond, Path(src), _prov))
+    except NameError:
+        print(f"  {cond}: {_prov}  {src}")
  
     # Match Gamry condition
     gamry_df = _gamry.get(cond, None)
@@ -1768,7 +1917,7 @@ for cond in _conds:
     _gstr = f' + Gamry {cond}' if gamry_df is not None else ''
     fig.update_layout(
         title=f'<b>Leepa {_LEEPA} / {cond}: {n_seg} segments{_gstr}</b><br>'
-              f'<sup>Source: {src}</sup>',
+              f'<sup>Source: {_prov} — {src}</sup>',
         height=580, width=1550,
         paper_bgcolor='white', plot_bgcolor='white',
         margin=dict(t=100, b=55, r=280), hovermode='closest',
@@ -1787,22 +1936,33 @@ from pathlib import Path
 import gamry_dta
 from config import A_CELL_CM2
  
-LEEPA     = '2612030'
+# THREE HARD-CODED VALUES USED TO LIVE HERE, AND EACH ONE WAS A TRAP.
+#   LEEPA = '2612030'      -- and it OVERWROTE the notebook's LEEPA global, so
+#                             every later cell silently changed plate.
+#   /tmp/eis_1003          -- another user's scratch directory. On any other
+#                             cluster login this is simply someone else's run.
+#   SNR_TAG = 'snr_-20.0'  -- a cache folder from one particular sweep, read
+#                             no matter which SNR the widget said.
+# All three now come from the widgets, through the same resolver the heat maps
+# and the overlay use, so this table describes the run that is selected.
+_ASR_LEEPA = str(_widget('leepa_id', 'LEEPA', 'leepa'))
 GAMRY_DIR = Path('/Volumes/ps_xplatform_dev/rvadvtec_dev/ev_rvadvtec_dev/Gamry')
-RESULT_ROOTS = [Path('/tmp/eis_1003')/LEEPA,
-                Path('/Volumes/ps_xplatform_dev/rvadvtec_dev/ev_rvadvtec_dev/EIS_Results')/LEEPA]
-SNR_TAG = 'snr_-20.0'          # subfolder used by the Volume cache; None for /tmp
- 
+
 DTA = {'45A':'V26_092_HFR_101_CurrVal_45.dta', '60A':'V26_092_HFR_102_CurrVal_60.dta',
        '150A':'V26_092_HFR_103_CurrVal_150.dta','450A':'V26_092_HFR_104_CurrVal_450.dta'}
 SETPOINT = {'45A':45.,'60A':60.,'150A':150.,'450A':450.}
- 
+
+_ASR_PROV = {}
+
+
 def find_silver(cond):
-    for r in RESULT_ROOTS:
-        for c in [r/cond/'silver'] + ([r/cond/SNR_TAG/'silver'] if SNR_TAG else []):
-            if (c/'cell_aggregate.csv').exists():
-                return c
-    return None
+    """The silver directory for this condition, or None. See result_dir()."""
+    d, prov = result_dir(_ASR_LEEPA, cond)
+    _ASR_PROV[cond] = prov
+    if d is None:
+        return None
+    sv = Path(d) / 'silver'
+    return sv if (sv / 'cell_aggregate.csv').exists() else None
  
 def decompose(f, Zg, Zl):
     """Zl = a*Zg + R + jwL  with a, R, L real — separates the three causes."""
@@ -1822,7 +1982,8 @@ print(hdr); print('-'*len(hdr))
 for cond, fn in DTA.items():
     sv = find_silver(cond)
     if sv is None:
-        print(f"{cond:>5}   no cell_aggregate.csv under {[str(r/cond) for r in RESULT_ROOTS]}")
+        print(f"{cond:>5}   no cell_aggregate.csv "
+              f"({_ASR_PROV.get(cond, 'not found')})")
         continue
     dta = GAMRY_DIR/fn
     if not dta.exists():
@@ -1884,18 +2045,26 @@ for cond, fn in DTA.items():
 
 # DBTITLE 1,Interactive Plate Heatmaps (plate_viewer)
 # ═══════════════════════════════════════════════════════════════════════════════
-# INTERACTIVE PLATE HEATMAPS — keyed on (leepa, condition, SNR)
+# INTERACTIVE PLATE HEATMAPS — for the condition the widgets actually selected
 #
-# The cache tree is
-#     EIS_Results/<leepa>/<cond>/
-#         bronze/ silver/ gold/     <- the LAST run, whatever SNR it used
-#         snr_-10.0/  snr_-20.0/    <- the per-SNR snapshots
-# so reading "<cond>/gold/plate_summary.csv" shows whichever run wrote last.
-# That is why moving the SNR widget never changed the map.  This cell reads
-# the snr_<value> snapshot for the SNR you selected, writes its outputs INSIDE
-# that snapshot (so the -10 and -20 maps stop overwriting each other), and
-# re-reads from disk whenever leepa, condition, SNR, rerun or the file's own
-# mtime changes.
+# THIS CELL USED TO IGNORE THE CONDITION WIDGET.
+# It listed every <leepa>/<cond> directory on the Volume and drew a map for
+# each, so selecting 450 A still produced a 60 A heat map: with one figure per
+# condition, the last one drawn is the one you end up looking at, and 60A
+# sorts last among 150A, 450A, 45A, 60A. The title said 60A and was telling
+# the truth -- about a condition nobody had asked for.
+#
+# It also pasted its own copy of the cache layout (<cond>/snr_<v>/), which is
+# not the layout the run cell writes any more, and it preferred the Volume
+# cache over the run this kernel had just finished unless the run-mode widget
+# happened to say 'rerun'.
+#
+# All three are now one call to result_dir() from the Run Dashboard cell:
+# this session's run first, then the cache entry for the CURRENT mode and
+# settings digest, then older layouts -- each labelled, with its age printed.
+# Nothing is drawn for a condition that was not selected, and a selected
+# condition with no results says so instead of a neighbour's map appearing in
+# its place.
 # ═══════════════════════════════════════════════════════════════════════════════
 import sys, html
 import numpy as np
@@ -1928,119 +2097,57 @@ _FIELD_DEFS = [
 
 
 # ── widgets ───────────────────────────────────────────────────────────────────
-def _widget(*names, default=''):
-    """First widget that exists, else a notebook global, else the default.
-
-    Written this way because the widget names differ between versions of the
-    runner and a NameError here kills the whole cell.
-    """
-    for n in names:
-        try:
-            v = dbutils.widgets.get(n)
-            if v not in (None, ''):
-                return v
-        except Exception:
-            pass
-        g = globals().get(n) or globals().get(n.upper())
-        if g not in (None, ''):
-            return g
-    return default
-
-
+# _widget, result_dir, selected_conditions and describe_source all live in the
+# widgets / Run Dashboard cells now. This cell used to carry its own copy of
+# the first one and its own idea of where results live, which is precisely how
+# it drifted away from the run cell and started showing another condition.
 _LEEPA = str(_widget('leepa_id', 'LEEPA', 'leepa'))
-_SNR   = str(_widget('snr', 'min_snr_db', 'snr_db', 'SNR', default=''))
-_MODE  = str(_widget('mode', 'rerun', 'run_mode', default='')).strip().lower()
-#: "rerun" anywhere in the mode widget means: ignore the cache, use the results
-#: this kernel just computed, and rebuild every figure.
-_RERUN = 'rerun' in _MODE or _MODE in ('force', 'fresh', 'true', '1', 'yes')
+# The SNR PRINTED must be the SNR LOOKED UP, or the heading is decoration.
+# Both are MIN_SNR_DB, the value the run cell built its config from.
+_SNR = f'{MIN_SNR_DB:g}'
 
-
-# ── where does (leepa, cond, snr) actually live? ──────────────────────────────
-def _snr_dir_names(snr):
-    """A widget hands back "-10", "-10.0" or -10.0; the folder is "snr_-10.0"."""
-    out = []
-    text = str(snr).strip()
-    if text:
-        out.append(f'snr_{text}')
-    try:
-        f = float(text)
-        for spelling in (repr(f), f'{f:g}'):
-            if f'snr_{spelling}' not in out:
-                out.append(f'snr_{spelling}')
-    except (TypeError, ValueError):
-        pass
-    return out
-
-
-def _find_gold_csv(leepa, cond, snr, allow_unversioned=True):
-    """(csv_path, provenance). Provenance names WHICH tree was read."""
-    base = _CACHE_VOL / str(leepa) / str(cond)
-    for name in _snr_dir_names(snr):
-        d = base / name
-        if not d.is_dir():
-            continue
-        for rel in ('gold/plate_summary.csv', 'plate_summary.csv'):
-            p = d / rel
-            if p.is_file():
-                return p, f'{name}/{rel}'
-        hits = sorted(d.rglob('plate_summary.csv'))
-        if hits:
-            return hits[0], f'{name}/{hits[0].relative_to(d)}'
-    if allow_unversioned:
-        p = base / 'gold' / 'plate_summary.csv'
-        if p.is_file():
-            return p, 'gold/plate_summary.csv   *** NOT SNR-SPECIFIC ***'
-    return None, 'not found'
-
-
-def _available_snrs(leepa, cond):
-    base = _CACHE_VOL / str(leepa) / str(cond)
-    if not base.is_dir():
-        return []
-    got = [d.name[4:] for d in base.iterdir()
-           if d.is_dir() and d.name.startswith('snr_')]
-    def key(s):
-        try:
-            return (0, float(s))
-        except ValueError:
-            return (1, 0.0)
-    return sorted(got, key=key)
+# _snr_dir_names, _find_gold_csv and _available_snrs used to live here. They
+# encoded the cache layout a second time, and a second copy of a path shape is
+# a copy that goes stale: the run cell now writes
+# <cond>/mode_<mode>/snr_<v>_<digest>/, which none of them knew about. The one
+# implementation is _cache_dir(), reached through result_dir().
 
 
 # ── which conditions, and which CSV for each ─────────────────────────────────
+# ONLY the conditions the widgets asked for. Never "everything on the Volume".
 _COND_GOLD: dict[str, tuple[Path, str]] = {}
+_MISSING: list[str] = []
 
-# 1. Results this kernel just computed win when rerun was asked for -- they are
-#    by definition the fresh ones, and they may not be on the Volume yet.
-if _RERUN:
-    try:
-        for cond, pr in PIPELINE_RESULTS.items():
-            if not pr:
-                continue
-            p = Path(pr['out_dir']) / 'gold' / 'plate_summary.csv'
-            if p.exists():
-                _COND_GOLD[cond] = (p, 'live pipeline run (rerun)')
-    except NameError:
-        pass
+print(f'  plate {_LEEPA}   SNR {_SNR or "(not set)"}   '
+      f'mode {EVALUATION_MODE}   selected: {", ".join(selected_conditions())}')
 
-# 2. Everything else comes from the SNR snapshot on the Volume.
-_leepa_dir = _CACHE_VOL / _LEEPA
-if _leepa_dir.is_dir():
-    for cd in sorted(_leepa_dir.iterdir()):
-        if not cd.is_dir() or cd.name in _COND_GOLD:
-            continue
-        csv, prov = _find_gold_csv(_LEEPA, cd.name, _SNR,
-                                   allow_unversioned=not _SNR)
-        if csv:
-            _COND_GOLD[cd.name] = (csv, prov)
+for cond in selected_conditions():
+    _d, _prov = result_dir(_LEEPA, cond)
+    print(describe_source(cond, _d, _prov))
+    if _d is None:
+        _MISSING.append(cond)
+        continue
+    _csv = None
+    for _rel in ('gold/plate_summary.csv', 'plate_summary.csv'):
+        if (_d / _rel).is_file():
+            _csv = _d / _rel
+            break
+    if _csv is None:
+        _hits = sorted(Path(_d).rglob('plate_summary.csv'))
+        _csv = _hits[0] if _hits else None
+    if _csv is None:
+        print(f'    no plate_summary.csv here -- gold did not run, or '
+              f'stop_after was set below gold')
+        _MISSING.append(cond)
+        continue
+    _COND_GOLD[cond] = (_csv, _prov)
 
-print(f'  plate {_LEEPA}   SNR {_SNR or "(not set)"}'
-      f'   mode {_MODE or "(default)"}{"   [RERUN]" if _RERUN else ""}')
+if _MISSING:
+    print(f'\n  No map drawn for: {", ".join(_MISSING)}. Nothing else is '
+          f'shown in their place -- a map from a condition you did not select '
+          f'is worse than no map.')
 if not _COND_GOLD:
-    print(f'  No gold results for SNR {_SNR!r} under {_leepa_dir}')
-    for cd in sorted(p.name for p in _leepa_dir.iterdir()) if _leepa_dir.is_dir() else []:
-        print(f'    {cd}: snr snapshots = {_available_snrs(_LEEPA, cd) or "none"}')
-    print('  Run the pipeline cell at this SNR first.')
+    print('  Run the pipeline cell for this condition, mode and SNR first.')
 
 
 for cond, (gold_csv, prov) in sorted(_COND_GOLD.items()):
@@ -2049,14 +2156,16 @@ for cond, (gold_csv, prov) in sorted(_COND_GOLD.items()):
 
     print(f'\n{"="*75}')
     print(f'  PLATE MAPS — {_LEEPA} / {cond} / SNR {_SNR or "(default)"}'
+          f' / mode {EVALUATION_MODE}'
           f'   ({len(measured)}/{len(df)} measured)')
     print(f'  read: {prov}')
     print(f'  file: {gold_csv}  (mtime {gold_csv.stat().st_mtime:.0f})')
     print(f'{"="*75}')
-    if 'NOT SNR-SPECIFIC' in prov:
-        print('  WARNING: no snr_ snapshot matched, so this is the shared '
-              'gold/ tree -- it belongs to whichever run wrote last, not '
-              'necessarily to the SNR selected above.')
+    if prov.startswith('LEGACY'):
+        print('  WARNING: this came from an older cache layout. It was NOT '
+              'written by a run at the mode and settings selected above, and '
+              'nothing recorded what settings did produce it. Re-run this '
+              'condition before using these numbers.')
 
     # Outputs go INSIDE the snapshot that produced them. Writing them to the
     # shared <cond>/gold/ is why every SNR overwrote the previous one's PNGs.
@@ -2080,9 +2189,13 @@ for cond, (gold_csv, prov) in sorted(_COND_GOLD.items()):
     if fields:
         _html_out = _out_dir / 'plate_interactive.html'
         _html_out.parent.mkdir(parents=True, exist_ok=True)
+        # The condition belongs in the figure itself. A screenshot of a heat
+        # map outlives the cell output it was printed under, and this title
+        # is the only thing that travels with it.
         write_html(fields, _html_out,
                    title=f'{_LEEPA} / {cond} / SNR {_SNR or "default"}',
-                   subtitle=f'{len(measured)} segments measured | plate gen1')
+                   subtitle=f'{len(measured)} segments measured | plate gen1'
+                            f' | mode {EVALUATION_MODE} | {prov}')
         print(f'  Interactive viewer: {_html_out}')
 
         # html.escape handles & BEFORE " -- escaping only the quote corrupts
@@ -2099,7 +2212,8 @@ for cond, (gold_csv, prov) in sorted(_COND_GOLD.items()):
         if not vals:
             continue
         fig, ax = draw_plate(vals, label=label, unit=unit, cmap=ramp)
-        ax.set_title(f'{_LEEPA} / {cond} / SNR {_SNR or "default"} — {label}',
+        ax.set_title(f'{_LEEPA} / {cond} / SNR {_SNR or "default"} / '
+                     f'{EVALUATION_MODE} — {label}',
                      fontsize=13, fontweight='bold')
         plt.tight_layout()
         _png_out = _out_dir / f'plate_{col}.png'

@@ -69,6 +69,8 @@ except ImportError:       # flat layout (Databricks, notebooks): already there
     pass
 import r2d2_geometry as geom
 from eis_local import FamosFile, PlateCalibration, detect_schedule, Step
+import hf_schedule
+import ladder_snap
 
 import utils
 from config import Config, DEFAULT, KNOWN_BAD_SEGMENTS, T_FALLBACK_C
@@ -201,8 +203,14 @@ class BronzeRun:
                      if k in ("ok", "ppd", "f0", "n_on_grid", "n_total")},
             "config_digest": self.config_digest,
             "input_digest": self.input_digest,
-            "card_lag_s": {k: round(v["lag"] / 10000.0, 6)
-                           for k, v in self.lags.items()},
+            # EACH CARD'S OWN fs, NOT A CONSTANT.  A lag is measured in
+            # SAMPLES; dividing by a hardcoded 10 kHz reports the right
+            # number of seconds only on a 10 kHz card.  This campaign mixes
+            # 50 kHz and 100 kHz cards, where the same constant understates
+            # a lag by 5x and 10x -- and the lag is the number a reader uses
+            # to decide whether the cards were aligned at all.
+            "card_lag_s": {k: round(v["lag"] / self.cards[k].fs, 6)
+                           for k, v in self.lags.items() if k in self.cards},
             "card_lag_corr": {k: round(v["corr"], 4)
                               for k, v in self.lags.items()},
             "sensor_T_degC": {k: round(v, 3) for k, v in self.sensor_T.items()},
@@ -549,17 +557,57 @@ def consensus_schedule(files: list[Path], cards: dict[str, CardInfo],
     utils.section("schedule detection (blind, consensus across cards)", log)
 
     per_card: dict[str, list[Step]] = {}
+    hf_info: dict[str, dict] = {}
+    fs_seen: dict[str, float] = {}
     for fp in files:
         stem = fp.stem
         if stem not in cards:
             continue
         fam = FamosFile(fp)
-        ref = fam.channel(cards[stem].ref_name)
         f_hi = cfg.f_hi(fam.fs)
-        steps = detect_schedule(ref, fam.fs, ppd=cfg.ppd,
-                                f_lo=cfg.f_min_hz, f_hi=f_hi,
-                                min_snr_db=cfg.min_snr_db,
-                                verbose=False)
+        # DETECT ON THE CURRENT-CARRYING ENSEMBLE, NOT ON THE CELL VOLTAGE.
+        # The sweep is galvanostatic, so the amplitude arriving on the UC
+        # reference is |i_ac| * |Z_cell(f)| and it falls with |Z_cell| by an
+        # order of magnitude across the band; the segment channels measure
+        # current density, which the sweep holds constant, so their tone is
+        # flat in frequency.  hf_schedule stacks them and hands the result to
+        # detect_schedule UNCHANGED -- the estimator is the same one, only
+        # its input improved -- then fits the sweep's ladder on the confident
+        # low-frequency steps and verifies each predicted high-frequency rung
+        # on a frequency CFAR and a rank-1 test across the array, neither of
+        # which uses the ladder.  Measured on RO2612025-01 card 4 at 45 A:
+        # 11 -> 21 steps from the stack, 42 with the extension, taking the
+        # recovered band from 0.478-7.47 Hz to 0.478-18.9 kHz.
+        hf = None
+        if getattr(cfg, "hf_use_ensemble", False) and fam.segment_names:
+            hf = hf_schedule.recover_schedule(
+                hf_schedule.LazyChannels(fam), fam.fs,
+                f_lo=cfg.f_min_hz, f_hi=f_hi, ppd=cfg.ppd,
+                min_snr_db=cfg.min_snr_db,
+                sigma_rel_max=cfg.sigma_rel_max,
+                extend=getattr(cfg, "hf_ladder_extend", True),
+                snap_ppd=getattr(cfg, "hf_ladder_snap_ppd", True),
+                ladder_tol=getattr(cfg, "hf_ladder_tol", 0.02),
+                prune=getattr(cfg, "hf_ladder_prune", False),
+                # the old path's trace is pooled in, not replaced: nothing
+                # the shipped pipeline would have found can be lost
+                uc_ref=fam.channel(cards[stem].ref_name),
+                log=log)
+            hf_info[stem] = hf.summary()
+        if hf is not None and hf.as_steps():
+            steps = hf.as_steps()
+        else:
+            # no segment channels, or the stack found nothing: the old path
+            # is still the right fallback, not an error
+            if hf is not None:
+                log.warning(f"  {stem}: the stacked ensemble found nothing - "
+                            f"falling back to the {cards[stem].ref_name} "
+                            f"reference channel")
+            ref = fam.channel(cards[stem].ref_name)
+            steps = detect_schedule(ref, fam.fs, ppd=cfg.ppd,
+                                    f_lo=cfg.f_min_hz, f_hi=f_hi,
+                                    min_snr_db=cfg.min_snr_db,
+                                    verbose=False)
         # PUT THE WINDOWS ON THE COMMON TIME BASE BEFORE THEY ARE POOLED.
         # Detection runs in each card's own sample index; the consensus that
         # follows mixes windows from different cards, so they have to mean
@@ -582,6 +630,7 @@ def consensus_schedule(files: list[Path], cards: dict[str, CardInfo],
                           amp=s.amp, snr_db=s.snr_db, thd=s.thd,
                           stationarity=s.stationarity) for s in steps]
         per_card[stem] = steps
+        fs_seen[stem] = float(fam.fs)
         log.info(f"  {stem}: {len(steps)} candidate steps "
                  f"({steps[0].freq:.3f}..{steps[-1].freq:.1f} Hz)"
                  if steps else f"  {stem}: nothing found")
@@ -676,6 +725,61 @@ def consensus_schedule(files: list[Path], cards: dict[str, CardInfo],
         n_grid_rescued += (on_grid and not enough)
 
     kept.sort(key=lambda s: s.freq)
+
+    # ---- snap the consensus onto the excitation ladder ---------------------
+    # The grid above is used only to ACCEPT or REJECT a cluster.  Using it to
+    # CORRECT the frequency is strictly stronger, because the sine fit is
+    # evaluated at the reported frequency and a 1 % error over a 0.25 s dwell
+    # at 600 Hz is 1.7 cycles of phase slip -- ~16 dB of phasor SNR.  That is
+    # the whole of the 590.29 Hz failure: the rung is at 596.99 Hz, and the
+    # cards that reported 590.29 lost the step to the SNR gate while the cards
+    # that reported 597 kept it.  Snapping also merges the duplicate
+    # detections that share one dwell window (71 -> 45 steps at 45 A,
+    # 77 -> 45 at 450 A on RO2612030), which is what `grid_tol` was failing to
+    # do.  Nothing is deleted here; the quality gates still decide.
+    if getattr(cfg, "ladder_snap", True) and kept:
+        fs_ref = float(np.median(list(fs_seen.values()))) if fs_seen else 25000.0
+        snapped, snap_info = ladder_snap.snap_steps(
+            kept, fs_ref,
+            ppd=getattr(cfg, "ladder_snap_ppd", None), log=log)
+        if snap_info.get("ok"):
+            kept = snapped
+            # THE SNAPPED LADDER *IS* THE GRID NOW.  Overwrite the fitted one.
+            # `_on_grid` decides which of the two SNR gates a point faces in
+            # silver (snr_floor_db when on grid, min_snr_db when not).  On
+            # RO2612030 the free fit broke on a single 1.46 %-apart pair, came
+            # back at 158 points/decade, and `on_grid` was then false for all
+            # 4828 rows -- so snr_floor_db never applied to anything and the
+            # whole top of the band was gated at min_snr_db.  After snapping,
+            # every step lies on the ladder by construction, so the grid is
+            # exact rather than fitted and that failure cannot recur.
+            grid = dict(grid)
+            grid.update(ok=True, ppd=float(snap_info["ppd"]),
+                        ratio=10.0 ** (1.0 / snap_info["ppd"]),
+                        f0=float(kept[-1].freq),
+                        n_on_grid=len(kept), n_total=len(kept),
+                        from_ladder_snap=True)
+            grid["ladder_snap"] = snap_info
+
+    # ---- dwell-window sanity ----------------------------------------------
+    # The snap corrects FREQUENCIES; it does not touch windows.  A rung whose
+    # only detection was spurious therefore keeps a window that cannot belong
+    # to the sweep, and silver then fits a sine at the right frequency over
+    # the wrong stretch of record and every segment rejects the point.  A
+    # stepped sweep is monotonic in time, so those windows are identifiable
+    # without any extra data and can be replaced by the one the sweep would
+    # have placed there.
+    if getattr(cfg, "window_sanity", True) and len(kept) >= 4:
+        fs_ref = float(np.median(list(fs_seen.values()))) if fs_seen else 25000.0
+        fixed, win_info = ladder_snap.repair_windows(
+            kept, fs_ref,
+            min_dwell_frac=getattr(cfg, "window_min_dwell_frac", 0.40),
+            max_repair_frac=getattr(cfg, "window_max_repair_frac", 0.25),
+            log=log)
+        if win_info.get("ok"):
+            kept = fixed
+            grid["window_sanity"] = win_info
+
     log.info(f"  consensus: {len(kept)} steps "
              f"({kept[0].freq:.3f}..{kept[-1].freq:.1f} Hz), "
              f"{n_votes_kept} by card agreement, "
@@ -689,6 +793,8 @@ def consensus_schedule(files: list[Path], cards: dict[str, CardInfo],
     else:
         log.warning("  geometric grid: NOT recovered - every step had to be "
                     "carried by card agreement alone")
+    if hf_info:
+        grid["hf_schedule"] = hf_info
     return kept, grid
 
 
@@ -708,6 +814,97 @@ def _on_grid(f: float, grid: dict, tol: float) -> bool:
 # ===========================================================================
 # 4. Per-card extraction
 # ===========================================================================
+
+
+def pooled_reference_phasors(files: list[Path], cards: dict[str, CardInfo],
+                             schedule: list[Step], cfg: Config,
+                             lags: dict[str, dict] | None = None, log=None
+                             ) -> tuple[np.ndarray, np.ndarray, dict] | None:
+    """One cell-voltage phasor per step, averaged over every card.
+
+    WHY THIS AND NOT AVERAGING THE SEGMENTS
+    ---------------------------------------
+    Averaging segment impedances across cards is wrong: they are DIFFERENT
+    SEGMENTS, and the whole point of the plate is that they differ.  The five
+    UC channels are not different quantities -- they are five measurements of
+    ONE cell voltage, made by five converters with uncorrelated front-end
+    noise.  Averaging them is valid, and it pays exactly where it is needed,
+    because once detection has moved onto the segment ensemble the reference
+    is the weak phasor in Z = K * A_ref / A_seg.  Five cards buy about 7 dB.
+
+    TWO THINGS HAVE TO BE TRUE FIRST
+    --------------------------------
+    1.  The cards must be on a common time base, or the sum is partially
+        destructive at the top of the band.  Only cards whose lag was
+        APPLIED are pooled; a card whose alignment was refused contributes
+        nothing rather than contributing noise with a phase error.
+    2.  The multiplexer slot of each UC channel is a real per-card delay of
+        slot/(n_ch*fs).  Each card's phasor is rotated back to SLOT 0 before
+        it is averaged, and `process_card` then records `ref_slot = 0`, so
+        silver's structural skew model still sees a consistent geometry.
+
+    Weights are inverse residual variance, w = N / r_rms^2, which is the
+    Cramer-Rao weighting for a phasor and is what makes this an estimator
+    rather than an average.  The pooled SNR adds in linear power, as
+    independent noise on a coherent signal does.
+
+    Returns (A_ref, snr_ref_db, info), or None when fewer than two cards
+    qualify -- in which case `process_card` uses its own reference and
+    nothing changes.
+    """
+    log = log or utils.get_logger(cfg.verbose)
+    n_st = len(schedule)
+    if n_st == 0:
+        return None
+
+    num = np.zeros(n_st, complex)
+    den = np.zeros(n_st, float)
+    gam = np.zeros(n_st, float)
+    n_cards = 0
+    used: list[str] = []
+    for fp in files:
+        stem = fp.stem
+        if stem not in cards:
+            continue
+        info = lags.get(stem, {}) if lags else {}
+        if info and not info.get("applied", True):
+            continue
+        shift = int(info.get("lag", 0)) if info.get("applied") else 0
+        fam = FamosFile(fp)
+        name = cards[stem].ref_name
+        if name not in fam.names:
+            continue
+        ref = fam.channel(name)
+        slot_dt = fam.position(name) / (fam.n_ch * fam.fs)
+        n_cards += 1
+        used.append(stem)
+        for i, st in enumerate(schedule):
+            a, b = st.start + shift, st.stop + shift
+            if b <= a or a < 0 or b > len(ref):
+                continue
+            A, r_rms, snr = utils.fit3(ref[a:b], fam.fs, st.freq)
+            if not np.isfinite(snr) or not np.isfinite(A) or r_rms <= 0:
+                continue
+            # rotate this card's UC phasor from its own mux slot to slot 0
+            A = A * np.exp(2j * np.pi * st.freq * slot_dt)
+            w = (b - a) / (r_rms ** 2)
+            num[i] += w * A
+            den[i] += w
+            gam[i] += 10.0 ** (snr / 10.0)
+
+    if n_cards < 2:
+        return None
+    with np.errstate(invalid="ignore", divide="ignore"):
+        A_ref = np.where(den > 0, num / np.where(den > 0, den, 1.0),
+                         complex("nan"))
+        snr_db = np.where(gam > 0, 10.0 * np.log10(np.where(gam > 0, gam, 1.0)),
+                          np.nan)
+    n_ok = int(np.sum(np.isfinite(A_ref)))
+    log.info(f"  reference pooled over {n_cards} card(s) "
+             f"({', '.join(c[-8:] for c in used)}): {n_ok}/{n_st} steps, "
+             f"median SNR {np.nanmedian(snr_db):.1f} dB")
+    return A_ref, snr_db, {"n_cards": n_cards, "cards": used,
+                           "n_steps": n_ok}
 
 
 def _sensor_key(channel_name: str) -> str:
@@ -809,12 +1006,24 @@ def _fix_polarity(Z: np.ndarray, freqs: np.ndarray, snr_db: np.ndarray,
 def process_card(fp: Path, cal: PlateCalibration, schedule: list[Step],
                  grid: dict, cfg: Config, log=None,
                  T_seg: dict[str, float] | None = None,
-                 lag: int = 0) -> dict[str, BronzeSpectrum]:
+                 lag: int = 0,
+                 ref_pool: tuple[np.ndarray, np.ndarray, dict] | None = None
+                 ) -> dict[str, BronzeSpectrum]:
     """Raw phasors for every segment on one card.
 
     `schedule` windows are indices on the COMMON time base; `lag` is this
     card's offset relative to it, so the window actually read is
     (start + lag, stop + lag).
+
+    `ref_pool` is the plate-wide cell-voltage phasor from
+    `pooled_reference_phasors`, already rotated to mux slot 0.  When it is
+    given it REPLACES this card's own UC phasor in Z = K*A_ref/A_seg -- the
+    reference is the weak measurement now that detection runs on the segment
+    ensemble, and five cards measuring one cell voltage is the one average
+    across cards that is physically legitimate.  The segment phasor, the
+    frequency and every gate stay exactly as they were; only A_ref and its
+    SNR change, and `ref_slot` is then recorded as 0 so that silver's
+    structural skew model still reads a consistent geometry.
     """
     log = log or utils.get_logger(cfg.verbose)
     fam = FamosFile(fp)
@@ -837,6 +1046,16 @@ def process_card(fp: Path, cal: PlateCalibration, schedule: list[Step],
 
     freqs = np.array([s.freq for s in schedule], float)
     on_grid = np.array([_on_grid(f, grid, cfg.grid_tol) for f in freqs], bool)
+
+    A_pool = snr_pool = None
+    if ref_pool is not None:
+        A_pool, snr_pool, _pool_info = ref_pool
+        # the pooled phasor was rotated to slot 0, so that is the slot the
+        # skew model must be told about
+        ref_slot = 0
+        ref_name = f"pooled({_pool_info.get('n_cards', 0)} cards)"
+        log.info(f"    reference: plate-wide pool, "
+                 f"{_pool_info.get('n_cards', 0)} card(s), slot 0")
 
     out: dict[str, BronzeSpectrum] = {}
     n_excluded = 0
@@ -878,6 +1097,13 @@ def process_card(fp: Path, cal: PlateCalibration, schedule: list[Step],
                 A_ref, _, snr_r[i] = utils.fit3(yr, fam.fs, st.freq)
                 A_seg, _, snr_s[i] = utils.fit3(ys, fam.fs, st.freq)
                 f_used = st.freq
+
+            # The joint fit still estimates the FREQUENCY from both channels
+            # together, which is where its factor-of-six CRLB advantage comes
+            # from; what the pool replaces is only the reference amplitude
+            # and phase, which is the noisiest term in the ratio.
+            if A_pool is not None and np.isfinite(A_pool[i]):
+                A_ref, snr_r[i] = A_pool[i], snr_pool[i]
 
             #  j_s = u_s / K   ->   Z = U_cell / j_s = K * A_ref / A_seg
             Z[i] = K * A_ref / A_seg if A_seg != 0 else complex("nan")
@@ -964,6 +1190,13 @@ def run(cfg: Config = DEFAULT, log=None) -> BronzeRun:
     schedule, grid = consensus_schedule(files, cards, cfg, log, lags=lags)
 
     utils.section("per-segment raw phasors", log)
+    # One cell-voltage phasor per step, pooled over every aligned card.  This
+    # is the one average across cards that is physically legitimate: the five
+    # UC channels measure ONE cell voltage, while the segment channels
+    # measure different segments and must never be averaged together.
+    ref_pool = (pooled_reference_phasors(files, cards, schedule, cfg,
+                                         lags=lags, log=log)
+                if getattr(cfg, "hf_pool_reference", False) else None)
     spectra: dict[str, BronzeSpectrum] = {}
     for fp in files:
         if fp.stem not in cards:
@@ -972,7 +1205,7 @@ def run(cfg: Config = DEFAULT, log=None) -> BronzeRun:
         info = lags.get(fp.stem, {})
         shift = int(info.get("lag", 0)) if info.get("applied") else 0
         got = process_card(fp, cal, schedule, grid, cfg, log,
-                           T_seg=T_seg, lag=shift)
+                           T_seg=T_seg, lag=shift, ref_pool=ref_pool)
         for seg, sp in got.items():
             if seg in spectra:
                 # two cards claim the same segment: keep the better SNR

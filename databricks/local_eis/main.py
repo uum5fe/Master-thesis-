@@ -133,6 +133,24 @@ def build_parser() -> argparse.ArgumentParser:
                    default=None,
                    help="gate preset; 'permissive' keeps almost everything, "
                         "for comparing against a coherence-threshold pipeline")
+    g.add_argument("--prune-ladder", action="store_true",
+                   help="drop detections that miss the sweep's fitted "
+                        "geometric ladder. OFF by default because it is the "
+                        "only step that can REMOVE a step the old path kept, "
+                        "and on one campaign it cost a decade of band; on "
+                        "another it takes 13 spurious steps to 0. Read "
+                        "off_ladder_hz in the manifest to see what it took")
+    g.add_argument("--ensemble", action="store_true",
+                   help="detect the schedule on the stacked segment ensemble "
+                        "instead of the cell-voltage channel. Worth it where "
+                        "the cell voltage has collapsed and the band is short "
+                        "(RO2612025 at 150 A); it made a working result WORSE "
+                        "on RO2611976, where the record is mostly not swept "
+                        "and the extra sensitivity fills the idle stretches "
+                        "with candidates. A/B it per campaign")
+    g.add_argument("--pool-reference", action="store_true",
+                   help="average the cards' UC channels into one reference "
+                        "phasor. Not validated against field data")
     g.add_argument("--no-drt", action="store_true",
                    help="skip the DRT; loses the process split and tau maps")
     g.add_argument("--no-spatial", action="store_true",
@@ -199,6 +217,12 @@ def config_from_args(a) -> Config:
         kw["skew_model"] = a.skew
     if a.phasor:
         kw["phasor_method"] = a.phasor
+    if a.prune_ladder:
+        kw["hf_ladder_prune"] = True
+    if a.ensemble:
+        kw["hf_use_ensemble"] = True
+    if a.pool_reference:
+        kw["hf_pool_reference"] = True
     if a.no_drt:
         kw["drt_enable"] = False
     if a.no_spatial:

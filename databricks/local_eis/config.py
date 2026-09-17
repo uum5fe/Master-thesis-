@@ -117,6 +117,8 @@ KNOWN_BAD_SEGMENTS: dict[str, str] = {}
 #: should take minutes never finished.
 FAMOS_PATTERNS = (
     "Leepa_{leepa}_Current_{cond}_Test_{test}_Karte_*.DAT",
+    "Leepa_RO{leepa}_Current_{cond}_Test_{test}_Karte_*.DAT",
+    "Leepa_RO{leepa}_Current_{cond}_Test_*_Karte_*.DAT",
     "RO{leepa}-*_Current_{cond}_Test_{test}_Karte_*.DAT",
     "{leepa}_Current_{cond}_Test_{test}_Karte_*.DAT",
 )
@@ -216,8 +218,19 @@ class Config:
     # bronze.py now finds the schedule once, globally, and silver.py only ever
     # fits at known frequencies, the usable ceiling is set by signal amplitude
     # rather than by the search.
+    #
+    # THE CEILING WAS THE CONFIG CONSTANT, NOT NYQUIST.  A real card header
+    # from the campaign reads dx = 1.0e-5 s, i.e. fs = 100 kHz on 16
+    # channels, so f_hi(fs) = min(f_max_hz, 0.45*fs) = min(4500, 45000) =
+    # 4500 Hz: the converter had 45 kHz of headroom it was never asked for.
+    # On RO2612025-01 card 4 (fs = 50 kHz) the Gamry band recorded in the
+    # file runs to 23.9 kHz while the pipeline stopped at 7.47 Hz.  Raising
+    # this is NECESSARY BUT NOT SUFFICIENT -- on its own it took that card
+    # from 11 recovered steps to 13, with the same 7.47 Hz top.  What
+    # recovers the band is hf_schedule (see hf_use_ensemble below); this
+    # constant only stops binding before it gets the chance.
     f_min_hz: float = 0.15
-    f_max_hz: float = 4500.0
+    f_max_hz: float = 30000.0
     f_hi_frac_fs: float = 0.45       # detection ceiling as a fraction of fs
     ppd: int = 12                    # points per decade of the detection grid
 
@@ -249,8 +262,128 @@ class Config:
     # 30 seeds, while a correct lag at the field data's own |r| ~ 0.27 scores
     # ~250.  25 sits three times above the noise ceiling and ten times below
     # the real signal, so it is not a close call in either direction.
-    align_min_corr: float = 0.05        # absolute floor against pure garbage
-    align_min_prominence: float = 25.0  # robust sigma above the background
+    # MEASURED SEPARATION, NOT A GUESS.  On RO2612030 the correct lags score
+    # |r| = 0.980-0.998 on every healthy card at 45 A and 450 A.  At 150 A
+    # cards 1 and 2 score |r| = 0.083 -- a dead cell-voltage reference -- yet
+    # 0.083 cleared the old 0.05 floor, so an 8.63 s lag was ACCEPTED and
+    # applied.  The consensus schedule then carried windows from two
+    # incompatible time bases 17.7 s apart (= 2 x 8.63 s), 13 of its 45 steps
+    # sat out of time order, and the 75-189 Hz block survived only on the two
+    # shifted cards.  Real and false lags differ here by a factor of twelve;
+    # 0.5 sits halfway between them in the log and nothing on this campaign
+    # falls in between.
+    align_min_corr: float = 0.50        # absolute floor against pure garbage
+    align_min_prominence: float = 15.0  # robust sigma above the background
+    # NOTE: was 25.0 but that refused clearly-correct alignments on 25 kHz
+    # recordings (RO2612030: prominence 21-22, |r| > 0.994).  15.0 is still
+    # 3.5x above the noise floor (worst genuinely-bad alignment was 4.1 on
+    # RO2612025) while accepting these valid results.
+
+    # ---- high-frequency schedule recovery (bronze, hf_schedule.py) --------
+    # The blind detector used to be run on the card's REFERENCE channel, the
+    # UC* cell-voltage channel with the largest standard deviation.  The
+    # sweep is galvanostatic, so the amplitude arriving there is
+    # |i_ac| * |Z_cell(f)|, and |Z_cell| falls by an order of magnitude from
+    # the bottom of the band to its ~45 mOhm*cm2 minimum near 8 kHz.  The
+    # detector was being asked to find a tone exactly where the cell had
+    # removed it -- which no value of min_snr_db can undo.
+    #
+    # The SEGMENT channels measure current density, and current is what the
+    # sweep imposes, so their tone amplitude is flat in frequency.  Stacking
+    # the ~14 of them on a card adds the tone coherently and the noise in
+    # power.  Measured on RO2612025-01 card 4 at 45 A: +11.2 dB narrowband
+    # over UC2 above 1 kHz, and the recovered band went 11 -> 21 steps
+    # (0.478 .. 189 Hz) on the stack alone, 42 steps (0.478 .. 18.9 kHz)
+    # with the ladder extension below.
+    #
+    # STACK PER CARD, NOT ACROSS THE PLATE.  Pooling all five cards scored
+    # WORSE than one card on the synthetic (23/26 against 26/26): the cards
+    # are not on a common time base until estimate_card_lags has run, and
+    # the residual sub-sample offsets plus the per-slot multiplexer skew make
+    # the sum partially destructive at the top of the band.  Each card gets
+    # its own stack and consensus_schedule does the cross-card vote it
+    # already does.
+    # OFF BY DEFAULT, AND THIS IS A REVERSAL.
+    # It was on. On RO2612025-01 at 150 A, where the cell voltage really has
+    # collapsed, detecting on the ensemble is the difference between a band
+    # and no band. On RO2611976-01 at 45 A and 60 A it made a working result
+    # WORSE: the stack is a more sensitive detector, so on a record that is
+    # mostly not swept -- and that one is 252 s carrying about 23 s of sweep
+    # -- it finds more candidates in the idle stretches too, and the schedule
+    # inflates. Silver then has more junk to gate than signal to keep, and
+    # the Nyquist that came out was a zigzag where the old path drew clean
+    # arcs.
+    #
+    # A change that can make a good result bad has to be opted into, not out
+    # of. Off, this whole module is inert and the pipeline is exactly the one
+    # that produced those arcs. Turn it on per campaign, with --ensemble, and
+    # compare.
+    hf_use_ensemble: bool = False    # detect on the stacked segment ensemble
+    hf_ladder_extend: bool = True    # predict-and-verify the missing rungs
+    # Generators are asked for round numbers of points per decade; a free fit
+    # is not.  On card 4 a ladder fitted on the fifteen steps below 12 Hz
+    # returned 10.059 points/decade, and that 0.13 % error in r compounds
+    # with the rung index: checked blind against fifteen tones observed
+    # between 946 Hz and 24 kHz, the prediction error grew monotonically from
+    # +3.4 % to +5.8 %, so the extension found noise.  Snapping to 10 brings
+    # the same blind prediction to -0.9 .. +1.0 %, and 27 of 32 predicted
+    # rungs then verify.
+    hf_ladder_snap_ppd: bool = True  # snap the fitted spacing to an integer
+    hf_ladder_tol: float = 0.02      # relative window for ladder membership
+
+    # ---- consensus ladder snap -------------------------------------------
+    # After the cross-card consensus, replace each step frequency by the exact
+    # rung of the sweep's own geometric ladder.  The detector's frequency
+    # estimate is good to ~0.5 % on a clean dwell but drifts to >1 % where the
+    # window was mis-cut, and the sine fit is evaluated AT THE REPORTED
+    # FREQUENCY: 1.12 % at 596.99 Hz over the 0.2498 s dwell is 1.67 cycles of
+    # phase slip, measured at -16.5 dB on cards 1, 4 and 5 of RO2612030 while
+    # the same step passed on cards 2 and 3.  Snapping also collapses the
+    # duplicate detections that share a dwell window: 71 -> 45 steps at 45 A
+    # and 77 -> 45 at 450 A, both recovering 10 points/decade independently.
+    ladder_snap: bool = True
+    ladder_snap_ppd: int | None = None   # None = recover it from the data
+
+    # ---- dwell-window sanity ----------------------------------------------
+    # A stepped sweep visits its rungs in order, so the window start time is
+    # monotonic in frequency.  A step that breaks that order, or whose dwell
+    # is a small fraction of the local dwell, did not come from the sweep --
+    # the detector latched onto something else and the ladder snap carried it
+    # through, because the snap corrects frequencies and not windows.  On
+    # RO2612030 at 450 A the 1501.05 Hz rung claimed a window at t = 246.9 s,
+    # 132 s after both neighbours and outside the swept part of the record,
+    # with a 0.036 s dwell against a local median of 0.240 s; all 68 segments
+    # rejected it.  The repair interpolates the window in log-frequency from
+    # the steps that do sit in order.  It is a PREDICTION, not a measurement:
+    # the quality gates still decide whether a real tone is found there.
+    window_sanity: bool = True
+    window_min_dwell_frac: float = 0.40
+    # A few stray windows are a detector slip. Half the schedule out of order
+    # is a second time base -- a card lag accepted on a correlation that
+    # should have refused it -- and repairing those windows would hide the
+    # fault. Above this fraction the repair refuses and says so.
+    window_max_repair_frac: float = 0.25
+    # OFF BY DEFAULT.  Pruning is the only part of the ensemble path that can
+    # REMOVE a step the old pipeline would have kept, so it is the only part
+    # that can make a run worse -- and it did, on real 45 A data: a band that
+    # reached 550 Hz came back reaching 375 Hz.  A detection is a measurement;
+    # the ladder is a model fitted on a handful of low-frequency steps and
+    # extrapolated upward, and at the top of the band, where its extrapolation
+    # error is largest, the model is the one more likely to be wrong.  Left
+    # off, the ensemble path is purely additive.  Turn it on for a record with
+    # a continuous interferer the detector keeps latching onto -- the one case
+    # ladder membership handles and an SNR gate provably cannot -- and read
+    # off_ladder_hz in the manifest to see what it took.
+    hf_ladder_prune: bool = False    # drop detections that miss the ladder
+    # Averaging SEGMENT impedances across cards is wrong -- they are
+    # different segments.  Averaging the five UC channels is not: they are
+    # five measurements of one cell voltage, with uncorrelated front-end
+    # noise, and the reference is the weak phasor now that detection has
+    # moved off it.  Worth ~7 dB exactly where it is weakest.
+    # Off for the same reason: it replaces each card's own reference phasor,
+    # and it reports ref_slot = 0 to silver's skew model on the strength of a
+    # rotation this has not been validated against field data.
+    hf_pool_reference: bool = False  # inverse-variance mean of A_uc across cards
 
     # ---- per-step quality gates -------------------------------------------
     # A step that lies on the sweep's own geometric grid is a real step: a
@@ -259,6 +392,29 @@ class Config:
     # Off-grid candidates still face the full gate.
     min_snr_db: float = 5.0          # gate for OFF-grid steps
     snr_floor_db: float = -3.0       # absolute floor even for on-grid steps
+
+    # SILVER'S OWN SNR BACKSTOP, SEPARATE FROM THE TWO ABOVE.
+    # `min_snr_db` is overloaded: bronze uses it for blind detection, for the
+    # basis of the grid fit, and for the polarity decision, where a strict
+    # value is right.  Silver used the SAME number as a per-point membership
+    # test, where it is wrong, because raw SNR does not decide whether a
+    # phasor is usable -- N*gamma does (Rife & Boorstyn), and the dwell N
+    # spans three orders of magnitude across one sweep.  Measured on
+    # RO2612030: a 10 % phasor needs -37 dB at 0.20 Hz, -20 dB at 95 Hz and
+    # -18 dB at 377 Hz.  No single number is right at both ends, and at
+    # min_snr_db = 5 dB the frequencies with full 68/68 coverage stop at
+    # 47.5 Hz (45 A) and 3.7 Hz (450 A) -- which is why the heat maps above
+    # the low-frequency arc were unreadable.
+    #
+    # sigma_rel_max below is the physically correct gate and already folds in
+    # the dwell length.  It is bimodal on real data: 2918 of 4828 points at
+    # 45 A sit below sigma_rel = 0.10 and only 102 fall in 0.03..0.10, so the
+    # threshold sits in a genuine valley rather than on a slope.  These two
+    # are left far below where they bind, as a backstop against pathological
+    # points, not as the main filter.  Set them to 5.0 / -3.0 to reproduce
+    # the old behaviour exactly.
+    silver_snr_gate_db: float = -40.0    # silver, OFF-grid points
+    silver_snr_floor_db: float = -40.0   # silver, ON-grid points
 
     # THE GATE THAT ACTUALLY MATTERS.
     # Raw SNR is the wrong quantity to threshold on, because a long dwell
@@ -362,7 +518,8 @@ class Config:
     # setting is "correct" -- the honest procedure is to run both and read
     # the flags column to see which points differ and why.
     preset_name: str = "default"
-    max_thd: float = 0.10            # linearity (Giner-Sanz 2015)
+    max_thd: float = 0.10
+              # linearity (Giner-Sanz 2015)
     max_drift: float = 0.25          # amplitude stationarity across sub-windows
 
     # ---- phasor estimation (silver) ---------------------------------------
@@ -654,7 +811,8 @@ class Config:
 
         g = p.add_argument_group("band")
         g.add_argument("--f-min", dest="f_min_hz", type=float, default=0.15)
-        g.add_argument("--f-max", dest="f_max_hz", type=float, default=4500.0)
+        g.add_argument("--f-max", dest="f_max_hz", type=float,
+                       default=30000.0)
         g.add_argument("--ppd", type=int, default=12)
 
         g = p.add_argument_group("estimation")

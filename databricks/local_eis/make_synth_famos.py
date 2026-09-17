@@ -74,5 +74,48 @@ def main(out="/tmp/famos"):
     Path("/tmp/temp.csv").write_text("\n".join("1.0;0.01" for _ in range(4)))
     print("  /tmp/curr.csv, /tmp/temp.csv")
 
+def write_v2(path, names, data, fs, bytes_per_val=8):
+    """Write a FAMOS **v2** file: one metadata block per channel, float64.
+
+    Exists so the v2 reader is tested against a byte layout rather than
+    against a description of one. The campaign files this mirrors are on a
+    share the test suite cannot reach, and a reader verified only by "it did
+    not raise on the one file I had" is not verified.
+
+    Layout, per the recordings it was written from:
+
+        |CF,2,...           file format, version 2
+        |CK,...             key block
+        per channel:  |CG  |CD (dt)  |CP (.., bytes/value, ..)  |Cb  |CR  |CN
+        |CS,<ver>,<bytes>,  then the interleaved samples
+
+    |CN carries the name as field 6, counting from zero.
+    """
+    import numpy as np
+    from pathlib import Path
+
+    d = np.asarray(data, dtype="<f8" if bytes_per_val == 8 else "<f4")
+    n_samples, n_ch = d.shape
+    assert n_ch == len(names)
+
+    parts = [b"|CF,2,1,1;", b"|CK,1,3,1,1;"]
+    for i, nm in enumerate(names):
+        nm_b = nm.encode("latin-1")
+        parts.append(b"|CG,1,1,1;")
+        parts.append(f"|CD,2,16,{1.0 / fs:.10g},1,0;".encode("latin-1"))
+        # |CP,<ver>,<len>,<buffer>,<bytes per value>,<numeric type>,...
+        parts.append(f"|CP,1,14,1,{bytes_per_val},7,0,1;".encode("latin-1"))
+        parts.append(b"|Cb,1,10,1,0,0,0,0;")
+        parts.append(b"|CR,1,12,1,1,0,1,;")
+        # |CN,<ver>,<len>,<idx>,0,0,<name len>,<NAME>,<comment len>,;
+        parts.append(b"|CN,1,20," + str(i).encode() + b",0,0,"
+                     + str(len(nm_b)).encode() + b"," + nm_b + b",0,;")
+    raw = d.tobytes()
+    parts.append(f"|CS,1,{len(raw)},".encode("latin-1"))
+    header = b"".join(parts)
+    Path(path).write_bytes(header + raw)
+    return Path(path)
+
+
 if __name__ == "__main__":
     main()

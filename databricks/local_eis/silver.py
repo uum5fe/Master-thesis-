@@ -228,6 +228,10 @@ class SilverRun:
     dc_closure: dict
     cell_freq: np.ndarray
     Z_cell: np.ndarray
+    #: Segments contributing at each aggregate frequency. A point carried by a
+    #: handful of segments is not a cell measurement; filter on this before
+    #: comparing against a whole-cell instrument.
+    cell_n_seg: np.ndarray = field(default_factory=lambda: np.zeros(0, int))
     #: One row per segment per point: whether it was kept, and if not, which
     #: gate removed it. This is the evidence for "why does my spectrum stop
     #: at 400 Hz" and "why is this segment missing".
@@ -1120,8 +1124,13 @@ def process_segment(sp: BronzeSpectrum, skew: SkewModel, cfg: Config,
     # still face the full gate.  This is what keeps the top-of-band points,
     # which are always the weakest, without letting noise in elsewhere.
     snr = np.asarray(sp.snr_comb_db, float)
-    snr_gate = np.where(sp.on_grid, snr >= cfg.snr_floor_db,
-                        snr >= cfg.min_snr_db)
+    # Backstop only -- the uncertainty gate below is what actually decides.
+    # See the note above silver_snr_gate_db in config.py.
+    snr_gate = np.where(sp.on_grid,
+                        snr >= getattr(cfg, "silver_snr_floor_db",
+                                       cfg.snr_floor_db),
+                        snr >= getattr(cfg, "silver_snr_gate_db",
+                                       cfg.min_snr_db))
     keep &= gate(np.nan_to_num(snr_gate, nan=False).astype(bool), "snr")
     keep &= gate(~(np.isfinite(sp.thd) & (sp.thd > cfg.max_thd)), "thd")
     keep &= gate(~(np.isfinite(sp.drift) & (sp.drift > cfg.max_drift)), "drift")
@@ -1398,7 +1407,7 @@ def dc_closure(spectra: dict[str, SilverSpectrum], cfg: Config) -> dict:
 
 
 def cell_aggregate(spectra: dict[str, SilverSpectrum]
-                   ) -> tuple[np.ndarray, np.ndarray]:
+                   ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Area-weighted harmonic mean -- what a cell-level instrument would see.
 
     Segments sit in parallel across one cell voltage, so admittances add.
@@ -1406,19 +1415,66 @@ def cell_aggregate(spectra: dict[str, SilverSpectrum]
     which is the mathematical statement of why an integral measurement hides
     local faults: a flooded segment has high Z, contributes little
     admittance, and barely moves the cell curve.
+
+    THE GRID IS THE UNION OF EVERY SEGMENT'S FREQUENCIES, NOT ONE SEGMENT'S.
+    This used to take `f_ref` from whichever segment had the most surviving
+    points, which silently deleted any frequency that segment happened to
+    lose.  Measured on RO2612030 at 150 A: the reference was segment 49 on
+    card 5, and eight frequencies -- 0.19, 75.3, 94.8, 119.3, 150.2, 189.2,
+    299.8, 475.1 Hz -- were dropped from the aggregate although 29 of the 68
+    segments carried a valid point at each of them.  On the Nyquist that is
+    the straight chord between 59.8 and 238.1 Hz.
+
+    Returns (freq, Z_cell, n_seg).  `n_seg` counts the segments that actually
+    MEASURED a point at that frequency -- not the ones whose band merely spans
+    it -- so a caller can require a minimum coverage before believing a point.
+    The distinction matters: at 150 A, 75.3 Hz lies inside all 68 segments'
+    bands but only 29 of them kept a point there, and a coverage of 68 would
+    have claimed evidence that does not exist.  The aggregate VALUE still uses
+    every segment whose band covers the frequency, since the Kramers-Kronig
+    model is continuous and interpolating it across a segment's own gap is
+    legitimate; only the reported count is restricted.  Frequencies are
+    matched on a relative tolerance, because each segment carries its own
+    float copy of the same ladder rung.
     """
     if not spectra:
-        return np.zeros(0), np.zeros(0)
-    ref = max(spectra.values(), key=lambda s: len(s.freq))
-    f_ref = ref.freq
-    on = {}
-    areas = {}
-    for s, sp in spectra.items():
-        if len(sp.freq) < 3:
-            continue
-        on[s] = utils.interp_complex(f_ref, sp.freq, sp.Z_model)
+        return np.zeros(0), np.zeros(0), np.zeros(0, int)
+
+    usable = {s: sp for s, sp in spectra.items() if len(sp.freq) >= 3}
+    if not usable:
+        return np.zeros(0), np.zeros(0), np.zeros(0, int)
+
+    # ---- union grid, with near-duplicate rungs collapsed -------------------
+    every = np.sort(np.concatenate([np.asarray(sp.freq, float)
+                                    for sp in usable.values()]))
+    every = every[np.isfinite(every) & (every > 0)]
+    grid: list[float] = []
+    for f in every:
+        if not grid or abs(f / grid[-1] - 1.0) > 1e-3:
+            grid.append(float(f))
+        else:                       # same rung seen again: keep the mean
+            grid[-1] = 0.5 * (grid[-1] + float(f))
+    f_ref = np.asarray(grid, float)
+
+    on, areas = {}, {}
+    n_seg = np.zeros(len(f_ref), int)
+    for s, sp in usable.items():
+        z = utils.interp_complex(f_ref, sp.freq, sp.Z_model)
+        # interp_complex CLAMPS outside this segment's own band, holding the
+        # endpoint flat.  |Z| falls with frequency, so a held value is too
+        # large and inflates the aggregate at the top of the band.  Mask it.
+        lo, hi = float(np.min(sp.freq)), float(np.max(sp.freq))
+        inside = (f_ref >= lo * (1 - 1e-3)) & (f_ref <= hi * (1 + 1e-3))
+        on[s] = np.where(inside, z, np.nan + 0j)
         areas[s] = sp.area_cm2
-    return f_ref, mm.aggregate_asr(f_ref, on, areas, A_CELL_CM2)
+        # measured here, not merely spanned: nearest own frequency within tol
+        own = np.asarray(sp.freq, float)
+        j = np.clip(np.searchsorted(own, f_ref), 1, len(own) - 1)
+        near = np.minimum(np.abs(f_ref / own[j] - 1.0),
+                          np.abs(f_ref / own[j - 1] - 1.0))
+        n_seg += (inside & np.isfinite(z) & (near <= 1e-3)).astype(int)
+
+    return f_ref, mm.aggregate_asr(f_ref, on, areas, A_CELL_CM2), n_seg
 
 
 # ===========================================================================
@@ -1521,15 +1577,17 @@ def run(bronze_run: BronzeRun, cfg: Config = DEFAULT, log=None) -> SilverRun:
             log.warning(f"  residual skew check skipped: "
                         f"{type(exc).__name__}: {exc}")
 
-    f_cell, Z_cell = cell_aggregate(spectra)
+    f_cell, Z_cell, n_cell = cell_aggregate(spectra)
     if len(f_cell):
         log.info(f"  cell aggregate: area-weighted harmonic mean over "
-                 f"{len(spectra)} segments, {len(f_cell)} frequencies")
+                 f"{len(spectra)} segments, {len(f_cell)} frequencies "
+                 f"(coverage {int(n_cell.min())}-{int(n_cell.max())} segments "
+                 f"per frequency, median {int(np.median(n_cell))})")
 
     return SilverRun(point_ledger=point_ledger,
                      unwired=list(bronze_run.segments_missing()),
                      spectra=spectra, skew=skew, dc_closure=dcc,
-                     cell_freq=f_cell, Z_cell=Z_cell)
+                     cell_freq=f_cell, Z_cell=Z_cell, cell_n_seg=n_cell)
 
 
 def save(sr: SilverRun, cfg: Config, log=None) -> Path:
@@ -1600,7 +1658,10 @@ def save(sr: SilverRun, cfg: Config, log=None) -> Path:
             "freq_hz": round(float(f), 6),
             "z_re_mohm_cm2": round(1000 * float(np.real(z)), 5),
             "z_im_mohm_cm2": round(1000 * float(np.imag(z)), 5),
-        } for f, z in zip(sr.cell_freq, sr.Z_cell)])
+            "n_segments": int(n),
+        } for f, z, n in zip(sr.cell_freq, sr.Z_cell,
+                             (sr.cell_n_seg if len(sr.cell_n_seg) == len(sr.cell_freq)
+                              else np.zeros(len(sr.cell_freq), int)))])
 
     utils.write_json(out / "silver_manifest.json", {
         "n_segments": len(sr.spectra), "tiers": sr.tiers(),

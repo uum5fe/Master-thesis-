@@ -287,12 +287,100 @@ class Config:
     # shifted cards.  Real and false lags differ here by a factor of twelve;
     # 0.5 sits halfway between them in the log and nothing on this campaign
     # falls in between.
+    # ---- card alignment filter band ---------------------------------------
+    # The alignment cross-correlation runs on a band-passed copy of the
+    # reference. This band exists ONLY to estimate the lag -- it never limits
+    # the reported impedance spectrum -- but it was hard-coded at 0.5-300 Hz
+    # in bronze.py, so a sensitivity study meant editing the module and no
+    # run recorded which band produced its lags. Both limits are clamped to
+    # 0.45*fs per card, so a band above a slow card's Nyquist degrades to
+    # that card's usable top rather than zeroing its whole spectrum.
+    align_f_lo_hz: float = 0.5
+    align_f_hi_hz: float = 300.0
+    # THE PROMINENCE GUARD IS A TIME, NOT A SAMPLE COUNT.
+    # The guard excludes the peak's own shoulders from the background the
+    # peak is scored against. The correlation peak of a band-limited signal
+    # is about 1/align_f_lo_hz wide, i.e. 2 s at 0.5 Hz -- a duration. The
+    # old fixed 5000 samples is 0.5 s on a 10 kHz card and 0.05 s on a
+    # 100 kHz one, so the same recording scored differently for no reason but
+    # its sample rate, and on the fast cards most of the shoulder was counted
+    # as background, which UNDERSTATES a real peak.
+    #
+    # 2.0 s (= 1/align_f_lo_hz) is measured, not assumed. On the 60 s
+    # synthetic of test_card_alignment.py, sweeping the guard from 0.05 s to
+    # 4 s (see test_prominence_guard.py):
+    #
+    #     guard      null max (30 seeds)     correct 5.7121 s lag
+    #     0.05 s          8.53                      252
+    #     0.20 s          8.53                      258
+    #     2.00 s          8.51                      345
+    #     4.00 s          8.47                      417
+    #
+    # The null does not move -- noise has no shoulders, so widening the
+    # excluded region changes nothing about its background -- while a real
+    # peak climbs, because its own shoulders stop being averaged into the
+    # background it is scored against. Separation goes from ~30x to ~41x at
+    # no cost, and because only real peaks move, nothing that passed
+    # align_min_prominence before can fail it now.
+    #
+    # WHAT THIS DOES NOT FIX. The null ceiling stays at ~8.5, so the 15.0
+    # gate below still clears it by 1.8x, not the 2x that
+    # test_card_alignment.py::test_noise_alone_produces_no_prominent_peak
+    # demands -- that test fails for that reason and the failure is real.
+    # The gate was cut from 25 to 15 because RO2612030's genuine alignments
+    # scored 21-22 at a 0.2 s guard; those same peaks should score ~1.3x
+    # higher at 2.0 s, which would leave room to put the gate back up. That
+    # is a threshold to re-derive from a re-run of the field data, not to
+    # guess at here.
+    align_guard_s: float = 2.0
     align_min_corr: float = 0.50        # absolute floor against pure garbage
     align_min_prominence: float = 15.0  # robust sigma above the background
     # NOTE: was 25.0 but that refused clearly-correct alignments on 25 kHz
     # recordings (RO2612030: prominence 21-22, |r| > 0.994).  15.0 is still
     # 3.5x above the noise floor (worst genuinely-bad alignment was 4.1 on
     # RO2612025) while accepting these valid results.
+
+    # ---- corroboration between cards --------------------------------------
+    # A weak peak that a SECOND card independently reproduces is a different
+    # claim from a weak peak alone: the cards are armed in groups, so two of
+    # them sharing a trigger genuinely share an offset, while noise does not
+    # put two independent correlations 2 ms apart on an 8.6 s lag. A card
+    # whose prominence falls between align_corroborate_min_prominence and
+    # align_min_prominence is accepted if another card agrees to within
+    # align_agree_tol_s.
+    #
+    # THIS RELAXES PROMINENCE ONLY, NEVER align_min_corr. The pair this rule
+    # was written from -- RO2612030 at 150 A, cards 1 and 2, +215634 and
+    # +215687 samples, 53 samples apart -- scored |r| = 0.083 on a dead
+    # reference, and the 0.50 floor still refuses it. Corroboration buys a
+    # card past a ragged peak, not past a dead channel.
+    #
+    # 20 ms is the agreement window because it is an order of magnitude above
+    # the 2.1 ms that two genuinely co-triggered cards differed by, and three
+    # orders below the offsets being confirmed. 5.0 is the corroboration
+    # floor because 4.1 is the worst genuinely-bad alignment measured on this
+    # campaign (RO2612025); below that, agreement proves nothing.
+    # Set align_corroborate_min_prominence above align_min_prominence to
+    # disable the mechanism.
+    align_agree_tol_s: float = 0.02
+    align_corroborate_min_prominence: float = 5.0
+
+    # ---- alignment diagnostics (report-only, never a gate) -----------------
+    # A constant lag corrects a different start TIME. It does not test that
+    # two cards kept the same sample RATE: at 20 ppm over a 300 s record the
+    # two slide 6 ms apart, a quarter of a 25 ms dwell, so the windows at one
+    # end of the sweep walk off their tone while the other end looks perfect.
+    # The lag is re-estimated in blocks, each compared over the SAME physical
+    # interval, and the slope of lag against time is reported in ppm.
+    #
+    # These numbers are recorded, logged and never used to refuse a lag. A
+    # diagnostic that becomes a gate the day it is written is a gate whose
+    # threshold was never checked against a distribution; per the rollout
+    # plan these run in report-only mode until the ppm and closure
+    # distributions have been seen across 45/60/150/450 A.
+    align_drift_blocks: int = 5          # < 3 disables the diagnostic
+    align_drift_half_window_s: float = 0.050
+    align_max_clock_ppm: float = 20.0
 
     # ---- high-frequency schedule recovery (bronze, hf_schedule.py) --------
     # The blind detector used to be run on the card's REFERENCE channel, the

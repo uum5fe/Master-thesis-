@@ -214,8 +214,32 @@ class BronzeRun:
                            for k, v in self.lags.items() if k in self.cards},
             "card_lag_corr": {k: round(v["corr"], 4)
                               for k, v in self.lags.items()},
+            # WHICH LAGS WERE ACTUALLY USED, AND ON WHAT EVIDENCE.
+            # A manifest that reports a lag without reporting whether it was
+            # applied describes a run that may never have happened.
+            "card_lag_applied": {k: bool(v.get("applied"))
+                                 for k, v in self.lags.items()},
+            "card_lag_prominence": {
+                k: (round(v["prominence"], 2)
+                    if np.isfinite(v.get("prominence", np.nan)) else None)
+                for k, v in self.lags.items()},
+            "card_lag_rescued": [k for k, v in self.lags.items()
+                                 if v.get("rescued")],
+            "card_clock_ppm": {
+                k: round(v["drift"]["clock_mismatch_ppm"], 2) + 0.0
+                for k, v in self.lags.items()
+                if isinstance(v.get("drift"), dict) and v["drift"].get("ok")},
+            "alignment_closure": next(
+                (v["closure"] for v in self.lags.values() if "closure" in v),
+                None),
             "sensor_T_degC": {k: round(v, 3) for k, v in self.sensor_T.items()},
+            "coverage": self.coverage_summary(),
         }
+
+    def coverage_summary(self) -> dict:
+        """Per-frequency plate coverage, area-weighted.  See
+        `bronze_frequency_coverage`."""
+        return coverage_summary(bronze_frequency_coverage(self))
 
 
 # ===========================================================================
@@ -426,54 +450,143 @@ def estimate_card_lags(files: list[Path], cards: dict[str, CardInfo],
     if not stems:
         return {}
 
-    def _ac(stem):
-        c = cards[stem]
-        fam = FamosFile(c.path)
-        x = np.asarray(fam.channel(c.ref_name), float)
-        x = x - x.mean()
-        # keep the band that carries the sweep; kills DC drift and the top
-        # of the band where the two cards genuinely differ in phase
-        n = len(x)
-        X = np.fft.rfft(x)
-        fr = np.fft.rfftfreq(n, 1.0 / c.fs)
-        X[(fr < 0.5) | (fr > 300.0)] = 0.0
-        return np.fft.irfft(X, n)
+    traces = {stem: _alignment_trace(stem, cards, cfg) for stem in stems}
 
-    traces = {stem: _ac(stem) for stem in stems}
-    max_lag = int(cfg.align_max_lag_s * cards[stems[0]].fs)
+    # THE ANCHOR COMES FROM THE LARGEST GROUP OF CARDS THAT SHARE A RATE.
+    # A lag in samples only means something between two cards sampled at the
+    # same rate, and this campaign mixes rates. Choosing the anchor from all
+    # cards at once could put it on a lone 100 kHz card and refuse the four
+    # 50 kHz ones below -- refusing the majority to keep the outlier.
+    by_fs: dict[float, list[str]] = {}
+    for st in stems:
+        by_fs.setdefault(float(cards[st].fs), []).append(st)
+    group = max(by_fs.values(), key=lambda g: (len(g), -stems.index(g[0])))
+    if len(by_fs) > 1:
+        log.warning(f"  cards report {len(by_fs)} different sample rates "
+                    f"({', '.join(f'{k:.0f} Hz x{len(v)}' for k, v in sorted(by_fs.items()))}). "
+                    f"Aligning within the largest group only.")
 
-    base = _pick_anchor(stems, traces, max_lag, log)
+    # max_lag and the guard are both TIMES converted to samples, so they are
+    # taken from the rate of the group being aligned -- not from whichever
+    # card happened to sort first, which on a mixed-rate plate is a different
+    # number of samples for the same number of seconds.
+    fs_group = cards[group[0]].fs
+    max_lag = int(cfg.align_max_lag_s * fs_group)
+    guard = _guard_samples(cfg, fs_group)
+
+    base = _pick_anchor(group, traces, max_lag, log, guard=guard)
     ref = traces[base]
     out = {base: {"lag": 0, "corr": 1.0, "prominence": float("inf"),
-                  "applied": True}}
+                  "applied": True, "corroborated_by": [], "rescued": False}}
     log.info(f"  reference card: {base} (ref channel {cards[base].ref_name})")
 
+    # A CARD AT A DIFFERENT SAMPLE RATE CANNOT BE CORRELATED WITH THIS ONE.
+    # `_best_lag` compares two arrays sample by sample and returns an offset
+    # in samples; if the two cards did not sample at the same rate, those
+    # samples are not the same unit and the answer is meaningless -- the more
+    # so because `max_lag` is derived from the anchor's fs alone. The
+    # campaign does mix rates (50 kHz and 100 kHz cards appear in the same
+    # run), so this is not hypothetical. Refusing is the only honest
+    # outcome; a resampling path would be a real change, not a guard.
+    fs_base = cards[base].fs
+    mismatched = [s for s in stems
+                  if s != base and not np.isclose(cards[s].fs, fs_base,
+                                                  rtol=0, atol=1e-6)]
+    for stem in mismatched:
+        out[stem] = {"lag": 0, "corr": float("nan"), "prominence": float("nan"),
+                     "applied": False, "corroborated_by": [], "rescued": False,
+                     "refused_reason": "sample rate differs from the anchor"}
+        log.warning(f"  {stem[-8:]}: fs = {cards[stem].fs:.0f} Hz against the "
+                    f"anchor's {fs_base:.0f} Hz - NOT aligned. A lag in "
+                    f"samples means nothing between two rates; this card "
+                    f"stays on its own clock.")
+
+    # ALL CANDIDATES FIRST, THEN THE DECISION.
+    # The acceptance rule below asks whether ANOTHER card independently
+    # returned the same offset, so no card can be judged until every card has
+    # been measured.
+    candidates: dict[str, tuple[int, float, float]] = {}
     for stem in stems:
-        if stem == base:
+        if stem == base or stem in mismatched:
             continue
-        lag, corr, prom = _best_lag(traces[stem], ref, max_lag)
+        candidates[stem] = _best_lag(traces[stem], ref, max_lag, guard)
+
+    for stem, (lag, corr, prom) in candidates.items():
         # lag < 0 means this card's record RUNS AHEAD of the reference's,
         # i.e. it was armed later; the schedule index must be shifted by
         # +lag to read the same instant.
+        partners = _agreeing_cards(stem, lag, candidates, cards, cfg)
+        rescued = bool(partners
+                       and prom < cfg.align_min_prominence
+                       and prom >= cfg.align_corroborate_min_prominence)
         strong = prom >= cfg.align_min_prominence
         above_floor = abs(corr) >= cfg.align_min_corr
-        applied = bool(cfg.align_cards and strong and above_floor)
+        applied = bool(cfg.align_cards and above_floor and (strong or rescued))
         out[stem] = {"lag": lag, "corr": corr, "prominence": prom,
-                     "applied": applied}
+                     "applied": applied, "corroborated_by": partners,
+                     "rescued": rescued}
         why = ("" if applied else
-               "   REFUSED (peak not prominent)" if not strong else
-               "   REFUSED (below the absolute floor)")
+               "   REFUSED (below the absolute floor)" if not above_floor else
+               "   REFUSED (peak not prominent, and no card agrees)")
+        note = (f"   CORROBORATED by {', '.join(p[-8:] for p in partners)}"
+                if rescued else "")
         log.info(f"  {stem[-8:]}: lag {lag:+8d} samples = "
                  f"{lag / cards[stem].fs:+8.4f} s   peak corr {corr:+.3f}"
-                 f"   prominence {prom:5.1f}" + why)
+                 f"   prominence {prom:5.1f}" + why + note)
         if not applied:
             log.warning(f"    {stem[-8:]} stays on its own clock. If its true "
                         f"offset is not ~0 its dwell windows will land on the "
                         f"wrong tone and EVERY segment on this card will fail "
                         f"the SNR gate in silver.")
-        elif abs(lag) >= max_lag - 1:
+            continue
+        if abs(lag) >= max_lag - 1:
             log.warning("    lag is at the search limit - raise "
                         "align_max_lag_s and re-run")
+
+        # ---- is ONE constant lag enough for the whole record? -------------
+        drift = _blockwise_lag_diagnostic(traces[stem], ref, lag,
+                                          cards[stem].fs, cfg)
+        out[stem]["drift"] = drift
+        if drift.get("ok"):
+            log.info(f"    clock: {drift['clock_mismatch_ppm']:+7.2f} ppm over "
+                     f"{len(drift['blocks'])} blocks "
+                     f"(residual {drift['residual_span_samples']:+d} samples "
+                     f"end to end)")
+            if not drift.get("within_limit", True):
+                log.warning(
+                    f"    residual clock mismatch "
+                    f"{drift['clock_mismatch_ppm']:+.1f} ppm exceeds "
+                    f"{cfg.align_max_clock_ppm:.0f} ppm: a single constant lag "
+                    f"does not align the whole record. The dwell windows at "
+                    f"one end of the sweep are the ones that will suffer.")
+
+    # ---- does the whole set of lags form one consistent timing network? ---
+    closure = _pairwise_closure(stems, traces, out, cards, cfg, guard)
+    if closure.get("pairs"):
+        # Plate-level facts live on the ANCHOR's entry, not under a key of
+        # their own: `out` is keyed by card stem and several callers iterate
+        # it expecting every value to be a card record (summary() reads
+        # v["corr"] off each one). The anchor is the card the whole timing
+        # network is expressed against, so it is where a statement about that
+        # network belongs.
+        out[base]["closure"] = closure
+        out[base]["band_hz"] = [float(cfg.align_f_lo_hz),
+                                float(cfg.align_f_hi_hz)]
+        out[base]["guard_s"] = float(cfg.align_guard_s)
+        if closure["max_abs_error_samples"] is not None:
+            log.info(f"  pairwise closure: max |error| "
+                     f"{closure['max_abs_error_samples']} samples "
+                     f"({closure['max_abs_error_s']:+.4f} s), RMS "
+                     f"{closure['rms_error_samples']:.1f} samples over "
+                     f"{closure['n_pairs']} pairs")
+            if not closure["consistent"]:
+                log.warning(
+                    f"  the card offsets do NOT close: measuring A against B "
+                    f"directly disagrees with going through the anchor by up "
+                    f"to {closure['max_abs_error_s']:+.4f} s. At least one "
+                    f"accepted lag is wrong, and the closure table says which "
+                    f"pair carries it.")
+
     if not cfg.align_cards:
         log.warning("  align_cards is off: schedule windows will be applied "
                     "to every card unshifted, which is only correct if the "
@@ -481,8 +594,63 @@ def estimate_card_lags(files: list[Path], cards: dict[str, CardInfo],
     return out
 
 
-def _best_lag(x: np.ndarray, ref: np.ndarray,
-              max_lag: int) -> tuple[int, float, float]:
+#: The guard the prominence score used before it was expressed as a time.
+#: Kept only so a direct `_best_lag` call without a config still behaves as
+#: it always did; production passes `_guard_samples(cfg, fs)`.
+GUARD_SAMPLES_LEGACY = 5000
+
+
+def _guard_samples(cfg: Config, fs: float) -> int:
+    """The prominence guard for this card, in samples.
+
+    `align_guard_s` is a duration because the peak it has to exclude is a
+    duration -- roughly 1/align_f_lo_hz wide, whatever the sample rate.
+    """
+    g = float(getattr(cfg, "align_guard_s", 0.0) or 0.0)
+    if g <= 0.0:
+        return GUARD_SAMPLES_LEGACY
+    return max(1, int(round(g * float(fs))))
+
+
+def _alignment_trace(stem: str, cards: dict[str, CardInfo],
+                     cfg: Config) -> np.ndarray:
+    """The card's reference, band-passed to the band the lag is measured in.
+
+    The band kills DC drift at the bottom and, at the top, the part of the
+    spectrum where two cards genuinely differ in phase -- neither of which
+    carries information about the OFFSET between the records.  It limits the
+    alignment estimate only; the impedance spectrum is built from the full
+    band in `process_card`.
+
+    The upper limit is clamped to 0.45*fs of THIS card.  Without the clamp a
+    band chosen for the fast cards asks a slow card for frequencies it never
+    recorded, and `X[(fr < f_lo) | (fr > f_hi)] = 0` then zeroes its entire
+    trace -- an all-zero correlation, which is not a refusal but a silent
+    one.
+    """
+    c = cards[stem]
+    fam = FamosFile(c.path)
+    x = np.asarray(fam.channel(c.ref_name), float)
+    x = x - x.mean()
+
+    n = len(x)
+    X = np.fft.rfft(x)
+    fr = np.fft.rfftfreq(n, 1.0 / c.fs)
+
+    f_lo = max(0.0, float(cfg.align_f_lo_hz))
+    f_hi = min(float(cfg.align_f_hi_hz), 0.45 * c.fs)
+    if not 0.0 <= f_lo < f_hi:
+        raise ValueError(
+            f"bronze: invalid alignment band {f_lo:g}..{f_hi:g} Hz for "
+            f"fs = {c.fs:g} Hz on {stem}. align_f_lo_hz must be below both "
+            f"align_f_hi_hz and 0.45*fs.")
+
+    X[(fr < f_lo) | (fr > f_hi)] = 0.0
+    return np.fft.irfft(X, n)
+
+
+def _best_lag(x: np.ndarray, ref: np.ndarray, max_lag: int,
+              guard: int = GUARD_SAMPLES_LEGACY) -> tuple[int, float, float]:
     """The lag of best agreement, its correlation, and its prominence."""
     n = min(len(x), len(ref))
     a, b = x[:n], ref[:n]
@@ -495,10 +663,11 @@ def _best_lag(x: np.ndarray, ref: np.ndarray,
     k = int(np.argmax(np.abs(cc_sel)))
     denom = np.sqrt(float(np.dot(a, a)) * float(np.dot(b, b)))
     corr = float(cc_sel[k] / denom) if denom > 0 else 0.0
-    return int(lag_sel[k]), corr, _prominence(np.abs(cc_sel), k)
+    return int(lag_sel[k]), corr, _prominence(np.abs(cc_sel), k, guard)
 
 
-def _prominence(mag: np.ndarray, k: int, guard: int = 5000) -> float:
+def _prominence(mag: np.ndarray, k: int,
+                guard: int = GUARD_SAMPLES_LEGACY) -> float:
     """How many robust sigma the peak stands above the rest of the curve.
 
     Median and MAD rather than mean and sd, because the correlation of a
@@ -517,8 +686,190 @@ def _prominence(mag: np.ndarray, k: int, guard: int = 5000) -> float:
     return float((float(mag[k]) - med) / (1.4826 * mad))
 
 
+def _agreeing_cards(stem: str, lag: int,
+                    candidates: dict[str, tuple[int, float, float]],
+                    cards: dict[str, CardInfo], cfg: Config) -> list[str]:
+    """Which other cards independently returned the same offset.
+
+    A weak peak that a SECOND card reproduces is not the same claim as a weak
+    peak on its own.  The cards are armed in groups, so two of them genuinely
+    sharing a trigger will genuinely share an offset; noise will not put two
+    independent correlations within 20 ms of each other at an 8.6 s lag.
+
+    This is evidence ABOUT PROMINENCE ONLY.  `align_min_corr` is not relaxed
+    by agreement, and that matters: on RO2612030 at 150 A cards 1 and 2 agreed
+    to 53 samples on a 215634-sample offset while scoring |r| = 0.083 on a
+    dead reference, and that pair is exactly what the 0.50 floor exists to
+    refuse.  Under the shipped floor they stay refused, agreement or not --
+    corroboration buys a card past a ragged peak, never past a dead one.
+
+    Set `align_corroborate_min_prominence` above `align_min_prominence` to
+    switch the mechanism off entirely.
+    """
+    partners: list[str] = []
+    fs = cards[stem].fs
+    tol = int(round(cfg.align_agree_tol_s * fs))
+    for other, (other_lag, _corr, other_prom) in candidates.items():
+        if other == stem:
+            continue
+        if not np.isclose(cards[other].fs, fs, rtol=0, atol=1e-6):
+            continue
+        # A partner must itself clear the corroboration floor: two peaks that
+        # are both indistinguishable from noise cannot vouch for each other,
+        # however well they agree.
+        if other_prom < cfg.align_corroborate_min_prominence:
+            continue
+        if abs(int(other_lag) - int(lag)) <= tol:
+            partners.append(other)
+    return partners
+
+
+def _blockwise_lag_diagnostic(x: np.ndarray, ref: np.ndarray, global_lag: int,
+                              fs: float, cfg: Config) -> dict:
+    """Does ONE constant lag hold for the whole record, or do the clocks drift?
+
+    A single global lag corrects a different START time.  It says nothing
+    about the two cards keeping the same sample RATE: if their oscillators
+    differ by even a few ppm, the offset that is right at the start of a
+    300 s record is wrong at the end.  At 20 ppm over 300 s the records slide
+    by 6 ms, which is a quarter of a 25 ms dwell -- enough to walk a window
+    off its tone at the end of the sweep while the beginning still looks
+    perfect.
+
+    Measured by re-estimating the lag in blocks.  The key point, and the one
+    the naive version gets wrong: the two blocks compared must cover the SAME
+    PHYSICAL INTERVAL.  x is delayed relative to ref by `global_lag`, so
+    ref[a:b] corresponds to x[a+lag : b+lag], and only then is the local
+    result a RESIDUAL that should sit near zero.  Slicing both at [a:b] and
+    searching +-50 ms would be searching for an 8 s offset in a 50 ms window
+    and finding nothing.
+
+    Report-only: this never rejects a lag.  It says whether a constant lag
+    was the right model, which is a different question from whether the lag
+    that was found is the best constant one.
+    """
+    n_blocks = int(getattr(cfg, "align_drift_blocks", 0) or 0)
+    if n_blocks < 3:
+        return {"ok": False, "reason": "disabled (align_drift_blocks < 3)"}
+
+    lag = int(global_lag)
+    # the stretch of ref for which the matching stretch of x exists
+    lo = max(0, -lag)
+    hi = min(len(ref), len(x) - lag)
+    if hi - lo < 1024:
+        return {"ok": False, "reason": "records do not overlap after the lag"}
+
+    block_len = (hi - lo) // n_blocks
+    half = max(2, int(round(cfg.align_drift_half_window_s * fs)))
+    # The guard cannot be the global one here: it excludes +-align_guard_s
+    # around the peak, and the whole local search is only +-half.  A guard
+    # wider than the search leaves no background at all, and `_prominence`
+    # returns NaN.  Keep three quarters of the window as background.
+    guard_local = max(1, (2 * half + 1) // 8)
+
+    rows = []
+    for b_i in range(n_blocks):
+        a = lo + b_i * block_len
+        b = hi if b_i == n_blocks - 1 else lo + (b_i + 1) * block_len
+        if b - a < 256:
+            continue
+        local, corr, _prom = _best_lag(x[a + lag:b + lag], ref[a:b],
+                                       half, guard_local)
+        rows.append({
+            "block": b_i,
+            "time_s": float(0.5 * (a + b) / fs),
+            "lag_samples": int(lag + local),
+            "residual_samples": int(local),
+            "corr": float(corr),
+        })
+
+    if len(rows) < 3:
+        return {"ok": False, "reason": "fewer than three usable blocks",
+                "blocks": rows}
+
+    tt = np.array([r["time_s"] for r in rows], float)
+    ll = np.array([r["lag_samples"] for r in rows], float)
+    slope, intercept = np.polyfit(tt, ll, 1)
+    ppm = 1e6 * slope / float(fs)
+    residuals = [r["residual_samples"] for r in rows]
+    at_limit = [r for r in rows if abs(r["residual_samples"]) >= half - 1]
+    return {
+        "ok": True,
+        "lag_intercept_samples": float(intercept),
+        "lag_slope_samples_per_s": float(slope),
+        "clock_mismatch_ppm": float(ppm),
+        "within_limit": bool(abs(ppm) <= cfg.align_max_clock_ppm),
+        "residual_span_samples": int(max(residuals) - min(residuals)),
+        # a residual pinned at the edge of the search window means the true
+        # drift is larger than this window can see, so the ppm is a floor
+        "n_blocks_at_search_limit": len(at_limit),
+        "half_window_samples": int(half),
+        "blocks": rows,
+    }
+
+
+def _pairwise_closure(stems: list[str], traces: dict[str, np.ndarray],
+                      lags: dict[str, dict], cards: dict[str, CardInfo],
+                      cfg: Config, guard: int) -> dict:
+    """Do the anchor-relative lags agree with direct card-to-card lags?
+
+    Every lag here is measured against one anchor, so nothing so far has
+    tested the set of them for CONSISTENCY.  Measuring A against B directly
+    must reproduce lag(A) - lag(B), because the card index of a feature is
+    `anchor_index + lag` on each card by construction.  If it does not, one
+    of the two accepted lags is wrong -- and the closure table names the pair,
+    which is more than the correlation scores can do on their own.
+
+    Only cards whose lag was APPLIED take part: an unapplied lag is not a
+    claim about the timing network, so including it would manufacture errors
+    that mean nothing.
+
+    Report-only, like the drift diagnostic.  A closure failure says the set
+    cannot all be right; it does not say which one to throw away, and
+    guessing is exactly what got this pipeline into trouble before.
+    """
+    usable = [s for s in stems
+              if lags.get(s, {}).get("applied") and s in traces]
+    rows: list[dict] = []
+    for i, a in enumerate(usable):
+        for b in usable[i + 1:]:
+            fs_a, fs_b = cards[a].fs, cards[b].fs
+            if not np.isclose(fs_a, fs_b, rtol=0, atol=1e-6):
+                rows.append({"card_a": a, "card_b": b, "ok": False,
+                             "reason": "different sample rates"})
+                continue
+            max_lag = int(cfg.align_max_lag_s * fs_a)
+            direct, corr, prom = _best_lag(traces[a], traces[b], max_lag, guard)
+            # a_index = anchor + lag_a and b_index = anchor + lag_b, so a
+            # measured against b must come out at lag_a - lag_b
+            implied = int(lags[a]["lag"]) - int(lags[b]["lag"])
+            error = int(direct) - implied
+            rows.append({
+                "card_a": a, "card_b": b, "ok": True,
+                "direct_lag": int(direct), "implied_lag": implied,
+                "closure_error_samples": error,
+                "closure_error_s": float(error / fs_a),
+                "corr": float(corr), "prominence": float(prom),
+            })
+
+    errors = [abs(r["closure_error_samples"]) for r in rows if r.get("ok")]
+    fs_ref = cards[usable[0]].fs if usable else 1.0
+    tol = int(round(cfg.align_agree_tol_s * fs_ref))
+    return {
+        "n_pairs": len(errors),
+        "max_abs_error_samples": max(errors) if errors else None,
+        "max_abs_error_s": float(max(errors) / fs_ref) if errors else None,
+        "rms_error_samples": (float(np.sqrt(np.mean(np.square(errors))))
+                              if errors else None),
+        "tolerance_samples": tol,
+        "consistent": bool(errors and max(errors) <= tol) if errors else True,
+        "pairs": rows,
+    }
+
+
 def _pick_anchor(stems: list[str], traces: dict[str, np.ndarray],
-                 max_lag: int, log) -> str:
+                 max_lag: int, log,
+                 guard: int = GUARD_SAMPLES_LEGACY) -> str:
     """The card whose clock the others are shifted onto: the one they agree
     with best.
 
@@ -537,7 +888,7 @@ def _pick_anchor(stems: list[str], traces: dict[str, np.ndarray],
         return stems[0]
     scores: dict[str, float] = {}
     for cand in stems:
-        others = [abs(_best_lag(traces[s], traces[cand], max_lag)[1])
+        others = [abs(_best_lag(traces[s], traces[cand], max_lag, guard)[1])
                   for s in stems if s != cand]
         scores[cand] = float(np.median(others))
     best = max(scores, key=lambda s: scores[s])
@@ -646,9 +997,8 @@ def consensus_schedule(files: list[Path], cards: dict[str, CardInfo],
         info = lags.get(stem, {}) if lags else {}
         d = int(info.get("lag", 0)) if info.get("applied") else 0
         if d:
-            steps = [Step(freq=s.freq, start=s.start - d, stop=s.stop - d,
-                          amp=s.amp, snr_db=s.snr_db, thd=s.thd,
-                          stationarity=s.stationarity) for s in steps]
+            steps = [ladder_snap._rebuild(Step, s, start=s.start - d,
+                                          stop=s.stop - d) for s in steps]
         per_card[stem] = steps
         fs_seen[stem] = float(fam.fs)
         log.info(f"  {stem}: {len(steps)} candidate steps "
@@ -737,14 +1087,39 @@ def consensus_schedule(files: list[Path], cards: dict[str, CardInfo],
         # the one least likely to have been truncated by a neighbour
         best = max(cl, key=lambda cs: cs[1].stop - cs[1].start)[1]
         snr = float(np.nanmax([s.snr_db for _, s in cl]))
-        thd = float(np.nanmedian([s.thd for _, s in cl]))
-        drift = float(np.nanmedian([s.stationarity for _, s in cl]))
-        kept.append(Step(freq=float(f_hat), start=best.start, stop=best.stop,
-                         amp=best.amp, snr_db=snr, thd=thd, stationarity=drift))
+        # _finite_median, not nanmedian: a cluster whose every card reported
+        # a NaN THD is not an error, it is a step where nobody could measure
+        # distortion, and nanmedian answers that with a RuntimeWarning and a
+        # NaN. The NaN is the right answer; the warning is noise that trains
+        # the reader to ignore warnings.
+        thd = _finite_median(s.thd for _, s in cl)
+        drift = _finite_median(s.stationarity for _, s in cl)
+        kept.append(ladder_snap._rebuild(Step, best, freq=float(f_hat),
+                                         snr_db=snr, thd=thd,
+                                         stationarity=drift))
         n_votes_kept += enough
         n_grid_rescued += (on_grid and not enough)
 
     kept.sort(key=lambda s: s.freq)
+
+    # A MISSING DIAGNOSTIC IS "NOT MEASURED", NEVER "PASSED".
+    # THD and stationarity are quality evidence; a step that has neither is a
+    # step nothing is known about, and silver must not read that silence as a
+    # clean bill of health. The counts are recorded so a run that lost its
+    # distortion diagnostics says so in the manifest instead of looking like
+    # a run with no distortion.
+    grid["diagnostics"] = {
+        "n_steps": len(kept),
+        "steps_without_thd": int(sum(not np.isfinite(s.thd) for s in kept)),
+        "steps_without_stationarity":
+            int(sum(not np.isfinite(s.stationarity) for s in kept)),
+    }
+    _d = grid["diagnostics"]
+    if _d["steps_without_thd"] or _d["steps_without_stationarity"]:
+        log.warning(f"  {_d['steps_without_thd']} of {len(kept)} steps carry "
+                    f"no THD and {_d['steps_without_stationarity']} no "
+                    f"stationarity: those diagnostics are UNAVAILABLE for "
+                    f"them, not passed")
 
     # ---- snap the consensus onto the excitation ladder ---------------------
     # The grid above is used only to ACCEPT or REJECT a cluster.  Using it to
@@ -816,6 +1191,103 @@ def consensus_schedule(files: list[Path], cards: dict[str, CardInfo],
     if hf_info:
         grid["hf_schedule"] = hf_info
     return kept, grid
+
+
+def bronze_frequency_coverage(run_obj) -> list[dict]:
+    """How much of the plate actually carries each frequency.
+
+    A schedule step is a statement that the plate was excited at a frequency.
+    It is NOT a statement that the frequency survived on any given segment,
+    and an aggregate built from a schedule alone can be a plate-wide number
+    computed from four segments in one corner.
+
+    Two fractions, because they answer different questions:
+
+      segment_fraction  -- what share of the measured segments returned a
+                           finite phasor here.  Answers "is this frequency
+                           broadly measured, or did one card carry it?"
+      area_coverage     -- the same, weighted by segment AREA.  This is the
+                           one that matters for any aggregate, because the
+                           plate's segments span 0.678 to 8.470 cm^2, a
+                           factor of 12.5: two thirds of the segments can be
+                           a third of the plate.
+
+    Report-only.  Nothing is discarded for low coverage here -- the right
+    response to a thinly covered frequency is to say so next to the number,
+    not to delete it and leave the gap unexplained.
+    """
+    rows: list[dict] = []
+    segs = list(run_obj.spectra.items())
+    if not segs:
+        return rows
+    areas = {seg: float(geom.SEGMENTS[seg].area_cm2)
+             for seg, _ in segs if seg in geom.SEGMENTS}
+    total_area = float(sum(areas.values()))
+
+    for i, st in enumerate(run_obj.schedule):
+        n_valid = 0
+        area_ok = 0.0
+        for seg, sp in segs:
+            z = sp.Z_raw
+            ok = bool(i < len(z) and np.isfinite(z[i].real)
+                      and np.isfinite(z[i].imag)
+                      and i < len(sp.n_per_step) and sp.n_per_step[i] > 0)
+            if ok:
+                n_valid += 1
+                area_ok += areas.get(seg, 0.0)
+        rows.append({
+            "index": i,
+            "freq_hz": float(st.freq),
+            "n_valid_segments": int(n_valid),
+            "n_measured_segments": int(len(segs)),
+            "segment_fraction": round(n_valid / len(segs), 4) if segs else 0.0,
+            "area_coverage": (round(area_ok / total_area, 4)
+                              if total_area > 0 else float("nan")),
+            "window_source": getattr(st, "window_source", "detected"),
+        })
+    return rows
+
+
+def coverage_summary(rows: list[dict], min_area_coverage: float = 0.80) -> dict:
+    """What the coverage table says in one line, for the manifest.
+
+    `min_area_coverage` is a REPORTING threshold, not a gate: it marks the
+    band over which an aggregate rests on most of the plate, so that a
+    comparison against a whole-cell Gamry sweep can state the band it is
+    entitled to use instead of quietly averaging over whatever survived.
+    """
+    if not rows:
+        return {"ok": False, "reason": "no spectra"}
+    ac = np.array([r["area_coverage"] for r in rows], float)
+    f = np.array([r["freq_hz"] for r in rows], float)
+    good = np.isfinite(ac) & (ac >= min_area_coverage)
+    rep = [r for r in rows if r.get("window_source") != "detected"]
+    return {
+        "ok": True,
+        "min_area_coverage": float(min_area_coverage),
+        "n_steps": len(rows),
+        "n_steps_above_threshold": int(good.sum()),
+        "f_lo_covered_hz": float(f[good].min()) if good.any() else None,
+        "f_hi_covered_hz": float(f[good].max()) if good.any() else None,
+        "median_area_coverage": float(np.nanmedian(ac)) if ac.size else None,
+        "worst_area_coverage": float(np.nanmin(ac)) if ac.size else None,
+        "n_repaired_windows": len(rep),
+        "repaired_freqs_hz": [round(r["freq_hz"], 3) for r in rep],
+    }
+
+
+def _finite_median(values) -> float:
+    """Median of the finite values, or NaN when there are none.
+
+    `np.nanmedian` of an all-NaN slice is NaN with a RuntimeWarning, which is
+    the right value announced the wrong way: a step whose cards all failed to
+    measure THD is an ordinary outcome near the top of the band, not an
+    exceptional condition, and a run that prints dozens of All-NaN warnings
+    teaches its reader to skip warnings.
+    """
+    a = np.asarray(list(values), float)
+    a = a[np.isfinite(a)]
+    return float(np.median(a)) if a.size else float("nan")
 
 
 def _on_grid(f: float, grid: dict, tol: float) -> bool:
@@ -1303,18 +1775,51 @@ def save(run_obj: BronzeRun, cfg: Config, log=None) -> Path:
         })
     utils.write_table(out / "segment_meta.csv", meta)
 
+    # `window_source` travels to the CSV because a reader deciding whether to
+    # believe a point needs to know whether its dwell window was found or
+    # predicted, and a log line that scrolled past two stages ago is not an
+    # answer to that.
+    cov = {r["index"]: r for r in bronze_frequency_coverage(run_obj)}
     utils.write_table(out / "schedule.csv", [
         {"index": i, "freq_hz": round(s.freq, 6), "start": s.start,
          "stop": s.stop, "n_samples": s.stop - s.start,
          "amp_V": s.amp, "snr_db": round(s.snr_db, 2),
          "thd": round(s.thd, 5) if np.isfinite(s.thd) else "",
-         "drift": round(s.stationarity, 5) if np.isfinite(s.stationarity) else ""}
+         "drift": round(s.stationarity, 5) if np.isfinite(s.stationarity) else "",
+         "window_source": getattr(s, "window_source", "detected"),
+         "window_repaired": int(getattr(s, "window_repaired", False)),
+         "n_valid_segments": cov.get(i, {}).get("n_valid_segments", ""),
+         "segment_fraction": cov.get(i, {}).get("segment_fraction", ""),
+         "area_coverage": cov.get(i, {}).get("area_coverage", "")}
         for i, s in enumerate(run_obj.schedule)])
 
     utils.write_table(out / "channels.csv", [
         {"card": c.card, "name": c.name, "slot": c.slot, "kind": c.kind,
          "n_ch": c.n_ch_on_card, "slot_us": round(c.slot_seconds * 1e6, 3)}
         for c in sorted(run_obj.channels.values(), key=lambda c: (c.card, c.slot))])
+
+    utils.write_table(out / "frequency_coverage.csv",
+                      bronze_frequency_coverage(run_obj))
+
+    # The alignment evidence, one row per card: what was measured, what was
+    # believed, and why. Previously only the log carried it, so a cached run
+    # could not be audited after the fact.
+    utils.write_table(out / "card_alignment.csv", [
+        {"card": k,
+         "lag_samples": v.get("lag"),
+         "lag_s": (round(v["lag"] / run_obj.cards[k].fs, 6)
+                   if k in run_obj.cards else ""),
+         "corr": round(v["corr"], 4) if np.isfinite(v.get("corr", np.nan)) else "",
+         "prominence": (round(v["prominence"], 2)
+                        if np.isfinite(v.get("prominence", np.nan)) else ""),
+         "applied": int(bool(v.get("applied"))),
+         "rescued": int(bool(v.get("rescued"))),
+         "corroborated_by": " ".join(v.get("corroborated_by", []) or []),
+         "refused_reason": v.get("refused_reason", ""),
+         "clock_ppm": (round(v["drift"]["clock_mismatch_ppm"], 2) + 0.0
+                       if isinstance(v.get("drift"), dict)
+                       and v["drift"].get("ok") else "")}
+        for k, v in sorted(run_obj.lags.items())])
 
     utils.write_json(out / "bronze_manifest.json", run_obj.summary())
     log.info(f"  bronze written to {out}")

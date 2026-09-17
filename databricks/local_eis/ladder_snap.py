@@ -204,10 +204,8 @@ def snap_steps(steps, fs, ppd=None, offset=None, log=None):
     new = []
     for r in out:
         src = steps[r["_i"]]
-        new.append(cls(freq=float(r["freq_hz"]),
-                       start=int(r["start"]), stop=int(r["stop"]),
-                       amp=src.amp, snr_db=src.snr_db, thd=src.thd,
-                       stationarity=src.stationarity))
+        new.append(_rebuild(cls, src, freq=float(r["freq_hz"]),
+                            start=int(r["start"]), stop=int(r["stop"])))
     new.sort(key=lambda s: s.freq)
     if log:
         log.info(f"  ladder snap: {info['n_in']} -> {info['n_out']} steps on a "
@@ -220,6 +218,25 @@ def snap_steps(steps, fs, ppd=None, offset=None, log=None):
 # ===========================================================================
 # window sanity: a stepped sweep is monotonic in time
 # ===========================================================================
+def _rebuild(cls, src, **changes):
+    """A copy of `src` with `changes` applied, keeping every other field.
+
+    Rebuilding a Step field by field silently drops any field added later --
+    which is how `window_source` would have been reset to "detected" by the
+    very function that repairs windows.  Copying what is there and overriding
+    only what changed cannot lose a field it does not know about.
+    """
+    fields = ("freq", "start", "stop", "amp", "snr_db", "thd", "stationarity",
+              "window_source")
+    kw = {f: getattr(src, f) for f in fields if hasattr(src, f)}
+    kw.update(changes)
+    try:
+        return cls(**kw)
+    except TypeError:                     # a Step-alike without the new field
+        kw.pop("window_source", None)
+        return cls(**kw)
+
+
 def repair_windows(steps, fs, descending=None, min_dwell_frac=0.40,
                    t_tol_s=0.5, max_repair_frac=0.25, log=None):
     """Replace dwell windows that cannot belong to the sweep.
@@ -323,8 +340,8 @@ def repair_windows(steps, fs, descending=None, min_dwell_frac=0.40,
         n_new = float(_np.interp(x, lf, ln))
         a = int(round(t_new * float(fs)))
         b = a + int(round(n_new))
-        out.append(cls(freq=s.freq, start=a, stop=b, amp=s.amp,
-                       snr_db=s.snr_db, thd=s.thd, stationarity=s.stationarity))
+        out.append(_rebuild(cls, s, start=a, stop=b,
+                            window_source="interpolated"))
         repaired.append({"freq_hz": float(s.freq),
                          "t_old_s": round(t0[k], 3), "t_new_s": round(t_new, 3),
                          "dwell_old_s": round(n[k] / float(fs), 4),

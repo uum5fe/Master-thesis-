@@ -917,6 +917,20 @@ class Step:
     thd: float
     stationarity: float  # spread of the phasor over three sub-windows
 
+    #: WHERE THE DWELL WINDOW CAME FROM.  "detected" means a detector found
+    #: this window in the record.  "interpolated" means the window was
+    #: PREDICTED -- ladder_snap.repair_windows replaced one that could not
+    #: belong to a monotonic sweep with the window the sweep would have
+    #: placed there.  That is a hypothesis about where a tone should be, and
+    #: a point built on it has a different evidential status from one whose
+    #: window was measured, so the distinction travels with the step instead
+    #: of living only in a log line.
+    window_source: str = "detected"
+
+    @property
+    def window_repaired(self) -> bool:
+        return self.window_source != "detected"
+
     def valid(self, min_snr=8.0, max_thd=0.10, max_drift=0.15,
               sigma_rel_max: float = 0.60) -> bool:
         """Is this step usable?

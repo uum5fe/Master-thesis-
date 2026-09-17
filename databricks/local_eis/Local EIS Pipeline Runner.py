@@ -196,6 +196,17 @@ try:
     #   gold   = + spatial field, plate maps, plausibility (full run)
     dbutils.widgets.dropdown('stop_after', 'gold',
                              ['bronze', 'silver', 'gold'], 'Stop after')
+    # EVALUATION MODE IS A CHOICE, NOT A DEFAULT.
+    # This notebook used to relax snr_floor_db to -80, max_drift to 2.5 and
+    # max_thd to 1.0 inside the config it built, so every run it produced was
+    # an exploratory run wearing the pipeline's default clothes. Those
+    # settings are legitimate for looking at a noisy top-of-band; they are
+    # not legitimate as the number that goes in a thesis without being named.
+    # 'default' now means the shipped gates, and anything looser has to be
+    # asked for here and is carried into the cache path and the manifest.
+    dbutils.widgets.dropdown('evaluation_mode', 'default',
+                             ['default', 'permissive', 'strict'],
+                             'Evaluation mode')
 except Exception:
     pass
  
@@ -222,6 +233,7 @@ F_MIN = float(_w('f_min_hz', '0.15'))
 F_MAX = float(_w('f_max_hz', '4500.0'))
 MIN_SNR_DB = float(_w('min_snr_db', '0'))
 STOP_AFTER = _w('stop_after', 'gold')
+EVALUATION_MODE = _w('evaluation_mode', 'default')
  
 # Select the plate for the whole session
 _plate = geom.use_plate(PLATE)
@@ -656,12 +668,58 @@ CACHE_WRITE = _w('cache_write', 'yes') == 'yes'
 FORCE_RERUN = (RUN_MODE == 'rerun')
  
  
+# ─── Cache identity ───
+# A CACHE KEY MUST NAME EVERY SETTING THAT CHANGED THE NUMBERS.
+# The key used to be the SNR widget alone, so a permissive run and a default
+# run of the same condition wrote to the same directory and whichever ran
+# last was served to both. Drift, THD, consensus, the frequency band and
+# every alignment setting were invisible to the key while being perfectly
+# visible in the results.
+#
+# The key is now the evaluation mode plus a digest of the settings that
+# decide what survives. Caches written before this change live under the old
+# path and are simply not found -- which is the correct outcome, because
+# nothing recorded what produced them.
+_CACHE_IDENTITY_KEYS = (
+    'f_min_hz', 'f_max_hz', 'ppd', 'grid_tol',
+    'min_snr_db', 'snr_floor_db', 'max_thd', 'max_drift',
+    'sigma_rel_max', 'min_cycles_per_dwell', 'zmag_outlier_mad',
+    'min_points_per_spectrum',
+    'ref_channel', 'align_cards', 'align_max_lag_s',
+    'align_min_corr', 'align_min_prominence', 'align_f_lo_hz',
+    'align_f_hi_hz', 'align_guard_s', 'align_agree_tol_s',
+    'align_corroborate_min_prominence',
+    'ladder_snap', 'window_sanity', 'hf_use_ensemble',
+    'phasor_method', 'skew_model', 'uncertainty_model',
+)
+# min_ref_channels is deliberately NOT in the key: it is set from the number
+# of cards the condition actually has, which is a property of the data, not
+# an operator choice, and folding it in would give the same measurement two
+# different cache entries for no reason.
+
+
+def _run_identity(mode=None, f_min=None, f_max=None, snr=None):
+    """Short digest of the settings that decide what a run keeps."""
+    import hashlib as _hashlib
+    mode = EVALUATION_MODE if mode is None else mode
+    base = DEFAULT.replace(
+        f_min_hz=F_MIN if f_min is None else f_min,
+        f_max_hz=F_MAX if f_max is None else f_max,
+        min_snr_db=MIN_SNR_DB if snr is None else float(snr))
+    if mode and mode != 'default':
+        base = base.preset(mode)
+    payload = {k: getattr(base, k, None) for k in _CACHE_IDENTITY_KEYS}
+    blob = json.dumps(payload, sort_keys=True, default=str)
+    return _hashlib.sha256(blob.encode('utf-8')).hexdigest()[:10]
+
+
 # ─── Cache paths ───
-def _cache_dir(leepa, cond, snr=None):
+def _cache_dir(leepa, cond, snr=None, mode=None):
     base = _CACHE_VOL / leepa / cond
-    if snr is not None:
-        return base / f'snr_{snr}'
-    return base
+    if snr is None:
+        return base
+    mode = EVALUATION_MODE if mode is None else mode
+    return base / f'mode_{mode}' / f'snr_{snr}_{_run_identity(mode=mode, snr=snr)}'
  
  
 def _cache_exists(leepa, cond, snr=None):
@@ -1069,7 +1127,13 @@ print(f"  Curr cal:   {_CURR_CAL}")
 print(f"  Gamry ref:  {GAMRY_DIR or '(none - whole-cell check skipped)'}")
 print(f"  Conditions: {_conditions_to_run}")
 print(f"  Band:       {F_MIN} – {F_MAX} Hz")
-print(f"  Stop after: {STOP_AFTER}\n")
+print(f"  Stop after: {STOP_AFTER}")
+# The mode decides the gates AND the cache entry, so it is printed with the
+# rest of the run identity rather than left to be inferred from the results.
+print(f"  Eval mode:  {EVALUATION_MODE}"
+      + ("" if EVALUATION_MODE == 'default'
+         else "   <-- NOT the pipeline defaults; exploratory"))
+print(f"  Run id:     {_run_identity()}   (cache key: settings digest)\n")
  
 # ─── Run pipeline once per condition (or load from cache) ───
 PIPELINE_RESULTS = {}  # {condition_str: manifest_dict}
@@ -1103,6 +1167,21 @@ for cond in _conditions_to_run:
         print(f"    {_cd}")
         continue
  
+    # ── Count the cards for THIS condition, before the run ───────────────
+    # The consensus requirement is relaxed below only for a genuine
+    # single-card condition, so the count has to come from the files that
+    # were selected -- not from a discovery that failed, which would make
+    # "nothing matched" indistinguishable from "one card".
+    _selected_files = []
+    if SOURCE_FORMAT == 'famos':
+        try:
+            _selected_files = bronze.discover_files(
+                DEFAULT.replace(dat_dir=_DAT_DIR, leepa=LEEPA, condition=cond))
+        except SystemExit as _de:
+            print(f"   {cond}: file discovery found nothing ({_de})")
+            _selected_files = []
+        print(f"   {cond}: {len(_selected_files)} card file(s) selected")
+
     _out_dir = _TMP_BASE / LEEPA / cond
     # Force-clean if stale directory with wrong permissions exists
     if _out_dir.exists():
@@ -1134,13 +1213,38 @@ for cond in _conditions_to_run:
         write_png=True,
         write_html=True,
         infer_missing_segments=False,  # Don't infer unmeasured segments (36,66,70,71)
-        min_ref_channels=1,  # allow single-card measurements (e.g. 2612025)
         min_snr_db=MIN_SNR_DB,    # from widget (default 0 dB; raise to 5-8 for cleaner plots)
-        align_min_prominence=15.0, # lowered from 25: 25 kHz cards score 21-23 prominence
-        snr_floor_db=-80.0,        # lowered from -3: 25 kHz cards have -20 to -35 dB SNR above 120 Hz
-        max_drift=2.5,             # lowered from 0.25: HF dwells on short records are not stationary
-        max_thd=1.0,               # loosened from 0.10: allow noisy HF points through for display
+        # A five-card FAMOS campaign must keep REAL consensus: a step seen by
+        # one card only is carried by grid membership, not by lowering the
+        # vote. min_ref_channels=1 is restored below, explicitly and out
+        # loud, when the run genuinely has one card.
+        min_ref_channels=2,
     )
+
+    # ── Gate preset: named, not smuggled ──────────────────────────────────
+    # Everything that relaxes a quality gate now comes from Config.preset(),
+    # so the mode is a single word that travels into the cache path, the
+    # manifest and the printout below. Nothing here silently edits a
+    # threshold the pipeline documents elsewhere.
+    if EVALUATION_MODE != 'default':
+        cfg = cfg.preset(EVALUATION_MODE)
+        print(f"\n  EVALUATION MODE: {EVALUATION_MODE.upper()} — gates are "
+              f"NOT the pipeline defaults. These results are exploratory and "
+              f"are cached separately from the default-mode results.")
+
+    # ── Single-card exception, stated rather than assumed ─────────────────
+    # Counted from the files actually selected, never inferred from a failed
+    # discovery: "no files matched" must not read as "one card".
+    _n_cards = len(_selected_files) if _selected_files else 0
+    if SOURCE_FORMAT == 'famos' and _n_cards == 1:
+        cfg = cfg.replace(min_ref_channels=1)
+        print(f"  Consensus reduced to 1 reference channel: this condition "
+              f"has exactly one card ({Path(_selected_files[0]).name}). "
+              f"Cross-card agreement is unavailable, so every step rests on "
+              f"grid membership alone.")
+    elif SOURCE_FORMAT == 'famos' and _n_cards == 0:
+        print("  WARNING: no FAMOS files were counted for this condition; "
+              "consensus settings left at the default rather than relaxed.")
  
     print(f"\n{'═'*75}")
     print(f"  {'FILE' if SOURCE_FORMAT == 'csv' else 'CONDITION'}: {cond}"
@@ -1218,11 +1322,21 @@ import matplotlib.pyplot as plt
  
 SEG_AREA_CM2 = 4.235  # fallback, used for ASR conversion
  
+# ── The display rule, in one place and stated in the figure ──────────────
+# Set DISPLAY_FILTER = False to see every finite point silver accepted. When
+# it is True the rule is still not hidden: the points it removes are drawn as
+# grey crosses and counted in the caption, so nothing disappears silently.
+DISPLAY_FILTER = True
+DISPLAY_RULE_TEXT = ("display rule: 1 ≤ Z′ ≤ 500 mΩ·cm², f ≤ 2 kHz, "
+                     "no inductive below 1 kHz")
+
 for cond, pr in PIPELINE_RESULTS.items():
     if pr is None:
         continue
     out_dir = pr['out_dir']
-    
+    _n_hidden_total = 0
+    _n_finite_total = 0
+
     # Load silver spectra for this condition
     _spectra_path = spectra_csv(out_dir)
     if not _spectra_path.exists():
@@ -1256,25 +1370,43 @@ for cond, pr in PIPELINE_RESULTS.items():
         zr = sd['z_re_mohm_cm2'].values  # already in mΩ·cm² from silver
         zi = sd['z_im_mohm_cm2'].values
         
-        # Physical cleaning (same as old Gold Table pipeline):
-        # Reject non-physical points (Z' < 0 at HF = phase artifact)
-        keep = np.isfinite(zr) & np.isfinite(zi)
-        keep &= (zr > 0)                          # must be positive real
-        keep &= (zr >= 1.0) & (zr <= 500.0)       # plausible range mΩ·cm²
-        keep &= (f <= 2000.0)                      # display up to 2 kHz
-        cap = f <= 1000.0
-        keep &= ~(cap & (-zi < -5.0))              # no inductive below 1kHz
-        f, zr, zi = f[keep], zr[keep], zi[keep]
-        
-        if len(f) < 3:
+        # ── A DISPLAY FILTER IS NOT AN ACCEPTANCE GATE ──────────────────
+        # Everything in spectra_clean.csv has already passed silver's nine
+        # gates; whatever this cell removes on top is a VIEWING choice, and
+        # the four rules below are opinionated ones. "Z' between 1 and
+        # 500 mΩ·cm²" deletes a genuinely bad segment rather than showing it
+        # as bad. "f <= 2 kHz" hides exactly the band this campaign spent
+        # hf_schedule recovering. "No inductive below 1 kHz" removes real
+        # low-frequency inductive behaviour, which on a fuel cell is a
+        # finding, not an artefact.
+        #
+        # So the points are not dropped any more, they are SPLIT: what the
+        # filter keeps is drawn as a line, what it hides is drawn as grey
+        # crosses in the same figure, and the count of hidden points is
+        # printed per condition. A plot that looks clean because the ugly
+        # points were deleted is the failure mode this exists to prevent.
+        finite = np.isfinite(zr) & np.isfinite(zi) & np.isfinite(f)
+
+        shown = finite.copy()
+        if DISPLAY_FILTER:
+            shown &= (zr > 0)
+            shown &= (zr >= 1.0) & (zr <= 500.0)
+            shown &= (f <= 2000.0)
+            cap = f <= 1000.0
+            shown &= ~(cap & (-zi < -5.0))
+        hidden = finite & ~shown
+        _n_hidden_total += int(hidden.sum())
+        _n_finite_total += int(finite.sum())
+
+        if shown.sum() < 3 and hidden.sum() < 3:
             continue
-        
+
         clr = colors[i]
         seg_name = f'Seg {seg}'
-        
+
         # Nyquist — show frequency on hover
         fig.add_trace(go.Scatter(
-            x=zr, y=-zi,
+            x=zr[shown], y=-zi[shown],
             mode='markers+lines', marker=dict(size=4, color=clr),
             line=dict(width=1, color=clr),
             name=seg_name, legendgroup=seg_name, showlegend=True,
@@ -1282,8 +1414,27 @@ for cond, pr in PIPELINE_RESULTS.items():
                            'f = %{customdata:.2f} Hz<br>'
                            "Z' = %{x:.1f} mΩ·cm²<br>"
                            "-Z'' = %{y:.1f} mΩ·cm²<extra></extra>"),
-            customdata=f,
+            customdata=f[shown],
         ), row=1, col=1)
+
+        # the points the display rule removed: visible, greyed, never silent
+        if hidden.any():
+            fig.add_trace(go.Scatter(
+                x=zr[hidden], y=-zi[hidden],
+                mode='markers',
+                marker=dict(size=7, symbol='x', color='rgba(120,120,120,0.55)'),
+                name=f'{seg_name} hidden by display filter',
+                legendgroup=seg_name, showlegend=False,
+                hovertemplate=(f'<b>Seg {seg}</b> (hidden by display rule)<br>'
+                               'f = %{customdata:.2f} Hz<br>'
+                               "Z' = %{x:.1f} mΩ·cm²<br>"
+                               "-Z'' = %{y:.1f} mΩ·cm²<extra></extra>"),
+                customdata=f[hidden],
+            ), row=1, col=1)
+
+        f, zr, zi = f[shown], zr[shown], zi[shown]
+        if len(f) < 3:
+            continue
         
         # Bode |Z|
         fig.add_trace(go.Scatter(
@@ -1312,8 +1463,17 @@ for cond, pr in PIPELINE_RESULTS.items():
     fig.update_xaxes(title_text="f [Hz]", type="log", row=1, col=3)
     fig.update_yaxes(title_text="Phase [°]", row=1, col=3)
     
+    _hidden_note = (
+        f'<br><span style="font-size:11px;color:#888">'
+        f'{DISPLAY_RULE_TEXT} — {_n_hidden_total} of {_n_finite_total} '
+        f'silver-accepted points shown as grey × (hidden by the rule, not '
+        f'rejected by the pipeline)</span>'
+        if DISPLAY_FILTER and _n_hidden_total else
+        '<br><span style="font-size:11px;color:#888">every finite '
+        'silver-accepted point shown</span>')
     fig.update_layout(
-        title=f'<b>Local EIS — Leepa {LEEPA}, {cond} ({n_seg} segments)</b>',
+        title=f'<b>Local EIS — Leepa {LEEPA}, {cond} ({n_seg} segments)</b>'
+              + _hidden_note,
         height=550, width=1500,
         paper_bgcolor='white', plot_bgcolor='white',
         margin=dict(t=80, b=50, r=250),
@@ -1325,7 +1485,10 @@ for cond, pr in PIPELINE_RESULTS.items():
         ),
     )
     fig.show()
-    print(f"  {cond}: {n_seg} segments plotted")
+    print(f"  {cond}: {n_seg} segments plotted, "
+          f"{_n_finite_total - _n_hidden_total} of {_n_finite_total} "
+          f"silver-accepted points inside the display rule"
+          + (f" ({_n_hidden_total} drawn as grey ×)" if _n_hidden_total else ""))
 
 # COMMAND ----------
 

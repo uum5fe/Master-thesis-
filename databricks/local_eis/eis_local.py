@@ -409,6 +409,70 @@ class FamosFile:
               "with the byte offset it was found at.")
 
 
+#: The cell-voltage channel that every card in this campaign is wired to.
+#: The reference is the SAME PHYSICAL SIGNAL on all cards -- one cell voltage,
+#: fanned out to each Dewetron card -- so the channel that carries it is a
+#: property of the wiring, not something to be rediscovered per card.
+DEFAULT_REF_CHANNEL = "UC2"
+
+
+def pick_reference_channel(fam, prefer: str = DEFAULT_REF_CHANNEL,
+                           stride: int = 10, log=None) -> str | None:
+    """The UC channel to use as this card's reference.  Fixed by name.
+
+    WHY A FIXED NAME AND NOT THE LOUDEST UC CHANNEL
+    -----------------------------------------------
+    This used to be `max(uc_names, key=std)`: whichever UC channel carried the
+    most AC content won.  That is a reasonable guess when you do not know how
+    the plate was wired, and it is the wrong answer when you do.  On this
+    campaign only ONE cell-voltage line is fanned out to the cards, on UC2,
+    and the other UC inputs are either unconnected or carry something that is
+    not the shared reference at all.  A per-card argmax is then free to pick a
+    DIFFERENT channel on different cards, and nothing downstream notices:
+
+      * card alignment cross-correlates card A's UC2 against card B's UC1 and
+        reads the lag of two unrelated signals -- a lag that can clear both
+        the prominence gate and the absolute floor while being meaningless,
+        which then shifts every dwell window on that card onto the wrong tone;
+      * the consensus schedule collects votes from channels that did not see
+        the same excitation;
+      * `ref_slot` is recorded from whichever channel won, so silver's
+        structural skew model is handed a reference geometry that changes
+        from card to card.
+
+    An unconnected input is also the one most likely to win an argmax on
+    std: a floating input is noisy, and noise has a large standard deviation.
+
+    So the reference is named, not discovered.  `prefer` is
+    `Config.ref_channel` (default "UC2"); set it, or EIS_REF_CHANNEL, if a
+    campaign was wired to a different line.
+
+    If the named channel is not on a card, this says so loudly and falls back
+    to the old argmax rather than dropping the card: a missing UC2 is a wiring
+    fact worth seeing in the log, and the fallback keeps a partially-wired
+    plate processable.  Returns None only if the card carries no UC channel
+    at all.
+    """
+    names = list(getattr(fam, "uc_names", []) or [])
+    if not names:
+        return None
+    if prefer:
+        want = str(prefer).strip().upper()
+        for n in names:
+            if n.upper() == want:
+                return n
+        where = getattr(getattr(fam, "path", None), "name", "card")
+        msg = (f"  {where}: reference channel {prefer} is not on this card "
+               f"(UC channels present: {', '.join(names)}). Falling back to "
+               f"the UC channel with the most AC content, which may not be "
+               f"the same physical signal the other cards are using.")
+        if log is not None:
+            log.warning(msg)
+        else:
+            print("WARNING:" + msg)
+    return max(names, key=lambda c: float(np.std(fam.channel(c)[::stride])))
+
+
 # ===========================================================================
 # 2. Plate calibration  (the "Abgleich")
 # ===========================================================================
@@ -1354,7 +1418,7 @@ def evaluate(dat_dir, out_dir, curr_cal=None, temp_cal=None, gain_file=None,
             T_seg = {s: T_FALLBACK_C for s in areas}
 
         # ---- reference channel and schedule -------------------------------
-        uc_name = max(fam.uc_names, key=lambda c: float(np.std(fam.channel(c)[::10])))
+        uc_name = pick_reference_channel(fam)
         print(f"  reference: {uc_name}")
         steps = detect_schedule(fam.channel(uc_name), fam.fs, ppd=ppd,
                                 min_snr_db=min_snr)

@@ -241,6 +241,21 @@ class Config:
     # membership.
     min_ref_channels: int = 2
     grid_tol: float = 0.01
+    # THE REFERENCE CHANNEL IS NAMED, NOT DISCOVERED.
+    # One cell-voltage line is fanned out to every Dewetron card, on UC2, and
+    # the remaining UC inputs are unconnected or carry something else. The
+    # code used to take the UC channel with the largest standard deviation on
+    # each card independently, which is free to land on a DIFFERENT channel
+    # per card -- and an unconnected input is exactly the kind of channel an
+    # argmax on std likes, because a floating input is noisy. Cross-
+    # correlating one card's UC2 against another's UC1 then returns the lag
+    # of two unrelated signals, which can pass both the prominence gate and
+    # the absolute floor while meaning nothing, and every dwell window on
+    # that card lands on the wrong tone. Naming the channel makes the wiring
+    # an input to the pipeline instead of something it re-guesses per file.
+    # Set this (or EIS_REF_CHANNEL, or --ref-channel) if a campaign was wired
+    # to a different line; empty string restores the old per-card argmax.
+    ref_channel: str = "UC2"
     align_cards: bool = True         # cross-correlate cards onto a common t0
     # The Dewetron cards are ARMED SEPARATELY.  Measured on the 45 A set:
     # card 3 starts 5.712 s after card 1, cards 4/5 about 2.54 s after.
@@ -808,6 +823,16 @@ class Config:
         g.add_argument("--condition", default="ALL")
         g.add_argument("--current", dest="i_setpoint_a", type=float,
                        help="setpoint in A; only ever printed as a check")
+
+        # default=None, not "UC2": from_cli layers argparse OVER the env and
+        # the JSON config, so a flag that always carries a value would make
+        # EIS_REF_CHANNEL and --config unsettable. The real default lives on
+        # the dataclass field.
+        g.add_argument("--ref-channel", dest="ref_channel", default=None,
+                       help="UC channel carrying the shared cell-voltage "
+                            "reference on every card (default: UC2); pass an "
+                            "empty string to fall back to the loudest UC "
+                            "channel on each card")
 
         g = p.add_argument_group("band")
         g.add_argument("--f-min", dest="f_min_hz", type=float, default=0.15)

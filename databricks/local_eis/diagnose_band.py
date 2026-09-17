@@ -201,13 +201,13 @@ def tone_census(x: np.ndarray, fs: float, f_lo: float, f_hi: float,
 def _attrition(fam, cfg, log=None) -> dict:
     """Detected on each trace, and what each later stage would keep."""
     import hf_schedule as H
-    from eis_local import detect_schedule
+    from eis_local import detect_schedule, pick_reference_channel
 
     f_hi_cfg = cfg.f_hi(fam.fs)
     uc_names = fam.uc_names
-    ref_name = (max(uc_names,
-                    key=lambda c: float(np.std(fam.channel(c)[::10])))
-                if uc_names else None)
+    # the same named channel bronze uses, so this diagnoses the run that
+    # bronze would actually make rather than a different one
+    ref_name = pick_reference_channel(fam, cfg.ref_channel)
 
     out = {"fs": fam.fs, "f_hi_used": f_hi_cfg,
            "f_hi_nyquist": cfg.f_hi_frac_fs * fam.fs,
@@ -340,9 +340,8 @@ def report(dat, curr_cal=None, condition="ALL", f_max_hz=None,
         # ---- 2. what tones exist --------------------------------------
         import hf_schedule as H
         ens, _info = H.polarity_aligned_reference(H.LazyChannels(fam))
-        ref_name = (max(fam.uc_names,
-                        key=lambda c: float(np.std(fam.channel(c)[::10])))
-                    if fam.uc_names else None)
+        from eis_local import pick_reference_channel
+        ref_name = pick_reference_channel(fam, cfg.ref_channel)
         print(f"\n    TONES PRESENT  {cfg.f_min_hz} .. {f_hi:.0f} Hz  "
               f"(spectrogram, no detector, no ladder)")
         cen_e = tone_census(ens, fam.fs, cfg.f_min_hz, f_hi, top=top)

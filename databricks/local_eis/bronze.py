@@ -68,7 +68,8 @@ try:                      # package layout: core/ holds the science modules
 except ImportError:       # flat layout (Databricks, notebooks): already there
     pass
 import r2d2_geometry as geom
-from eis_local import FamosFile, PlateCalibration, detect_schedule, Step
+from eis_local import (FamosFile, PlateCalibration, detect_schedule,
+                       pick_reference_channel, Step)
 import hf_schedule
 import ladder_snap
 
@@ -311,9 +312,13 @@ def inventory_channels(files: list[Path], cfg: Config,
             log.warning(f"  {fp.name}: no UC reference channel - card skipped")
             continue
 
-        # the reference is the UC channel carrying the most AC content
-        ref = max(fam.uc_names,
-                  key=lambda c: float(np.std(fam.channel(c)[::cfg_stride(cfg)])))
+        # THE REFERENCE IS THE SAME NAMED CHANNEL ON EVERY CARD.
+        # One cell voltage is fanned out to all the cards on cfg.ref_channel
+        # (UC2 on this campaign), so the reference is read off the wiring, not
+        # re-guessed per file. See eis_local.pick_reference_channel for what
+        # the old per-card argmax on std could do to the card alignment.
+        ref = pick_reference_channel(fam, cfg.ref_channel,
+                                     cfg_stride(cfg), log)
         ref_slot = fam.position(ref)
 
         for name in fam.names:
@@ -374,14 +379,24 @@ def estimate_card_lags(files: list[Path], cards: dict[str, CardInfo],
 
     HOW
     ---
-    Every card carries a copy of the same cell-voltage reference, so a plain
-    cross-correlation of the band-passed reference gives the offset directly.
-    The correlation is dominated by the excitation window, which is where the
+    Every card carries a copy of the same cell-voltage reference -- the one
+    named by `cfg.ref_channel`, UC2 on this campaign -- so a plain cross-
+    correlation of the band-passed reference gives the offset directly.  The
+    correlation is dominated by the excitation window, which is where the
     signal is, so the estimate is well determined.
 
-    WHICH CARD IS THE ANCHOR
-    ------------------------
-    Not simply the first one.  A card whose reference channel is degraded
+    That the SAME NAMED CHANNEL is compared on every card is what makes the
+    lag mean anything.  While the reference was chosen per card by largest
+    standard deviation, this could correlate one card's UC2 against another's
+    UC1: two unrelated signals, whose peak can still clear the prominence
+    gate and the floor, and whose "lag" then shifts every dwell window on
+    that card onto the wrong tone.
+
+    WHICH CARD IS THE ANCHOR  (the card, not the channel)
+    -----------------------------------------------------
+    The reference CHANNEL is fixed by name on every card (above).  Which
+    CARD's clock the others are shifted onto is a separate question, and the
+    answer is not simply the first one.  A card whose reference channel is degraded
     makes a bad anchor: every other card then correlates weakly against it,
     and a gate on peak HEIGHT refuses them all.  That is not hypothetical --
     on the 45 A set card 1's reference yields 2 detectable steps where the
@@ -504,7 +519,12 @@ def _prominence(mag: np.ndarray, k: int, guard: int = 5000) -> float:
 
 def _pick_anchor(stems: list[str], traces: dict[str, np.ndarray],
                  max_lag: int, log) -> str:
-    """The card the others agree with best.
+    """The card whose clock the others are shifted onto: the one they agree
+    with best.
+
+    This chooses a CARD, not a channel.  Every trace handed here is the same
+    named reference channel (`cfg.ref_channel`, UC2), read off each card;
+    what is being chosen is which card's t0 the plate is expressed in.
 
     Anchoring on whichever card happens to be first is a coin flip, and it
     loses when that card's reference channel is the degraded one: every
@@ -1031,8 +1051,10 @@ def process_card(fp: Path, cal: PlateCalibration, schedule: list[Step],
     if not fam.uc_names:
         return {}
 
-    ref_name = max(fam.uc_names,
-                   key=lambda c: float(np.std(fam.channel(c)[::cfg_stride(cfg)])))
+    # the same named channel inventory_channels and the alignment used, so
+    # A_ref here is measured on the signal the lags were measured on
+    ref_name = pick_reference_channel(fam, cfg.ref_channel,
+                                      cfg_stride(cfg), log)
     ref = fam.channel(ref_name)
     ref_slot = fam.position(ref_name)
 

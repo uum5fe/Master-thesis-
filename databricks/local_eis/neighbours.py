@@ -308,6 +308,96 @@ def spectrum_outliers(spectra: dict, plate_name: str | None = None,
 # ===========================================================================
 
 
+def donor_ring(seg: str, available, plate_name: str | None = None,
+               max_hops: int = 2) -> tuple[list[str], int]:
+    """The nearest ring of AVAILABLE segments around `seg`.
+
+    Returns (donors, hops). The immediate edge-sharing ring is tried first,
+    because those segments share this one's position in the inlet-to-outlet
+    gradient; only if none of them is available does the search widen.
+
+    Widening is not free and it is not silent: a value reconstructed from
+    two hops away is an interpolation across a longer distance than the
+    gradient is flat over, and the hop count is carried out with the result
+    so the caller can say so. Segment 33 is exactly this case on RO2612030 --
+    its ring is 61, 62, 67, 68 and two of those (67, 68) are themselves
+    missing, so it rests on 61 and 62 alone.
+    """
+    adj = adjacency(plate_name)
+    have = {str(x) for x in available}
+    seen = {str(seg)}
+    ring = {str(seg)}
+    for hop in range(1, max_hops + 1):
+        ring = {n for r in ring for n in adj.get(r, set())} - seen
+        if not ring:
+            break
+        seen |= ring
+        donors = sorted(ring & have, key=_as_int)
+        if donors:
+            return donors, hop
+    return [], 0
+
+
+def fill_spectrum(seg: str, spectra: dict, areas: dict | None = None,
+                  plate_name: str | None = None, max_hops: int = 2):
+    """An area-specific spectrum for `seg`, built from its neighbours.
+
+    WHY AN ARITHMETIC MEAN AND NOT A PARALLEL SUM
+    ---------------------------------------------
+    The quantity being reconstructed is an AREA-SPECIFIC impedance, which is
+    intensive: it is a property of the material at that place, not of how
+    much of it there is. Interpolating an intensive field is an average of
+    the surrounding values, weighted by how much each neighbour represents.
+    The parallel (harmonic) sum is the other operation entirely -- it is what
+    you do when you COMBINE regions into one electrode, and using it here
+    would return the ASR of the ring acting together rather than an estimate
+    of the ASR at the centre.
+
+    The mean is taken on the complex spectrum, frequency by frequency, over
+    the grid the donors share. A donor contributes only where it has a value,
+    so a neighbour whose own band stops early does not truncate the estimate.
+
+    Returns (freq, Z, info) or (None, None, info) when nothing is available.
+    """
+    import utils as _utils
+
+    donors, hops = donor_ring(seg, spectra.keys(), plate_name, max_hops)
+    info = {"segment": str(seg), "donors": donors, "hops": hops,
+            "method": "area-weighted mean of neighbour ASR"}
+    if not donors:
+        info["ok"] = False
+        info["reason"] = "no measured segment within reach"
+        return None, None, info
+
+    grids = [np.asarray(spectra[d].freq, float) for d in donors]
+    f_ref = max(grids, key=len)
+    f_ref = np.sort(f_ref[np.isfinite(f_ref) & (f_ref > 0)])
+
+    num = np.zeros(f_ref.size, complex)
+    den = np.zeros(f_ref.size)
+    for d in donors:
+        sp = spectra[d]
+        a = float((areas or {}).get(d, getattr(sp, "area_cm2", 1.0)) or 1.0)
+        z = _utils.interp_complex(f_ref, np.asarray(sp.freq, float),
+                                  np.asarray(sp.Z_model, complex))
+        lo, hi = float(np.min(sp.freq)), float(np.max(sp.freq))
+        inside = (f_ref >= lo * (1 - 1e-3)) & (f_ref <= hi * (1 + 1e-3))
+        ok = inside & np.isfinite(z)
+        num += np.where(ok, a * z, 0.0)
+        den += np.where(ok, a, 0.0)
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        Z = np.where(den > 0, num / np.where(den > 0, den, 1.0),
+                     np.nan + 1j * np.nan)
+    keep = np.isfinite(Z.real) & np.isfinite(Z.imag)
+    info["ok"] = bool(keep.sum() >= 3)
+    info["n_points"] = int(keep.sum())
+    if not info["ok"]:
+        info["reason"] = "donors share fewer than three frequencies"
+        return None, None, info
+    return f_ref[keep], Z[keep], info
+
+
 def analyse(params: dict[str, dict[str, float]],
             spectra: dict | None = None,
             plate_name: str | None = None,

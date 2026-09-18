@@ -72,6 +72,26 @@ FLOW_AXIS = "x"
 # Flow-channel separator lines (mm in y), for the plate drawing only.
 FLOW_CHANNEL_Y_MM = (30.25, 60.50, 90.75)
 
+# WHICH WAY THE GASES ACTUALLY GO.
+# The maps used to be titled "gas flows left to right", which is true of one
+# gas and false of the other: on this bench the plate is COUNTER-FLOW -- H2
+# enters at the bottom left and leaves top right, air enters at the bottom
+# right and leaves top left. The distinction is not cosmetic. Under co-flow
+# both inlets are at the same end, so a hydration gradient is monotonic along
+# the plate; under counter-flow each gas is driest at its own end, so the
+# membrane can be driest at BOTH ends and wettest in the middle. A reader
+# told "left to right" will look for a monotonic trend that counter-flow has
+# no reason to produce.
+#
+# Set to "co" (both inlets at x = 0) or "counter" for the rebuild being
+# evaluated; the maps and the trend diagnostic annotate themselves from it.
+FLOW_ARRANGEMENT = "counter"
+FLOW_DESCRIPTION = {
+    "counter": "counter-flow: H2 left to right, air right to left",
+    "co": "co-flow: both gases left to right",
+    "unknown": "flow arrangement not recorded",
+}
+
 
 # ===========================================================================
 # 2. ACQUISITION
@@ -530,6 +550,20 @@ class Config:
     # are left far below where they bind, as a backstop against pathological
     # points, not as the main filter.  Set them to 5.0 / -3.0 to reproduce
     # the old behaviour exactly.
+    # gamma >= 0 IN THE DRT. A distribution of relaxation times is a sum of
+    # RC elements of a passive network, so it cannot be negative. The
+    # unconstrained posterior does go negative on noisy data, and not
+    # slightly: it describes the low-frequency arc with excess weight at
+    # mid tau and cancels it with negative weight at slow tau. The slow
+    # bucket then sums negative, gold clamped that to a hard 0.0, and the
+    # plate reported "no mass transport" everywhere while R_ct absorbed the
+    # difference. On a synthetic carrying R_ct = 40 and R_mt = 30 mOhm*cm2,
+    # the unconstrained fit returns R_mt = 15 and R_ct = 46 at zero noise and
+    # R_pol biased -37 % at 8 % noise; constrained it returns 30.6 and 38.2,
+    # with R_pol within 3.5 % and the same fit to the data. Turn this off
+    # only to reproduce the old behaviour for comparison.
+    drt_nonneg: bool = True
+
     silver_snr_gate_db: float = -40.0    # silver, OFF-grid points
     silver_snr_floor_db: float = -40.0   # silver, ON-grid points
 
@@ -762,6 +796,39 @@ class Config:
         default_factory=lambda: frozenset(KNOWN_BAD_SEGMENTS)
     )
 
+    # ---- reconstructing a segment from the ones around it ------------------
+    # THREE DIFFERENT THINGS, KEPT APART ON PURPOSE.
+    #
+    #   exclude_segments      the segment is gone. No measurement, no value,
+    #                         no place in the aggregate. Its area is not
+    #                         counted. Use when the segment must play no part.
+    #
+    #   substitute_segments   the segment's OWN measurement is not trusted,
+    #                         but the plate still has that area and it still
+    #                         conducts. The measurement is discarded and a
+    #                         value is reconstructed from the measured
+    #                         segments touching it, so the aggregate covers
+    #                         the whole plate and the map has no hole. The
+    #                         donors are recorded per segment.
+    #
+    #   fill_missing_from_neighbours
+    #                         the same reconstruction, applied to every
+    #                         segment that has no spectrum at all -- an
+    #                         unwired channel, or one every gate rejected.
+    #
+    # The reconstruction is an area-weighted mean of the neighbours'
+    # area-specific spectra (neighbours.fill_spectrum). It is an estimate and
+    # it is labelled as one everywhere it appears: class "substituted" in
+    # gold, its own CSV in silver, and the donor list in both. It is never
+    # mixed into spectra_clean.csv, which stays measurements only.
+    substitute_segments: frozenset[str] = frozenset()
+    fill_missing_from_neighbours: bool = False
+    #: How far the search for measured neighbours may widen. 1 = the ring
+    #: that shares an edge. 2 allows one more hop when that ring is itself
+    #: unmeasured, which is segment 33's situation on RO2612030 (its ring is
+    #: 61, 62, 67, 68 and two of those are missing).
+    fill_max_hops: int = 2
+
     # -- helpers ------------------------------------------------------------
 
     def replace(self, **kw) -> "Config":
@@ -929,6 +996,16 @@ class Config:
                             "excluded segment is never measured, so the "
                             "exclusion can never be disproved")
         g.add_argument("--areas", dest="areas_file", type=Path)
+        g.add_argument("--substitute", dest="substitute_segments", default=None,
+                       type=lambda v: frozenset(
+                           x.strip() for x in v.split(",") if x.strip()),
+                       help="segments whose own measurement is discarded and "
+                            "rebuilt from their measured neighbours, e.g. 33")
+        g.add_argument("--fill-gaps", dest="fill_missing_from_neighbours",
+                       action="store_true", default=None,
+                       help="rebuild every segment that has no spectrum from "
+                            "its measured neighbours, so the aggregate covers "
+                            "the whole plate")
         g.add_argument("--equal-areas", dest="equal_areas",
                        action="store_true",
                        help="treat every segment as A_cell/72 = 4.235 cm2")
@@ -1028,6 +1105,8 @@ SEGMENT_CLASS_STYLE = {
     # drawn blank -- distinguishable at a glance from a measured neighbour and
     # from a guessed one.
     "excluded": dict(alpha=0.15, linewidth=1.0, hatch="..."),
+    # rebuilt from the ring that touches it: coloured, but visibly not solid
+    "substituted": dict(alpha=0.55, linewidth=1.2, hatch="\\\\"),
 }
 
 # Units and human labels for every scalar the gold layer can map.

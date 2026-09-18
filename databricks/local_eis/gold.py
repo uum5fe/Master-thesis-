@@ -69,7 +69,8 @@ import utils
 from config import (Config, DEFAULT, COLORS, SEGMENT_CLASS_STYLE, PARAM_META,
                     FAULT_RULES, PLATE_W_CM, PLATE_H_CM, PLATE_W_MM,
                     PLATE_H_MM, FLOW_CHANNEL_Y_MM, N_COLS, N_ROWS,
-                    PAD_W_MM, PAD_H_MM, KNOWN_BAD_SEGMENTS)
+                    PAD_W_MM, PAD_H_MM, KNOWN_BAD_SEGMENTS,
+                    FLOW_ARRANGEMENT, FLOW_DESCRIPTION)
 from silver import SilverRun, SilverSpectrum
 
 
@@ -86,7 +87,7 @@ class SegmentRecord:
     cx_mm: float
     cy_mm: float
     area_cm2: float
-    cls: str            # "measured" | "inferred" | "excluded" | "bad"
+    cls: str     # measured | substituted | inferred | excluded | bad
     tier: str                      # A/B/C from silver, or D when inferred
     values: dict[str, float] = field(default_factory=dict)
     sd: dict[str, float] = field(default_factory=dict)
@@ -141,9 +142,100 @@ def split_processes(sp: SilverSpectrum, cfg: Config) -> dict[str, float]:
     #
     # R_ohmic therefore stays as silver measured it, from the data at the top
     # of the band, and the fast bucket is reported beside it as a diagnostic.
-    out["R_hf_extra"] = float(max(g[fast].sum(), 0.0))
-    out["R_ct"] = float(max(g[mid].sum(), 0.0))
-    out["R_mt"] = float(max(g[slow].sum(), 0.0))
+    # A NEGATIVE BUCKET IS NOT ZERO RESISTANCE, IT IS A FAILED FIT.
+    # max(sum, 0) reported a hard 0.0 whenever the unconstrained DRT had
+    # cancelled a real arc with negative weight -- and 0.0 reads as a
+    # measurement ("this segment has no mass transport") when it is the
+    # opposite, a sign that the fit did not resolve the process. With
+    # drt_nonneg on (the default) gamma cannot be negative and this never
+    # fires; if it is switched off, the bucket is reported as unavailable
+    # rather than as zero.
+    def _bucket(mask) -> float:
+        total = float(g[mask].sum())
+        if total < 0:
+            return float("nan")
+        return total
+
+    out["R_hf_extra"] = _bucket(fast)
+    out["R_ct"] = _bucket(mid)
+    out["R_mt"] = _bucket(slow)
+    return out
+
+
+def spatial_trends(records: dict, params, plate_w_mm: float = PLATE_W_MM
+                   ) -> list[dict]:
+    """Is a pattern on the map a gradient, or is it the segment geometry?
+
+    A segmented plate does not have segments of one size. On this one the
+    areas span 1.36 to 8.47 cm2, a factor of 6.2, and the SMALL ones are the
+    staircase segments along the two ends. So "high at both ends" and "high
+    on the small segments" are the same set of segments, and a map cannot
+    tell them apart by eye.
+
+    That matters because the two have opposite meanings. A hydration
+    gradient is the measurement working. An area-correlated offset is a
+    systematic -- contact pressure at the plate edge, lateral current
+    spreading into the periphery, or an area that disagrees between the
+    calibration and the geometry -- and it is not a property of the cell.
+
+    Three correlations are reported per field, plus the PARTIAL correlation
+    with area once the along-plate shape is removed. On RO2612030 at 450 A
+    the measured numbers are r(x) = -0.11, r(|x-centre|) = +0.65 and
+    r(area) = -0.65, with partials of +0.10 and -0.08: the flow-direction
+    gradient is absent, the centre-low pattern is real, and it is
+    indistinguishable from an area effect in this geometry. Nothing here
+    decides which it is -- that needs a second condition or a second plate --
+    but a run that does not report it invites the wrong conclusion.
+    """
+    out = []
+    for p in params:
+        segs = [s for s, r in records.items()
+                if r.cls == "measured" and np.isfinite(r.values.get(p, np.nan))]
+        if len(segs) < 8:
+            continue
+        x = np.array([records[s].cx_mm for s in segs], float)
+        y = np.array([records[s].cy_mm for s in segs], float)
+        a = np.array([records[s].area_cm2 for s in segs], float)
+        v = np.array([records[s].values[p] for s in segs], float)
+        u = np.abs(x - 0.5 * plate_w_mm)
+
+        # A FIELD THAT DOES NOT VARY HAS NO TREND, AND SAYS SO.
+        # Correlating against a constant is 0/0: numpy returns whatever the
+        # floating-point dust happens to be, which came out as r = +0.88 on a
+        # field that was identical on every segment. The scale to compare the
+        # spread against is the field's own magnitude, not an absolute number,
+        # because these fields range from microseconds to hundreds of
+        # milliohms.
+        scale = max(float(np.mean(np.abs(v))), 1e-30)
+
+        def _r(q, w):
+            if np.std(q) <= 1e-9 * max(float(np.mean(np.abs(q))), 1e-30):
+                return float("nan")
+            if np.std(w) <= 1e-9 * max(float(np.mean(np.abs(w))), 1e-30):
+                return float("nan")
+            return float(np.corrcoef(q, w)[0, 1])
+
+        def _partial(q, control):
+            """correlation of q with v after removing a linear trend in control"""
+            if np.std(v) <= 1e-9 * scale:
+                return float("nan")
+            if np.std(control) == 0:
+                return _r(q, v)
+            b = np.polyfit(control, v, 1)
+            resid = v - np.polyval(b, control)
+            if np.std(resid) <= 1e-9 * scale:
+                return float("nan")       # the control explains it entirely
+            return _r(q, resid)
+
+        row = {"param": p, "n": len(segs),
+               "r_along_flow": round(_r(x, v), 3),
+               "r_across": round(_r(y, v), 3),
+               "r_edge": round(_r(u, v), 3),
+               "r_area": round(_r(a, v), 3),
+               "r_area_partial": round(_partial(a, u), 3),
+               "r_edge_partial": round(_partial(u, a), 3),
+               "area_span": round(float(a.max() / a.min()), 2)}
+        out.append(row)
     return out
 
 
@@ -396,8 +488,10 @@ def plate_heatmap(records: dict[str, SegmentRecord], param: str, cfg: Config,
     ax.set_ylim(-0.1, PLATE_H_CM + 0.1)
     ax.axis("off")
     ax.set_title(f"{meta.get('label', param)}{title_extra}\n"
-                 f"{len(records) - n_inf} measured, {n_inf} inferred "
-                 f"(hatched) - gas flows left to right",
+                 f"{len(records) - n_inf} measured, {n_inf} not measured "
+                 f"(hatched) - "
+                 + FLOW_DESCRIPTION.get(FLOW_ARRANGEMENT,
+                                        FLOW_DESCRIPTION['unknown']),
                  fontsize=13, fontweight="bold", pad=12)
     fig.tight_layout()
     return fig
@@ -446,7 +540,8 @@ def plate_heatmap_interactive(records: dict[str, SegmentRecord], param: str,
     fig.update_layout(
         title=f"{meta.get('label', param)} - open squares are inferred, "
               f"not measured",
-        xaxis=dict(title="x [cm] (gas flow ->)", range=[-0.3, PLATE_W_CM + 0.3],
+        xaxis=dict(title=f"x [cm] — {FLOW_DESCRIPTION.get(FLOW_ARRANGEMENT, '')}",
+                   range=[-0.3, PLATE_W_CM + 0.3],
                    constrain="domain"),
         yaxis=dict(title="y [cm]", range=[-0.3, PLATE_H_CM + 0.3],
                    scaleanchor="x", scaleratio=1),
@@ -533,8 +628,20 @@ def run(sr: SilverRun, cfg: Config = DEFAULT, log=None) -> GoldRun:
     # the opposite of what excluding it meant: the request was to leave it
     # out of the evaluation, not to replace its measurement with a guess.
     excluded = {str(x) for x in getattr(cfg, "exclude_segments", ()) or ()}
+    # Segments silver rebuilt from their neighbours. They are NOT measured and
+    # they are not GP-inferred either -- they come from the ring that touches
+    # them, which is a different and more local statement, so they get their
+    # own class and carry their donors.
+    rebuilt = dict(getattr(sr, "filled", {}) or {})
     fields: dict[str, dict] = {}
     for p, v in vals.items():
+        v = dict(v)
+        if p == "R_ohmic":
+            # the only scalar a reconstruction can supply: it is read off the
+            # rebuilt curve by the same top-band rule the measured segments use
+            for seg, sp in rebuilt.items():
+                if np.isfinite(getattr(sp, "R_ohmic", np.nan)):
+                    v.setdefault(seg, float(sp.R_ohmic))
         if do_infer:
             m, s, info = fit_field(v, sds.get(p, {}), cfg)
         else:
@@ -566,6 +673,12 @@ def run(sr: SilverRun, cfg: Config = DEFAULT, log=None) -> GoldRun:
         elif s in KNOWN_BAD_SEGMENTS:
             cls, tier = "bad", "D"
             flags = [f"hardware: {KNOWN_BAD_SEGMENTS[s]}"]
+        elif s in rebuilt:
+            cls, tier = "substituted", "D"
+            _d = rebuilt[s]
+            flags = [f"rebuilt from neighbours {' '.join(_d.donors)}"
+                     + (f" ({_d.hops} hops)" if _d.hops > 1 else "")
+                     + "; an estimate, not a measurement"]
         elif s in excluded:
             # Said plainly, and distinctly from "the fit failed": a reader
             # comparing two runs needs to see that this segment was taken out
@@ -588,9 +701,34 @@ def run(sr: SilverRun, cfg: Config = DEFAULT, log=None) -> GoldRun:
         records[s] = rec
 
     label_faults(records)
+
+    # ---- is the pattern on the map a gradient or the geometry? ------------
+    trends = spatial_trends(records, list(fields))
+    if trends:
+        utils.section("spatial trends (gradient, or segment geometry?)", log)
+        log.info("  field         n   r(flow) r(edge) r(area)  partial area")
+        for t in trends:
+            log.info(f"  {t['param']:<12} {t['n']:3d}   {t['r_along_flow']:+6.3f} "
+                     f" {t['r_edge']:+6.3f} {t['r_area']:+6.3f}   "
+                     f"{t['r_area_partial']:+6.3f}")
+        worst = max(trends, key=lambda t: abs(t["r_area"]))
+        if abs(worst["r_area"]) >= 0.4:
+            log.warning(
+                f"  {worst['param']} correlates with segment AREA at "
+                f"r = {worst['r_area']:+.2f} (areas span "
+                f"{worst['area_span']:.1f}x on this plate). The small "
+                f"segments are the ones along the two ends, so an edge "
+                f"pattern and an area effect are the SAME set of segments "
+                f"here and this map cannot separate them. Before reading it "
+                f"as hydration, check it against a second condition: a "
+                f"hydration gradient moves with current and stoichiometry, "
+                f"a geometric systematic does not.")
+
     n_fault = sum(1 for r in records.values() if r.fault)
     log.info(f"  {len(measured)} measured, "
              f"{sum(1 for r in records.values() if r.cls=='inferred')} inferred, "
+             f"{sum(1 for r in records.values() if r.cls=='substituted')} "
+             f"rebuilt from neighbours, "
              f"{sum(1 for r in records.values() if r.cls=='excluded')} excluded, "
              f"{sum(1 for r in records.values() if r.cls=='bad')} hardware-bad")
     if n_fault:
@@ -607,6 +745,11 @@ def run(sr: SilverRun, cfg: Config = DEFAULT, log=None) -> GoldRun:
         "n_total": len(allseg), "n_measured": len(measured),
         "n_inferred": sum(1 for r in records.values() if r.cls == "inferred"),
         "n_excluded": sum(1 for r in records.values() if r.cls == "excluded"),
+        "n_substituted": sum(1 for r in records.values()
+                             if r.cls == "substituted"),
+        "spatial_trends": trends,
+        "substituted_segments": {s: list(sp.donors)
+                                 for s, sp in sorted(rebuilt.items())},
         "excluded_segments": sorted(excluded, key=lambda x: int(x)
                                     if str(x).isdigit() else 0),
         "n_bad": sum(1 for r in records.values() if r.cls == "bad"),

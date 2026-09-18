@@ -1561,8 +1561,15 @@ def process_card(fp: Path, cal: PlateCalibration, schedule: list[Step],
 
     out: dict[str, BronzeSpectrum] = {}
     n_excluded = 0
+    # A SUBSTITUTED SEGMENT IS DROPPED HERE TOO.
+    # The point of substituting is that this segment's own measurement is not
+    # trusted; reading it and then overwriting it downstream would leave the
+    # untrusted number in the raw tables, where something would eventually
+    # use it. It is rebuilt from its neighbours in silver instead.
+    _skip = set(cfg.exclude_segments) | set(
+        getattr(cfg, "substitute_segments", ()) or ())
     for seg in fam.segment_names:
-        if seg in cfg.exclude_segments:
+        if seg in _skip:
             n_excluded += 1
             continue
         x = fam.channel(seg)

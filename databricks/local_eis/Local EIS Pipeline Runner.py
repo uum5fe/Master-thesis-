@@ -350,6 +350,17 @@ try:
     # segment before its data is seen removes the only evidence that could
     # ever overturn the exclusion.
     dbutils.widgets.text('exclude_segments', '', 'Exclude segments (e.g. 33)')
+    # Segments whose OWN measurement is discarded and rebuilt from the
+    # segments touching them. Different from excluding: the plate still has
+    # that area and it still conducts, so it stays in the aggregate and on
+    # the map -- as an estimate, labelled, with its donors recorded.
+    dbutils.widgets.text('substitute_segments', '',
+                         'Rebuild from neighbours (e.g. 33)')
+    # The same reconstruction for every segment that has no spectrum at all.
+    # Off by default: it changes the cell aggregate, so it is a choice that
+    # has to be made deliberately and it is recorded in the cache key.
+    dbutils.widgets.dropdown('fill_gaps', 'no', ['no', 'yes'],
+                             'Fill unmeasured segments from neighbours')
 except Exception:
     pass
  
@@ -402,9 +413,14 @@ F_MAX = float(_w('f_max_hz', '4500.0'))
 MIN_SNR_DB = float(_w('min_snr_db', '0'))
 STOP_AFTER = _w('stop_after', 'gold')
 EVALUATION_MODE = _w('evaluation_mode', 'default')
-EXCLUDE_SEGMENTS = frozenset(
-    x.strip() for x in _w('exclude_segments', '').replace(';', ',').split(',')
-    if x.strip())
+def _seg_list(name):
+    return frozenset(x.strip() for x in
+                     _w(name, '').replace(';', ',').split(',') if x.strip())
+
+
+EXCLUDE_SEGMENTS = _seg_list('exclude_segments')
+SUBSTITUTE_SEGMENTS = _seg_list('substitute_segments')
+FILL_GAPS = _w('fill_gaps', 'no') == 'yes'
  
 # Select the plate for the whole session
 _plate = geom.use_plate(PLATE)
@@ -864,6 +880,10 @@ _CACHE_IDENTITY_KEYS = (
     # every plate map. A run with segment 33 and a run without it are two
     # different results and must not share a cache entry.
     'exclude_segments',
+    # Reconstruction changes the aggregate and the maps, so it changes the
+    # result and therefore the cache entry.
+    'substitute_segments', 'fill_missing_from_neighbours', 'fill_max_hops',
+    'drt_nonneg',
     'ref_channel', 'align_cards', 'align_max_lag_s',
     'align_min_corr', 'align_min_prominence', 'align_f_lo_hz',
     'align_f_hi_hz', 'align_guard_s', 'align_agree_tol_s',
@@ -886,7 +906,9 @@ def _run_identity(mode=None, f_min=None, f_max=None, snr=None):
         f_max_hz=F_MAX if f_max is None else f_max,
         min_snr_db=MIN_SNR_DB if snr is None else float(snr),
         gamry_version=globals().get('GAMRY_VERSION', ''),
-        exclude_segments=globals().get('EXCLUDE_SEGMENTS', frozenset()))
+        exclude_segments=globals().get('EXCLUDE_SEGMENTS', frozenset()),
+        substitute_segments=globals().get('SUBSTITUTE_SEGMENTS', frozenset()),
+        fill_missing_from_neighbours=globals().get('FILL_GAPS', False))
     if mode and mode != 'default':
         base = base.preset(mode)
     # A set has no order, and json's default=str would spell the SAME
@@ -1439,6 +1461,12 @@ print(f"  Band:       {F_MIN} – {F_MAX} Hz")
 print(f"  Stop after: {STOP_AFTER}")
 # The mode decides the gates AND the cache entry, so it is printed with the
 # rest of the run identity rather than left to be inferred from the results.
+print(f"  Rebuilt:    "
+      + (", ".join(sorted(SUBSTITUTE_SEGMENTS, key=lambda x: int(x)
+                          if x.isdigit() else 0))
+         + "   <-- own measurement discarded, value from neighbours"
+         if SUBSTITUTE_SEGMENTS else "(none)")
+      + ("   + every unmeasured segment" if FILL_GAPS else ""))
 print(f"  Excluded:   "
       + (", ".join(sorted(EXCLUDE_SEGMENTS, key=lambda x: int(x)
                           if x.isdigit() else 0))
@@ -1534,6 +1562,8 @@ for cond in _conditions_to_run:
         # loud, when the run genuinely has one card.
         min_ref_channels=2,
         exclude_segments=EXCLUDE_SEGMENTS,
+        substitute_segments=SUBSTITUTE_SEGMENTS,
+        fill_missing_from_neighbours=FILL_GAPS,
     )
 
     # ── Gate preset: named, not smuggled ──────────────────────────────────

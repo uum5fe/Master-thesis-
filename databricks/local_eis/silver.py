@@ -211,6 +211,11 @@ class SilverSpectrum:
     # the leftover delay against converter channel order
     channel_slot: int = -1
     ref_slot: int = -1
+    #: R_inf by extrapolating the top of the arc to Im Z = 0. A SECOND
+    #: estimator of the same quantity, with a different failure mode: it is
+    #: the better one when the arc does not close inside the band. Quoted
+    #: beside R_ohmic so the two bracket the answer -- see r_ohmic_axis_fit.
+    R_ohmic_xint: float = float("nan")
 
     @property
     def j_dc(self) -> float:
@@ -240,6 +245,14 @@ class SilverRun:
     #: card. A different fact from "measured and rejected", and the two used to
     #: be indistinguishable from the outputs.
     unwired: list = field(default_factory=list)
+    #: Segments rebuilt from their measured neighbours: {segment: spectrum}.
+    #: Kept SEPARATE from `spectra`, which is measurements only, so nothing
+    #: downstream can mistake a reconstruction for a measurement.
+    filled: dict = field(default_factory=dict)
+    #: Per rebuilt segment: the donors it came from and how far away they are.
+    fill_info: dict = field(default_factory=dict)
+    #: The full aggregate, both normalisations and the coverage.
+    aggregate: dict = field(default_factory=dict)
 
     def reach(self) -> list[dict]:
         """Per segment: how far up in frequency it got, and what stopped it.
@@ -917,6 +930,81 @@ def bayesian_drt(freq: np.ndarray, Z: np.ndarray, sigma_rel: np.ndarray,
     except np.linalg.LinAlgError:
         return {"ok": False, "note": "posterior is singular"}
 
+    # ------------------------------------------------------------------
+    # gamma >= 0.  A DISTRIBUTION OF RELAXATION TIMES CANNOT BE NEGATIVE.
+    # ------------------------------------------------------------------
+    # The posterior above is an unconstrained Gaussian, so nothing stops it
+    # returning negative gamma, and on noisy data it does -- not as a small
+    # wobble but as a large oscillation: the fit describes the low-frequency
+    # arc with excess weight in the mid-tau bucket and cancels it with
+    # negative weight in the slow bucket.
+    #
+    # gold.split_processes took max(sum, 0), so a negative sum became a hard
+    # ZERO: the plate then reports "no mass transport" on a cell that visibly
+    # has a transport arc, and the resistance that went missing reappears
+    # inside R_ct. Two wrong numbers, both looking like measurements.
+    #
+    # MEASURED on a synthetic carrying R_ct = 40 and R_mt = 30 mOhm*cm2 at
+    # tau = 2 ms and 0.2 s (test_drt_nonnegativity.py), with the declared SNR
+    # matched to the noise actually present:
+    #
+    #             R_ct           R_mt           R_pol        model vs truth
+    #   noise   off     on     off     on     off     on     off      on
+    #    0 %   .0456  .0382  .0151  .0306   .0458  .0689
+    #    1 %   .0465  .0391  .0345  .0319   .0666  .0710   0.38 %  0.43 %
+    #    3 %   .0414  .0393  .0352  .0356   .0725  .0749   0.92 %  0.99 %
+    #    8 %   .0448  .0398  .0451  .0466   .0845  .0865   2.12 %  1.96 %
+    #
+    # R_pol bias goes from -37 % to +3.5 % at 8 % noise while the fit to the
+    # data is unchanged (last two columns), so this buys accuracy in the
+    # split without costing anything in the curve that the cell aggregate is
+    # built from. R_ohmic is untouched either way: it is measured at the top
+    # of the band, not taken from the DRT.
+    #
+    # The constraint is not a regularisation choice, it is physics: gamma is
+    # a sum of RC elements of a passive network. Imposing it keeps the same
+    # objective -- weighted least squares plus the same GP prior, written in
+    # augmented (Tikhonov) form -- and simply forbids the cancellation.
+    # R_inf and L stay free, because a series inductance is genuinely signed.
+    if getattr(cfg, "drt_nonneg", True) and np.any(mu[n_free:] < 0):
+        try:
+            from scipy.optimize import lsq_linear
+            # SOLVED THROUGH THE POSTERIOR PRECISION, NOT THE PRIOR SQUARE ROOT.
+            # The objective is the same either way, but the obvious stacking
+            # -- [W^1/2 A ; P^-1/2] -- needs P^-1/2, and P carries a
+            # squared-exponential kernel over log tau, which is close to
+            # singular by construction. Its inverse spans enormous magnitudes
+            # and the bounded solver converges poorly on it: measured 16 %
+            # median error against the true curve at 1 % noise, where the
+            # unconstrained fit gives 0.4 %.
+            #
+            # H = A'WA + Pinv is the posterior precision, already well
+            # conditioned (it is the matrix inverted for Sigma above). With
+            # H = C C', minimising (t-mu)'H(t-mu) is the same as minimising
+            # ||C' t - C^-1 g||, which is an ordinary bounded least squares
+            # on a square, well-scaled system.
+            H = A.T @ W @ A + Pinv
+            H = 0.5 * (H + H.T)
+            g = A.T @ W @ b + Pinv @ m0
+            C = np.linalg.cholesky(
+                H + 1e-12 * np.trace(H) / len(H) * np.eye(len(H)))
+            lo = np.concatenate([np.full(n_free, -np.inf), np.zeros(m)])
+            hi = np.full(A.shape[1], np.inf)
+            sol = lsq_linear(C.T, np.linalg.solve(C, g), bounds=(lo, hi),
+                             max_iter=500, tol=1e-12)
+            if sol.success or np.all(np.isfinite(sol.x)):
+                mu = sol.x
+                nonneg_applied = True
+            else:
+                nonneg_applied = False
+        except Exception:                                   # noqa: BLE001
+            # scipy missing or the solve failed: clip rather than ship a
+            # negative distribution, and say so in the result.
+            mu = np.concatenate([mu[:n_free], np.maximum(mu[n_free:], 0.0)])
+            nonneg_applied = "clipped"
+    else:
+        nonneg_applied = bool(getattr(cfg, "drt_nonneg", True))
+
     R_inf = float(mu[0])
     R_inf_sd = float(np.sqrt(max(Sigma[0, 0], 0.0)))
     L = float(mu[1]) if with_L else 0.0
@@ -973,6 +1061,7 @@ def bayesian_drt(freq: np.ndarray, Z: np.ndarray, sigma_rel: np.ndarray,
 
     return {
         "ok": True, "freq": freq, "Z": Z, "Z_model": Z_model, "Z_model_sd": Z_sd,
+        "nonneg": nonneg_applied,
         "R_inf": R_inf, "R_inf_sd": R_inf_sd_total,
         "R_inf_sd_posterior": R_inf_sd, "hf_arc_open": arc_open,
         "hf_closure": closure, "L": L, "R_pol": R_pol,
@@ -1047,6 +1136,53 @@ def r_ohmic_topband(freq: np.ndarray, Z: np.ndarray, sigma_rel: np.ndarray,
     mean = float(np.sum(wts * re) / np.sum(wts))
     sd_mean = float(np.sqrt(1.0 / np.sum(wts)))
     return mean, sd_mean, int(sel.sum())
+
+
+def r_ohmic_axis_fit(freq: np.ndarray, Z: np.ndarray,
+                     n_top: int = 6) -> float:
+    """R_inf by extrapolating the top of the arc to Im Z = 0.
+
+    The textbook definition of HFR is where the spectrum CROSSES THE REAL
+    AXIS. Taking that literally -- hunting for the zero crossing of Im Z --
+    is the worst thing you can do with a band-limited measurement, because
+    when the arc does not close inside the band there is no crossing to find,
+    and the search then latches onto the inductive tail or onto nothing.
+
+    MEASURED over 12 noise realisations at 2 % noise, against a known
+    R_ohm = 60 mOhm*cm2 (test_hfr_estimators.py). Bias and rms in mOhm*cm2:
+
+      estimator                 arc closed    near f_max    arc OPEN
+      Re Z at f_max             -0.16  0.72   -0.02  0.62   +0.69  0.98
+      top-band weighted mean    -0.06  0.42   +0.24  0.45   +1.36  1.41
+      Im Z zero crossing        +0.19  0.57   +0.43  0.95  +40.3  40.3
+      THIS (fit to Im Z = 0)    +0.11  0.40   +0.60  0.67   -0.61  1.35
+      DRT posterior R_inf       -0.37  0.59   +0.50  0.69   +0.75  0.95
+
+    The zero crossing is competitive right up until the arc stops closing,
+    and then it is wrong by 67 % of the answer -- silently, because it still
+    returns a number. That is the failure mode to avoid in a plate map, where
+    nobody inspects 72 Nyquists.
+
+    This estimator fits Re Z against Im Z over the top `n_top` points and
+    reads off the intercept at Im Z = 0. It is the same idea as the crossing
+    but it EXTRAPOLATES to the axis instead of requiring the data to reach
+    it, which is why it survives the open-arc case (-0.61) where the crossing
+    does not. It is reported beside the shipped top-band mean rather than
+    replacing it: the two bracket the truth, and when they disagree by more
+    than their uncertainties the arc is not closed and neither should be
+    quoted without saying so.
+    """
+    freq = np.asarray(freq, float)
+    Z = np.asarray(Z, complex)
+    ok = np.isfinite(freq) & (freq > 0) & np.isfinite(Z.real) & np.isfinite(Z.imag)
+    if ok.sum() < 3:
+        return float("nan")
+    f, z = freq[ok], Z[ok]
+    idx = np.argsort(f)[-min(n_top, ok.sum()):]
+    im, re = np.imag(z[idx]), np.real(z[idx])
+    if np.ptp(im) <= 0:
+        return float("nan")
+    return float(np.polyval(np.polyfit(im, re, 1), 0.0))
 
 
 def extrapolate_hf(drt: dict, f_hi: float, n: int = 40) -> dict:
@@ -1305,6 +1441,8 @@ def process_segment(sp: BronzeSpectrum, skew: SkewModel, cfg: Config,
     # the statistical error rather than being subtracted from the estimate:
     # its sign is known but its size is only bracketed.
     R_sd_total = float(np.sqrt(np.nan_to_num(R_top_sd) ** 2 + arc_open ** 2))
+    # the axis-intercept cross-check: same quantity, different failure mode
+    R_xint = r_ohmic_axis_fit(f_m, z_m)
 
     # ---- independent validation -------------------------------------------
     kk = lin_kk(f_m, z_m, mu_crit=cfg.mu_crit, tol=cfg.kk_tol)
@@ -1360,7 +1498,8 @@ def process_segment(sp: BronzeSpectrum, skew: SkewModel, cfg: Config,
         Z_model=Z_model, Z_model_sd=model.get("Z_model_sd", np.zeros_like(f_m)),
         sigma_rel=model.get("sigma_rel", s_rel),
         R_ohmic=float(R_top), R_ohmic_sd=float(R_sd_total),
-        R_ohmic_drt=R_drt, hf_arc_open=arc_open, hf_closure=closure,
+        R_ohmic_drt=R_drt, R_ohmic_xint=float(R_xint),
+        hf_arc_open=arc_open, hf_closure=closure,
         R_pol=float(model["R_pol"]), L=float(L), dt_applied=float(dt),
         tau_peak=float(model.get("tau_peak", np.nan)),
         gamma=np.asarray(model.get("gamma", np.zeros(0))),
@@ -1477,6 +1616,155 @@ def cell_aggregate(spectra: dict[str, SilverSpectrum]
     return f_ref, mm.aggregate_asr(f_ref, on, areas, A_CELL_CM2), n_seg
 
 
+class FilledSpectrum:
+    """A segment reconstructed from its neighbours.
+
+    Deliberately NOT a SilverSpectrum. It carries only what the aggregate and
+    the maps need, so that nothing can hand it to code expecting a measured
+    spectrum and get back a plausible-looking answer: there is no tier, no
+    KK residual and no DRT here, because none of those were measured.
+    """
+
+    __slots__ = ("segment", "freq", "Z_model", "area_cm2", "donors", "hops",
+                 "R_ohmic", "card")
+
+    def __init__(self, segment, freq, Z_model, area_cm2, donors, hops,
+                 R_ohmic=float("nan")):
+        self.segment = str(segment)
+        self.freq = freq
+        self.Z_model = Z_model
+        self.area_cm2 = float(area_cm2)
+        self.donors = list(donors)
+        self.hops = int(hops)
+        self.R_ohmic = float(R_ohmic)
+        self.card = "reconstructed"
+
+
+def build_filled_spectra(spectra: dict, cfg: Config, log=None
+                         ) -> tuple[dict, dict]:
+    """Rebuild substituted and (optionally) missing segments from neighbours.
+
+    Returns ({segment: FilledSpectrum}, {segment: info}). Both are empty
+    unless `substitute_segments` or `fill_missing_from_neighbours` asks for
+    it -- the default run reconstructs nothing.
+    """
+    import r2d2_geometry as geom
+    try:
+        import neighbours
+    except ImportError:                                     # noqa: BLE001
+        return {}, {}
+
+    log = log or utils.get_logger(getattr(cfg, "verbose", False))
+    want = {str(x) for x in (getattr(cfg, "substitute_segments", ()) or ())}
+    if getattr(cfg, "fill_missing_from_neighbours", False):
+        want |= {s for s in geom.SEGMENTS if s not in spectra}
+    # never rebuild something that was excluded outright: exclusion means the
+    # segment plays no part, and inventing a value for it is the opposite
+    want -= {str(x) for x in (getattr(cfg, "exclude_segments", ()) or ())}
+    want -= set(spectra)
+    if not want:
+        return {}, {}
+
+    areas = utils.segment_areas(cfg)
+    hops_max = int(getattr(cfg, "fill_max_hops", 2))
+    out, info = {}, {}
+    for seg in sorted(want, key=lambda x: int(x) if str(x).isdigit() else 0):
+        f, z, meta = neighbours.fill_spectrum(seg, spectra, areas,
+                                              max_hops=hops_max)
+        info[seg] = meta
+        if not meta.get("ok"):
+            log.warning(f"  segment {seg}: cannot rebuild from neighbours "
+                        f"({meta.get('reason')})")
+            continue
+        # R_ohmic of the reconstruction, by the same top-band rule the
+        # measured segments use, so the map compares like with like
+        r_top, _sd, _n = r_ohmic_topband(f, z, np.full(f.size, 0.05))
+        out[seg] = FilledSpectrum(seg, f, z, areas.get(seg,
+                                  geom.SEGMENTS[seg].area_cm2),
+                                  meta["donors"], meta["hops"], r_top)
+        log.info(f"  segment {seg}: rebuilt from {', '.join(meta['donors'])}"
+                 f"{' (2 hops away)' if meta['hops'] > 1 else ''} -- "
+                 f"an ESTIMATE, not a measurement")
+    return out, info
+
+
+def cell_aggregate_full(spectra: dict, filled: dict | None = None,
+                        a_cell: float = A_CELL_CM2) -> dict:
+    """The cell curve, with the arithmetic written out and both normalisations.
+
+    THE PRIMITIVE IS AN ADMITTANCE SUM.  Segments sit in parallel across one
+    cell voltage, so their admittances add:
+
+        1 / Z_cell(f) = SUM_v 1 / Z_v(f)          Z_v in ohm, per segment
+
+    Each segment is measured as an AREA-SPECIFIC impedance z_v [ohm.cm2], and
+    an area-specific impedance over an area A_v is an absolute impedance
+    z_v / A_v, so
+
+        Y_cell(f) = SUM_v A_v / z_v(f)            siemens
+        Z_cell(f) = 1 / Y_cell(f)                 ohm        <- the cell
+        z_cell(f) = A / Y_cell(f)                 ohm.cm2    <- area-specific
+
+    and the only question left is WHICH A the last line divides by. Two are
+    defensible and they are not the same number:
+
+      A_used(f)  the area that actually returned a value at this frequency.
+                 Self-consistent: it is the ASR of the region that was
+                 measured, and it is what to quote for the local result.
+      A_cell     the whole plate. This is what a cell-level instrument
+                 measures, so it is the one to compare against a Gamry sweep
+                 -- but it is only honest when the coverage is near 1,
+                 because uncovered area is being treated as if it carried
+                 current with the same ASR as the rest.
+
+    Both are returned, with the coverage, rather than one being chosen
+    silently. `filled` carries neighbour-reconstructed segments (see
+    neighbours.fill_spectrum); they count towards A_used, which is what
+    closes the gap between the two normalisations.
+
+    Returns a dict: freq, Y, Z_ohm, z_asr_used, z_asr_full, area_used,
+    area_coverage, n_seg, n_filled.
+    """
+    merged = dict(spectra)
+    filled = filled or {}
+    for seg, sp in filled.items():
+        merged[seg] = sp
+
+    f_ref, z_used, n_seg = cell_aggregate(merged)
+    if not len(f_ref):
+        return {"ok": False, "reason": "no usable segments"}
+
+    # rebuild the admittance and the contributing area on the same grid
+    Y = np.zeros(len(f_ref), complex)
+    a_used = np.zeros(len(f_ref))
+    for seg, sp in merged.items():
+        if len(sp.freq) < 3:
+            continue
+        a = float(sp.area_cm2)
+        z = utils.interp_complex(f_ref, np.asarray(sp.freq, float),
+                                 np.asarray(sp.Z_model, complex))
+        lo, hi = float(np.min(sp.freq)), float(np.max(sp.freq))
+        inside = (f_ref >= lo * (1 - 1e-3)) & (f_ref <= hi * (1 + 1e-3))
+        ok = inside & np.isfinite(z) & (z != 0)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            Y += np.where(ok, a / z, 0.0)
+        a_used += np.where(ok, a, 0.0)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        Z_ohm = np.where(Y != 0, 1.0 / Y, np.nan + 1j * np.nan)
+        z_full = np.where(Y != 0, a_cell / Y, np.nan + 1j * np.nan)
+
+    return {
+        "ok": True, "freq": f_ref, "Y": Y, "Z_ohm": Z_ohm,
+        "z_asr_used": z_used, "z_asr_full": z_full,
+        "area_used": a_used, "area_cell": float(a_cell),
+        "area_coverage": a_used / float(a_cell),
+        "n_seg": n_seg, "n_filled": len(filled),
+        "filled_segments": sorted(filled, key=lambda x: int(x)
+                                  if str(x).isdigit() else 0),
+    }
+
+
 # ===========================================================================
 # 6. Entry point
 # ===========================================================================
@@ -1577,17 +1865,36 @@ def run(bronze_run: BronzeRun, cfg: Config = DEFAULT, log=None) -> SilverRun:
             log.warning(f"  residual skew check skipped: "
                         f"{type(exc).__name__}: {exc}")
 
-    f_cell, Z_cell, n_cell = cell_aggregate(spectra)
-    if len(f_cell):
-        log.info(f"  cell aggregate: area-weighted harmonic mean over "
-                 f"{len(spectra)} segments, {len(f_cell)} frequencies "
-                 f"(coverage {int(n_cell.min())}-{int(n_cell.max())} segments "
-                 f"per frequency, median {int(np.median(n_cell))})")
+    # ---- segments rebuilt from their neighbours ----------------------------
+    filled, fill_info = build_filled_spectra(spectra, cfg, log)
+
+    agg = cell_aggregate_full(spectra, filled)
+    if agg.get("ok"):
+        f_cell, Z_cell, n_cell = agg["freq"], agg["z_asr_used"], agg["n_seg"]
+        cov = agg["area_coverage"]
+        log.info(f"  cell aggregate: 1/Z_cell = sum_v A_v / z_v over "
+                 f"{len(spectra)} measured"
+                 + (f" + {len(filled)} reconstructed" if filled else "")
+                 + f" segments, {len(f_cell)} frequencies")
+        log.info(f"    plate area covered: {100*np.nanmin(cov):.0f}-"
+                 f"{100*np.nanmax(cov):.0f} % "
+                 f"(median {100*np.nanmedian(cov):.0f} %) of "
+                 f"{agg['area_cell']:.1f} cm2; segments per frequency "
+                 f"{int(n_cell.min())}-{int(n_cell.max())}")
+        if np.nanmedian(cov) < 0.95:
+            log.warning(f"    the area-specific aggregate is normalised by "
+                        f"the COVERED area. Comparing it against a whole-cell "
+                        f"instrument means comparing "
+                        f"{100*np.nanmedian(cov):.0f} % of the plate against "
+                        f"100 % of it; use z_asr_full, or fill the gaps.")
+    else:
+        f_cell, Z_cell, n_cell = cell_aggregate(spectra)
 
     return SilverRun(point_ledger=point_ledger,
                      unwired=list(bronze_run.segments_missing()),
                      spectra=spectra, skew=skew, dc_closure=dcc,
-                     cell_freq=f_cell, Z_cell=Z_cell, cell_n_seg=n_cell)
+                     cell_freq=f_cell, Z_cell=Z_cell, cell_n_seg=n_cell,
+                     filled=filled, fill_info=fill_info, aggregate=agg)
 
 
 def save(sr: SilverRun, cfg: Config, log=None) -> Path:
@@ -1618,6 +1925,14 @@ def save(sr: SilverRun, cfg: Config, log=None) -> Path:
         "R_ohmic_mohm_cm2": round(1000 * s.R_ohmic, 4),
         "R_ohmic_sd_mohm_cm2": round(1000 * s.R_ohmic_sd, 4)
         if np.isfinite(s.R_ohmic_sd) else "",
+        # The second HFR estimator, and how far apart the two are. When the
+        # gap exceeds R_ohmic_sd the arc did not close inside the band and
+        # neither number should be quoted without saying so.
+        "R_ohmic_xint_mohm_cm2": round(1000 * s.R_ohmic_xint, 4)
+        if np.isfinite(s.R_ohmic_xint) else "",
+        "R_ohmic_spread_mohm_cm2": round(1000 * abs(s.R_ohmic - s.R_ohmic_xint), 4)
+        if np.isfinite(s.R_ohmic_xint) else "",
+        "hf_closure": round(s.hf_closure, 4) if np.isfinite(s.hf_closure) else "",
         "R_pol_mohm_cm2": round(1000 * s.R_pol, 4),
         "L_nH": round(1e9 * s.L, 3),
         "tau_peak_s": f"{s.tau_peak:.4g}" if np.isfinite(s.tau_peak) else "",
@@ -1654,14 +1969,50 @@ def save(sr: SilverRun, cfg: Config, log=None) -> Path:
         utils.write_table(out / "segment_reach.csv", sr.reach())
 
     if len(sr.cell_freq):
-        utils.write_table(out / "cell_aggregate.csv", [{
-            "freq_hz": round(float(f), 6),
-            "z_re_mohm_cm2": round(1000 * float(np.real(z)), 5),
-            "z_im_mohm_cm2": round(1000 * float(np.imag(z)), 5),
-            "n_segments": int(n),
-        } for f, z, n in zip(sr.cell_freq, sr.Z_cell,
-                             (sr.cell_n_seg if len(sr.cell_n_seg) == len(sr.cell_freq)
-                              else np.zeros(len(sr.cell_freq), int)))])
+        # The columns say which normalisation each number uses, because the
+        # two differ by exactly the uncovered area and a reader cannot tell
+        # them apart from the values. z_re/z_im stay first and keep their
+        # meaning (the covered-area ASR) so existing readers are unaffected.
+        agg = sr.aggregate if sr.aggregate.get("ok") else {}
+        n_arr = (sr.cell_n_seg if len(sr.cell_n_seg) == len(sr.cell_freq)
+                 else np.zeros(len(sr.cell_freq), int))
+        rows = []
+        for i, (f, z, n) in enumerate(zip(sr.cell_freq, sr.Z_cell, n_arr)):
+            row = {
+                "freq_hz": round(float(f), 6),
+                "z_re_mohm_cm2": round(1000 * float(np.real(z)), 5),
+                "z_im_mohm_cm2": round(1000 * float(np.imag(z)), 5),
+                "n_segments": int(n),
+            }
+            if agg:
+                row.update({
+                    "z_re_full_mohm_cm2": round(1000 * float(np.real(agg["z_asr_full"][i])), 5),
+                    "z_im_full_mohm_cm2": round(1000 * float(np.imag(agg["z_asr_full"][i])), 5),
+                    "Z_re_mohm": round(1000 * float(np.real(agg["Z_ohm"][i])), 6),
+                    "Z_im_mohm": round(1000 * float(np.imag(agg["Z_ohm"][i])), 6),
+                    "area_used_cm2": round(float(agg["area_used"][i]), 3),
+                    "area_coverage": round(float(agg["area_coverage"][i]), 4),
+                })
+            rows.append(row)
+        utils.write_table(out / "cell_aggregate.csv", rows)
+
+    # Reconstructions live in their OWN file. Putting them in
+    # spectra_clean.csv would make an estimate indistinguishable from a
+    # measurement the moment anyone reads the table without the flags.
+    if sr.filled:
+        frows = []
+        for seg, sp in sorted(sr.filled.items(),
+                              key=lambda kv: int(kv[0]) if kv[0].isdigit() else 0):
+            for f, z in zip(sp.freq, sp.Z_model):
+                frows.append({
+                    "segment": seg, "source": "neighbours",
+                    "donors": " ".join(sp.donors), "hops": sp.hops,
+                    "freq_hz": round(float(f), 6),
+                    "z_re_mohm_cm2": round(1000 * float(np.real(z)), 5),
+                    "z_im_mohm_cm2": round(1000 * float(np.imag(z)), 5),
+                    "area_cm2": round(sp.area_cm2, 4),
+                })
+        utils.write_table(out / "spectra_reconstructed.csv", frows)
 
     utils.write_json(out / "silver_manifest.json", {
         "n_segments": len(sr.spectra), "tiers": sr.tiers(),

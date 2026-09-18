@@ -633,15 +633,35 @@ def run(sr: SilverRun, cfg: Config = DEFAULT, log=None) -> GoldRun:
     # them, which is a different and more local statement, so they get their
     # own class and carry their donors.
     rebuilt = dict(getattr(sr, "filled", {}) or {})
+    _areas = utils.segment_areas(cfg)
     fields: dict[str, dict] = {}
     for p, v in vals.items():
         v = dict(v)
-        if p == "R_ohmic":
-            # the only scalar a reconstruction can supply: it is read off the
-            # rebuilt curve by the same top-band rule the measured segments use
-            for seg, sp in rebuilt.items():
-                if np.isfinite(getattr(sp, "R_ohmic", np.nan)):
-                    v.setdefault(seg, float(sp.R_ohmic))
+        # EVERY scalar, not just R_ohmic.
+        # The first version filled only the HF intercept, because that one can
+        # be read straight off the rebuilt curve. R_ct and R_mt cannot: they
+        # come from the DRT, which is not linear in Z, so there is no rebuilt
+        # spectrum to read them from. The result was a plate where the HFR map
+        # had 72 segments and the charge-transfer and mass-transport maps had
+        # 67 -- the same run, the same request, three different plates.
+        #
+        # They are taken from the DONORS instead, area-weighted, which is what
+        # "use the neighbouring segments" means for a scalar and is the same
+        # rule the spectrum reconstruction uses. For R_ohmic the two agree to
+        # within the per-point weights anyway, because the top-band estimator
+        # is itself a weighted mean of Re Z and the reconstruction is a
+        # weighted mean of Z.
+        for seg, sp in rebuilt.items():
+            donor_vals, donor_w = [], []
+            for d in getattr(sp, "donors", []):
+                dv = v.get(d, np.nan)
+                if np.isfinite(dv):
+                    donor_vals.append(float(dv))
+                    donor_w.append(float(_areas.get(d, 1.0)))
+            if donor_vals:
+                w = np.asarray(donor_w, float)
+                v.setdefault(seg, float(np.sum(w * np.asarray(donor_vals))
+                                        / np.sum(w)))
         if do_infer:
             m, s, info = fit_field(v, sds.get(p, {}), cfg)
         else:
@@ -660,7 +680,6 @@ def run(sr: SilverRun, cfg: Config = DEFAULT, log=None) -> GoldRun:
 
     # ---- assemble records --------------------------------------------------
     cen = geom.centroids()
-    _areas = utils.segment_areas(cfg)
     records: dict[str, SegmentRecord] = {}
     for s in allseg:
         g = geom.SEGMENTS[s]

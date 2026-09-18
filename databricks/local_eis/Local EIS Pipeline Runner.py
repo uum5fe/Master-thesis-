@@ -1715,10 +1715,20 @@ import matplotlib.pyplot as plt
 SEG_AREA_CM2 = 4.235  # fallback, used for ASR conversion
  
 # ── The display rule, in one place and stated in the figure ──────────────
-# Set DISPLAY_FILTER = False to see every finite point silver accepted. When
-# it is True the rule is still not hidden: the points it removes are drawn as
-# grey crosses and counted in the caption, so nothing disappears silently.
-DISPLAY_FILTER = True
+# OFF. Every finite point silver accepted is drawn as an ordinary point of
+# its segment's colour -- no grey crosses, nothing set aside.
+#
+# The rule it replaces (1 <= Z' <= 500 mOhm*cm2, f <= 2 kHz, no inductive
+# below 1 kHz) was a viewing convenience with opinions in it: it deletes a
+# genuinely bad segment rather than showing it as bad, hides the band
+# hf_schedule exists to recover, and removes low-frequency inductive
+# behaviour, which on a fuel cell is a finding. Silver's nine gates have
+# already decided what is a measurement; a second, softer opinion on top of
+# them belongs to whoever is looking, not to the plot.
+#
+# Set it True to get the rule back, with the excluded points drawn as grey
+# crosses and counted in the caption rather than dropped.
+DISPLAY_FILTER = False
 DISPLAY_RULE_TEXT = ("display rule: 1 ≤ Z′ ≤ 500 mΩ·cm², f ≤ 2 kHz, "
                      "no inductive below 1 kHz")
 
@@ -1728,6 +1738,7 @@ for cond, pr in PIPELINE_RESULTS.items():
     out_dir = pr['out_dir']
     _n_hidden_total = 0
     _n_finite_total = 0
+    _n_rebuilt = 0
 
     # Load silver spectra for this condition
     _spectra_path = spectra_csv(out_dir)
@@ -1848,6 +1859,41 @@ for cond, pr in PIPELINE_RESULTS.items():
                            'Phase = %{y:.1f}°<extra></extra>'),
         ), row=1, col=3)
     
+    # Segments rebuilt from their neighbours, dotted so they cannot be
+    # mistaken for measurements. They live in their own file because
+    # spectra_clean.csv is measurements only -- and leaving them off this plot
+    # meant the run said "67 segments" while the maps and the aggregate beside
+    # it were built from 72.
+    _rec_path = Path(out_dir) / 'silver' / 'spectra_reconstructed.csv'
+    if _rec_path.exists():
+        _rec = pd.read_csv(_rec_path)
+        _n_rebuilt = _rec['segment'].nunique()
+        for _j, _seg in enumerate(sorted(_rec['segment'].unique(),
+                                         key=lambda x: int(x))):
+            _rd = _rec[_rec['segment'] == _seg].sort_values('freq_hz')
+            _zr, _zi = _rd['z_re_mohm_cm2'].values, _rd['z_im_mohm_cm2'].values
+            _f = _rd['freq_hz'].values
+            _ok = np.isfinite(_zr) & np.isfinite(_zi)
+            if _ok.sum() < 3:
+                continue
+            _don = str(_rd['donors'].iloc[0])
+            fig.add_trace(go.Scatter(
+                x=_zr[_ok], y=-_zi[_ok], mode='lines',
+                line=dict(width=1.6, color='#444', dash='dot'),
+                name=f'Seg {_seg} (rebuilt)', legendgroup='rebuilt',
+                showlegend=(_j == 0), customdata=_f[_ok],
+                hovertemplate=(f'<b>Seg {_seg}</b> \u2014 REBUILT from {_don}<br>'
+                               'f = %{customdata:.2f} Hz<br>'
+                               "Z' = %{x:.1f}<br>-Z'' = %{y:.1f}<extra></extra>"),
+            ), row=1, col=1)
+            _Z = _zr[_ok] + 1j * _zi[_ok]
+            fig.add_trace(go.Scatter(x=_f[_ok], y=np.abs(_Z), mode='lines',
+                line=dict(width=1.6, color='#444', dash='dot'),
+                legendgroup='rebuilt', showlegend=False), row=1, col=2)
+            fig.add_trace(go.Scatter(x=_f[_ok], y=np.degrees(np.angle(_Z)),
+                mode='lines', line=dict(width=1.6, color='#444', dash='dot'),
+                legendgroup='rebuilt', showlegend=False), row=1, col=3)
+
     fig.update_xaxes(title_text="Z' [mΩ·cm²]", row=1, col=1)
     fig.update_yaxes(title_text="-Z'' [mΩ·cm²]", row=1, col=1)
     fig.update_xaxes(title_text="f [Hz]", type="log", row=1, col=2)
@@ -1864,7 +1910,9 @@ for cond, pr in PIPELINE_RESULTS.items():
         '<br><span style="font-size:11px;color:#888">every finite '
         'silver-accepted point shown</span>')
     fig.update_layout(
-        title=f'<b>Local EIS — Leepa {LEEPA}, {cond} ({n_seg} segments)</b>'
+        title=f'<b>Local EIS — Leepa {LEEPA}, {cond} ({n_seg} measured'
+              + (f' + {_n_rebuilt} rebuilt' if _n_rebuilt else '')
+              + ' segments)</b>'
               + _hidden_note,
         height=550, width=1500,
         paper_bgcolor='white', plot_bgcolor='white',
@@ -1877,10 +1925,13 @@ for cond, pr in PIPELINE_RESULTS.items():
         ),
     )
     fig.show()
-    print(f"  {cond}: {n_seg} segments plotted, "
-          f"{_n_finite_total - _n_hidden_total} of {_n_finite_total} "
-          f"silver-accepted points inside the display rule"
-          + (f" ({_n_hidden_total} drawn as grey ×)" if _n_hidden_total else ""))
+    print(f"  {cond}: {n_seg} segments plotted"
+          + (f" + {_n_rebuilt} rebuilt from neighbours" if _n_rebuilt else "")
+          + (f", all {_n_finite_total} silver-accepted points shown"
+             if not _n_hidden_total else
+             f", {_n_finite_total - _n_hidden_total} of {_n_finite_total} "
+             f"points inside the display rule "
+             f"({_n_hidden_total} drawn as grey \u00d7)"))
 
 # COMMAND ----------
 
@@ -2032,9 +2083,22 @@ def _load_pipeline(leepa, cond):
         if not sp.exists():
             continue
         seg = pd.read_csv(sp)
+        # RECONSTRUCTED SEGMENTS BELONG ON THIS PLOT TOO.
+        # They are kept out of spectra_clean.csv on purpose -- that file is
+        # measurements only -- but leaving them off the overlay meant the
+        # aggregate was drawn over 72 segments while the segment lines behind
+        # it were 67, and the missing five were exactly the ones the operator
+        # had asked to rebuild. They are read from their own file and marked
+        # so nothing can mistake one for a measurement.
+        rec_p = Path(d) / 'silver' / 'spectra_reconstructed.csv'
+        rec = pd.read_csv(rec_p) if rec_p.exists() else None
+
         agg_p = Path(d) / 'silver' / 'cell_aggregate.csv'
         agg = pd.read_csv(agg_p) if agg_p.exists() else None
+        cov = None
         if agg is not None:
+            if 'area_coverage' in agg.columns:
+                cov = float(np.nanmedian(agg['area_coverage']))
             agg = pd.DataFrame({
                 'freq_hz': agg['freq_hz'],
                 'z_re': agg['z_re_mohm_cm2'],
@@ -2042,8 +2106,8 @@ def _load_pipeline(leepa, cond):
             }).sort_values('freq_hz').reset_index(drop=True)
             if np.nanmedian(agg['z_im']) > 0:
                 agg['z_im'] = -agg['z_im']
-        return seg, agg, str(d), prov
-    return None, None, None, f'{prov} (no spectra_clean.csv in it)'
+        return seg, agg, str(d), f'{prov}|{rec_p.name if rec is not None else ""}', rec, cov
+    return None, None, None, f'{prov} (no spectra_clean.csv in it)', None, None
  
  
 # ─── 4. Plot overlay for each condition ───
@@ -2057,7 +2121,8 @@ except NameError:
     _conds = [_COND] if _COND != 'ALL' else ['45A', '60A', '150A', '450A']
  
 for cond in _conds:
-    seg_df, agg_df, src, _prov = _load_pipeline(_LEEPA, cond)
+    seg_df, agg_df, src, _prov, rec_df, _cov = _load_pipeline(_LEEPA, cond)
+    _prov = _prov.split('|')[0]
     if seg_df is None:
         print(f"  {cond}: no pipeline results found ({_prov})")
         continue
@@ -2136,6 +2201,37 @@ for cond in _conds:
             mode='lines', line=dict(width=0.8, color=clr), opacity=0.4,
             legendgroup='seg', showlegend=False), row=1, col=3)
  
+    # Reconstructed segments (dashed, so they read as estimates at a glance)
+    if rec_df is not None and len(rec_df):
+        for j, seg in enumerate(sorted(rec_df['segment'].unique(),
+                                       key=lambda x: int(x))):
+            rd = rec_df[rec_df['segment'] == seg].sort_values('freq_hz')
+            zr = rd['z_re_mohm_cm2'].values
+            zi = rd['z_im_mohm_cm2'].values
+            f = rd['freq_hz'].values
+            ok = np.isfinite(zr) & np.isfinite(zi)
+            if ok.sum() < 3:
+                continue
+            donors = str(rd['donors'].iloc[0])
+            fig.add_trace(go.Scatter(
+                x=zr[ok], y=-zi[ok], mode='lines',
+                line=dict(width=1.6, color='#444', dash='dot'),
+                opacity=0.8,
+                name='Rebuilt from neighbours' if j == 0 else f'Seg {seg} (rebuilt)',
+                legendgroup='rebuilt', showlegend=(j == 0),
+                customdata=f[ok],
+                hovertemplate=(f'<b>Seg {seg}</b> — REBUILT from {donors}<br>'
+                               'f=%{customdata:.1f} Hz<br>'
+                               "Z'=%{x:.1f}<br>-Z''=%{y:.1f}<extra></extra>"),
+            ), row=1, col=1)
+            Z = zr[ok] + 1j * zi[ok]
+            fig.add_trace(go.Scatter(x=f[ok], y=np.abs(Z), mode='lines',
+                line=dict(width=1.6, color='#444', dash='dot'), opacity=0.8,
+                legendgroup='rebuilt', showlegend=False), row=1, col=2)
+            fig.add_trace(go.Scatter(x=f[ok], y=np.degrees(np.angle(Z)),
+                mode='lines', line=dict(width=1.6, color='#444', dash='dot'),
+                opacity=0.8, legendgroup='rebuilt', showlegend=False), row=1, col=3)
+
     # Cell aggregate (thick red)
     if agg_df is not None and len(agg_df) > 3:
         Z_agg = agg_df['z_re'].values + 1j * agg_df['z_im'].values
@@ -2186,16 +2282,32 @@ for cond in _conds:
     fig.update_yaxes(title_text="Phase [deg]", row=1, col=3)
  
     _gstr = f' + Gamry {cond}' if gamry_df is not None else ''
+    _nrec = 0 if rec_df is None else rec_df['segment'].nunique()
+    # THE AGGREGATE'S COVERAGE IS PART OF WHAT IT MEANS.
+    # Compared against a whole-cell Gamry sweep, an aggregate over 96 % of the
+    # plate is not the same quantity as the instrument's, and the difference
+    # is exactly the missing 4 %. Say which it is, on the figure.
+    _covstr = ('' if _cov is None else
+               f' — aggregate covers {100*_cov:.0f} % of the plate area'
+               + ('' if _cov > 0.995 else
+                  '; the Gamry measures 100 %, so this comparison is '
+                  'short by the difference'))
     fig.update_layout(
-        title=f'<b>Leepa {_LEEPA} / {cond}: {n_seg} segments{_gstr}</b><br>'
-              f'<sup>Source: {_prov} — {src}</sup>',
+        title=f'<b>Leepa {_LEEPA} / {cond}: {n_seg} measured'
+              + (f' + {_nrec} rebuilt' if _nrec else '')
+              + f' segments{_gstr}</b><br>'
+              f'<sup>Source: {_prov} — {src}{_covstr}</sup>',
         height=580, width=1550,
         paper_bgcolor='white', plot_bgcolor='white',
         margin=dict(t=100, b=55, r=280), hovermode='closest',
         legend=dict(font=dict(size=10), y=0.5, yanchor='middle'))
     fig.show()
  
-    print(f"\n  {cond}: {n_seg} segments from {src}")
+    print(f"\n  {cond}: {n_seg} measured"
+          + (f" + {_nrec} rebuilt from neighbours" if _nrec else "")
+          + f" segments from {src}")
+    if _cov is not None:
+        print(f"  aggregate covers {100*_cov:.1f} % of the plate area")
     if gamry_df is not None:
         print(f"  Gamry: {len(gamry_df)} pts")
 

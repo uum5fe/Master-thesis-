@@ -181,6 +181,8 @@ class BronzeRun:
     n_files: int
     lags: dict = field(default_factory=dict)
     sensor_T: dict = field(default_factory=dict)
+    #: Segments left out on purpose, from cfg.exclude_segments.
+    excluded: frozenset = field(default_factory=frozenset)
 
     def segments_measured(self) -> list[str]:
         return sorted(self.spectra, key=int)
@@ -234,6 +236,12 @@ class BronzeRun:
                 None),
             "sensor_T_degC": {k: round(v, 3) for k, v in self.sensor_T.items()},
             "coverage": self.coverage_summary(),
+            # A segment that is absent because it was EXCLUDED and one that is
+            # absent because nothing was recorded on it look identical in a
+            # list of missing segments. Only the manifest can tell them apart,
+            # so it says which were asked for.
+            "excluded_segments": sorted(self.excluded, key=lambda s: int(s)
+                                        if str(s).isdigit() else 0),
         }
 
     def coverage_summary(self) -> dict:
@@ -1643,7 +1651,7 @@ def process_card(fp: Path, cal: PlateCalibration, schedule: list[Step],
     n_imp = sum(1 for s in out.values() if s.K_imputed)
     slots = [s.channel_slot for s in out.values()]
     log.info(f"    {len(out)} segments extracted"
-             + (f", {n_excluded} hardware-excluded" if n_excluded else "")
+             + (f", {n_excluded} excluded by config" if n_excluded else "")
              + (f", {n_imp} with imputed calibration" if n_imp else "")
              + (f", slots {min(slots)}..{max(slots)} (ref {ref_slot})"
                 if slots else ""))
@@ -1717,13 +1725,24 @@ def run(cfg: Config = DEFAULT, log=None) -> BronzeRun:
         config_digest=_digest([json.dumps(cfg.to_dict(), sort_keys=True)]),
         input_digest=_digest([f"{p.name}:{p.stat().st_size}" for p in files]),
         n_files=len(files), lags=lags, sensor_T=sensor_T,
+        excluded=frozenset(str(x) for x in (cfg.exclude_segments or ())),
     )
 
     miss = run_obj.segments_missing()
     log.info(f"\n  bronze complete: {len(spectra)}/{geom.N_SEGMENTS} segments "
              f"carry raw data, {len(miss)} do not")
     if miss:
-        log.info(f"  not measured: {', '.join(miss)}")
+        # Separate the two kinds of absence. "Not measured" invites a hunt for
+        # a wiring fault; "left out on purpose" does not, and a reader cannot
+        # tell them apart from a list of numbers.
+        left_out = sorted((set(miss) & run_obj.excluded), key=int)
+        unmeasured = sorted((set(miss) - run_obj.excluded), key=int)
+        if unmeasured:
+            log.info(f"  not measured: {', '.join(unmeasured)}")
+        if left_out:
+            log.info(f"  excluded on purpose: {', '.join(left_out)} "
+                     f"(exclude_segments) - these carry no data anywhere "
+                     f"downstream and are not inferred")
         log.info("  (these are NOT dropped - gold.py infers them from the "
                  "spatial field and marks them as inferred)")
     return run_obj

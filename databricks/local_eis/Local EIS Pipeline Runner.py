@@ -342,6 +342,14 @@ try:
     dbutils.widgets.dropdown('evaluation_mode', 'default',
                              ['default', 'permissive', 'strict'],
                              'Evaluation mode')
+    # Segments to leave out of the WHOLE evaluation, comma separated, e.g.
+    # "33" or "33,59". An excluded segment is skipped in bronze before its
+    # channel is read, so it has no spectrum, no scalars, no place in the cell
+    # aggregate and no inferred value on any map -- and the run says so rather
+    # than leaving a silent hole. Empty is the default on purpose: excluding a
+    # segment before its data is seen removes the only evidence that could
+    # ever overturn the exclusion.
+    dbutils.widgets.text('exclude_segments', '', 'Exclude segments (e.g. 33)')
 except Exception:
     pass
  
@@ -394,6 +402,9 @@ F_MAX = float(_w('f_max_hz', '4500.0'))
 MIN_SNR_DB = float(_w('min_snr_db', '0'))
 STOP_AFTER = _w('stop_after', 'gold')
 EVALUATION_MODE = _w('evaluation_mode', 'default')
+EXCLUDE_SEGMENTS = frozenset(
+    x.strip() for x in _w('exclude_segments', '').replace(';', ',').split(',')
+    if x.strip())
  
 # Select the plate for the whole session
 _plate = geom.use_plate(PLATE)
@@ -849,6 +860,10 @@ _CACHE_IDENTITY_KEYS = (
     # against, and that comparison is written into the manifest. Two builds
     # are two different references, so they are two different results.
     'gamry_version',
+    # Excluding a segment changes the cell aggregate, the area weighting and
+    # every plate map. A run with segment 33 and a run without it are two
+    # different results and must not share a cache entry.
+    'exclude_segments',
     'ref_channel', 'align_cards', 'align_max_lag_s',
     'align_min_corr', 'align_min_prominence', 'align_f_lo_hz',
     'align_f_hi_hz', 'align_guard_s', 'align_agree_tol_s',
@@ -870,10 +885,22 @@ def _run_identity(mode=None, f_min=None, f_max=None, snr=None):
         f_min_hz=F_MIN if f_min is None else f_min,
         f_max_hz=F_MAX if f_max is None else f_max,
         min_snr_db=MIN_SNR_DB if snr is None else float(snr),
-        gamry_version=globals().get('GAMRY_VERSION', ''))
+        gamry_version=globals().get('GAMRY_VERSION', ''),
+        exclude_segments=globals().get('EXCLUDE_SEGMENTS', frozenset()))
     if mode and mode != 'default':
         base = base.preset(mode)
-    payload = {k: getattr(base, k, None) for k in _CACHE_IDENTITY_KEYS}
+    # A set has no order, and json's default=str would spell the SAME
+    # exclusion differently from one session to the next -- a cache key that
+    # changes when nothing did, so every run misses and re-computes. Sets are
+    # normalised to sorted lists, and Paths to strings.
+    def _norm(v):
+        if isinstance(v, (set, frozenset)):
+            return sorted(str(x) for x in v)
+        if isinstance(v, (tuple, list)):
+            return [str(x) for x in v]
+        return v
+
+    payload = {k: _norm(getattr(base, k, None)) for k in _CACHE_IDENTITY_KEYS}
     blob = json.dumps(payload, sort_keys=True, default=str)
     return _hashlib.sha256(blob.encode('utf-8')).hexdigest()[:10]
 
@@ -1412,6 +1439,10 @@ print(f"  Band:       {F_MIN} – {F_MAX} Hz")
 print(f"  Stop after: {STOP_AFTER}")
 # The mode decides the gates AND the cache entry, so it is printed with the
 # rest of the run identity rather than left to be inferred from the results.
+print(f"  Excluded:   "
+      + (", ".join(sorted(EXCLUDE_SEGMENTS, key=lambda x: int(x)
+                          if x.isdigit() else 0))
+         + "   <-- left out of every stage" if EXCLUDE_SEGMENTS else "(none)"))
 print(f"  Eval mode:  {EVALUATION_MODE}"
       + ("" if EVALUATION_MODE == 'default'
          else "   <-- NOT the pipeline defaults; exploratory"))
@@ -1502,6 +1533,7 @@ for cond in _conditions_to_run:
         # vote. min_ref_channels=1 is restored below, explicitly and out
         # loud, when the run genuinely has one card.
         min_ref_channels=2,
+        exclude_segments=EXCLUDE_SEGMENTS,
     )
 
     # ── Gate preset: named, not smuggled ──────────────────────────────────

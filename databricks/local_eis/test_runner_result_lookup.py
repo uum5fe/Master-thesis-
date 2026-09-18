@@ -202,3 +202,27 @@ def test_the_gamry_build_changes_the_cache_entry(tmp_path) -> None:
     b = _namespace(tmp_path)
     b["GAMRY_VERSION"] = "V26_088"
     assert a["_run_identity"]() != b["_run_identity"]()
+
+
+def test_excluding_a_segment_changes_the_cache_entry(tmp_path) -> None:
+    """A run with segment 33 and a run without it are different results.
+
+    The exclusion changes the cell aggregate, the area weighting and every
+    plate map, so the two must not share a cache entry.
+    """
+    a = _namespace(tmp_path)
+    b = _namespace(tmp_path)
+    b["EXCLUDE_SEGMENTS"] = frozenset({"33"})
+    assert a["_run_identity"]() != b["_run_identity"]()
+
+
+def test_the_exclusion_hashes_the_same_way_every_time(tmp_path) -> None:
+    """A set has no order. Spelled straight into the key it would hash
+    differently from session to session, so every run would miss its own
+    cache and recompute."""
+    keys = set()
+    for order in (["33", "59", "7"], ["7", "33", "59"], ["59", "7", "33"]):
+        ns = _namespace(tmp_path)
+        ns["EXCLUDE_SEGMENTS"] = frozenset(order)
+        keys.add(ns["_run_identity"]())
+    assert len(keys) == 1

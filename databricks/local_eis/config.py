@@ -858,7 +858,16 @@ class Config:
             if "Path" in t:
                 kw[k] = Path(v)
             elif "frozenset" in t:
-                kw[k] = frozenset(str(s) for s in v)
+                # A STRING IS ONE VALUE, NOT A SEQUENCE OF CHARACTERS.
+                # The environment hands everything over as text, so
+                # EIS_EXCLUDE_SEGMENTS="33,59" was iterated character by
+                # character into {'3', '5', '9', ','} -- which excludes
+                # segments 3, 5 and 9 and leaves 33 and 59 in. Every element
+                # of that set is a plausible segment number, so nothing
+                # downstream could notice.
+                if isinstance(v, str):
+                    v = [x for x in v.replace(";", ",").split(",") if x.strip()]
+                kw[k] = frozenset(str(s).strip() for s in v)
             elif "tuple" in t:
                 kw[k] = tuple(v)
             elif "bool" in t:
@@ -1014,6 +1023,11 @@ SEGMENT_CLASS_STYLE = {
     "measured": dict(alpha=0.92, linewidth=1.6, hatch=None),
     "inferred": dict(alpha=0.45, linewidth=1.0, hatch="///"),
     "bad":      dict(alpha=0.25, linewidth=1.0, hatch="xxx"),
+    # A segment the operator excluded is not a segment that failed, and it is
+    # not one whose value was inferred. It carries no value at all, so it is
+    # drawn blank -- distinguishable at a glance from a measured neighbour and
+    # from a guessed one.
+    "excluded": dict(alpha=0.15, linewidth=1.0, hatch="..."),
 }
 
 # Units and human labels for every scalar the gold layer can map.

@@ -86,7 +86,7 @@ class SegmentRecord:
     cx_mm: float
     cy_mm: float
     area_cm2: float
-    cls: str                       # "measured" | "inferred" | "bad"
+    cls: str            # "measured" | "inferred" | "excluded" | "bad"
     tier: str                      # A/B/C from silver, or D when inferred
     values: dict[str, float] = field(default_factory=dict)
     sd: dict[str, float] = field(default_factory=dict)
@@ -372,7 +372,7 @@ def plate_heatmap(records: dict[str, SegmentRecord], param: str, cfg: Config,
         style = SEGMENT_CLASS_STYLE.get(r.cls, SEGMENT_CLASS_STYLE["measured"])
         face = cmap(norm(v)) if np.isfinite(v) else (0.6, 0.6, 0.6, 1.0)
         edge = (COLORS["measured_edge"] if r.cls == "measured"
-                else COLORS["bad_edge"] if r.cls == "bad"
+                else COLORS["bad_edge"] if r.cls in ("bad", "excluded")
                 else COLORS["inferred_edge"])
         ax.add_patch(Rectangle((x0, y0), w, h, facecolor=face,
                                alpha=style["alpha"], edgecolor=edge,
@@ -526,12 +526,22 @@ def run(sr: SilverRun, cfg: Config = DEFAULT, log=None) -> GoldRun:
                             f"({100*cfg.max_inferred_fraction:.0f} %). "
                             f"A map that is mostly guess is worse than no map."))
 
+    # AN EXCLUDED SEGMENT MUST NOT COME BACK AS AN INFERRED ONE.
+    # `fit_field` returns a value for EVERY segment, so a segment the operator
+    # excluded would otherwise be handed a Gaussian-process value from its
+    # neighbours, labelled "inferred", and drawn on every heat map. That is
+    # the opposite of what excluding it meant: the request was to leave it
+    # out of the evaluation, not to replace its measurement with a guess.
+    excluded = {str(x) for x in getattr(cfg, "exclude_segments", ()) or ()}
     fields: dict[str, dict] = {}
     for p, v in vals.items():
         if do_infer:
             m, s, info = fit_field(v, sds.get(p, {}), cfg)
         else:
             m, s, info = dict(v), dict(sds.get(p, {})), {"ok": False}
+        for x in excluded:
+            m.pop(x, None)
+            s.pop(x, None)
         fields[p] = {"value": m, "sd": s, "info": info}
     if do_infer:
         info = fields.get("R_ohmic", {}).get("info", {})
@@ -556,6 +566,13 @@ def run(sr: SilverRun, cfg: Config = DEFAULT, log=None) -> GoldRun:
         elif s in KNOWN_BAD_SEGMENTS:
             cls, tier = "bad", "D"
             flags = [f"hardware: {KNOWN_BAD_SEGMENTS[s]}"]
+        elif s in excluded:
+            # Said plainly, and distinctly from "the fit failed": a reader
+            # comparing two runs needs to see that this segment was taken out
+            # on purpose, not that it stopped working.
+            cls, tier = "excluded", "D"
+            flags = ["excluded by configuration (exclude_segments); "
+                     "not measured, not inferred"]
         else:
             cls, tier = "inferred", "D"
             flags = ["no channel or fit failed; value from the spatial field"]
@@ -574,6 +591,7 @@ def run(sr: SilverRun, cfg: Config = DEFAULT, log=None) -> GoldRun:
     n_fault = sum(1 for r in records.values() if r.fault)
     log.info(f"  {len(measured)} measured, "
              f"{sum(1 for r in records.values() if r.cls=='inferred')} inferred, "
+             f"{sum(1 for r in records.values() if r.cls=='excluded')} excluded, "
              f"{sum(1 for r in records.values() if r.cls=='bad')} hardware-bad")
     if n_fault:
         by = {}
@@ -588,6 +606,9 @@ def run(sr: SilverRun, cfg: Config = DEFAULT, log=None) -> GoldRun:
     stats = {
         "n_total": len(allseg), "n_measured": len(measured),
         "n_inferred": sum(1 for r in records.values() if r.cls == "inferred"),
+        "n_excluded": sum(1 for r in records.values() if r.cls == "excluded"),
+        "excluded_segments": sorted(excluded, key=lambda x: int(x)
+                                    if str(x).isdigit() else 0),
         "n_bad": sum(1 for r in records.values() if r.cls == "bad"),
         "inferred_fraction": frac,
         "tiers": sr.tiers(),

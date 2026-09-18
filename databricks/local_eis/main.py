@@ -331,7 +331,8 @@ def run_pipeline(cfg: Config, stop_after: str = "gold") -> dict:
                 cfg.out_dir, cfg.gamry_dir, geom_area(cfg),
                 out_dir=cfg.out_dir, bench_path=cfg.bench_log,
                 chain_applied=cfg.gain_file is not None,
-                only=cfg.condition, order_id=cfg.leepa, log=log)
+                only=cfg.condition, order_id=cfg.leepa,
+                version=getattr(cfg, "gamry_version", "") or None, log=log)
             manifest["stages"]["gamry"] = [c.summary() for c in comps]
             if comps and comps[0].freq.size:
                 # the reference arm of the plausibility aggregate check, in

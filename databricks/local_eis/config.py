@@ -197,6 +197,20 @@ class Config:
     gamry_dir: Path | None = None
     bench_log: Path | None = None    # ASAM MDF4; defaults to one in gamry_dir
 
+    # WHICH CAMPAIGN'S SWEEPS, WHEN THE FOLDER HOLDS SEVERAL.
+    # A whole-cell sweep is named "V26_092_HFR_101_CurrVal_45.dta": it carries
+    # the BUILD TOKEN and no order number at all. The measurement file for the
+    # same cell, "..._RO2612030-01_V26_092_lokale_EIS_6_Boxen_3.mf4", carries
+    # both, which is what lets an order be resolved to a build and a build to
+    # its sweeps.
+    #
+    # Leave it empty and a shared Gamry folder is read whole. That is not a
+    # loud failure: sweeps are keyed by current, every campaign has a 45 A,
+    # and the last file read simply replaces the earlier one. The comparison
+    # then runs this cell's local aggregate against another cell's reference
+    # with nothing visibly wrong. Set it whenever the folder is shared.
+    gamry_version: str = ""          # e.g. "V26_092"
+
     # EQUAL-AREA MODE.  The plate's true segment areas span 0.678..8.470
     # cm^2, a factor of 12.5.  Setting this replaces them all with
     # A_CELL/72 = 4.235 cm^2.  Local ASR is area-free and does not move,
@@ -888,6 +902,11 @@ class Config:
         g.add_argument("--gamry", dest="gamry_dir", type=Path,
                        help="folder of whole-cell Gamry .DTA sweeps to "
                             "compare the aggregated local result against")
+        g.add_argument("--gamry-version", dest="gamry_version", default=None,
+                       help="build token of the sweeps that belong to this "
+                            "cell, e.g. V26_092. Required when the Gamry "
+                            "folder holds more than one campaign, because a "
+                            ".dta name carries no order number")
         g.add_argument("--bench-log", dest="bench_log", type=Path,
                        help="ASAM MDF4 bench log, to report the operating "
                             "point at each reference sweep")

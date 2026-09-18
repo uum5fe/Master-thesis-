@@ -83,6 +83,18 @@ _CURRENT_RE = re.compile(r"CurrVal[_-]?(\d+(?:[.,]\d+)?)", re.I)
 _START_RE = re.compile(r"STARTTIME\s+LABEL\s+([\d.]+\s+[\d:]+)")
 #: The order number as it appears in a bench file name, e.g. "RO2611976-01".
 _ORDER_RE = re.compile(r"(R[OA]\d{6,}|FC\d{6,}|\d{7,})", re.I)
+#: The build token, e.g. "V26_092".  THIS IS THE ONLY LINK BETWEEN A GAMRY
+#: SWEEP AND A CELL.  A whole-cell sweep is named
+#: "V26_092_HFR_101_CurrVal_45.dta" -- there is no order number anywhere in
+#: it, so `names_order` can never rule one out, and a shared Gamry folder
+#: holding several campaigns hands back whichever file sorted last for each
+#: current. The measurement file for that cell,
+#: "..._RO2612030-01_V26_092_lokale_EIS_6_Boxen_3.mf4", carries both, which is
+#: what makes order -> version -> sweep resolvable at all.
+# \b is wrong here: "_" is a word character, so "_V26_092_HFR" has no
+# boundary on either side of the token.
+_VERSION_RE = re.compile(r"(?<![A-Za-z0-9])V(\d{2})[_-](\d{2,3})(?![0-9])",
+                         re.I)
 
 
 @dataclass(frozen=True)
@@ -210,12 +222,22 @@ def read_cell_sweep(path) -> CellSweep:
 
 
 def find_cell_sweeps(root, pattern: str = "*.dta",
-                     order_id: str | None = None) -> list[CellSweep]:
-    """Every whole-cell sweep under `root`, newest naming first.
+                     order_id: str | None = None,
+                     version: str | None = None) -> list[CellSweep]:
+    """Every whole-cell sweep under `root` that belongs to THIS cell.
 
     Per-segment chain-response files carry a "#<n>" in the name and live in a
     `bode/` folder; they are a different measurement entirely and are skipped
     here rather than silently averaged into a cell reference.
+
+    `version` is the build token ("V26_092"). Pass it whenever the folder can
+    hold more than one campaign, which on a shared share is always: a sweep is
+    named "V26_092_HFR_101_CurrVal_45.dta" and carries NO order number, so
+    `order_id` alone cannot exclude another cell's file. It cannot even
+    detect the collision, because the sweeps are keyed by current downstream
+    and two campaigns both have a 45 A -- the second one read simply replaces
+    the first, and the comparison then runs a local result against another
+    cell's reference with nothing out of place to see.
     """
     root = Path(root)
     out: list[CellSweep] = []
@@ -228,10 +250,18 @@ def find_cell_sweeps(root, pattern: str = "*.dta",
             continue
         if names_order(path.name, order_id) is False:
             continue                     # names a different cell
+        if names_version(path.name, version) is False:
+            continue                     # names a different build
         try:
             out.append(read_cell_sweep(path))
         except Exception:                                   # noqa: BLE001
             continue
+    # Prefer files that SAY they are this cell's, over files that are merely
+    # silent about it. Version first: it is the token a .dta actually carries.
+    if version:
+        named = [s for s in out if names_version(s.path.name, version) is True]
+        if named:
+            return named
     if order_id:
         named = [s for s in out if names_order(s.path.name, order_id) is True]
         if named:
@@ -434,6 +464,31 @@ def _order_core(text: str) -> str:
     return re.sub(r"\D", "", text or "")
 
 
+def version_of(name: str) -> str | None:
+    """The build token in a file name, normalised to "V26_092", or None."""
+    m = _VERSION_RE.search(str(name))
+    return f"V{m.group(1)}_{m.group(2)}" if m else None
+
+
+def names_version(name: str, version: str | None) -> bool | None:
+    """Does this filename carry this build token?
+
+    Three-valued for the same reason as `names_order`: True names it, False
+    names a DIFFERENT one and is therefore the wrong cell's sweep, None is
+    silent and may legitimately be the right file. The difference in practice
+    is that Gamry .dta names are silent about the ORDER and explicit about the
+    VERSION, so this is the test that can actually separate two campaigns
+    sharing one folder.
+    """
+    want = version_of(version or "") or (version or "").strip().upper() or None
+    if not want:
+        return None
+    found = version_of(name)
+    if not found:
+        return None
+    return found.upper() == want
+
+
 def names_order(name: str, order_id: str | None) -> bool | None:
     """Does this filename name this cell?
 
@@ -456,7 +511,8 @@ def names_order(name: str, order_id: str | None) -> bool | None:
     return want in found
 
 
-def find_bench_log(root, order_id: str | None = None) -> Path | None:
+def find_bench_log(root, order_id: str | None = None,
+                   version: str | None = None) -> Path | None:
     """The bench .mf4 for this cell, or None.
 
     A campaign share holds one folder per cell, and pointing at the parent used
@@ -466,10 +522,17 @@ def find_bench_log(root, order_id: str | None = None) -> Path | None:
     files = sorted(Path(root).rglob("*.mf4")) + sorted(Path(root).rglob("*.MF4"))
     # The "_Anfang" file is the run-up; the main file is the one with the data.
     files = [f for f in files if "anfang" not in f.name.lower()] or files
+    # A file naming another cell or another build is never this one's.
+    files = [f for f in files
+             if names_order(f.name, order_id) is not False
+             and names_version(f.name, version) is not False] or []
     if not files:
         return None
 
     named = [f for f in files if names_order(f.name, order_id) is True]
+    if named:
+        return named[0]
+    named = [f for f in files if names_version(f.name, version) is True]
     if named:
         return named[0]
     # Nothing names the order. A file that names ANOTHER one is excluded;
@@ -755,7 +818,7 @@ def plot(comparisons: list[Comparison], path="gamry_comparison.png"):
 def run(results_root, gamry_root, area_cm2: float, out_dir=None,
         bench_path=None, chain_applied: bool | None = None,
         only: str | None = None, order_id: str | None = None,
-        log=None) -> list[Comparison]:
+        version: str | None = None, log=None) -> list[Comparison]:
     """Compare every condition that has BOTH a local result and a sweep.
 
     `results_root` is a pipeline output tree laid out
@@ -768,12 +831,35 @@ def run(results_root, gamry_root, area_cm2: float, out_dir=None,
     in the campaign each produce a "no local result" warning -- three lines of
     alarm about conditions that were never part of this run and are not
     missing anything.
+
+    `version` is the build token ("V26_092") and restricts the sweeps to the
+    campaign that belongs to this cell. On a share holding several campaigns
+    it is the only thing that can: the .dta names carry no order number, and
+    two campaigns both have a 45 A sweep.
     """
     log = log or utils.get_logger(True)
     results_root, gamry_root = Path(results_root), Path(gamry_root)
 
-    sweeps = {s.condition: s
-              for s in find_cell_sweeps(gamry_root, order_id=order_id)}
+    found = find_cell_sweeps(gamry_root, order_id=order_id, version=version)
+    sweeps = {s.condition: s for s in found}
+    if len(found) != len(sweeps):
+        # Two files claiming the same current is what a mixed folder looks
+        # like. Say so: the dict silently kept one of them.
+        kept = {s.condition: s.path.name for s in found}
+        log.warning(f"  {len(found)} sweeps collapsed to {len(sweeps)} "
+                    f"conditions -- more than one file per current under "
+                    f"{gamry_root}. Kept: {kept}. If these are different "
+                    f"campaigns, pass the build version.")
+    if version:
+        log.info(f"  whole-cell sweeps restricted to build {version}: "
+                 f"{[s.path.name for s in found]}")
+    elif any(version_of(s.path.name) for s in found):
+        builds = sorted({version_of(s.path.name) or "?" for s in found})
+        if len(builds) > 1:
+            log.warning(f"  sweeps under {gamry_root} come from MORE THAN ONE "
+                        f"build ({', '.join(builds)}) and no version was "
+                        f"given. This comparison may be against another "
+                        f"cell's reference.")
     if only and only.upper() != "ALL":
         sweeps = {k: v for k, v in sweeps.items()
                   if k.upper() == only.upper()}
@@ -786,7 +872,8 @@ def run(results_root, gamry_root, area_cm2: float, out_dir=None,
 
     bench = None
     if bench_path is None:
-        bench_path = find_bench_log(gamry_root)
+        bench_path = find_bench_log(gamry_root, order_id=order_id,
+                                    version=version)
     if bench_path is not None:
         try:
             bench = read_bench_log(bench_path)

@@ -81,13 +81,14 @@ import r2d2_geometry as geom
 import csv_source
 import csv_pipeline
 import gamry_dta
+import gamry_compare
 import abgleich
 import ladder_snap
 import eis_measurement_model
  
 # Force reload during development
 for mod in [config, utils, eis_local, bronze, silver, gold, pipeline_main,
-            geom, csv_source, csv_pipeline, gamry_dta, abgleich,
+            geom, csv_source, csv_pipeline, gamry_dta, gamry_compare, abgleich,
             ladder_snap, eis_measurement_model]:
     importlib.reload(mod)
  
@@ -163,12 +164,146 @@ try:
 except Exception:
     CONDITIONS = ['450A', '60A', '45A', '150A']
  
+# ═══════════════════════════════════════════════════════════════════════════
+#  GAMRY REFERENCE FILES — THE ONE BLOCK TO EDIT IF THE PATHS EVER MOVE
+# ═══════════════════════════════════════════════════════════════════════════
+# A whole-cell sweep is named        V26_092_HFR_101_CurrVal_45.dta
+# and the measurement file for the
+# same cell is named                 ..._RO2612030-01_V26_092_lokale_EIS_...mf4
+#
+# The sweep carries the BUILD TOKEN and no order number; the measurement file
+# carries both. So the chain is
+#
+#     Leepa 2612030  ->  build V26_092  ->  V26_092_*.dta
+#
+# and the middle step is read off the measurement filenames rather than
+# hard-coded. Selecting a different order in the dashboard therefore selects
+# a different build and a different set of sweeps, with no table to maintain.
+#
+# Why this matters more than it looks: a shared Gamry folder holds several
+# campaigns, the sweeps are keyed by CURRENT downstream, and every campaign
+# has a 45 A. Reading the folder whole does not fail loudly -- the last file
+# read replaces the earlier one, and the cell is then compared against another
+# cell's reference with nothing visibly wrong.
+
+#: Folders searched for .dta sweeps, in order. ADD NEW LOCATIONS HERE.
+GAMRY_SEARCH_ROOTS = [
+    _EV_ROOT / f'RO{LEEPA}_Gamry',       # per-order folder, if there is one
+    _EV_ROOT / f'{LEEPA}_Gamry',
+    _EV_ROOT / 'Gamry',                  # the shared folder
+]
+
+#: Folders searched for the measurement files that carry order AND build.
+GAMRY_VERSION_SOURCES = [
+    _EV_ROOT / 'Gamry',
+    _EV_ROOT,
+    FAMOS_ROOT,
+]
+
+#: Last resort when no filename states the build: '2612030': 'V26_092'.
+#: Prefer fixing the filenames; a table here is a fact that can go stale.
+PLATE_VERSION_OVERRIDE: dict[str, str] = {}
+
+
+def plate_version(leepa, quiet=True):
+    """The build token for this order, e.g. 'V26_092', or None.
+
+    Read from any measurement filename that names BOTH the order and a build.
+    """
+    leepa = str(leepa)
+    if leepa in PLATE_VERSION_OVERRIDE:
+        return PLATE_VERSION_OVERRIDE[leepa]
+    digits = ''.join(ch for ch in leepa if ch.isdigit())
+    seen: dict[str, int] = {}
+    for root in GAMRY_VERSION_SOURCES:
+        try:
+            if not Path(root).is_dir():
+                continue
+            for f in Path(root).iterdir():
+                if digits not in f.name:
+                    continue
+                v = gamry_compare.version_of(f.name)
+                if v:
+                    seen[v] = seen.get(v, 0) + 1
+        except Exception:                                  # noqa: BLE001
+            continue
+    if not seen:
+        return None
+    if len(seen) > 1 and not quiet:
+        # Two builds naming one order is a question about the data, not
+        # something to average away.
+        print(f"  WARNING: order {leepa} appears with more than one build "
+              f"{dict(seen)}; using the most frequent. Set "
+              f"PLATE_VERSION_OVERRIDE['{leepa}'] to choose.")
+    return max(seen, key=lambda v: seen[v])
+
+
+def gamry_root_for(leepa):
+    """First folder from GAMRY_SEARCH_ROOTS that holds any .dta, or None."""
+    for root in GAMRY_SEARCH_ROOTS:
+        try:
+            r = Path(root)
+            if r.is_dir() and (any(r.glob('*.dta')) or any(r.glob('*.DTA'))):
+                return r
+        except Exception:                                  # noqa: BLE001
+            continue
+    return None
+
+
+def gamry_files(leepa, version=None):
+    """The .dta sweeps that belong to this order. Never another campaign's.
+
+    A file naming a different build is excluded. A file naming no build is
+    kept only when nothing names this one -- the same last-resort rule
+    gamry_compare uses for order numbers, because a folder holding exactly
+    one campaign has no reason to spell the build out.
+    """
+    root = gamry_root_for(leepa)
+    if root is None:
+        return [], None
+    version = version or plate_version(leepa)
+    files = sorted(list(root.glob('*.dta')) + list(root.glob('*.DTA')))
+    files = [f for f in files if '_raw' not in f.stem.lower()]
+
+    if not version:
+        # No build for this order. That is survivable in a folder holding ONE
+        # campaign and not survivable in a folder holding several: the sweeps
+        # are keyed by current downstream and every campaign has a 45 A, so
+        # handing back a mix means one of them silently wins. Refuse instead.
+        builds = {gamry_compare.version_of(f.name) for f in files}
+        builds.discard(None)
+        if len(builds) > 1:
+            print(f"  REFUSING to pick Gamry sweeps for order {leepa}: "
+                  f"{root} holds {len(builds)} campaigns "
+                  f"({', '.join(sorted(builds))}) and nothing names the build "
+                  f"for this order.\n"
+                  f"    Fix: add the order's measurement .mf4 (the one named "
+                  f"..._RO{leepa}-01_V26_xxx_...) to GAMRY_VERSION_SOURCES, "
+                  f"or set PLATE_VERSION_OVERRIDE['{leepa}'] = 'V26_xxx' in "
+                  f"the setup cell.")
+            return [], None
+        return files, (builds.pop() if builds else None)
+
+    named = [f for f in files
+             if gamry_compare.names_version(f.name, version) is True]
+    if named:
+        return named, version
+    # Nothing names this build. Files that name ANOTHER one are already out;
+    # what is left is silent and may legitimately be this campaign's.
+    silent = [f for f in files
+              if gamry_compare.names_version(f.name, version) is None]
+    if silent:
+        print(f"  no sweep names build {version}; falling back to "
+              f"{len(silent)} file(s) that name no build at all")
+    return silent, version
+
+
 # Gamry reference: auto-discover per Leepa (may not exist for every order)
 try:
-    _gamry_candidates = sorted(_EV_ROOT.glob(f'*{LEEPA}*Gamry*')) + sorted(_EV_ROOT.glob(f'*Gamry*{LEEPA}*'))
-    GAMRY_ROOT = _gamry_candidates[0] if _gamry_candidates else None
-except Exception:
-    GAMRY_ROOT = None
+    GAMRY_ROOT = gamry_root_for(LEEPA)
+    GAMRY_VERSION = plate_version(LEEPA, quiet=False) or ''
+except Exception:                                          # noqa: BLE001
+    GAMRY_ROOT, GAMRY_VERSION = None, ''
  
 # ─── Remove old widgets that are no longer needed ───
 for _old in ('plate', 'csv_path', 'csv_dialect', 'csv_tones',
@@ -247,6 +382,10 @@ CSV_DIALECT = 'auto'
 CSV_TONES = ()
 GAIN_FILE = ''
 GAMRY_DIR = str(GAMRY_ROOT) if GAMRY_ROOT else ''
+# The build token that ties this order to its sweeps. It travels into the
+# Config, so the pipeline's own whole-cell comparison filters on it too --
+# not just the display cells below.
+GAMRY_VERSION = globals().get('GAMRY_VERSION', '')
 BENCH_LOG = ''
 LEEPA = _w('leepa_id', _default)
 COND_FILTER = _w('condition', 'ALL')
@@ -706,6 +845,10 @@ _CACHE_IDENTITY_KEYS = (
     'min_snr_db', 'snr_floor_db', 'max_thd', 'max_drift',
     'sigma_rel_max', 'min_cycles_per_dwell', 'zmag_outlier_mad',
     'min_points_per_spectrum',
+    # The build decides WHICH whole-cell sweep the aggregate is compared
+    # against, and that comparison is written into the manifest. Two builds
+    # are two different references, so they are two different results.
+    'gamry_version',
     'ref_channel', 'align_cards', 'align_max_lag_s',
     'align_min_corr', 'align_min_prominence', 'align_f_lo_hz',
     'align_f_hi_hz', 'align_guard_s', 'align_agree_tol_s',
@@ -726,7 +869,8 @@ def _run_identity(mode=None, f_min=None, f_max=None, snr=None):
     base = DEFAULT.replace(
         f_min_hz=F_MIN if f_min is None else f_min,
         f_max_hz=F_MAX if f_max is None else f_max,
-        min_snr_db=MIN_SNR_DB if snr is None else float(snr))
+        min_snr_db=MIN_SNR_DB if snr is None else float(snr),
+        gamry_version=globals().get('GAMRY_VERSION', ''))
     if mode and mode != 'default':
         base = base.preset(mode)
     payload = {k: getattr(base, k, None) for k in _CACHE_IDENTITY_KEYS}
@@ -1259,6 +1403,10 @@ _TEMP_CAL = Path('/Workspace/Users/uum5fe@bosch.com/temp.csv')
 print(f"  DAT dir:    {_DAT_DIR}")
 print(f"  Curr cal:   {_CURR_CAL}")
 print(f"  Gamry ref:  {GAMRY_DIR or '(none - whole-cell check skipped)'}")
+print(f"  Gamry build:{' ' + GAMRY_VERSION if GAMRY_VERSION else ''}"
+      + ('' if GAMRY_VERSION else ' (UNKNOWN — if that folder holds more than '
+                                 'one campaign, the sweeps may be another '
+                                 "cell's)"))
 print(f"  Conditions: {_conditions_to_run}")
 print(f"  Band:       {F_MIN} – {F_MAX} Hz")
 print(f"  Stop after: {STOP_AFTER}")
@@ -1335,6 +1483,7 @@ for cond in _conditions_to_run:
         csv_tones=CSV_TONES,
         gain_file=Path(GAIN_FILE) if GAIN_FILE else None,
         gamry_dir=Path(GAMRY_DIR) if GAMRY_DIR else None,
+        gamry_version=GAMRY_VERSION,
         bench_log=Path(BENCH_LOG) if BENCH_LOG else None,
         dat_dir=_DAT_DIR,
         out_dir=_out_dir,
@@ -1653,12 +1802,12 @@ A_CELL_CM2 = 304.92
 # Auto-detect Gamry folder for current Leepa
 # Priority: per-Leepa folder > common Gamry folder (files matching Leepa ID)
 _VOL_BASE = '/Volumes/ps_xplatform_dev/rvadvtec_dev/ev_rvadvtec_dev'
-_GAMRY_CANDIDATES = [
-    Path(f'{_VOL_BASE}/RO{_LEEPA}_Gamry'),      # per-Leepa folder
-    Path(f'{_VOL_BASE}/{_LEEPA}_Gamry'),
-    Path(f'{_VOL_BASE}/Gamry'),                  # shared folder for all Leepas
-]
-_GAMRY_VOL = next((p for p in _GAMRY_CANDIDATES if p.exists()), Path(f'{_VOL_BASE}/Gamry'))
+# The paths live in the setup cell (GAMRY_SEARCH_ROOTS) -- one place to edit.
+# This cell used to carry its own copy of the folder list and then read every
+# .dta in whichever folder it found, keyed by current: with a shared folder
+# holding several campaigns, each key was overwritten by whichever file sorted
+# last, so the overlay could compare this cell against another cell's sweep.
+_GAMRY_VOL = gamry_root_for(_LEEPA) or Path(f'{_VOL_BASE}/Gamry')
 _CACHE_VOL = Path('/Volumes/ps_xplatform_dev/rvadvtec_dev/ev_rvadvtec_dev/EIS_Results')
  
  
@@ -1685,24 +1834,37 @@ def _parse_dta(fp):
                 Zimag=np.array(zi), Zmod=np.array(zm), name=fp.stem)
  
  
-# ─── 2. Load Gamry for all conditions ───
+# ─── 2. Load the sweeps that belong to THIS order ───
+_GAMRY_FILES, _GAMRY_BUILD = gamry_files(_LEEPA)
 print(f"  Gamry source: {_GAMRY_VOL}")
+print(f"  Order {_LEEPA} -> build {_GAMRY_BUILD or 'UNKNOWN'}"
+      f"   ({len(_GAMRY_FILES)} sweep file(s) selected)")
+if not _GAMRY_BUILD:
+    print("    No build token found for this order. Every .dta that does not "
+          "name a build is being read; if that folder holds more than one "
+          "campaign, set PLATE_VERSION_OVERRIDE in the setup cell.")
+
 _gamry = {}
-for fp in sorted(list(_GAMRY_VOL.glob('*.DTA')) + list(_GAMRY_VOL.glob('*.dta'))):
-    if '_Raw' in fp.stem:
-        continue
+for fp in _GAMRY_FILES:
     sp = _parse_dta(fp)
-    if sp:
-        k = A_CELL_CM2 * 1e3  # ohm -> mohm.cm2
-        # Extract condition from CurrVal_{number} in filename → e.g. "60A"
-        _cm = re.search(r'CurrVal_(\d+)', fp.stem)
-        _gamry_key = (_cm.group(1) + 'A') if _cm else sp['name']
-        _gamry[_gamry_key] = pd.DataFrame({
-            'freq_hz': sp['freq'],
-            'z_re': sp['Zreal'] * k,
-            'z_im': sp['Zimag'] * k,
-        }).sort_values('freq_hz').reset_index(drop=True)
-        print(f"    {_gamry_key}: {len(sp['freq'])} pts  ({fp.name})")
+    if not sp:
+        continue
+    k = A_CELL_CM2 * 1e3  # ohm -> mohm.cm2
+    # Condition from CurrVal_{number} in the filename -> e.g. "60A"
+    _cm = re.search(r'CurrVal_(\d+)', fp.stem)
+    _gamry_key = (_cm.group(1) + 'A') if _cm else sp['name']
+    if _gamry_key in _gamry:
+        # Two files for one current, after filtering by build, is a real
+        # ambiguity rather than something to resolve by sort order.
+        print(f"    WARNING: {_gamry_key} claimed by more than one file "
+              f"({fp.name}); keeping the first and ignoring this one")
+        continue
+    _gamry[_gamry_key] = pd.DataFrame({
+        'freq_hz': sp['freq'],
+        'z_re': sp['Zreal'] * k,
+        'z_im': sp['Zimag'] * k,
+    }).sort_values('freq_hz').reset_index(drop=True)
+    print(f"    {_gamry_key}: {len(sp['freq'])} pts  ({fp.name})")
  
  
 # ─── 2b. Load Gamry from MF4 files (if no DTA found) ───
@@ -1946,11 +2108,32 @@ from config import A_CELL_CM2
 # All three now come from the widgets, through the same resolver the heat maps
 # and the overlay use, so this table describes the run that is selected.
 _ASR_LEEPA = str(_widget('leepa_id', 'LEEPA', 'leepa'))
-GAMRY_DIR = Path('/Volumes/ps_xplatform_dev/rvadvtec_dev/ev_rvadvtec_dev/Gamry')
 
-DTA = {'45A':'V26_092_HFR_101_CurrVal_45.dta', '60A':'V26_092_HFR_102_CurrVal_60.dta',
-       '150A':'V26_092_HFR_103_CurrVal_150.dta','450A':'V26_092_HFR_104_CurrVal_450.dta'}
-SETPOINT = {'45A':45.,'60A':60.,'150A':150.,'450A':450.}
+# The filenames used to be written out here, V26_092 and all -- one campaign's
+# sweeps, pasted into a cell that runs for whichever order is selected. Pick a
+# different order and this table still read RO2612030's references.
+# They are discovered now, from the build token that order resolves to.
+# GAMRY_DIR is deliberately NOT reassigned: the run cell reads that global to
+# build its Config, and a display cell that overwrites it changes the run.
+_ASR_GAMRY_DIR = gamry_root_for(_ASR_LEEPA) or Path(
+    '/Volumes/ps_xplatform_dev/rvadvtec_dev/ev_rvadvtec_dev/Gamry')
+_ASR_FILES, _ASR_BUILD = gamry_files(_ASR_LEEPA)
+
+DTA = {}
+for _f in _ASR_FILES:
+    _m = re.search(r'CurrVal_(\d+(?:[.,]\d+)?)', _f.stem)
+    if _m:
+        DTA.setdefault(_m.group(1).replace(',', '.') + 'A', _f.name)
+# The setpoint is in the key, so it does not need a second table that can
+# disagree with the first.
+SETPOINT = {k: float(k[:-1]) for k in DTA}
+
+print(f"  order {_ASR_LEEPA} -> build {_ASR_BUILD or 'UNKNOWN'} -> "
+      f"{len(DTA)} sweep(s) in {_ASR_GAMRY_DIR}")
+for _k in sorted(DTA, key=lambda c: SETPOINT[c]):
+    print(f"    {_k:>6}: {DTA[_k]}")
+if not DTA:
+    print("    none found -- check GAMRY_SEARCH_ROOTS in the setup cell")
 
 _ASR_PROV = {}
 
@@ -1985,7 +2168,7 @@ for cond, fn in DTA.items():
         print(f"{cond:>5}   no cell_aggregate.csv "
               f"({_ASR_PROV.get(cond, 'not found')})")
         continue
-    dta = GAMRY_DIR/fn
+    dta = _ASR_GAMRY_DIR/fn
     if not dta.exists():
         print(f"{cond:>5}   missing {dta}"); continue
  
@@ -2024,7 +2207,7 @@ for cond, fn in DTA.items():
     loc = pd.read_csv(sv/'cell_aggregate.csv').sort_values('freq_hz')
     f_l = loc.freq_hz.values
     Z_l = (loc.z_re_mohm_cm2.values + 1j*loc.z_im_mohm_cm2.values)/1e3
-    sw = gamry_dta.read_dta(GAMRY_DIR/fn).sorted()
+    sw = gamry_dta.read_dta(_ASR_GAMRY_DIR/fn).sorted()
     f_g, Z_g = np.asarray(sw.freq,float), np.asarray(sw.Z,complex)
     lo, hi = max(f_l.min(), f_g.min()), min(f_l.max(), f_g.max())
     m = (f_l>=lo)&(f_l<=hi); f, Zl = f_l[m], Z_l[m]
@@ -3934,15 +4117,27 @@ for cond, ecm_cond in ECM_FIT_RESULTS.items():
 
 # COMMAND ----------
 
+import re
 import numpy as np, pandas as pd
 from pathlib import Path
 import gamry_dta
 from config import A_CELL_CM2
 
-GAMRY_DIR = Path('/Volumes/ps_xplatform_dev/rvadvtec_dev/ev_rvadvtec_dev/Gamry')
-DTA = {'45A':'V26_092_HFR_101_CurrVal_45.dta', '60A':'V26_092_HFR_102_CurrVal_60.dta',
-       '150A':'V26_092_HFR_103_CurrVal_150.dta','450A':'V26_092_HFR_104_CurrVal_450.dta'}
-SETPOINT = {'45A':45.,'60A':60.,'150A':150.,'450A':450.}
+# Second copy of the same hard-coded table, removed for the same reason: it
+# named one campaign's files and one folder, whichever order was selected.
+# _ASR_GAMRY_DIR, DTA and SETPOINT come from the cell above, which resolves
+# them from the order through its build token.
+_ASR_GAMRY_DIR = globals().get('_ASR_GAMRY_DIR') or (
+    gamry_root_for(_widget('leepa_id', 'LEEPA', 'leepa'))
+    or Path('/Volumes/ps_xplatform_dev/rvadvtec_dev/ev_rvadvtec_dev/Gamry'))
+if not globals().get('DTA'):
+    _files, _build = gamry_files(_widget('leepa_id', 'LEEPA', 'leepa'))
+    DTA = {}
+    for _f in _files:
+        _m = re.search(r'CurrVal_(\d+(?:[.,]\d+)?)', _f.stem)
+        if _m:
+            DTA.setdefault(_m.group(1).replace(',', '.') + 'A', _f.name)
+    SETPOINT = {k: float(k[:-1]) for k in DTA}
 MIN_COV  = 0.80        # area fraction a frequency must have to be trusted
 
 def gamry_series_L(f, Z, top_decade=1.0):
@@ -3972,7 +4167,7 @@ def interp_log(f_new, f, Z):
 
 for cond, fn in DTA.items():
     sv = find_silver(cond)                       # from the earlier script
-    if sv is None or not (GAMRY_DIR/fn).exists():
+    if sv is None or not (_ASR_GAMRY_DIR/fn).exists():
         print(f"{cond}: missing data"); continue
 
     ca  = pd.read_csv(sv/'cell_aggregate.csv').sort_values('freq_hz')
@@ -3997,7 +4192,7 @@ for cond, fn in DTA.items():
     I_err  = I_full/SETPOINT[cond] - 1.0
     Z_l    = Z_l * (1.0 + I_err)
 
-    sw  = gamry_dta.read_dta(GAMRY_DIR/fn).sorted()
+    sw  = gamry_dta.read_dta(_ASR_GAMRY_DIR/fn).sorted()
     f_g = np.asarray(sw.freq, float); Z_g = np.asarray(sw.Z, complex)*A_CELL_CM2
     Z_g = Z_g - 1j*2*np.pi*f_g*gamry_series_L(f_g, Z_g)
 

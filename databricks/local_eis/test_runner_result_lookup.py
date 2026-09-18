@@ -188,3 +188,17 @@ def test_a_directory_with_no_stage_folders_is_not_a_result(tmp_path) -> None:
     ns = _namespace(tmp_path)
     (ns["_CACHE_VOL"] / "2612030" / "450A" / "mode_default").mkdir(parents=True)
     assert ns["result_dir"]("2612030", "450A")[0] is None
+
+
+def test_the_gamry_build_changes_the_cache_entry(tmp_path) -> None:
+    """Two builds are two different whole-cell references, so two results.
+
+    The comparison against the Gamry sweep is written into the manifest. A
+    cache key blind to the build would serve a run compared against one cell's
+    reference as if it had been compared against another's.
+    """
+    a = _namespace(tmp_path)
+    a["GAMRY_VERSION"] = "V26_092"
+    b = _namespace(tmp_path)
+    b["GAMRY_VERSION"] = "V26_088"
+    assert a["_run_identity"]() != b["_run_identity"]()

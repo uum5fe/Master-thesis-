@@ -147,7 +147,38 @@ except Exception:
 # ─── Fixed paths ───
 FAMOS_ROOT = Path('/Volumes/ps_xplatform_dev/rvadvtec_dev/ev_rvadvtec_dev/Famos')
 _EV_ROOT = Path('/Volumes/ps_xplatform_dev/rvadvtec_dev/ev_rvadvtec_dev')
- 
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  WHICH ORDER, DECIDED BEFORE ANYTHING THAT DEPENDS ON IT
+# ═══════════════════════════════════════════════════════════════════════════
+# Everything below this point -- the condition list, the Gamry folders, the
+# build token -- is a property of ONE order, so the order has to be known
+# first. It was being read at the bottom of the cell instead, which on a
+# fresh kernel meant LEEPA did not exist yet when those blocks ran.
+#
+# That did not fail loudly, which is worse: the condition discovery sits in a
+# try/except, so the NameError was swallowed and CONDITIONS silently fell
+# back to the hard-coded ['450A', '60A', '45A', '150A'] -- the dropdown was
+# never actually reading the disk on the first run of a session. It worked on
+# the SECOND run, because by then LEEPA was left over from the first.
+#
+# The widget is therefore created here, read here, and the order-dependent
+# discovery follows it.
+def _w(name, default=''):
+    try:
+        return dbutils.widgets.get(name)
+    except Exception:
+        return default
+
+
+_default = '2612025' if '2612025' in AVAILABLE_ORDERS else AVAILABLE_ORDERS[-1]
+try:
+    dbutils.widgets.dropdown('leepa_id', _default, AVAILABLE_ORDERS,
+                             'Order ID (Leepa)')
+except Exception:
+    pass
+LEEPA = _w('leepa_id', _default)
+
 # Discover conditions from filenames on disk for the SELECTED Leepa
 # This handles both Leepa_{id} and Leepa_RO{id} naming conventions
 try:
@@ -161,7 +192,15 @@ try:
             if _cm:
                 _all_conds.add(_cm.group(1))
     CONDITIONS = sorted(_all_conds) if _all_conds else ['450A', '60A', '45A', '150A']
-except Exception:
+    if not _all_conds:
+        print(f"  no FAMOS files found for order {LEEPA} under {FAMOS_ROOT}; "
+              f"condition list is the hard-coded fallback")
+except Exception as _ce:                                   # noqa: BLE001
+    # Say WHY. A silent fallback here is indistinguishable from a plate that
+    # genuinely has these four conditions, and it is how a broken discovery
+    # went unnoticed.
+    print(f"  condition discovery failed ({type(_ce).__name__}: {_ce}); "
+          f"falling back to the hard-coded list")
     CONDITIONS = ['450A', '60A', '45A', '150A']
  
 # ═══════════════════════════════════════════════════════════════════════════
@@ -187,11 +226,20 @@ except Exception:
 # cell's reference with nothing visibly wrong.
 
 #: Folders searched for .dta sweeps, in order. ADD NEW LOCATIONS HERE.
-GAMRY_SEARCH_ROOTS = [
-    _EV_ROOT / f'RO{LEEPA}_Gamry',       # per-order folder, if there is one
-    _EV_ROOT / f'{LEEPA}_Gamry',
-    _EV_ROOT / 'Gamry',                  # the shared folder
+#: Written as TEMPLATES rather than as finished paths: a list built once from
+#: whatever LEEPA happened to hold is wrong twice over -- it cannot be built
+#: before the order is known, and it silently keeps the old order's folders
+#: if the widget changes and only the later cells are re-run.
+GAMRY_SEARCH_ROOT_TEMPLATES = [
+    '{ev}/RO{leepa}_Gamry',       # per-order folder, if there is one
+    '{ev}/{leepa}_Gamry',
+    '{ev}/Gamry',                 # the shared folder
 ]
+
+
+def gamry_search_roots(leepa):
+    return [Path(t.format(ev=_EV_ROOT, leepa=leepa))
+            for t in GAMRY_SEARCH_ROOT_TEMPLATES]
 
 #: Folders searched for the measurement files that carry order AND build.
 GAMRY_VERSION_SOURCES = [
@@ -239,8 +287,8 @@ def plate_version(leepa, quiet=True):
 
 
 def gamry_root_for(leepa):
-    """First folder from GAMRY_SEARCH_ROOTS that holds any .dta, or None."""
-    for root in GAMRY_SEARCH_ROOTS:
+    """First folder from the search roots that holds any .dta, or None."""
+    for root in gamry_search_roots(leepa):
         try:
             r = Path(root)
             if r.is_dir() and (any(r.glob('*.dta')) or any(r.glob('*.DTA'))):
@@ -313,10 +361,11 @@ for _old in ('plate', 'csv_path', 'csv_dialect', 'csv_tones',
     except Exception:
         pass
  
-# ─── Create widgets (only the ones that matter) ───
-_default = '2612025' if '2612025' in AVAILABLE_ORDERS else AVAILABLE_ORDERS[-1]
+# ─── Create the remaining widgets ───
+# leepa_id is NOT here: it is created above, before the discovery that needs
+# to know which order is selected. The condition dropdown is here because its
+# choices come from that discovery.
 try:
-    dbutils.widgets.dropdown('leepa_id', _default, AVAILABLE_ORDERS, 'Order ID (Leepa)')
     dbutils.widgets.dropdown('condition', 'ALL', ['ALL'] + CONDITIONS, 'Condition')
     dbutils.widgets.text('f_min_hz', '0.15', 'F min (Hz)')
     dbutils.widgets.text('f_max_hz', '4500.0', 'F max (Hz)')
@@ -365,12 +414,7 @@ except Exception:
     pass
  
  
-def _w(name, default=''):
-    try:
-        return dbutils.widgets.get(name)
-    except Exception:
-        return default
-
+# _w is defined above, with the order resolution it serves.
 
 def _widget(*names, default=''):
     """First widget that exists, else a notebook global, else the default.
@@ -406,6 +450,9 @@ GAMRY_DIR = str(GAMRY_ROOT) if GAMRY_ROOT else ''
 # not just the display cells below.
 GAMRY_VERSION = globals().get('GAMRY_VERSION', '')
 BENCH_LOG = ''
+# LEEPA was resolved at the top of this cell, before the discovery that uses
+# it. Re-read here only so that changing the widget and re-running from this
+# point still picks the change up.
 LEEPA = _w('leepa_id', _default)
 COND_FILTER = _w('condition', 'ALL')
 F_MIN = float(_w('f_min_hz', '0.15'))

@@ -154,12 +154,13 @@ def _runner_ns(tmp_path, ev_root):
     ns["_EV_ROOT"] = ev_root
     ns["FAMOS_ROOT"] = ev_root / "Famos"
     ns["LEEPA"] = "2612030"
-    for name in ("GAMRY_SEARCH_ROOTS", "GAMRY_VERSION_SOURCES",
+    for name in ("GAMRY_SEARCH_ROOT_TEMPLATES", "GAMRY_VERSION_SOURCES",
                  "PLATE_VERSION_OVERRIDE"):
         m = re.search(rf"^{name}(: [^=]+)? = (\[.*?\n\]|\{{\}})", src, re.S | re.M)
         assert m, f"{name} is gone from the runner"
         exec(m.group(0), ns)
-    for name in ("plate_version", "gamry_root_for", "gamry_files"):
+    for name in ("gamry_search_roots", "plate_version", "gamry_root_for",
+                 "gamry_files"):
         m = re.search(rf"^def {name}\b.*?(?=^\S|\Z)", src, re.S | re.M)
         assert m, f"{name} is gone from the runner"
         exec(m.group(0), ns)

@@ -410,6 +410,22 @@ try:
     # has to be made deliberately and it is recorded in the cache key.
     dbutils.widgets.dropdown('fill_gaps', 'no', ['no', 'yes'],
                              'Fill unmeasured segments from neighbours')
+    # DETECT THE SCHEDULE ON THE STACKED SEGMENT ENSEMBLE.
+    # The sweep is galvanostatic, so the tone arriving on the UC reference is
+    # |i_ac| * |Z_cell(f)| and it falls with |Z_cell| across the band -- the
+    # detector is asked to find a tone exactly where the cell removed it. The
+    # segment channels measure current density, which the sweep holds flat,
+    # so stacking them recovers the top of the band. Measured on
+    # RO2612025-01 card 4 at 45 A: 11 -> 42 steps, 0.478-189 Hz -> 0.478-18.9
+    # kHz.
+    #
+    # It is OFF by default because it can make a good result worse: on a
+    # record that is mostly idle it finds candidates in the idle stretches
+    # too and the schedule inflates. It had no widget at all, which meant the
+    # one setting that decides whether the band reaches the HF intercept was
+    # unreachable from this notebook. Try it, and compare.
+    dbutils.widgets.dropdown('hf_ensemble', 'no', ['no', 'yes'],
+                             'Recover HF band from segment ensemble')
 except Exception:
     pass
  
@@ -460,6 +476,20 @@ F_MAX = float(_w('f_max_hz', '4500.0'))
 MIN_SNR_DB = float(_w('min_snr_db', '0'))
 STOP_AFTER = _w('stop_after', 'gold')
 EVALUATION_MODE = _w('evaluation_mode', 'default')
+def _setpoint_from_condition(cond):
+    """"150A" -> 150.0. None when the condition is not a current.
+
+    `re` is imported inside, not at the top of the cell: this function is
+    DEFINED here and CALLED from the run cell, and the notebook's top-level
+    `import re` lives in a cell that runs later still. A module that is in
+    scope at definition time and not at call time is the same ordering trap
+    that took the Gamry block down.
+    """
+    import re as _re_sp
+    m = _re_sp.match(r'^\s*(\d+(?:[.,]\d+)?)\s*A\s*$', str(cond), _re_sp.I)
+    return float(m.group(1).replace(',', '.')) if m else None
+
+
 def _seg_list(name):
     return frozenset(x.strip() for x in
                      _w(name, '').replace(';', ',').split(',') if x.strip())
@@ -468,6 +498,7 @@ def _seg_list(name):
 EXCLUDE_SEGMENTS = _seg_list('exclude_segments')
 SUBSTITUTE_SEGMENTS = _seg_list('substitute_segments')
 FILL_GAPS = _w('fill_gaps', 'no') == 'yes'
+HF_ENSEMBLE = _w('hf_ensemble', 'no') == 'yes'
  
 # Select the plate for the whole session
 _plate = geom.use_plate(PLATE)
@@ -1527,6 +1558,11 @@ print(f"  Excluded:   "
       + (", ".join(sorted(EXCLUDE_SEGMENTS, key=lambda x: int(x)
                           if x.isdigit() else 0))
          + "   <-- left out of every stage" if EXCLUDE_SEGMENTS else "(none)"))
+print(f"  HF band:    "
+      + ("segment ensemble (schedule detected on the stacked segments)"
+         if HF_ENSEMBLE else
+         "UC reference only — the top of the band may stop short of the "
+         "HF intercept"))
 print(f"  Eval mode:  {EVALUATION_MODE}"
       + ("" if EVALUATION_MODE == 'default'
          else "   <-- NOT the pipeline defaults; exploratory"))
@@ -1620,6 +1656,16 @@ for cond in _conditions_to_run:
         exclude_segments=EXCLUDE_SEGMENTS,
         substitute_segments=SUBSTITUTE_SEGMENTS,
         fill_missing_from_neighbours=FILL_GAPS,
+        hf_use_ensemble=HF_ENSEMBLE,
+        # THE SETPOINT IS IN THE CONDITION NAME.
+        # "150A" is the setpoint, so the DC current closure can be checked
+        # without being told it separately -- and that check is the
+        # complement of the parallel-resistance one: it is sharp on the
+        # geometry and blind to the calibration, where the parallel closure
+        # is sharp on the calibration and blind to the geometry. Running one
+        # without the other leaves a disagreement unattributable, which is
+        # exactly the state a "[ -- ] no setpoint given" line leaves you in.
+        i_setpoint_a=_setpoint_from_condition(cond),
     )
 
     # ── Gate preset: named, not smuggled ──────────────────────────────────

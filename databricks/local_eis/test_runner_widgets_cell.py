@@ -150,3 +150,46 @@ def test_an_empty_volume_says_so_rather_than_inventing_conditions(volume,
     out = capsys.readouterr().out
     assert ns["CONDITIONS"] == ["450A", "60A", "45A", "150A"]
     assert "fallback" in out
+
+
+# ---------------------------------------------------------------------------
+# the two settings that decide whether the plausibility checks can run
+# ---------------------------------------------------------------------------
+
+
+def test_the_setpoint_is_read_from_the_condition(volume) -> None:
+    """"150A" IS the setpoint.
+
+    The DC current closure check reports "[ -- ] no setpoint given to compare
+    against" without it, and that check is the complement of the parallel
+    resistance one: sharp on the geometry and blind to the calibration, where
+    the parallel closure is the reverse. Running one without the other leaves
+    a disagreement unattributable.
+    """
+    ns = _run_cell(volume)
+    f = ns["_setpoint_from_condition"]
+    assert f("150A") == 150.0
+    assert f("45A") == 45.0
+    assert f("1.5A") == 1.5
+    assert f("1,5A") == 1.5          # the German decimal comma
+    assert f("ALL") is None          # not a current, so no claim is made
+    assert f("some_csv_file") is None
+
+
+def test_the_setpoint_helper_does_not_need_a_module_it_cannot_see(volume):
+    """It is defined in this cell and called from the run cell, while the
+    notebook's own `import re` is in a cell that runs later still."""
+    ns = _run_cell(volume)
+    src = RUNNER.read_text()
+    body = src[src.index("def _setpoint_from_condition"):]
+    body = body[:body.index("\ndef ")]
+    assert "import re" in body, "relies on a module bound in another cell"
+
+
+def test_the_hf_ensemble_switch_is_reachable(volume) -> None:
+    """The one setting that decides whether the band reaches the HF intercept
+    had no widget, so it could not be tried from the notebook at all."""
+    ns = _run_cell(volume)
+    assert ns["HF_ENSEMBLE"] is False
+    ns = _run_cell(volume, {"hf_ensemble": "yes"})
+    assert ns["HF_ENSEMBLE"] is True

@@ -919,6 +919,15 @@ _CACHE_IDENTITY_KEYS = (
     'min_snr_db', 'snr_floor_db', 'max_thd', 'max_drift',
     'sigma_rel_max', 'min_cycles_per_dwell', 'zmag_outlier_mad',
     'min_points_per_spectrum',
+    # THE GATES SILVER ACTUALLY APPLIES, which were missing from this key.
+    # min_snr_db and snr_floor_db above are bronze's -- they choose the basis
+    # of the grid fit and the polarity vote, and they do NOT decide which
+    # points survive. These two do, and they decide it decisively: measured
+    # on a synthetic whose SNR falls with frequency, moving them from -40 to
+    # +5 dB costs 16 of 40 points and takes the top of the band from 3000 Hz
+    # to 58 Hz. Leaving them out meant editing the setting that matters most
+    # would have been served from the cache computed with the old one.
+    'silver_snr_gate_db', 'silver_snr_floor_db',
     # The build decides WHICH whole-cell sweep the aggregate is compared
     # against, and that comparison is written into the manifest. Two builds
     # are two different references, so they are two different results.

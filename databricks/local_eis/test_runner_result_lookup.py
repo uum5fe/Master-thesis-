@@ -226,3 +226,31 @@ def test_the_exclusion_hashes_the_same_way_every_time(tmp_path) -> None:
         ns["EXCLUDE_SEGMENTS"] = frozenset(order)
         keys.add(ns["_run_identity"]())
     assert len(keys) == 1
+
+
+@pytest.mark.parametrize("field", ["silver_snr_gate_db", "silver_snr_floor_db",
+                                   "sigma_rel_max", "min_snr_db"])
+def test_every_gate_that_changes_the_result_changes_the_key(tmp_path, field):
+    """The cache key has to cover the gates that decide what survives.
+
+    silver_snr_gate_db and silver_snr_floor_db are the ones silver applies
+    per point; min_snr_db and snr_floor_db are bronze's and choose the grid
+    basis and the polarity vote. Both belong in the key, and the first pair
+    was missing from it -- so editing the setting with the largest effect on
+    the result would have been served from a cache computed with the old
+    value.
+    """
+    import config
+
+    a = _namespace(tmp_path)
+    b = _namespace(tmp_path)
+
+    def _identity(ns, **over):
+        base = config.DEFAULT.replace(**over)
+        payload = {k: getattr(base, k, None) for k in ns["_CACHE_IDENTITY_KEYS"]}
+        return payload
+
+    assert field in a["_CACHE_IDENTITY_KEYS"], f"{field} is not in the cache key"
+    before = _identity(a)
+    after = _identity(b, **{field: getattr(config.DEFAULT, field) - 1.0})
+    assert before != after

@@ -188,25 +188,44 @@ def test_the_old_single_choice_widget_is_removed(volume) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_recommended_profile_pins_the_gates_that_scattered_the_spectra(volume,
-                                                                        capsys) -> None:
-    """Widgets left at permissive / 0 dB / 4500 Hz by an earlier session are
-    overridden -- and the cell says which ones it ignored."""
+def test_recommended_profile_pins_the_settings_of_the_clean_script(volume,
+                                                                    capsys) -> None:
+    """Widgets left at permissive / 5 dB / 2000 Hz by an earlier session are
+    overridden with the clean script's values -- and the cell says which ones
+    it ignored. 5 dB is the value that cut 45 A off at ~90 Hz."""
     ns = _run_cell(volume, {"evaluation_mode": "permissive",
-                            "min_snr_db": "0", "f_max_hz": "4500.0"})
+                            "min_snr_db": "5", "f_max_hz": "2000.0"})
     assert ns["PARAM_PROFILE"] == "recommended"
     assert ns["EVALUATION_MODE"] == "default"
-    assert ns["MIN_SNR_DB"] == 5.0
-    assert ns["F_MAX"] == 2000.0
+    assert ns["MIN_SNR_DB"] == 0.0
+    assert ns["F_MAX"] == 4500.0
     assert ns["F_MIN"] == 0.15
     out = capsys.readouterr().out
     assert "evaluation_mode=permissive" in out and "ignored" in out
+    assert "min_snr_db=5" in out
 
 
 def test_custom_profile_uses_the_widgets(volume) -> None:
     ns = _run_cell(volume, {"param_profile": "custom",
                             "evaluation_mode": "permissive",
-                            "min_snr_db": "0", "f_max_hz": "4500.0"})
+                            "min_snr_db": "5", "f_max_hz": "2000.0"})
     assert ns["EVALUATION_MODE"] == "permissive"
-    assert ns["MIN_SNR_DB"] == 0.0
-    assert ns["F_MAX"] == 4500.0
+    assert ns["MIN_SNR_DB"] == 5.0
+    assert ns["F_MAX"] == 2000.0
+
+
+def test_the_clean_script_config_is_the_default() -> None:
+    """The two config values the clean 45 A script ran with."""
+    from config import DEFAULT
+    assert DEFAULT.fit_common_delay is False
+    assert DEFAULT.silver_snr_gate_db == -40.0
+
+
+def test_those_config_values_are_in_the_cache_key() -> None:
+    """They changed between the clean run and the scattered one without
+    changing the key, so a stale cache entry would have been served."""
+    src = RUNNER.read_text()
+    block = src[src.index("_CACHE_IDENTITY_KEYS = ("):]
+    block = block[:block.index("\n)")]
+    for k in ("fit_common_delay", "silver_snr_gate_db", "silver_snr_floor_db"):
+        assert f"'{k}'" in block, k

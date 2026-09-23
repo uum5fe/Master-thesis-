@@ -123,8 +123,15 @@ def test_the_heatmap_cell_draws_labelled_maps_without_plate_viewer(
     gold_dir.mkdir()
     pd.DataFrame(rows).to_csv(gold_dir / "plate_summary.csv", index=False)
 
-    shown = []
+    shown, ramps = [], {}
     monkeypatch.setattr(ipd, "display", lambda obj: shown.append(obj))
+    _draw = plate_maps.draw_value_map
+
+    def _spy(vals, label, *a, **k):
+        ramps[label] = k.get("cmap")
+        return _draw(vals, label, *a, **k)
+
+    monkeypatch.setattr(plate_maps, "draw_value_map", _spy)
     ns = {"plate_maps": plate_maps, "MIN_SNR_DB": 5.0,
           "EVALUATION_MODE": "default", "displayHTML": lambda h: None,
           "_widget": lambda *a, default='': "2612030",
@@ -137,6 +144,11 @@ def test_the_heatmap_cell_draws_labelled_maps_without_plate_viewer(
     assert len(shown) == 4
     rs_ax = shown[0].axes[0]
     assert "HFR (Rs)" in rs_ax.get_title(loc="left")
+    # each map keeps its original ramp; HFR is viridis again
+    assert ramps == {"HFR (Rs)": "viridis",
+                     "R_ct (charge transfer)": "inferno",
+                     "R_mt (mass transport)": "magma",
+                     "R_pol (total polarisation)": "magma"}
     assert f"{rows[0]['R_ohmic']:.1f}" in _texts(rs_ax)
     for f in shown:
         plt.close(f)

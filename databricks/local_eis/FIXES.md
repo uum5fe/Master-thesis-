@@ -328,13 +328,36 @@ shipped gates.  What the three settings let through:
 | `min_snr_db` (bronze step acceptance) | 5 (old) / 10 | 0 | more off-grid steps admitted |
 | `f_max_hz` | — | 4500 | rungs above ~2 kHz read −40…−80° where the Gamry sweep reads ≈ −10° |
 
-A new **Parameter profile** widget, `recommended` by default, pins
-evaluation mode = default, Min SNR = 5 dB, band 0.15–2000 Hz, and prints
-which widget values it ignored.  `custom` restores the widgets.  Databricks
-keeps a widget's old value when its default changes, which is why this is a
-profile rather than new defaults alone.  All three settings are in the cache
-key, so the first recommended run recomputes; it never overwrites a
-permissive entry.
+A new **Parameter profile** widget, `recommended` by default, pins the
+widget settings; `custom` restores the widgets.  Databricks keeps a widget's
+old value when its default changes, which is why this is a profile rather
+than new defaults alone.
+
+**Correction (Fix 12).**  The first version of the profile pinned Min SNR =
+5 dB and f_max = 2000 Hz.  5 dB was wrong for low current: bronze uses
+`min_snr_db` to accept off-grid steps and to choose the steps the grid fit
+rests on, and the 45 A excitation is about a tenth of the 450 A one, so at
+45 A every step above ~90 Hz fell below 5 dB and was never detected.  The
+spectra stopped at ~90 Hz while 450 A still reached ~900 Hz.
+
+The earlier notebook that drew clean arcs (45 A up to ~1 kHz) has
+bronze/silver/gold code identical to this folder.  Only settings differ:
+
+| setting | clean script | scattered run |
+|---|---|---|
+| evaluation mode | default | permissive |
+| Min SNR (bronze) | 0 dB | 0 dB, then 5 dB |
+| f_max | 4500 Hz | 4500 Hz, then 2000 Hz |
+| `fit_common_delay` (config) | **False** | True |
+| `silver_snr_gate_db` (config) | **−40 dB** | −20 dB |
+
+The profile now pins mode = default, Min SNR = 0 dB, 0.15–4500 Hz.
+`fit_common_delay` goes back to False, as its own comment in `config.py`
+always said: dt0 is degenerate with the series inductance, and a wrong dt0
+rotates the top of the band on a whole card.  `silver_snr_gate_db` goes back
+to −40 dB.  Both, plus `silver_snr_floor_db`, are now in the cache key.  They
+had changed without changing the key, so a stale entry could have been
+served as current.
 
 **Conditions multi-select.**  `condition` (single dropdown) is replaced by
 `conditions` (multiselect): tick e.g. 45A and 450A to evaluate only those.
@@ -353,7 +376,9 @@ staircase outlines from `r2d2_geometry`, prints number **and value** in every
 segment, and scales colour over the 5th–95th percentile (arrow ends for
 values outside, still printed as measured).  Mean, median, sd, CV and
 min..max are printed under the title.  The HFR map now uses the same `magma`
-ramp as the mass-transport map.  The ECM parameter maps use the same
+ramp as the mass-transport map; **Fix 12 put the HFR map back on its
+original `viridis`** (R_ct inferno, R_mt magma, R_pol magma because
+matplotlib has no `thermal`).  The ECM parameter maps use the same
 renderer instead of centroid dots.  `plate_viewer` (interactive, outside this
 folder) became optional.
 

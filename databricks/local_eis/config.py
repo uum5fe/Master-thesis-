@@ -564,7 +564,11 @@ class Config:
     # only to reproduce the old behaviour for comparison.
     drt_nonneg: bool = True
 
-    silver_snr_gate_db: float = -20.0    # silver, OFF-grid points
+    # -40 as in the script that produced the clean 45 A spectra. At -20 the
+    # weak off-grid top-of-band points of a LOW-current condition (45 A: a
+    # tenth of the 450 A excitation) are cut here even though sigma_rel_max
+    # -- the gate that is meant to decide -- would keep them.
+    silver_snr_gate_db: float = -40.0    # silver, OFF-grid points
     silver_snr_floor_db: float = -40.0   # silver, ON-grid points
 
     # THE GATE THAT ACTUALLY MATTERS.
@@ -641,7 +645,13 @@ class Config:
     #
     # Set True only when an independent calibration (e.g. a short-circuit
     # recording) pins the inductance separately.
-    fit_common_delay: bool = True
+    #
+    # BACK TO FALSE. It had been flipped to True while this note still said
+    # not to. The script that drew clean 45 A arcs up to ~1 kHz on RO2612030
+    # ran with False; the same code with True lost everything above ~90 Hz at
+    # 45 A and scattered 450 A, which is what a wrong dt0 rotating the top of
+    # the band into the non-passive half-plane looks like.
+    fit_common_delay: bool = False
 
     # Which converter architecture to assume for the DIFFERENTIAL skew.
     #   "auto"    fit both and keep the lower Kramers-Kronig residual

@@ -432,8 +432,8 @@ try:
     dbutils.widgets.dropdown('param_profile', 'recommended',
                              ['recommended', 'custom'], 'Parameter profile')
     dbutils.widgets.text('f_min_hz', '0.15', 'F min (Hz)')
-    dbutils.widgets.text('f_max_hz', '2000.0', 'F max (Hz)')
-    dbutils.widgets.dropdown('min_snr_db', '5',
+    dbutils.widgets.text('f_max_hz', '4500.0', 'F max (Hz)')
+    dbutils.widgets.dropdown('min_snr_db', '0',
                              ['-30', '-20', '-10', '-3', '0', '3', '5', '8',
                               '10'],
                              'Min SNR (dB)')
@@ -523,47 +523,42 @@ SELECTED_CONDITIONS = parse_conditions(_w('conditions', 'ALL'), CONDITIONS)
 COND_FILTER = ('ALL' if SELECTED_CONDITIONS == list(CONDITIONS)
                else ', '.join(SELECTED_CONDITIONS))
 F_MIN = float(_w('f_min_hz', '0.15'))
-F_MAX = float(_w('f_max_hz', '2000.0'))
-MIN_SNR_DB = float(_w('min_snr_db', '5'))
+F_MAX = float(_w('f_max_hz', '4500.0'))
+MIN_SNR_DB = float(_w('min_snr_db', '0'))
 STOP_AFTER = _w('stop_after', 'gold')
 EVALUATION_MODE = _w('evaluation_mode', 'default')
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  RECOMMENDED PARAMETERS -- WHY THE 150 A / 450 A SPECTRA WERE SCATTERED
+#  RECOMMENDED PARAMETERS = THE SETTINGS OF THE SCRIPT THAT DREW CLEAN ARCS
 # ═══════════════════════════════════════════════════════════════════════════
-# The scattered Nyquist plots (points flung to -Z'' = -90 .. +110, spikes at
-# 1, 3, 10 and 20 Hz on one group of segments, phase diving to -80 deg above
-# 1 kHz) were read from  <cond>/mode_permissive/snr_0.0_<digest>/  -- the run used
-# Evaluation mode = permissive and Min SNR = 0 dB, f_max = 4500 Hz. The clean
-# arcs of the earlier run came from the shipped gates. What each setting did:
+# Reference: the earlier notebook that gave clean 45 A arcs up to ~1 kHz and
+# clean 150 A / 450 A spectra on RO2612030. Its bronze/silver/gold code is
+# identical to this folder's; what differs is settings only:
 #
-#   permissive preset   sigma_rel_max 0.60 -> 1.5   keeps phasors whose
-#                                                   propagated uncertainty
-#                                                   is 150 % of |Z| -- noise
-#                       zmag_outlier_mad 4.5 -> 8   lets the single-frequency
-#                                                   |Z| spikes through
-#                       max_thd / max_drift -> 0.5  keeps distorted and
-#                                                   non-stationary dwells
-#                       min_cycles 3 -> 1           one-cycle phasors at the
-#                                                   low-frequency end
-#   Min SNR 0 dB        bronze uses this number to accept OFF-grid steps,
-#                       to pick the basis of the grid fit and to decide the
-#                       polarity. At 0 dB it admits steps the pipeline's own
-#                       default (10 dB) and the version that drew the clean
-#                       arcs (5 dB) refuse. Silver's per-point backstop is a
-#                       separate setting and is not affected.
-#   f_max 4500 Hz       the rungs above ~2 kHz come out capacitive (phase
-#                       -40 .. -80 deg) on most segments AND in the area-
-#                       weighted aggregate, while the Gamry sweep of the same
-#                       cell reads about -10 deg there. That is not the cell;
-#                       the clean plot never showed anything above 2 kHz.
+#                               clean script    scattered run
+#   evaluation mode             default         permissive
+#   Min SNR (bronze)            0 dB            0 dB  (then 5 dB, see below)
+#   f_max                       4500 Hz         4500 Hz
+#   fit_common_delay (config)   False           True
+#   silver_snr_gate_db (config) -40 dB          -20 dB
 #
-# The 'recommended' profile pins these three to the values below. Pick
-# 'custom' in the Parameter profile widget to explore anything else -- the
-# mode and settings are still part of the cache key, so an exploratory run
-# never overwrites a recommended one.
-RECOMMENDED_PARAMS = dict(evaluation_mode='default', min_snr_db=5.0,
-                          f_min_hz=0.15, f_max_hz=2000.0)
+# The two config values are restored in config.py (and are now part of the
+# cache key). 'permissive' loosens sigma_rel_max to 1.5, zmag_outlier_mad to
+# 8 and thd/drift to 0.5, which keeps noise and spikes -- it is not used here.
+#
+# A 5 dB SNR gate was tried in between and was WRONG for 45 A: bronze uses
+# min_snr_db to accept off-grid steps and to decide which steps the grid fit
+# rests on. The excitation at 45 A is about a tenth of the 450 A one, so the
+# steps above ~90 Hz sit below 5 dB at 45 A and were never detected -- the
+# 45 A spectra stopped at ~90 Hz while 450 A still reached ~900 Hz. 0 dB is
+# what the clean script used; silver's uncertainty gate (sigma_rel_max 0.60)
+# and |Z| outlier gate are what keep noise out, per point.
+#
+# 'recommended' pins these widget values; 'custom' in the Parameter profile
+# widget uses the widgets instead. The mode and all these settings are in the
+# cache key, so different settings never share a cache entry.
+RECOMMENDED_PARAMS = dict(evaluation_mode='default', min_snr_db=0.0,
+                          f_min_hz=0.15, f_max_hz=4500.0)
 PARAM_PROFILE = _w('param_profile', 'recommended')
 if PARAM_PROFILE == 'recommended':
     _now = dict(evaluation_mode=EVALUATION_MODE, min_snr_db=MIN_SNR_DB,
@@ -1050,6 +1045,9 @@ _CACHE_IDENTITY_KEYS = (
     'align_corroborate_min_prominence',
     'ladder_snap', 'window_sanity', 'hf_use_ensemble',
     'phasor_method', 'skew_model', 'uncertainty_model',
+    # Both changed between the clean script and the scattered run without
+    # changing the key, so a stale entry would have been served as current.
+    'fit_common_delay', 'silver_snr_gate_db', 'silver_snr_floor_db',
 )
 # min_ref_channels is deliberately NOT in the key: it is set from the number
 # of cards the condition actually has, which is a property of the data, not
@@ -2603,7 +2601,7 @@ import matplotlib.pyplot as plt
 _CACHE_VOL = Path('/Volumes/ps_xplatform_dev/rvadvtec_dev/ev_rvadvtec_dev/EIS_Results')
 
 _FIELD_DEFS = [
-    ('R_ohmic',      'HFR (Rs)',                   'mohm.cm2', 'magma',   1),
+    ('R_ohmic',      'HFR (Rs)',                   'mohm.cm2', 'viridis', 1),
     ('R_ct',         'R_ct (charge transfer)',     'mohm.cm2', 'inferno', 1),
     ('R_mt',         'R_mt (mass transport)',      'mohm.cm2', 'magma',   1),
     ('R_pol',        'R_pol (total polarisation)', 'mohm.cm2', 'thermal', 1),
@@ -2723,9 +2721,10 @@ for cond, (gold_csv, prov) in sorted(_COND_GOLD.items()):
                     f'style="border:none;"></iframe>')
 
     # ── Static maps, one per parameter, VALUE PRINTED IN EVERY SEGMENT ──
-    # All resistance maps share one look: the 'magma' ramp the mass-transport
-    # map always had, and a colour scale over the 5th..95th percentile of the
-    # plate. On a min..max scale one low segment (e.g. 50 against a plate of
+    # Each map keeps its own ramp from _FIELD_DEFS (HFR viridis, R_ct
+    # inferno, R_mt magma; R_pol's 'thermal' is not a matplotlib ramp, so it
+    # is drawn in magma). The colour scale covers the 5th..95th percentile of
+    # the plate. On a min..max scale one low segment (e.g. 50 against a plate of
     # 60-70 mOhm.cm2) stretches the bar and the rest of the plate collapses
     # into a few shades -- the uniformity pattern is in the numbers but not
     # in the colours, which is how the HFR map looked. Values outside the
@@ -2733,13 +2732,13 @@ for cond, (gold_csv, prov) in sorted(_COND_GOLD.items()):
     # colour bar gets an arrow for them.
     _classes = ({str(int(r['segment'])): str(r['class'])
                  for _, r in df.iterrows()} if 'class' in _cols else {})
-    _STATIC = [('R_ohmic', 'magma'), ('R_ct', 'magma'), ('R_mt', 'magma'),
-               ('R_pol', 'magma')]
     _defs = {d[0]: d for d in _FIELD_DEFS}
-    for col, ramp in _STATIC:
+    for col in ('R_ohmic', 'R_ct', 'R_mt', 'R_pol'):
         if col not in _cols or col not in _defs:
             continue
-        _, label, unit, _ramp_unused, dec = _defs[col]
+        _, label, unit, ramp, dec = _defs[col]
+        if ramp not in plt.colormaps():
+            ramp = 'magma'
         vals = {int(r['segment']): float(r[col]) for _, r in df.iterrows()
                 if pd.notna(r[col]) and np.isfinite(r[col])}
         if not vals:
@@ -3211,7 +3210,7 @@ for cond, blob in ECM_ALL.items():
 # maps and the Nyquist overlays can never disagree about what was fitted.
 #
 # Drawn with plate_maps: the real segment outlines, the fitted VALUE printed
-# inside every segment, and the same 'magma' ramp over the 5th..95th
+# inside every segment, and the same ramps (Rs viridis) over the 5th..95th
 # percentile as the pipeline's own maps above -- so an ECM Rs map and a
 # pipeline HFR map can be read side by side. (This cell used to draw one dot
 # per segment centroid on an RdYlGn ramp, which showed neither the segment
@@ -3229,19 +3228,19 @@ for cond, blob in ECM_ALL.items():
         continue
  
     _maps = [
-        ('Rs (ECM)',    {s: r['params']['Rs'] * 1000 for s, r in seg_fits.items()}),
-        ('R_ct (ECM)',  {s: r['R_ct'] * 1000        for s, r in seg_fits.items()}),
-        ('R_pol (ECM)', {s: r['R_pol'] * 1000       for s, r in seg_fits.items()}),
+        ('Rs (ECM)',    {s: r['params']['Rs'] * 1000 for s, r in seg_fits.items()}, 'viridis'),
+        ('R_ct (ECM)',  {s: r['R_ct'] * 1000        for s, r in seg_fits.items()}, 'inferno'),
+        ('R_pol (ECM)', {s: r['R_pol'] * 1000       for s, r in seg_fits.items()}, 'magma'),
     ]
  
-    for param_name, param_map in _maps:
+    for param_name, param_map, ramp in _maps:
         param_map = {str(k): v for k, v in param_map.items()
                      if str(k) in geom.SEGMENTS and np.isfinite(v)}
         if len(param_map) < 3:
             print(f"  {cond}: too few segments with coordinates for {param_name}")
             continue
         fig_h, ax = plate_maps.draw_value_map(
-            param_map, label=param_name, unit='mΩ·cm²', cmap='magma',
+            param_map, label=param_name, unit='mΩ·cm²', cmap=ramp,
             decimals=1,
             title=f'{param_name} — Leepa {LEEPA}, {cond} '
                   f'({len(param_map)} segments)')

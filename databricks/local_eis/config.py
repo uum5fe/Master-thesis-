@@ -72,6 +72,26 @@ FLOW_AXIS = "x"
 # Flow-channel separator lines (mm in y), for the plate drawing only.
 FLOW_CHANNEL_Y_MM = (30.25, 60.50, 90.75)
 
+# WHICH WAY THE GASES ACTUALLY GO.
+# The maps used to be titled "gas flows left to right", which is true of one
+# gas and false of the other: on this bench the plate is COUNTER-FLOW -- H2
+# enters at the bottom left and leaves top right, air enters at the bottom
+# right and leaves top left. The distinction is not cosmetic. Under co-flow
+# both inlets are at the same end, so a hydration gradient is monotonic along
+# the plate; under counter-flow each gas is driest at its own end, so the
+# membrane can be driest at BOTH ends and wettest in the middle. A reader
+# told "left to right" will look for a monotonic trend that counter-flow has
+# no reason to produce.
+#
+# Set to "co" (both inlets at x = 0) or "counter" for the rebuild being
+# evaluated; the maps and the trend diagnostic annotate themselves from it.
+FLOW_ARRANGEMENT = "counter"
+FLOW_DESCRIPTION = {
+    "counter": "counter-flow: H2 left to right, air right to left",
+    "co": "co-flow: both gases left to right",
+    "unknown": "flow arrangement not recorded",
+}
+
 
 # ===========================================================================
 # 2. ACQUISITION
@@ -84,7 +104,7 @@ FLOW_CHANNEL_Y_MM = (30.25, 60.50, 90.75)
 # flags them as inferred rather than pretending they were measured).
 N_CARDS = 5
 CHANNELS_PER_CARD = 16
-NOMINAL_FS_HZ = 10_000.0
+NOMINAL_FS_HZ = 25_000.0
 
 # Segments with a known hardware fault, as segment -> reason.  Anything listed
 # here is skipped in bronze and drawn on the map as "bad" rather than measured.
@@ -117,6 +137,8 @@ KNOWN_BAD_SEGMENTS: dict[str, str] = {}
 #: should take minutes never finished.
 FAMOS_PATTERNS = (
     "Leepa_{leepa}_Current_{cond}_Test_{test}_Karte_*.DAT",
+    "Leepa_RO{leepa}_Current_{cond}_Test_{test}_Karte_*.DAT",
+    "Leepa_RO{leepa}_Current_{cond}_Test_*_Karte_*.DAT",
     "RO{leepa}-*_Current_{cond}_Test_{test}_Karte_*.DAT",
     "{leepa}_Current_{cond}_Test_{test}_Karte_*.DAT",
 )
@@ -195,6 +217,20 @@ class Config:
     gamry_dir: Path | None = None
     bench_log: Path | None = None    # ASAM MDF4; defaults to one in gamry_dir
 
+    # WHICH CAMPAIGN'S SWEEPS, WHEN THE FOLDER HOLDS SEVERAL.
+    # A whole-cell sweep is named "V26_092_HFR_101_CurrVal_45.dta": it carries
+    # the BUILD TOKEN and no order number at all. The measurement file for the
+    # same cell, "..._RO2612030-01_V26_092_lokale_EIS_6_Boxen_3.mf4", carries
+    # both, which is what lets an order be resolved to a build and a build to
+    # its sweeps.
+    #
+    # Leave it empty and a shared Gamry folder is read whole. That is not a
+    # loud failure: sweeps are keyed by current, every campaign has a 45 A,
+    # and the last file read simply replaces the earlier one. The comparison
+    # then runs this cell's local aggregate against another cell's reference
+    # with nothing visibly wrong. Set it whenever the folder is shared.
+    gamry_version: str = ""          # e.g. "V26_092"
+
     # EQUAL-AREA MODE.  The plate's true segment areas span 0.678..8.470
     # cm^2, a factor of 12.5.  Setting this replaces them all with
     # A_CELL/72 = 4.235 cm^2.  Local ASR is area-free and does not move,
@@ -216,8 +252,19 @@ class Config:
     # bronze.py now finds the schedule once, globally, and silver.py only ever
     # fits at known frequencies, the usable ceiling is set by signal amplitude
     # rather than by the search.
+    #
+    # THE CEILING WAS THE CONFIG CONSTANT, NOT NYQUIST.  A real card header
+    # from the campaign reads dx = 1.0e-5 s, i.e. fs = 100 kHz on 16
+    # channels, so f_hi(fs) = min(f_max_hz, 0.45*fs) = min(4500, 45000) =
+    # 4500 Hz: the converter had 45 kHz of headroom it was never asked for.
+    # On RO2612025-01 card 4 (fs = 50 kHz) the Gamry band recorded in the
+    # file runs to 23.9 kHz while the pipeline stopped at 7.47 Hz.  Raising
+    # this is NECESSARY BUT NOT SUFFICIENT -- on its own it took that card
+    # from 11 recovered steps to 13, with the same 7.47 Hz top.  What
+    # recovers the band is hf_schedule (see hf_use_ensemble below); this
+    # constant only stops binding before it gets the chance.
     f_min_hz: float = 0.15
-    f_max_hz: float = 4500.0
+    f_max_hz: float = 30000.0
     f_hi_frac_fs: float = 0.45       # detection ceiling as a fraction of fs
     ppd: int = 12                    # points per decade of the detection grid
 
@@ -228,6 +275,21 @@ class Config:
     # membership.
     min_ref_channels: int = 2
     grid_tol: float = 0.01
+    # THE REFERENCE CHANNEL IS NAMED, NOT DISCOVERED.
+    # One cell-voltage line is fanned out to every Dewetron card, on UC2, and
+    # the remaining UC inputs are unconnected or carry something else. The
+    # code used to take the UC channel with the largest standard deviation on
+    # each card independently, which is free to land on a DIFFERENT channel
+    # per card -- and an unconnected input is exactly the kind of channel an
+    # argmax on std likes, because a floating input is noisy. Cross-
+    # correlating one card's UC2 against another's UC1 then returns the lag
+    # of two unrelated signals, which can pass both the prominence gate and
+    # the absolute floor while meaning nothing, and every dwell window on
+    # that card lands on the wrong tone. Naming the channel makes the wiring
+    # an input to the pipeline instead of something it re-guesses per file.
+    # Set this (or EIS_REF_CHANNEL, or --ref-channel) if a campaign was wired
+    # to a different line; empty string restores the old per-card argmax.
+    ref_channel: str = "UC2"
     align_cards: bool = True         # cross-correlate cards onto a common t0
     # The Dewetron cards are ARMED SEPARATELY.  Measured on the 45 A set:
     # card 3 starts 5.712 s after card 1, cards 4/5 about 2.54 s after.
@@ -249,16 +311,261 @@ class Config:
     # 30 seeds, while a correct lag at the field data's own |r| ~ 0.27 scores
     # ~250.  25 sits three times above the noise ceiling and ten times below
     # the real signal, so it is not a close call in either direction.
-    align_min_corr: float = 0.05        # absolute floor against pure garbage
-    align_min_prominence: float = 25.0  # robust sigma above the background
+    # MEASURED SEPARATION, NOT A GUESS.  On RO2612030 the correct lags score
+    # |r| = 0.980-0.998 on every healthy card at 45 A and 450 A.  At 150 A
+    # cards 1 and 2 score |r| = 0.083 -- a dead cell-voltage reference -- yet
+    # 0.083 cleared the old 0.05 floor, so an 8.63 s lag was ACCEPTED and
+    # applied.  The consensus schedule then carried windows from two
+    # incompatible time bases 17.7 s apart (= 2 x 8.63 s), 13 of its 45 steps
+    # sat out of time order, and the 75-189 Hz block survived only on the two
+    # shifted cards.  Real and false lags differ here by a factor of twelve;
+    # 0.5 sits halfway between them in the log and nothing on this campaign
+    # falls in between.
+    # ---- card alignment filter band ---------------------------------------
+    # The alignment cross-correlation runs on a band-passed copy of the
+    # reference. This band exists ONLY to estimate the lag -- it never limits
+    # the reported impedance spectrum -- but it was hard-coded at 0.5-300 Hz
+    # in bronze.py, so a sensitivity study meant editing the module and no
+    # run recorded which band produced its lags. Both limits are clamped to
+    # 0.45*fs per card, so a band above a slow card's Nyquist degrades to
+    # that card's usable top rather than zeroing its whole spectrum.
+    align_f_lo_hz: float = 0.5
+    align_f_hi_hz: float = 300.0
+    # THE PROMINENCE GUARD IS A TIME, NOT A SAMPLE COUNT.
+    # The guard excludes the peak's own shoulders from the background the
+    # peak is scored against. The correlation peak of a band-limited signal
+    # is about 1/align_f_lo_hz wide, i.e. 2 s at 0.5 Hz -- a duration. The
+    # old fixed 5000 samples is 0.5 s on a 10 kHz card and 0.05 s on a
+    # 100 kHz one, so the same recording scored differently for no reason but
+    # its sample rate, and on the fast cards most of the shoulder was counted
+    # as background, which UNDERSTATES a real peak.
+    #
+    # 2.0 s (= 1/align_f_lo_hz) is measured, not assumed. On the 60 s
+    # synthetic of test_card_alignment.py, sweeping the guard from 0.05 s to
+    # 4 s (see test_prominence_guard.py):
+    #
+    #     guard      null max (30 seeds)     correct 5.7121 s lag
+    #     0.05 s          8.53                      252
+    #     0.20 s          8.53                      258
+    #     2.00 s          8.51                      345
+    #     4.00 s          8.47                      417
+    #
+    # The null does not move -- noise has no shoulders, so widening the
+    # excluded region changes nothing about its background -- while a real
+    # peak climbs, because its own shoulders stop being averaged into the
+    # background it is scored against. Separation goes from ~30x to ~41x at
+    # no cost, and because only real peaks move, nothing that passed
+    # align_min_prominence before can fail it now.
+    #
+    # WHAT THIS DOES NOT FIX. The null ceiling stays at ~8.5, so the 15.0
+    # gate below still clears it by 1.8x, not the 2x that
+    # test_card_alignment.py::test_noise_alone_produces_no_prominent_peak
+    # demands -- that test fails for that reason and the failure is real.
+    # The gate was cut from 25 to 15 because RO2612030's genuine alignments
+    # scored 21-22 at a 0.2 s guard; those same peaks should score ~1.3x
+    # higher at 2.0 s, which would leave room to put the gate back up. That
+    # is a threshold to re-derive from a re-run of the field data, not to
+    # guess at here.
+    align_guard_s: float = 2.0
+    align_min_corr: float = 0.50        # absolute floor against pure garbage
+    align_min_prominence: float = 15.0  # robust sigma above the background
+    # NOTE: was 25.0 but that refused clearly-correct alignments on 25 kHz
+    # recordings (RO2612030: prominence 21-22, |r| > 0.994).  15.0 is still
+    # 3.5x above the noise floor (worst genuinely-bad alignment was 4.1 on
+    # RO2612025) while accepting these valid results.
+
+    # ---- corroboration between cards --------------------------------------
+    # A weak peak that a SECOND card independently reproduces is a different
+    # claim from a weak peak alone: the cards are armed in groups, so two of
+    # them sharing a trigger genuinely share an offset, while noise does not
+    # put two independent correlations 2 ms apart on an 8.6 s lag. A card
+    # whose prominence falls between align_corroborate_min_prominence and
+    # align_min_prominence is accepted if another card agrees to within
+    # align_agree_tol_s.
+    #
+    # THIS RELAXES PROMINENCE ONLY, NEVER align_min_corr. The pair this rule
+    # was written from -- RO2612030 at 150 A, cards 1 and 2, +215634 and
+    # +215687 samples, 53 samples apart -- scored |r| = 0.083 on a dead
+    # reference, and the 0.50 floor still refuses it. Corroboration buys a
+    # card past a ragged peak, not past a dead channel.
+    #
+    # 20 ms is the agreement window because it is an order of magnitude above
+    # the 2.1 ms that two genuinely co-triggered cards differed by, and three
+    # orders below the offsets being confirmed. 5.0 is the corroboration
+    # floor because 4.1 is the worst genuinely-bad alignment measured on this
+    # campaign (RO2612025); below that, agreement proves nothing.
+    # Set align_corroborate_min_prominence above align_min_prominence to
+    # disable the mechanism.
+    align_agree_tol_s: float = 0.02
+    align_corroborate_min_prominence: float = 5.0
+
+    # ---- alignment diagnostics (report-only, never a gate) -----------------
+    # A constant lag corrects a different start TIME. It does not test that
+    # two cards kept the same sample RATE: at 20 ppm over a 300 s record the
+    # two slide 6 ms apart, a quarter of a 25 ms dwell, so the windows at one
+    # end of the sweep walk off their tone while the other end looks perfect.
+    # The lag is re-estimated in blocks, each compared over the SAME physical
+    # interval, and the slope of lag against time is reported in ppm.
+    #
+    # These numbers are recorded, logged and never used to refuse a lag. A
+    # diagnostic that becomes a gate the day it is written is a gate whose
+    # threshold was never checked against a distribution; per the rollout
+    # plan these run in report-only mode until the ppm and closure
+    # distributions have been seen across 45/60/150/450 A.
+    align_drift_blocks: int = 5          # < 3 disables the diagnostic
+    align_drift_half_window_s: float = 0.050
+    align_max_clock_ppm: float = 20.0
+
+    # ---- high-frequency schedule recovery (bronze, hf_schedule.py) --------
+    # The blind detector used to be run on the card's REFERENCE channel, the
+    # UC* cell-voltage channel with the largest standard deviation.  The
+    # sweep is galvanostatic, so the amplitude arriving there is
+    # |i_ac| * |Z_cell(f)|, and |Z_cell| falls by an order of magnitude from
+    # the bottom of the band to its ~45 mOhm*cm2 minimum near 8 kHz.  The
+    # detector was being asked to find a tone exactly where the cell had
+    # removed it -- which no value of min_snr_db can undo.
+    #
+    # The SEGMENT channels measure current density, and current is what the
+    # sweep imposes, so their tone amplitude is flat in frequency.  Stacking
+    # the ~14 of them on a card adds the tone coherently and the noise in
+    # power.  Measured on RO2612025-01 card 4 at 45 A: +11.2 dB narrowband
+    # over UC2 above 1 kHz, and the recovered band went 11 -> 21 steps
+    # (0.478 .. 189 Hz) on the stack alone, 42 steps (0.478 .. 18.9 kHz)
+    # with the ladder extension below.
+    #
+    # STACK PER CARD, NOT ACROSS THE PLATE.  Pooling all five cards scored
+    # WORSE than one card on the synthetic (23/26 against 26/26): the cards
+    # are not on a common time base until estimate_card_lags has run, and
+    # the residual sub-sample offsets plus the per-slot multiplexer skew make
+    # the sum partially destructive at the top of the band.  Each card gets
+    # its own stack and consensus_schedule does the cross-card vote it
+    # already does.
+    # OFF BY DEFAULT, AND THIS IS A REVERSAL.
+    # It was on. On RO2612025-01 at 150 A, where the cell voltage really has
+    # collapsed, detecting on the ensemble is the difference between a band
+    # and no band. On RO2611976-01 at 45 A and 60 A it made a working result
+    # WORSE: the stack is a more sensitive detector, so on a record that is
+    # mostly not swept -- and that one is 252 s carrying about 23 s of sweep
+    # -- it finds more candidates in the idle stretches too, and the schedule
+    # inflates. Silver then has more junk to gate than signal to keep, and
+    # the Nyquist that came out was a zigzag where the old path drew clean
+    # arcs.
+    #
+    # A change that can make a good result bad has to be opted into, not out
+    # of. Off, this whole module is inert and the pipeline is exactly the one
+    # that produced those arcs. Turn it on per campaign, with --ensemble, and
+    # compare.
+    hf_use_ensemble: bool = False    # detect on the stacked segment ensemble
+    hf_ladder_extend: bool = True    # predict-and-verify the missing rungs
+    # Generators are asked for round numbers of points per decade; a free fit
+    # is not.  On card 4 a ladder fitted on the fifteen steps below 12 Hz
+    # returned 10.059 points/decade, and that 0.13 % error in r compounds
+    # with the rung index: checked blind against fifteen tones observed
+    # between 946 Hz and 24 kHz, the prediction error grew monotonically from
+    # +3.4 % to +5.8 %, so the extension found noise.  Snapping to 10 brings
+    # the same blind prediction to -0.9 .. +1.0 %, and 27 of 32 predicted
+    # rungs then verify.
+    hf_ladder_snap_ppd: bool = True  # snap the fitted spacing to an integer
+    hf_ladder_tol: float = 0.02      # relative window for ladder membership
+
+    # ---- consensus ladder snap -------------------------------------------
+    # After the cross-card consensus, replace each step frequency by the exact
+    # rung of the sweep's own geometric ladder.  The detector's frequency
+    # estimate is good to ~0.5 % on a clean dwell but drifts to >1 % where the
+    # window was mis-cut, and the sine fit is evaluated AT THE REPORTED
+    # FREQUENCY: 1.12 % at 596.99 Hz over the 0.2498 s dwell is 1.67 cycles of
+    # phase slip, measured at -16.5 dB on cards 1, 4 and 5 of RO2612030 while
+    # the same step passed on cards 2 and 3.  Snapping also collapses the
+    # duplicate detections that share a dwell window: 71 -> 45 steps at 45 A
+    # and 77 -> 45 at 450 A, both recovering 10 points/decade independently.
+    ladder_snap: bool = True
+    ladder_snap_ppd: int | None = None   # None = recover it from the data
+
+    # ---- dwell-window sanity ----------------------------------------------
+    # A stepped sweep visits its rungs in order, so the window start time is
+    # monotonic in frequency.  A step that breaks that order, or whose dwell
+    # is a small fraction of the local dwell, did not come from the sweep --
+    # the detector latched onto something else and the ladder snap carried it
+    # through, because the snap corrects frequencies and not windows.  On
+    # RO2612030 at 450 A the 1501.05 Hz rung claimed a window at t = 246.9 s,
+    # 132 s after both neighbours and outside the swept part of the record,
+    # with a 0.036 s dwell against a local median of 0.240 s; all 68 segments
+    # rejected it.  The repair interpolates the window in log-frequency from
+    # the steps that do sit in order.  It is a PREDICTION, not a measurement:
+    # the quality gates still decide whether a real tone is found there.
+    window_sanity: bool = True
+    window_min_dwell_frac: float = 0.40
+    # A few stray windows are a detector slip. Half the schedule out of order
+    # is a second time base -- a card lag accepted on a correlation that
+    # should have refused it -- and repairing those windows would hide the
+    # fault. Above this fraction the repair refuses and says so.
+    window_max_repair_frac: float = 0.25
+    # OFF BY DEFAULT.  Pruning is the only part of the ensemble path that can
+    # REMOVE a step the old pipeline would have kept, so it is the only part
+    # that can make a run worse -- and it did, on real 45 A data: a band that
+    # reached 550 Hz came back reaching 375 Hz.  A detection is a measurement;
+    # the ladder is a model fitted on a handful of low-frequency steps and
+    # extrapolated upward, and at the top of the band, where its extrapolation
+    # error is largest, the model is the one more likely to be wrong.  Left
+    # off, the ensemble path is purely additive.  Turn it on for a record with
+    # a continuous interferer the detector keeps latching onto -- the one case
+    # ladder membership handles and an SNR gate provably cannot -- and read
+    # off_ladder_hz in the manifest to see what it took.
+    hf_ladder_prune: bool = False    # drop detections that miss the ladder
+    # Averaging SEGMENT impedances across cards is wrong -- they are
+    # different segments.  Averaging the five UC channels is not: they are
+    # five measurements of one cell voltage, with uncorrelated front-end
+    # noise, and the reference is the weak phasor now that detection has
+    # moved off it.  Worth ~7 dB exactly where it is weakest.
+    # Off for the same reason: it replaces each card's own reference phasor,
+    # and it reports ref_slot = 0 to silver's skew model on the strength of a
+    # rotation this has not been validated against field data.
+    hf_pool_reference: bool = False  # inverse-variance mean of A_uc across cards
 
     # ---- per-step quality gates -------------------------------------------
     # A step that lies on the sweep's own geometric grid is a real step: a
     # geometric progression is not something noise produces.  For those, SNR
     # stops being a membership test and becomes a WEIGHT in the KK fit.
     # Off-grid candidates still face the full gate.
-    min_snr_db: float = 5.0          # gate for OFF-grid steps
+    min_snr_db: float = 10.0          # gate for OFF-grid steps
     snr_floor_db: float = -3.0       # absolute floor even for on-grid steps
+
+    # SILVER'S OWN SNR BACKSTOP, SEPARATE FROM THE TWO ABOVE.
+    # `min_snr_db` is overloaded: bronze uses it for blind detection, for the
+    # basis of the grid fit, and for the polarity decision, where a strict
+    # value is right.  Silver used the SAME number as a per-point membership
+    # test, where it is wrong, because raw SNR does not decide whether a
+    # phasor is usable -- N*gamma does (Rife & Boorstyn), and the dwell N
+    # spans three orders of magnitude across one sweep.  Measured on
+    # RO2612030: a 10 % phasor needs -37 dB at 0.20 Hz, -20 dB at 95 Hz and
+    # -18 dB at 377 Hz.  No single number is right at both ends, and at
+    # min_snr_db = 5 dB the frequencies with full 68/68 coverage stop at
+    # 47.5 Hz (45 A) and 3.7 Hz (450 A) -- which is why the heat maps above
+    # the low-frequency arc were unreadable.
+    #
+    # sigma_rel_max below is the physically correct gate and already folds in
+    # the dwell length.  It is bimodal on real data: 2918 of 4828 points at
+    # 45 A sit below sigma_rel = 0.10 and only 102 fall in 0.03..0.10, so the
+    # threshold sits in a genuine valley rather than on a slope.  These two
+    # are left far below where they bind, as a backstop against pathological
+    # points, not as the main filter.  Set them to 5.0 / -3.0 to reproduce
+    # the old behaviour exactly.
+    # gamma >= 0 IN THE DRT. A distribution of relaxation times is a sum of
+    # RC elements of a passive network, so it cannot be negative. The
+    # unconstrained posterior does go negative on noisy data, and not
+    # slightly: it describes the low-frequency arc with excess weight at
+    # mid tau and cancels it with negative weight at slow tau. The slow
+    # bucket then sums negative, gold clamped that to a hard 0.0, and the
+    # plate reported "no mass transport" everywhere while R_ct absorbed the
+    # difference. On a synthetic carrying R_ct = 40 and R_mt = 30 mOhm*cm2,
+    # the unconstrained fit returns R_mt = 15 and R_ct = 46 at zero noise and
+    # R_pol biased -37 % at 8 % noise; constrained it returns 30.6 and 38.2,
+    # with R_pol within 3.5 % and the same fit to the data. Turn this off
+    # only to reproduce the old behaviour for comparison.
+    drt_nonneg: bool = True
+
+    silver_snr_gate_db: float = -20.0    # silver, OFF-grid points
+    silver_snr_floor_db: float = -40.0   # silver, ON-grid points
 
     # THE GATE THAT ACTUALLY MATTERS.
     # Raw SNR is the wrong quantity to threshold on, because a long dwell
@@ -334,7 +641,7 @@ class Config:
     #
     # Set True only when an independent calibration (e.g. a short-circuit
     # recording) pins the inductance separately.
-    fit_common_delay: bool = False
+    fit_common_delay: bool = True
 
     # Which converter architecture to assume for the DIFFERENTIAL skew.
     #   "auto"    fit both and keep the lower Kramers-Kronig residual
@@ -362,7 +669,8 @@ class Config:
     # setting is "correct" -- the honest procedure is to run both and read
     # the flags column to see which points differ and why.
     preset_name: str = "default"
-    max_thd: float = 0.10            # linearity (Giner-Sanz 2015)
+    max_thd: float = 0.10
+              # linearity (Giner-Sanz 2015)
     max_drift: float = 0.25          # amplitude stationarity across sub-windows
 
     # ---- phasor estimation (silver) ---------------------------------------
@@ -488,6 +796,39 @@ class Config:
         default_factory=lambda: frozenset(KNOWN_BAD_SEGMENTS)
     )
 
+    # ---- reconstructing a segment from the ones around it ------------------
+    # THREE DIFFERENT THINGS, KEPT APART ON PURPOSE.
+    #
+    #   exclude_segments      the segment is gone. No measurement, no value,
+    #                         no place in the aggregate. Its area is not
+    #                         counted. Use when the segment must play no part.
+    #
+    #   substitute_segments   the segment's OWN measurement is not trusted,
+    #                         but the plate still has that area and it still
+    #                         conducts. The measurement is discarded and a
+    #                         value is reconstructed from the measured
+    #                         segments touching it, so the aggregate covers
+    #                         the whole plate and the map has no hole. The
+    #                         donors are recorded per segment.
+    #
+    #   fill_missing_from_neighbours
+    #                         the same reconstruction, applied to every
+    #                         segment that has no spectrum at all -- an
+    #                         unwired channel, or one every gate rejected.
+    #
+    # The reconstruction is an area-weighted mean of the neighbours'
+    # area-specific spectra (neighbours.fill_spectrum). It is an estimate and
+    # it is labelled as one everywhere it appears: class "substituted" in
+    # gold, its own CSV in silver, and the donor list in both. It is never
+    # mixed into spectra_clean.csv, which stays measurements only.
+    substitute_segments: frozenset[str] = frozenset()
+    fill_missing_from_neighbours: bool = False
+    #: How far the search for measured neighbours may widen. 1 = the ring
+    #: that shares an edge. 2 allows one more hop when that ring is itself
+    #: unmeasured, which is segment 33's situation on RO2612030 (its ring is
+    #: 61, 62, 67, 68 and two of those are missing).
+    fill_max_hops: int = 2
+
     # -- helpers ------------------------------------------------------------
 
     def replace(self, **kw) -> "Config":
@@ -584,7 +925,16 @@ class Config:
             if "Path" in t:
                 kw[k] = Path(v)
             elif "frozenset" in t:
-                kw[k] = frozenset(str(s) for s in v)
+                # A STRING IS ONE VALUE, NOT A SEQUENCE OF CHARACTERS.
+                # The environment hands everything over as text, so
+                # EIS_EXCLUDE_SEGMENTS="33,59" was iterated character by
+                # character into {'3', '5', '9', ','} -- which excludes
+                # segments 3, 5 and 9 and leaves 33 and 59 in. Every element
+                # of that set is a plausible segment number, so nothing
+                # downstream could notice.
+                if isinstance(v, str):
+                    v = [x for x in v.replace(";", ",").split(",") if x.strip()]
+                kw[k] = frozenset(str(s).strip() for s in v)
             elif "tuple" in t:
                 kw[k] = tuple(v)
             elif "bool" in t:
@@ -628,6 +978,11 @@ class Config:
         g.add_argument("--gamry", dest="gamry_dir", type=Path,
                        help="folder of whole-cell Gamry .DTA sweeps to "
                             "compare the aggregated local result against")
+        g.add_argument("--gamry-version", dest="gamry_version", default=None,
+                       help="build token of the sweeps that belong to this "
+                            "cell, e.g. V26_092. Required when the Gamry "
+                            "folder holds more than one campaign, because a "
+                            ".dta name carries no order number")
         g.add_argument("--bench-log", dest="bench_log", type=Path,
                        help="ASAM MDF4 bench log, to report the operating "
                             "point at each reference sweep")
@@ -641,6 +996,16 @@ class Config:
                             "excluded segment is never measured, so the "
                             "exclusion can never be disproved")
         g.add_argument("--areas", dest="areas_file", type=Path)
+        g.add_argument("--substitute", dest="substitute_segments", default=None,
+                       type=lambda v: frozenset(
+                           x.strip() for x in v.split(",") if x.strip()),
+                       help="segments whose own measurement is discarded and "
+                            "rebuilt from their measured neighbours, e.g. 33")
+        g.add_argument("--fill-gaps", dest="fill_missing_from_neighbours",
+                       action="store_true", default=None,
+                       help="rebuild every segment that has no spectrum from "
+                            "its measured neighbours, so the aggregate covers "
+                            "the whole plate")
         g.add_argument("--equal-areas", dest="equal_areas",
                        action="store_true",
                        help="treat every segment as A_cell/72 = 4.235 cm2")
@@ -652,9 +1017,20 @@ class Config:
         g.add_argument("--current", dest="i_setpoint_a", type=float,
                        help="setpoint in A; only ever printed as a check")
 
+        # default=None, not "UC2": from_cli layers argparse OVER the env and
+        # the JSON config, so a flag that always carries a value would make
+        # EIS_REF_CHANNEL and --config unsettable. The real default lives on
+        # the dataclass field.
+        g.add_argument("--ref-channel", dest="ref_channel", default=None,
+                       help="UC channel carrying the shared cell-voltage "
+                            "reference on every card (default: UC2); pass an "
+                            "empty string to fall back to the loudest UC "
+                            "channel on each card")
+
         g = p.add_argument_group("band")
         g.add_argument("--f-min", dest="f_min_hz", type=float, default=0.15)
-        g.add_argument("--f-max", dest="f_max_hz", type=float, default=4500.0)
+        g.add_argument("--f-max", dest="f_max_hz", type=float,
+                       default=30000.0)
         g.add_argument("--ppd", type=int, default=12)
 
         g = p.add_argument_group("estimation")
@@ -724,6 +1100,13 @@ SEGMENT_CLASS_STYLE = {
     "measured": dict(alpha=0.92, linewidth=1.6, hatch=None),
     "inferred": dict(alpha=0.45, linewidth=1.0, hatch="///"),
     "bad":      dict(alpha=0.25, linewidth=1.0, hatch="xxx"),
+    # A segment the operator excluded is not a segment that failed, and it is
+    # not one whose value was inferred. It carries no value at all, so it is
+    # drawn blank -- distinguishable at a glance from a measured neighbour and
+    # from a guessed one.
+    "excluded": dict(alpha=0.15, linewidth=1.0, hatch="..."),
+    # rebuilt from the ring that touches it: coloured, but visibly not solid
+    "substituted": dict(alpha=0.55, linewidth=1.2, hatch="\\\\"),
 }
 
 # Units and human labels for every scalar the gold layer can map.

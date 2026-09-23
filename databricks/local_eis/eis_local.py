@@ -74,7 +74,15 @@ from pathlib import Path
 import numpy as np
 
 import r2d2_geometry as geom
+# hf_schedule is imported at module level; it imports eis_local only inside
+# its own functions, so the cycle never closes at import time.
+import hf_schedule
 from eis_validation import estimate_delay, lin_kk, z_hit
+
+# A step whose tone is genuinely absent must fail whatever its dwell length,
+# because sigma_rel alone would accept pure noise given enough samples.  This
+# is that backstop, not a quality gate; the quality gate is sigma_rel_max.
+SNR_ABSOLUTE_FLOOR_DB = -5.0
 
 T_FALLBACK_C = 58.4          # used only if the temperature channels are unusable
 
@@ -85,8 +93,8 @@ T_FALLBACK_C = 58.4          # used only if the temperature channels are unusabl
 
 
 @dataclass
-class FamosFile:
-    """imc FAMOS binary reader.
+class FamosV1:
+    """imc FAMOS **v1** binary reader -- one |CP carrying every channel name.
 
     Two traps this class handles:
 
@@ -154,6 +162,315 @@ class FamosFile:
     @property
     def temp_names(self) -> list[str]:
         return [n for n in self.names if n.lower().startswith("temp")]
+
+
+class FamosV2:
+    """imc FAMOS **v2**: one metadata block per channel, and float64 samples.
+
+    The newer recordings on this campaign (RO2612025-01) are written by a
+    different exporter, and the v1 reader does not fail gracefully on them --
+    it raises `incomplete FAMOS header`, because the four keys it regexes for
+    are either absent in that shape or pushed past the 8 kB window it looks
+    in.
+
+    What actually differs:
+
+      * NAMES.  v1 packs every channel name into ONE |CP field as
+        ``7,32,<name>`` repeated. v2 writes one |CN block per channel and the
+        name is a length-prefixed field inside it.
+      * WIDTH.  v1 is float32. v2 is float64, and this is the dangerous one:
+        read a v2 file with v1's hardcoded ``<f4`` and a stride of 4*n_ch and
+        nothing raises -- you get a misaligned view of real numbers, which is
+        the worst possible outcome for a measurement pipeline. The width is
+        declared in |CP, and it is read here rather than assumed.
+      * SAMPLE INTERVAL.  v2 writes a |CD per channel; they must agree, and
+        a file where they do not is refused rather than averaged.
+
+    The interface is deliberately identical to `FamosV1`, so nothing
+    downstream knows which dialect it was handed.
+    """
+
+    #: v2 headers run to hundreds of kB on a 60-channel card -- one metadata
+    #: block per channel rather than one for the file.
+    HEADER_BYTES = 512_000
+
+    def __init__(self, path):
+        self.path = Path(path)
+        raw = self.path.open("rb").read(self.HEADER_BYTES)
+        hdr = raw.decode("latin-1", errors="replace")
+
+        # ---- names: one |CN per channel --------------------------------
+        # |CN,<ver>,<len>,<idx>,0,0,<name_len>,<NAME>,<comment_len>,...;
+        names = []
+        for m in re.finditer(r"\|CN,([^;]+);", hdr):
+            f = m.group(1).split(",")
+            if len(f) > 6:
+                names.append(f[6].strip())
+            elif len(f) >= 2:
+                names.append(f[-2].strip())
+        if not names:
+            raise ValueError(f"{self.path.name}: no |CN channel names found")
+
+        # ---- sample interval: one |CD per channel, and they must agree --
+        dts = [float(m.group(1)) for m in
+               re.finditer(r"\|CD,\d+,\d+,([\d.eE+-]+)", hdr)]
+        if not dts:
+            raise ValueError(f"{self.path.name}: no |CD sample interval found")
+        if max(dts) / min(dts) > 1.000001:
+            raise ValueError(
+                f"{self.path.name}: channels declare different sample "
+                f"intervals ({min(dts):g} .. {max(dts):g} s). Reading them as "
+                f"one interleaved block would misalign every channel, so this "
+                f"refuses rather than picking one.")
+
+        # ---- sample width: DECLARED, never assumed ---------------------
+        cp = re.search(r"\|CP,\d+,\d+,\d+,(\d+)", hdr)
+        self._bytes_per_val = int(cp.group(1)) if cp else 8
+        if self._bytes_per_val not in (4, 8):
+            raise ValueError(f"{self.path.name}: |CP declares "
+                             f"{self._bytes_per_val} bytes per value; "
+                             f"only 4 and 8 are supported")
+        self._dtype = "<f8" if self._bytes_per_val == 8 else "<f4"
+
+        # ---- where the samples start, CHECKED AGAINST |CS ---------------
+        # |CS declares how many bytes of samples follow it, and that number
+        # is what makes the offset verifiable instead of assumed: the right
+        # offset is the one where the bytes remaining in the file equal the
+        # bytes declared.
+        #
+        # This matters because the field count before the data is not fixed
+        # across writers. Counting a fixed number of commas -- which is what
+        # the adapter this was promoted from did -- lands INSIDE the binary
+        # data when the count is one too many, because a 0x2C byte in a
+        # float64 sample is indistinguishable from a delimiter. Measured: a
+        # 20,000-sample file read back 19,998 samples, every channel shifted.
+        size = self.path.stat().st_size
+        cs = raw.rfind(b"|CS,")
+        if cs < 0:
+            raise ValueError(f"{self.path.name}: no |CS data block found "
+                             f"in the first {self.HEADER_BYTES:,} bytes")
+        m_cs = re.match(rb"\|CS,(\d+),(\d+),", raw[cs:])
+        declared = int(m_cs.group(2)) if m_cs else None
+
+        candidates = []
+        if m_cs:
+            candidates.append(("|CS,<ver>,<bytes>,", cs + m_cs.end()))
+        off = cs + 4                       # the fixed-comma-count variant
+        for _ in range(3):
+            nxt = raw.find(b",", off)
+            if nxt < 0:
+                break
+            off = nxt + 1
+        else:
+            candidates.append(("three leading fields", off))
+
+        self.fs = 1.0 / dts[0]
+        self.names = names
+        self.n_ch = len(names)
+        row = self._bytes_per_val * self.n_ch
+
+        chosen = None
+        for label, cand in candidates:
+            remaining = size - cand
+            if remaining < row:
+                continue
+            if declared is not None and remaining == declared:
+                chosen = (label, cand, "declared byte count matches exactly")
+                break
+        if chosen is None:                 # fall back, and say so
+            for label, cand in candidates:
+                if size - cand >= row:
+                    chosen = (label, cand,
+                              f"declared {declared} bytes, {size - cand} "
+                              f"present -- offset NOT confirmed")
+                    break
+        if chosen is None:
+            raise ValueError(f"{self.path.name}: no |CS offset leaves a whole "
+                             f"sample row of {row} bytes")
+        self._offset_basis, self.offset, self._offset_note = chosen
+
+        available = size - self.offset
+        self.n_samples = available // row
+        if self.n_samples < 2:
+            raise ValueError(f"{self.path.name}: {self.n_samples} samples "
+                             f"after the header")
+
+    def channel(self, name: str) -> np.ndarray:
+        if name not in self.names:
+            raise KeyError(f"{name!r} not in {self.path.name}: {self.names}")
+        mm = np.memmap(self.path, dtype=self._dtype, mode="r",
+                       offset=self.offset, shape=(self.n_samples, self.n_ch))
+        return np.asarray(mm[:, self.names.index(name)], dtype=np.float64)
+
+    def position(self, name: str) -> int:
+        return self.names.index(name)
+
+    @property
+    def segment_names(self) -> list[str]:
+        return [n for n in self.names if re.fullmatch(r"\d+", n)]
+
+    @property
+    def uc_names(self) -> list[str]:
+        return [n for n in self.names if n.upper().startswith("UC")]
+
+    @property
+    def temp_names(self) -> list[str]:
+        return [n for n in self.names if n.lower().startswith("temp")]
+
+
+#: A file smaller than this is a placeholder, not a recording. Campaign
+#: folders carry 0-byte files for cards that were not connected, and letting
+#: one through produces a card with no channels rather than an error.
+MIN_FAMOS_BYTES = 1024
+
+
+def _famos_plausible(fam) -> str:
+    """Empty string if this parse can be believed, else why it cannot.
+
+    THE v1 READER DOES NOT RAISE ON A v2 FILE. It regexes for four keys, and
+    a v2 header contains strings that match all four -- just not with the
+    meaning v1 assumes. Handed one of these recordings it returns, without
+    complaint: zero channel names, a channel count read out of |CR's
+    calibration field, and a sample rate of 0.0625 Hz taken from a per-channel
+    |CD. Every one of those is wrong and none of them throws.
+
+    So a dispatcher cannot use "did it raise" as its test, which is what the
+    original adapter did. It has to ask whether the parse means anything.
+    """
+    if not getattr(fam, "names", None):
+        return "no channel names"
+    if len(fam.names) != fam.n_ch:
+        return f"{len(fam.names)} names for {fam.n_ch} channels"
+    if not np.isfinite(fam.fs) or not (0.1 <= fam.fs <= 10e6):
+        return f"sample rate {fam.fs:g} Hz is not a plausible acquisition rate"
+    if fam.n_samples < 2:
+        return f"{fam.n_samples} samples"
+    if not any(re.fullmatch(r"\d+", n) for n in fam.names):
+        return "no segment channels among the names"
+    return ""
+
+
+#: A file smaller than this is a placeholder, not a recording. Campaign
+#: folders carry 0-byte files for cards that were not connected, and letting
+#: one through produces a card with no channels rather than an error.
+MIN_FAMOS_BYTES = 1024
+
+
+class FamosFile:
+    """Open a FAMOS recording, whichever dialect it is written in.
+
+    Dispatches on what the file CONTAINS -- v1 packs every channel name into
+    one |CP field as ``7,32,<name>``; v2 writes one |CN block per channel --
+    and then checks that whichever reader ran produced something meaningful,
+    because the v1 reader does not raise on a v2 file (see
+    `_famos_plausible`). Both orderings are tried, so a file that defeats the
+    structural hint is still read if the other dialect can read it.
+
+    When nothing works it reports EVERY attempt: "v1 said X, v2 said Y" can be
+    acted on, "incomplete FAMOS header" cannot.
+
+    Returns a `FamosV1` or a `FamosV2`; both expose the same interface, so no
+    caller downstream knows or cares which dialect it was handed.
+    """
+
+    def __new__(cls, path, *args, **kwargs):
+        p = Path(path)
+        if not p.is_file():
+            raise ValueError(f"{p.name}: not a file")
+        size = p.stat().st_size
+        if size < MIN_FAMOS_BYTES:
+            raise ValueError(
+                f"{p.name}: {size} bytes -- a placeholder, not a recording. "
+                f"Campaign folders carry empty files for cards that were "
+                f"never connected.")
+
+        head = p.open("rb").read(65536).decode("latin-1", errors="replace")
+        m_cp = re.search(r"\|CP,([^;]*);", head)
+        looks_v1 = bool(m_cp and "7,32," in m_cp.group(1))
+        looks_v2 = "|CN," in head
+        order = ([FamosV2, FamosV1] if (looks_v2 and not looks_v1)
+                 else [FamosV1, FamosV2])
+
+        why = []
+        for reader in order:
+            try:
+                fam = reader(p) if reader is FamosV2 else reader(p, *args, **kwargs)
+            except Exception as exc:
+                why.append(f"{reader.__name__}: {exc}")
+                continue
+            problem = _famos_plausible(fam)
+            if not problem:
+                return fam
+            why.append(f"{reader.__name__}: parsed, but {problem}")
+        raise ValueError(
+            f"{p.name}: no FAMOS dialect could read this file.\n    "
+            + "\n    ".join(why)
+            + "\n    Run famos_probe.py on it; it prints every header key "
+              "with the byte offset it was found at.")
+
+
+#: The cell-voltage channel that every card in this campaign is wired to.
+#: The reference is the SAME PHYSICAL SIGNAL on all cards -- one cell voltage,
+#: fanned out to each Dewetron card -- so the channel that carries it is a
+#: property of the wiring, not something to be rediscovered per card.
+DEFAULT_REF_CHANNEL = "UC2"
+
+
+def pick_reference_channel(fam, prefer: str = DEFAULT_REF_CHANNEL,
+                           stride: int = 10, log=None) -> str | None:
+    """The UC channel to use as this card's reference.  Fixed by name.
+
+    WHY A FIXED NAME AND NOT THE LOUDEST UC CHANNEL
+    -----------------------------------------------
+    This used to be `max(uc_names, key=std)`: whichever UC channel carried the
+    most AC content won.  That is a reasonable guess when you do not know how
+    the plate was wired, and it is the wrong answer when you do.  On this
+    campaign only ONE cell-voltage line is fanned out to the cards, on UC2,
+    and the other UC inputs are either unconnected or carry something that is
+    not the shared reference at all.  A per-card argmax is then free to pick a
+    DIFFERENT channel on different cards, and nothing downstream notices:
+
+      * card alignment cross-correlates card A's UC2 against card B's UC1 and
+        reads the lag of two unrelated signals -- a lag that can clear both
+        the prominence gate and the absolute floor while being meaningless,
+        which then shifts every dwell window on that card onto the wrong tone;
+      * the consensus schedule collects votes from channels that did not see
+        the same excitation;
+      * `ref_slot` is recorded from whichever channel won, so silver's
+        structural skew model is handed a reference geometry that changes
+        from card to card.
+
+    An unconnected input is also the one most likely to win an argmax on
+    std: a floating input is noisy, and noise has a large standard deviation.
+
+    So the reference is named, not discovered.  `prefer` is
+    `Config.ref_channel` (default "UC2"); set it, or EIS_REF_CHANNEL, if a
+    campaign was wired to a different line.
+
+    If the named channel is not on a card, this says so loudly and falls back
+    to the old argmax rather than dropping the card: a missing UC2 is a wiring
+    fact worth seeing in the log, and the fallback keeps a partially-wired
+    plate processable.  Returns None only if the card carries no UC channel
+    at all.
+    """
+    names = list(getattr(fam, "uc_names", []) or [])
+    if not names:
+        return None
+    if prefer:
+        want = str(prefer).strip().upper()
+        for n in names:
+            if n.upper() == want:
+                return n
+        where = getattr(getattr(fam, "path", None), "name", "card")
+        msg = (f"  {where}: reference channel {prefer} is not on this card "
+               f"(UC channels present: {', '.join(names)}). Falling back to "
+               f"the UC channel with the most AC content, which may not be "
+               f"the same physical signal the other cards are using.")
+        if log is not None:
+            log.warning(msg)
+        else:
+            print("WARNING:" + msg)
+    return max(names, key=lambda c: float(np.std(fam.channel(c)[::stride])))
 
 
 # ===========================================================================
@@ -513,6 +830,53 @@ def fill_gaps(ref: np.ndarray, fs: float, steps: list[Step],
     return steps
 
 
+def _collapse_overlapping(steps: list[Step], min_overlap: float = 0.5
+                          ) -> list[Step]:
+    """Two steps cannot occupy the same stretch of the record.
+
+    A stepped sweep holds ONE frequency at a time, so its dwells are disjoint
+    in time BY CONSTRUCTION.  Two candidates whose windows overlap are two
+    readings of one stretch, and at most one of them can be the tone that was
+    actually playing there.
+
+    Nothing enforced that.  `_dedupe` collapses candidates whose FREQUENCIES
+    agree, which is a different question: the grid scan calls `dwell_window`
+    for every trial frequency, and on a record where most trials find their
+    envelope maximum in the same unclaimed stretch, dozens of different
+    frequencies come back with the same window.  `fill_gaps` then treats what
+    is left as more unclaimed stretches and does it again.
+
+    Measured on RO2611976-01 at 45 A: 142 reported steps sat on 41 distinct
+    windows, 111 of them (78 %) sharing.  One 118-SECOND window carried 57
+    "steps" from 0.157 Hz to 3.9 kHz -- a fifth of the record, reported as a
+    fifth of the sweep.  All but one of those is an artefact, and silver spent
+    its gates rejecting them one at a time, which is why 56 % of its points
+    came back `not_finite` and the band looked like a gating problem.
+
+    Keeping the strongest candidate per stretch is the whole rule.  It cannot
+    remove a real dwell, because a real dwell does not overlap another one.
+    """
+    if len(steps) < 2:
+        return list(steps)
+    order = sorted(steps, key=lambda s: (-(s.snr_db if np.isfinite(s.snr_db)
+                                           else -np.inf), s.start))
+    kept: list[Step] = []
+    for st in order:
+        span = max(st.stop - st.start, 1)
+        clash = False
+        for k in kept:
+            lo, hi = max(st.start, k.start), min(st.stop, k.stop)
+            if hi <= lo:
+                continue
+            shorter = max(min(span, k.stop - k.start), 1)
+            if (hi - lo) / shorter > min_overlap:
+                clash = True
+                break
+        if not clash:
+            kept.append(st)
+    return sorted(kept, key=lambda s: s.freq)
+
+
 def _dedupe(steps: list[Step], rel_tol: float = 0.02,
             overlap_tol: float = 0.5) -> list[Step]:
     """One physical step must yield one entry.
@@ -553,8 +917,49 @@ class Step:
     thd: float
     stationarity: float  # spread of the phasor over three sub-windows
 
-    def valid(self, min_snr=8.0, max_thd=0.10, max_drift=0.15) -> bool:
-        return (np.isfinite(self.snr_db) and self.snr_db >= min_snr
+    #: WHERE THE DWELL WINDOW CAME FROM.  "detected" means a detector found
+    #: this window in the record.  "interpolated" means the window was
+    #: PREDICTED -- ladder_snap.repair_windows replaced one that could not
+    #: belong to a monotonic sweep with the window the sweep would have
+    #: placed there.  That is a hypothesis about where a tone should be, and
+    #: a point built on it has a different evidential status from one whose
+    #: window was measured, so the distinction travels with the step instead
+    #: of living only in a log line.
+    window_source: str = "detected"
+
+    @property
+    def window_repaired(self) -> bool:
+        return self.window_source != "detected"
+
+    def valid(self, min_snr=8.0, max_thd=0.10, max_drift=0.15,
+              sigma_rel_max: float = 0.60) -> bool:
+        """Is this step usable?
+
+        A PHASOR'S PRECISION IS N*gamma, NOT gamma.  `snr_db` here is the one
+        `fit3` reports: the tone amplitude over the residual rms across the
+        whole Nyquist band.  That number says nothing about how well the
+        phasor is determined, because a long dwell beats the noise down and a
+        short one does not.  Rife & Boorstyn give sigma_A/A >= sqrt(1/(N
+        gamma)), so the criterion has to fold in the dwell length -- which is
+        exactly what config.py already argues in its comment above
+        `sigma_rel_max`.  The criterion was simply being applied in silver,
+        after bronze had already thrown the step away in `detect_schedule`.
+
+        Measured on RO2612025-01 card 4 at 45 A: of 23 rungs located above
+        100 Hz, 10 pass the flat 5 dB gate and all 23 pass sigma_rel_max =
+        0.60, with sigma_rel between 0.3 % and 23 %.  The 11.95 kHz step
+        reports -1.5 dB and has N*gamma = 2459 -- a 2.0 % phasor, discarded
+        by a gate that was never meant to decide this.
+
+        `min_snr` is kept as a floor against pure garbage, an order of
+        magnitude below where it used to sit, so that a step with no tone at
+        all still fails: sigma_rel alone would accept it if the dwell were
+        long enough.
+        """
+        floor = min(min_snr, SNR_ABSOLUTE_FLOOR_DB)
+        n = int(self.stop - self.start)
+        return (np.isfinite(self.snr_db) and self.snr_db >= floor
+                and hf_schedule.crlb_usable(self.snr_db, n, sigma_rel_max)
                 and (not np.isfinite(self.thd) or self.thd <= max_thd)
                 and (not np.isfinite(self.stationarity)
                      or self.stationarity <= max_drift))
@@ -639,6 +1044,9 @@ def detect_schedule(ref: np.ndarray, fs: float, ppd: int = 12,
     # second pass: anything the grid stepped over shows up as an unclaimed
     # stretch of the record
     steps = _dedupe(fill_gaps(ref, fs, steps, min_snr_db))
+    # ... and then the invariant BOTH passes can violate: one stretch of the
+    # record cannot be two steps of the sweep.  See `_collapse_overlapping`.
+    steps = _collapse_overlapping(steps)
     steps = [s for s in steps if f_lo * 0.8 <= s.freq <= f_hi]
 
     if verbose:
@@ -1024,7 +1432,7 @@ def evaluate(dat_dir, out_dir, curr_cal=None, temp_cal=None, gain_file=None,
             T_seg = {s: T_FALLBACK_C for s in areas}
 
         # ---- reference channel and schedule -------------------------------
-        uc_name = max(fam.uc_names, key=lambda c: float(np.std(fam.channel(c)[::10])))
+        uc_name = pick_reference_channel(fam)
         print(f"  reference: {uc_name}")
         steps = detect_schedule(fam.channel(uc_name), fam.fs, ppd=ppd,
                                 min_snr_db=min_snr)

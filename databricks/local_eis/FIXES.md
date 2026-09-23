@@ -158,3 +158,178 @@ average, and read the current closure with that in mind.
 - **Tiers are still mostly C** (A = 2, B = 19, C = 45), driven by
   `dropped_N_uncertain` at the top of the band. The residual per-card
   differential skew is still 50–70 µs, which is 80–113° at 4.5 kHz.
+
+---
+
+# Recovering the top decade  (`hf_schedule.py`, September 2026)
+
+Data: `RO2612025-01_Current_45A_Test_01_Karte_4`, fs = 50 kHz, 538 s, UC2 plus
+segments 39–53.  The sweep in that file runs downward from **23.9 kHz to
+0.48 Hz** at 10 points per decade.  The shipped pipeline recovered eleven
+steps of it, topping out at 7.47 Hz.  Nothing was missing from the recording.
+
+| path | steps | band recovered |
+|---|---|---|
+| shipped — UC2 channel, `f_max_hz` = 4500 | 11 | 0.478 – 7.47 Hz |
+| same channel, cap lifted to 0.45·fs | 13 | 0.478 – 7.47 Hz |
+| stacked segment ensemble, cap lifted | 21 | 0.478 – 189 Hz |
+| + ladder extension, points/decade snapped | 42 | 0.478 – 18 900 Hz |
+
+## Fix 7 — the detector was reading the channel the cell had emptied (`bronze.py`, new `hf_schedule.py`)
+
+`consensus_schedule` ran `detect_schedule` on each card's reference channel,
+chosen in `inventory_channels` as the UC* channel with the largest standard
+deviation — the cell voltage.  The sweep is **galvanostatic**: the ac current
+amplitude is set by the load and is constant across the sweep, so the
+amplitude arriving there is
+
+    |u_ref(f)| = |i_ac| · |Z_cell(f)|
+
+and |Z_cell| falls by an order of magnitude from the bottom of the band to the
+~45 mΩ·cm² minimum near 8 kHz.  The detector was being asked to find a tone
+exactly where the cell had removed it.  No value of `min_snr_db` puts signal
+back.
+
+The segment channels behave the other way round: they measure current density,
+and current is what the sweep imposes, so their tone amplitude is flat in
+frequency.  There are ~14 per card, driven by the same tone at the same
+instant, with independent front-end noise.  Above 1 kHz the stacked ensemble
+measures **+11.2 dB narrowband over UC2** (+7.4 dB above 5 kHz, +4.3 dB above
+10 kHz).
+
+**Changed:** new `hf_schedule.py`, three layers, adding **no new estimator** —
+layer 2 hands the work to `eis_local.detect_schedule` unchanged:
+
+1. `polarity_aligned_reference()` standardises every segment channel, checks
+   each sign against a provisional sum so a reversed sense pair cannot
+   subtract, and adds them.
+2. the pipeline's own detector runs on that trace.  **The old trace is pooled
+   in, not replaced** — see "what the card set changed" below.
+3. the geometric ladder `f_k = f0·r^-k` and its dwell law are fitted on the
+   confident steps only, the missing rungs are predicted, and each prediction
+   is accepted on a frequency-domain CFAR and a rank-1 (maximum-eigenvalue)
+   test across the array — neither of which uses the ladder.
+
+Stack **per card**, not across the plate: pooling all five scored 23/26 against
+26/26 for one card, because the cards are not on a common time base until
+`estimate_card_lags` has run and the residual offsets make the sum partially
+destructive at the top of the band.  `consensus_schedule` still does the
+cross-card vote.
+
+## Fix 8 — `Step.valid` thresholded the wrong quantity  (`eis_local.py`)
+
+`Step.valid` gated on `snr_db >= min_snr_db`, and `fit3` defines `snr_db` as
+the tone amplitude over the residual rms across the whole Nyquist band.  That
+is not what determines a phasor's precision — `N·γ` is (Rife & Boorstyn),
+because a longer dwell beats the noise down.
+
+Of 23 rungs located above 100 Hz on card 4, **10 pass the 5 dB gate and all 23
+pass `sigma_rel_max` = 0.60**, with σ_rel between 0.3 % and 23 %.  The
+11.95 kHz step reports −1.5 dB and has N·γ = 2459 — a 2.0 % phasor, thrown
+away by a gate that was never meant to decide this.  `config.py` already
+argues exactly this above `sigma_rel_max`; the criterion was simply applied in
+silver, after bronze had discarded the step in `detect_schedule`.
+
+**Changed:** `Step.valid` now applies `hf_schedule.crlb_usable`, with a new
+`SNR_ABSOLUTE_FLOOR_DB = -20` backstop so that a step with no tone at all
+still fails — σ_rel alone would accept pure noise given enough samples.
+
+## Fix 9 — the band ceiling was a config constant, not Nyquist  (`config.py`)
+
+A real card header reads `dx = 1.0e-5 s`, i.e. fs = 100 kHz on 16 channels, so
+`cfg.f_hi(fs) = min(f_max_hz, 0.45·fs) = min(4500, 45000) = 4500` Hz.  The
+converter had 45 kHz of headroom it was never asked for.
+
+**Changed:** `f_max_hz` 4500 → 30000, and the `--f-max` default with it.
+Necessary but **not sufficient**: on its own it took card 4 from 11 recovered
+steps to 13, with the same 7.47 Hz top.
+
+## Fix 10 — the five UC channels are five measurements of one voltage  (`bronze.py`)
+
+Averaging segment impedances across cards is wrong — they are different
+segments.  Averaging the five UC channels is not, and it pays exactly where it
+is needed, because once detection has moved onto the segment ensemble the
+reference is the weak phasor in `Z = K·A_ref/A_seg`.
+
+**Changed:** new `pooled_reference_phasors()`, inverse-residual-variance
+weighted (`w = N/r_rms²`, the Cramér–Rao weighting), pooling only cards whose
+lag was *applied*, each rotated from its own multiplexer slot to slot 0 —
+after which `process_card` records `ref_slot = 0` so silver's structural skew
+model still reads a consistent geometry.  On the synthetic card set the median
+combined SNR went **22.9 → 29.9 dB**.
+
+## What the synthetic card set changed about the design
+
+Run against `make_synth_famos.py`, whose reference amplitude is *flat* in
+frequency, the first version of this work was a regression: 13 steps against
+the shipped path's 27, and a decade of band lost.  Four things came out of it,
+each now carrying a test in `test_hf_schedule.py`:
+
+- **Neither trace dominates.**  Where the reference amplitude is flat, the old
+  path locates the top rungs *more precisely* than the stack — 730.3 / 1169.6 /
+  1873.2 / 3000.0 Hz exactly, against the stack's 807 / 1182 / 1972 / 3070.  So
+  both candidate sets are pooled and the ladder and array tests arbitrate.
+  Nothing the shipped path would have found can be lost.
+- **A ladder must not be a subdivision of itself.**  Every step of a 10 ppd
+  sweep also lies on a 20 ppd ladder, so a fit scored by "most steps on the
+  grid" prefers the subdivision, invents the rungs between, and at the top of
+  the band those sit a fraction of a DFT bin from a real tone — so both
+  acceptance tests see the neighbour's leakage and pass.  Cost when unguarded:
+  20 spurious steps.  Guard: the gcd of the observed rung indices.
+- **The membership window has to carry the fit's own uncertainty.**  A ladder
+  fitted at 4.9013 points/decade against a true 4.8891 — a good fit — runs 4 %
+  out at the ends of the band, and a flat 2 % window then discards genuine
+  steps.  `Ladder.tol_at` widens it by `|k − k̄|·σ_ln r`.  The ladder is also
+  refitted once on its own members, which extends the lever arm from 69 Hz to
+  1182 Hz and pins the spacing to 4.8931.
+- **Two dwell laws are in common use.**  Fixed cycle count *or* fixed time.
+  Assuming the first on a record that used the second mispredicts a
+  high-frequency step's start by the length of the sweep.  Both are fitted and
+  the better one kept.
+
+## Result on the synthetic card set
+
+| | shipped path | with `hf_use_ensemble` |
+|---|---|---|
+| schedule | 27 steps | 17 steps |
+| true steps found | 17 / 18 | 17 / 18 |
+| **spurious steps** | **10** | **0** |
+| band | 1.63 – 3709 Hz (3709 is spurious) | 1.63 – **3000 Hz** (the true top) |
+| median combined SNR | 22.9 dB | **29.9 dB** |
+
+On a galvanostatic synthetic with short high-frequency dwells — the field
+symptom in miniature — 22/34 true with 7 spurious topping out at 1325 Hz
+becomes **30/34 true with 1 spurious topping out at 3166 Hz**.
+
+## New configuration
+
+    hf_use_ensemble: bool = True     # detect on the stacked segment ensemble
+    hf_ladder_extend: bool = True    # predict-and-verify the missing rungs
+    hf_ladder_snap_ppd: bool = True  # snap the fitted spacing to an integer
+    hf_ladder_tol: float = 0.02      # base window for ladder membership
+    hf_pool_reference: bool = True   # inverse-variance mean of A_uc across cards
+
+All four are A/B switches: set them false and the pipeline takes the old path
+exactly.
+
+## Still not fixed
+
+- **Detection gain is not estimation gain.**  The array recovers *which*
+  frequency and *when*.  The per-segment impedance still rests on that one
+  segment's phasor; what the array buys there is a known f in a known window,
+  which drops the Cramér–Rao phase penalty from 6/(N·γ) to 1/(N·γ) and removes
+  the runaway-fit mechanism.
+- **Chain-response correction above 1 kHz** is still worth doing and is now
+  more valuable, because there are finally points up there to correct.  It is
+  orthogonal to everything here.
+- **Two FAMOS dialects.**  The DASYLab-native export carries one `|CN` block
+  per channel with float64 samples and a per-channel byte offset in `|CP`;
+  `eis_local.FamosFile` looks for `7,32,<name>` inside a single `|CP` field
+  with a hardcoded `<f4` and a 4·n_ch stride.  On the other dialect it raises
+  `incomplete FAMOS header`, or — if a file carries both markers — silently
+  reads garbage of exactly the right shape.  Worth confirming which dialect
+  the cards the thesis processed are in.
+- **Aliased steps above fs/2** could in principle be un-folded once the ladder
+  is known, since an aliased tone's Nyquist zone is then predictable.  Whether
+  anything survives depends entirely on the anti-alias filter in front of the
+  Dewetron converters.

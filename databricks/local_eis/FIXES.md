@@ -312,6 +312,51 @@ becomes **30/34 true with 1 spurious topping out at 3166 Hz**.
 All four are A/B switches: set them false and the pipeline takes the old path
 exactly.
 
+## Fix 11 — the runner: scattered 150 A / 450 A spectra, and how results are shown  (`Local EIS Pipeline Runner.py`, `figure_panels.py`, `plate_maps.py`)
+
+**Why 150 A and 450 A came out as a scatter.**  Those plots were read from
+`<cond>/mode_permissive/snr_0.0_<digest>/`: evaluation mode *permissive*,
+Min SNR 0 dB, f_max 4500 Hz.  The earlier plot with clean arcs used the
+shipped gates.  What the three settings let through:
+
+| setting | shipped | permissive run | effect |
+|---|---|---|---|
+| `sigma_rel_max` | 0.60 | 1.5 | phasors with 150 % relative uncertainty kept |
+| `zmag_outlier_mad` | 4.5 | 8.0 | single-frequency \|Z\| spikes (1, 3, 10, 20 Hz) kept |
+| `max_thd` / `max_drift` | 0.10 / 0.25 | 0.5 / 0.5 | distorted, non-stationary dwells kept |
+| `min_cycles_per_dwell` | 3 | 1 | one-cycle phasors at the low end kept |
+| `min_snr_db` (bronze step acceptance) | 5 (old) / 10 | 0 | more off-grid steps admitted |
+| `f_max_hz` | — | 4500 | rungs above ~2 kHz read −40…−80° where the Gamry sweep reads ≈ −10° |
+
+A new **Parameter profile** widget, `recommended` by default, pins
+evaluation mode = default, Min SNR = 5 dB, band 0.15–2000 Hz, and prints
+which widget values it ignored.  `custom` restores the widgets.  Databricks
+keeps a widget's old value when its default changes, which is why this is a
+profile rather than new defaults alone.  All three settings are in the cache
+key, so the first recommended run recomputes; it never overwrites a
+permissive entry.
+
+**Conditions multi-select.**  `condition` (single dropdown) is replaced by
+`conditions` (multiselect): tick e.g. 45A and 450A to evaluate only those.
+ALL, or nothing ticked, means every condition on disk.  Conditions are ordered
+by current (45, 60, 150, 450 A), not as strings.
+
+**One plot per figure.**  Every Plotly cell still builds its multi-panel
+figure and passes it to `show_fig()`, which uses
+`figure_panels.split_subplots` to draw each panel as its own full-width
+figure: traces, log axes, guide lines, legend (now on every panel) and
+dropdown masks follow their panel.  `PLOTS_ONE_BY_ONE = False` in the setup
+cell restores the rows.
+
+**Plate maps with values.**  `plate_maps.draw_value_map` draws the true
+staircase outlines from `r2d2_geometry`, prints number **and value** in every
+segment, and scales colour over the 5th–95th percentile (arrow ends for
+values outside, still printed as measured).  Mean, median, sd, CV and
+min..max are printed under the title.  The HFR map now uses the same `magma`
+ramp as the mass-transport map.  The ECM parameter maps use the same
+renderer instead of centroid dots.  `plate_viewer` (interactive, outside this
+folder) became optional.
+
 ## Still not fixed
 
 - **Detection gain is not estimation gain.**  The array recovers *which*

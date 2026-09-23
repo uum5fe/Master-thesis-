@@ -40,6 +40,9 @@ class _Widgets:
     def text(self, name, default, label=None):
         self.vals.setdefault(name, default)
 
+    def multiselect(self, name, default, choices, label=None):
+        self.vals.setdefault(name, default)
+
     def get(self, name):
         if name not in self.vals:
             raise Exception(f"no widget named {name}")
@@ -103,7 +106,8 @@ def test_the_conditions_come_from_the_disk_not_the_fallback(volume) -> None:
     conditions. Getting four back means the discovery never ran.
     """
     ns = _run_cell(volume)
-    assert ns["CONDITIONS"] == ["450A", "45A"]
+    # ordered by current, not as strings ("450A" < "45A" alphabetically)
+    assert ns["CONDITIONS"] == ["45A", "450A"]
     assert "60A" not in ns["CONDITIONS"]
 
 
@@ -150,3 +154,59 @@ def test_an_empty_volume_says_so_rather_than_inventing_conditions(volume,
     out = capsys.readouterr().out
     assert ns["CONDITIONS"] == ["450A", "60A", "45A", "150A"]
     assert "fallback" in out
+
+
+# ---------------------------------------------------------------------------
+# multi-select conditions
+# ---------------------------------------------------------------------------
+
+
+def test_the_default_selection_is_every_condition(volume) -> None:
+    ns = _run_cell(volume)
+    assert ns["SELECTED_CONDITIONS"] == ["45A", "450A"]
+    assert ns["COND_FILTER"] == "ALL"
+
+
+def test_a_multi_selection_is_honoured(volume) -> None:
+    for cond in ("60A", "150A"):
+        (volume / "Famos" /
+         f"Leepa_RO2612030_Current_{cond}_Test_1_Karte_1.DAT").touch()
+    ns = _run_cell(volume, {"conditions": "450A,45A"})
+    assert ns["CONDITIONS"] == ["45A", "60A", "150A", "450A"]
+    assert ns["SELECTED_CONDITIONS"] == ["45A", "450A"]
+
+
+def test_the_old_single_choice_widget_is_removed(volume) -> None:
+    """A dropdown cannot become a multiselect in place; the stale one would
+    otherwise sit in the widget bar doing nothing."""
+    ns = _run_cell(volume, {"condition": "450A"})
+    assert "condition" not in ns["dbutils"].widgets.vals
+
+
+# ---------------------------------------------------------------------------
+# the recommended parameter profile
+# ---------------------------------------------------------------------------
+
+
+def test_recommended_profile_pins_the_gates_that_scattered_the_spectra(volume,
+                                                                        capsys) -> None:
+    """Widgets left at permissive / 0 dB / 4500 Hz by an earlier session are
+    overridden -- and the cell says which ones it ignored."""
+    ns = _run_cell(volume, {"evaluation_mode": "permissive",
+                            "min_snr_db": "0", "f_max_hz": "4500.0"})
+    assert ns["PARAM_PROFILE"] == "recommended"
+    assert ns["EVALUATION_MODE"] == "default"
+    assert ns["MIN_SNR_DB"] == 5.0
+    assert ns["F_MAX"] == 2000.0
+    assert ns["F_MIN"] == 0.15
+    out = capsys.readouterr().out
+    assert "evaluation_mode=permissive" in out and "ignored" in out
+
+
+def test_custom_profile_uses_the_widgets(volume) -> None:
+    ns = _run_cell(volume, {"param_profile": "custom",
+                            "evaluation_mode": "permissive",
+                            "min_snr_db": "0", "f_max_hz": "4500.0"})
+    assert ns["EVALUATION_MODE"] == "permissive"
+    assert ns["MIN_SNR_DB"] == 0.0
+    assert ns["F_MAX"] == 4500.0

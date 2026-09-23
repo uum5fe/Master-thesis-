@@ -85,12 +85,35 @@ import gamry_compare
 import abgleich
 import ladder_snap
 import eis_measurement_model
+import figure_panels
+import plate_maps
  
 # Force reload during development
 for mod in [config, utils, eis_local, bronze, silver, gold, pipeline_main,
             geom, csv_source, csv_pipeline, gamry_dta, gamry_compare, abgleich,
-            ladder_snap, eis_measurement_model]:
+            ladder_snap, eis_measurement_model, figure_panels, plate_maps]:
     importlib.reload(mod)
+
+# ─── ONE PLOT PER FIGURE ───
+# Every spectrum cell below still builds its multi-panel figure (Nyquist, |Z|,
+# phase side by side, or a grid of segments) and hands it to show_fig(), which
+# draws each panel as its own full-width figure, one below the other. Set
+# PLOTS_ONE_BY_ONE = False to get the old side-by-side rows back.
+PLOTS_ONE_BY_ONE = True
+PANEL_HEIGHT = 560        # px, per single plot
+PANEL_WIDTH = 1150        # px; None = fill the cell width
+
+
+def show_fig(fig, html=False):
+    """Show a (possibly multi-panel) Plotly figure, one panel at a time."""
+    figs = (figure_panels.split_subplots(fig, panel_height=PANEL_HEIGHT,
+                                         panel_width=PANEL_WIDTH)
+            if PLOTS_ONE_BY_ONE else [fig])
+    for f in figs:
+        if html:
+            displayHTML(f.to_html(full_html=False, include_plotlyjs='cdn'))
+        else:
+            f.show()
  
 from config import Config, DEFAULT
  
@@ -178,6 +201,32 @@ except Exception:
     pass
 LEEPA = _w('leepa_id', _default)
 
+def condition_sort_key(cond):
+    """'45A' < '60A' < '150A' < '450A': by the number, then by the text."""
+    import re as _re_k
+    m = _re_k.match(r'\s*([0-9]+(?:\.[0-9]+)?)', str(cond))
+    return (float(m.group(1)) if m else float('inf'), str(cond))
+
+
+def parse_conditions(raw, available):
+    """The multi-select value -> the conditions to evaluate.
+
+    Databricks hands a multiselect back as one comma-separated string
+    ("45A,450A"). Empty, or anything containing ALL, means every condition
+    on disk. The result is in current order whatever order they were
+    clicked in, and a name that is not on disk is kept (and reported by the
+    run cell as "nothing found") rather than silently dropped.
+    """
+    picked = [x.strip() for x in str(raw or '').split(',') if x.strip()]
+    if not picked or any(x.upper() == 'ALL' for x in picked):
+        return list(available)
+    out = []
+    for c in picked:
+        if c not in out:
+            out.append(c)
+    return sorted(out, key=condition_sort_key)
+
+
 # Discover conditions from filenames on disk for the SELECTED Leepa
 # This handles both Leepa_{id} and Leepa_RO{id} naming conventions
 try:
@@ -190,7 +239,10 @@ try:
             _cm = _re2.search(r'_Current_([^_]+)_', _f.name)
             if _cm:
                 _all_conds.add(_cm.group(1))
-    CONDITIONS = sorted(_all_conds) if _all_conds else ['450A', '60A', '45A', '150A']
+    # Ordered by current (45A, 60A, 150A, 450A), not as strings -- the
+    # plots come out one condition after another in this order.
+    CONDITIONS = (sorted(_all_conds, key=condition_sort_key) if _all_conds
+                  else ['450A', '60A', '45A', '150A'])
     if not _all_conds:
         print(f"  no FAMOS files found for order {LEEPA} under {FAMOS_ROOT}; "
               f"condition list is the hard-coded fallback")
@@ -353,8 +405,10 @@ except Exception:                                          # noqa: BLE001
     GAMRY_ROOT, GAMRY_VERSION = None, ''
  
 # ─── Remove old widgets that are no longer needed ───
+# 'condition' was a single-choice dropdown; it is replaced by the
+# 'conditions' multi-select below (a widget cannot change type in place).
 for _old in ('plate', 'csv_path', 'csv_dialect', 'csv_tones',
-             'gain_file', 'gamry_dir', 'bench_log'):
+             'gain_file', 'gamry_dir', 'bench_log', 'condition'):
     try:
         dbutils.widgets.remove(_old)
     except Exception:
@@ -365,11 +419,23 @@ for _old in ('plate', 'csv_path', 'csv_dialect', 'csv_tones',
 # to know which order is selected. The condition dropdown is here because its
 # choices come from that discovery.
 try:
-    dbutils.widgets.dropdown('condition', 'ALL', ['ALL'] + CONDITIONS, 'Condition')
+    # MULTI-SELECT: tick e.g. 45A and 450A to evaluate only those two.
+    # ALL (or nothing ticked) evaluates every condition found on disk.
+    dbutils.widgets.multiselect('conditions', 'ALL', ['ALL'] + CONDITIONS,
+                                'Conditions (multi-select)')
+    # PARAMETER PROFILE -- see the RECOMMENDED_PARAMS block below.
+    #   recommended  evaluation mode, SNR gate and band are FIXED to the
+    #                values that give clean spectra; the three widgets for
+    #                them are ignored (and the printout says so)
+    #   custom       the Evaluation mode / Min SNR / F min / F max widgets
+    #                decide, exactly as before
+    dbutils.widgets.dropdown('param_profile', 'recommended',
+                             ['recommended', 'custom'], 'Parameter profile')
     dbutils.widgets.text('f_min_hz', '0.15', 'F min (Hz)')
-    dbutils.widgets.text('f_max_hz', '4500.0', 'F max (Hz)')
-    dbutils.widgets.dropdown('min_snr_db', '0',
-                             ['-30','-20', '-10', '-3', '0', '3', '5', '8'],
+    dbutils.widgets.text('f_max_hz', '2000.0', 'F max (Hz)')
+    dbutils.widgets.dropdown('min_snr_db', '5',
+                             ['-30', '-20', '-10', '-3', '0', '3', '5', '8',
+                              '10'],
                              'Min SNR (dB)')
     dbutils.widgets.dropdown('source_format', 'famos',
                              ['famos', 'csv'], 'Measurement file format')
@@ -453,12 +519,65 @@ BENCH_LOG = ''
 # it. Re-read here only so that changing the widget and re-running from this
 # point still picks the change up.
 LEEPA = _w('leepa_id', _default)
-COND_FILTER = _w('condition', 'ALL')
+SELECTED_CONDITIONS = parse_conditions(_w('conditions', 'ALL'), CONDITIONS)
+COND_FILTER = ('ALL' if SELECTED_CONDITIONS == list(CONDITIONS)
+               else ', '.join(SELECTED_CONDITIONS))
 F_MIN = float(_w('f_min_hz', '0.15'))
-F_MAX = float(_w('f_max_hz', '4500.0'))
-MIN_SNR_DB = float(_w('min_snr_db', '0'))
+F_MAX = float(_w('f_max_hz', '2000.0'))
+MIN_SNR_DB = float(_w('min_snr_db', '5'))
 STOP_AFTER = _w('stop_after', 'gold')
 EVALUATION_MODE = _w('evaluation_mode', 'default')
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  RECOMMENDED PARAMETERS -- WHY THE 150 A / 450 A SPECTRA WERE SCATTERED
+# ═══════════════════════════════════════════════════════════════════════════
+# The scattered Nyquist plots (points flung to -Z'' = -90 .. +110, spikes at
+# 1, 3, 10 and 20 Hz on one group of segments, phase diving to -80 deg above
+# 1 kHz) were read from  <cond>/mode_permissive/snr_0.0_<digest>/  -- the run used
+# Evaluation mode = permissive and Min SNR = 0 dB, f_max = 4500 Hz. The clean
+# arcs of the earlier run came from the shipped gates. What each setting did:
+#
+#   permissive preset   sigma_rel_max 0.60 -> 1.5   keeps phasors whose
+#                                                   propagated uncertainty
+#                                                   is 150 % of |Z| -- noise
+#                       zmag_outlier_mad 4.5 -> 8   lets the single-frequency
+#                                                   |Z| spikes through
+#                       max_thd / max_drift -> 0.5  keeps distorted and
+#                                                   non-stationary dwells
+#                       min_cycles 3 -> 1           one-cycle phasors at the
+#                                                   low-frequency end
+#   Min SNR 0 dB        bronze uses this number to accept OFF-grid steps,
+#                       to pick the basis of the grid fit and to decide the
+#                       polarity. At 0 dB it admits steps the pipeline's own
+#                       default (10 dB) and the version that drew the clean
+#                       arcs (5 dB) refuse. Silver's per-point backstop is a
+#                       separate setting and is not affected.
+#   f_max 4500 Hz       the rungs above ~2 kHz come out capacitive (phase
+#                       -40 .. -80 deg) on most segments AND in the area-
+#                       weighted aggregate, while the Gamry sweep of the same
+#                       cell reads about -10 deg there. That is not the cell;
+#                       the clean plot never showed anything above 2 kHz.
+#
+# The 'recommended' profile pins these three to the values below. Pick
+# 'custom' in the Parameter profile widget to explore anything else -- the
+# mode and settings are still part of the cache key, so an exploratory run
+# never overwrites a recommended one.
+RECOMMENDED_PARAMS = dict(evaluation_mode='default', min_snr_db=5.0,
+                          f_min_hz=0.15, f_max_hz=2000.0)
+PARAM_PROFILE = _w('param_profile', 'recommended')
+if PARAM_PROFILE == 'recommended':
+    _now = dict(evaluation_mode=EVALUATION_MODE, min_snr_db=MIN_SNR_DB,
+                f_min_hz=F_MIN, f_max_hz=F_MAX)
+    _ignored = [f'{k}={v:g}' if isinstance(v, float) else f'{k}={v}'
+                for k, v in _now.items() if v != RECOMMENDED_PARAMS[k]]
+    EVALUATION_MODE = RECOMMENDED_PARAMS['evaluation_mode']
+    MIN_SNR_DB = float(RECOMMENDED_PARAMS['min_snr_db'])
+    F_MIN = float(RECOMMENDED_PARAMS['f_min_hz'])
+    F_MAX = float(RECOMMENDED_PARAMS['f_max_hz'])
+    if _ignored:
+        print(f"  Parameter profile 'recommended': widget value(s) "
+              f"{', '.join(_ignored)} ignored. Set the profile to 'custom' "
+              f"to use them.")
 def _seg_list(name):
     return frozenset(x.strip() for x in
                      _w(name, '').replace(';', ',').split(',') if x.strip())
@@ -472,7 +591,8 @@ FILL_GAPS = _w('fill_gaps', 'no') == 'yes'
 _plate = geom.use_plate(PLATE)
  
 print(f"  Leepa:     {LEEPA}")
-print(f"  Condition: {COND_FILTER}")
+print(f"  Condition: {COND_FILTER}   -> {', '.join(SELECTED_CONDITIONS)}")
+print(f"  Profile:   {PARAM_PROFILE}   (mode {EVALUATION_MODE})")
 print(f"  Band:      {F_MIN} – {F_MAX} Hz")
 print(f"  Min SNR:   {MIN_SNR_DB} dB")
 print(f"  Stop:      {STOP_AFTER}")
@@ -1152,8 +1272,7 @@ def selected_conditions():
         return list(_conditions_to_run)
     except NameError:
         pass
-    cond = _w('condition', 'ALL')
-    return list(CONDITIONS) if cond == 'ALL' else [cond]
+    return parse_conditions(_w('conditions', 'ALL'), CONDITIONS)
 
 
 def result_dir(leepa, cond, snr=None, mode=None, prefer_live=True):
@@ -1249,10 +1368,9 @@ def describe_source(cond, d, prov):
 # identifies it.
 if SOURCE_FORMAT == 'csv':
     _conditions_to_run = [Path(CSV_PATH).stem or 'csv']
-elif COND_FILTER == 'ALL':
-    _conditions_to_run = CONDITIONS          # e.g. ['150A', '450A', '45A', '60A']
 else:
-    _conditions_to_run = [COND_FILTER]
+    # The multi-select, already parsed: e.g. ['45A', '450A'], in current order.
+    _conditions_to_run = list(SELECTED_CONDITIONS)
  
 RUN_PLAN = {c: cache_plan(LEEPA, c, MIN_SNR_DB) for c in _conditions_to_run}
  
@@ -1913,7 +2031,7 @@ for cond, pr in PIPELINE_RESULTS.items():
             y=0.5, yanchor='middle',
         ),
     )
-    fig.show()
+    show_fig(fig)          # one plot per figure, stacked
     print(f"  {cond}: {n_seg} segments plotted"
           + (f" + {_n_rebuilt} rebuilt from neighbours" if _n_rebuilt else "")
           + (f", all {_n_finite_total} silver-accepted points shown"
@@ -1942,9 +2060,9 @@ try:
 except NameError:
     _LEEPA = dbutils.widgets.get('leepa_id')
 try:
-    _COND = dbutils.widgets.get('condition')
+    _COND = dbutils.widgets.get('conditions')
 except Exception:
-    _COND = '450A'
+    _COND = 'ALL'
  
 A_CELL_CM2 = 304.92
 # Auto-detect Gamry folder for current Leepa
@@ -2106,7 +2224,7 @@ def _load_pipeline(leepa, cond):
 try:
     _conds = selected_conditions()
 except NameError:
-    _conds = [_COND] if _COND != 'ALL' else ['45A', '60A', '150A', '450A']
+    _conds = parse_conditions(_COND, ['45A', '60A', '150A', '450A'])
  
 for cond in _conds:
     seg_df, agg_df, src, _prov, rec_df, _cov = _load_pipeline(_LEEPA, cond)
@@ -2289,7 +2407,7 @@ for cond in _conds:
         paper_bgcolor='white', plot_bgcolor='white',
         margin=dict(t=100, b=55, r=280), hovermode='closest',
         legend=dict(font=dict(size=10), y=0.5, yanchor='middle'))
-    fig.show()
+    show_fig(fig)          # one plot per figure, stacked
  
     print(f"\n  {cond}: {n_seg} measured"
           + (f" + {_nrec} rebuilt from neighbours" if _nrec else "")
@@ -2468,8 +2586,15 @@ _map_dir = '/Workspace/Users/uum5fe@bosch.com/master_thesis/map'
 if _map_dir not in sys.path:
     sys.path.insert(0, _map_dir)
 
-from plate_model import PLATE, draw_plate
-from plate_viewer import write_html, Field
+# The interactive viewer lives outside this folder. It is optional: the
+# static maps below are drawn by plate_maps (beside this notebook), which
+# needs nothing but r2d2_geometry.
+try:
+    from plate_viewer import write_html, Field
+except Exception as _pv_err:                               # noqa: BLE001
+    write_html = Field = None
+    print(f'  plate_viewer not importable ({type(_pv_err).__name__}); '
+          f'interactive viewer skipped, static maps still drawn')
 
 import matplotlib
 matplotlib.use('Agg')
@@ -2478,7 +2603,7 @@ import matplotlib.pyplot as plt
 _CACHE_VOL = Path('/Volumes/ps_xplatform_dev/rvadvtec_dev/ev_rvadvtec_dev/EIS_Results')
 
 _FIELD_DEFS = [
-    ('R_ohmic',      'HFR (Rs)',                   'mohm.cm2', 'viridis', 1),
+    ('R_ohmic',      'HFR (Rs)',                   'mohm.cm2', 'magma',   1),
     ('R_ct',         'R_ct (charge transfer)',     'mohm.cm2', 'inferno', 1),
     ('R_mt',         'R_mt (mass transport)',      'mohm.cm2', 'magma',   1),
     ('R_pol',        'R_pol (total polarisation)', 'mohm.cm2', 'thermal', 1),
@@ -2576,9 +2701,10 @@ for cond, (gold_csv, prov) in sorted(_COND_GOLD.items()):
             # whose segments lost their sub-16 Hz points.
             print(f'  {col}: no finite values on any segment -- not mapped')
             continue
-        fields.append(Field(col, label, unit, ramp, dec, vals))
+        if Field is not None:
+            fields.append(Field(col, label, unit, ramp, dec, vals))
 
-    if fields:
+    if fields and write_html is not None:
         _html_out = _out_dir / 'plate_interactive.html'
         _html_out.parent.mkdir(parents=True, exist_ok=True)
         # The condition belongs in the figure itself. A screenshot of a heat
@@ -2596,18 +2722,33 @@ for cond, (gold_csv, prov) in sorted(_COND_GOLD.items()):
         displayHTML(f'<iframe srcdoc="{_doc}" width="100%" height="700" '
                     f'style="border:none;"></iframe>')
 
-    for col, label, unit, ramp, dec in _FIELD_DEFS[:3]:
-        if col not in _cols:
+    # ── Static maps, one per parameter, VALUE PRINTED IN EVERY SEGMENT ──
+    # All resistance maps share one look: the 'magma' ramp the mass-transport
+    # map always had, and a colour scale over the 5th..95th percentile of the
+    # plate. On a min..max scale one low segment (e.g. 50 against a plate of
+    # 60-70 mOhm.cm2) stretches the bar and the rest of the plate collapses
+    # into a few shades -- the uniformity pattern is in the numbers but not
+    # in the colours, which is how the HFR map looked. Values outside the
+    # percentile range keep the end colour, are printed as measured, and the
+    # colour bar gets an arrow for them.
+    _classes = ({str(int(r['segment'])): str(r['class'])
+                 for _, r in df.iterrows()} if 'class' in _cols else {})
+    _STATIC = [('R_ohmic', 'magma'), ('R_ct', 'magma'), ('R_mt', 'magma'),
+               ('R_pol', 'magma')]
+    _defs = {d[0]: d for d in _FIELD_DEFS}
+    for col, ramp in _STATIC:
+        if col not in _cols or col not in _defs:
             continue
+        _, label, unit, _ramp_unused, dec = _defs[col]
         vals = {int(r['segment']): float(r[col]) for _, r in df.iterrows()
                 if pd.notna(r[col]) and np.isfinite(r[col])}
         if not vals:
             continue
-        fig, ax = draw_plate(vals, label=label, unit=unit, cmap=ramp)
-        ax.set_title(f'{_LEEPA} / {cond} / SNR {_SNR or "default"} / '
-                     f'{EVALUATION_MODE} — {label}',
-                     fontsize=13, fontweight='bold')
-        plt.tight_layout()
+        fig, ax = plate_maps.draw_value_map(
+            vals, label=label, unit=unit.replace('mohm.cm2', 'mΩ·cm²'),
+            cmap=ramp, decimals=dec, classes=_classes,
+            title=(f'{_LEEPA} / {cond} / SNR {_SNR or "default"} / '
+                   f'{EVALUATION_MODE} — {label}'))
         _png_out = _out_dir / f'plate_{col}.png'
         fig.savefig(str(_png_out), dpi=200, bbox_inches='tight')
         display(fig)
@@ -2903,7 +3044,7 @@ for cond, blob in ECM_ALL.items():
     for i, o in enumerate(owner):
         fig.data[i].visible = o.startswith('seg:')
  
-    displayHTML(fig.to_html(full_html=False, include_plotlyjs='cdn'))
+    show_fig(fig, html=True)   # one plot per figure, stacked
 
 # COMMAND ----------
 
@@ -2990,7 +3131,7 @@ for cond, blob in ECM_ALL.items():
         height=520, width=1550, paper_bgcolor='white', plot_bgcolor='white',
         margin=dict(t=110, r=260), hovermode='closest',
         legend=dict(font=dict(size=10), y=0.5, yanchor='middle'))
-    displayHTML(fig.to_html(full_html=False, include_plotlyjs='cdn'))
+    show_fig(fig, html=True)   # one plot per figure, stacked
  
     AGG_ECM[cond] = {'Rs_mohm_cm2': _rs, 'R_pol_mohm_cm2': _rpol,
                      'R_ct_mohm_cm2': a['R_ct'] * 1000,
@@ -3068,14 +3209,19 @@ for cond, blob in ECM_ALL.items():
 # ═══════════════════════════════════════════════════════════════════════════════
 # The same ECM parameters, laid out on the plate.  Driven off ECM_ALL, so the
 # maps and the Nyquist overlays can never disagree about what was fitted.
+#
+# Drawn with plate_maps: the real segment outlines, the fitted VALUE printed
+# inside every segment, and the same 'magma' ramp over the 5th..95th
+# percentile as the pipeline's own maps above -- so an ECM Rs map and a
+# pipeline HFR map can be read side by side. (This cell used to draw one dot
+# per segment centroid on an RdYlGn ramp, which showed neither the segment
+# shapes nor the numbers.)
 # ═══════════════════════════════════════════════════════════════════════════════
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from matplotlib.colors import Normalize
 import numpy as np
- 
-_seg_coords = {int(s): (c.cx_mm, c.cy_mm) for s, c in geom.SEGMENTS.items()}
+from IPython.display import display
  
 for cond, blob in ECM_ALL.items():
     seg_fits = blob['segments']
@@ -3089,37 +3235,17 @@ for cond, blob in ECM_ALL.items():
     ]
  
     for param_name, param_map in _maps:
-        param_map = {k: v for k, v in param_map.items()
-                     if k in _seg_coords and np.isfinite(v)}
+        param_map = {str(k): v for k, v in param_map.items()
+                     if str(k) in geom.SEGMENTS and np.isfinite(v)}
         if len(param_map) < 3:
             print(f"  {cond}: too few segments with coordinates for {param_name}")
             continue
- 
-        segs = sorted(param_map)
-        xs = [_seg_coords[s][0] for s in segs]
-        ys = [_seg_coords[s][1] for s in segs]
-        vals = [param_map[s] for s in segs]
- 
-        fig_h, ax = plt.subplots(1, 1, figsize=(10, 6))
-        ax.set_facecolor('#f5f5f5')
-        vmin, vmax = np.percentile(vals, 5), np.percentile(vals, 95)
-        if vmax <= vmin:
-            vmin, vmax = min(vals), max(vals) + 1e-9
-        sc = ax.scatter(xs, ys, c=vals, cmap='RdYlGn_r',
-                        norm=Normalize(vmin=vmin, vmax=vmax),
-                        s=180, edgecolors='k', linewidths=0.5, zorder=3)
-        for s, x, y in zip(segs, xs, ys):
-            ax.annotate(f'{s}', (x, y), ha='center', va='center',
-                        fontsize=6, fontweight='bold', zorder=4)
-        cbar = plt.colorbar(sc, ax=ax, shrink=0.8)
-        cbar.set_label(f'{param_name} [mΩ·cm²]')
-        ax.set_xlabel('x [mm]')
-        ax.set_ylabel('y [mm]')
-        ax.set_title(f'{param_name} — Leepa {LEEPA}, {cond} ({len(segs)} segments)')
-        ax.set_aspect('equal')
-        ax.grid(True, alpha=0.3)
-        plt.tight_layout()
-        plt.show()
+        fig_h, ax = plate_maps.draw_value_map(
+            param_map, label=param_name, unit='mΩ·cm²', cmap='magma',
+            decimals=1,
+            title=f'{param_name} — Leepa {LEEPA}, {cond} '
+                  f'({len(param_map)} segments)')
+        display(fig_h)
         plt.close(fig_h)
  
     print(f"  {cond}: ECM plate maps rendered")
@@ -3470,7 +3596,7 @@ for cond in _to_plot:
         height=560, width=1500, paper_bgcolor='white', plot_bgcolor='white',
         margin=dict(t=105, b=55, r=260), hovermode='closest',
         legend=dict(font=dict(size=10), y=0.5, yanchor='middle'))
-    displayHTML(fig.to_html(full_html=False, include_plotlyjs='cdn'))
+    show_fig(fig, html=True)   # one plot per figure, stacked
  
 # ─── Summary table ───
 if VALIDATION:
@@ -3709,7 +3835,7 @@ for cond, kk_cond in KK_RESULTS.items():
                       showlegend=True, hovermode='closest')
     fig.update_xaxes(showgrid=True, gridcolor='#eee')
     fig.update_yaxes(showgrid=True, gridcolor='#eee')
-    displayHTML(fig.to_html(full_html=False, include_plotlyjs='cdn'))
+    show_fig(fig, html=True)   # one plot per figure, stacked
 
 # COMMAND ----------
 
@@ -3940,7 +4066,7 @@ for cond, drt_cond in DRT_RESULTS.items():
                       paper_bgcolor='white', plot_bgcolor='white', hovermode='closest')
     fig.update_xaxes(showgrid=True, gridcolor='#eee')
     fig.update_yaxes(showgrid=True, gridcolor='#eee')
-    displayHTML(fig.to_html(full_html=False, include_plotlyjs='cdn'))
+    show_fig(fig, html=True)   # one plot per figure, stacked
  
 # ─── Lambda sensitivity plot (Plotly interactive) ───
 for cond, drt_cond in DRT_RESULTS.items():
@@ -3979,7 +4105,7 @@ for cond, drt_cond in DRT_RESULTS.items():
                       hovermode='x unified')
     fig.update_xaxes(showgrid=True, gridcolor='#eee')
     fig.update_yaxes(showgrid=True, gridcolor='#eee')
-    displayHTML(fig.to_html(full_html=False, include_plotlyjs='cdn'))
+    show_fig(fig, html=True)   # one plot per figure, stacked
     break  # only show for first condition
 
 # COMMAND ----------
@@ -4255,7 +4381,7 @@ for cond, ecm_cond in ECM_FIT_RESULTS.items():
                       paper_bgcolor='white', plot_bgcolor='white', hovermode='closest')
     fig.update_xaxes(showgrid=True, gridcolor='#eee')
     fig.update_yaxes(showgrid=True, gridcolor='#eee')
-    displayHTML(fig.to_html(full_html=False, include_plotlyjs='cdn'))
+    show_fig(fig, html=True)   # one plot per figure, stacked
  
     # --- Residual plot ---
     titles_res = [f'Seg {s} — max {ecm_cond[s]["res_pct"].max():.1f}%' for s in show_segs]
@@ -4280,7 +4406,7 @@ for cond, ecm_cond in ECM_FIT_RESULTS.items():
                        paper_bgcolor='white', plot_bgcolor='white', hovermode='x unified')
     fig2.update_xaxes(showgrid=True, gridcolor='#eee')
     fig2.update_yaxes(showgrid=True, gridcolor='#eee')
-    displayHTML(fig2.to_html(full_html=False, include_plotlyjs='cdn'))
+    show_fig(fig2, html=True)  # one plot per figure, stacked
  
 # ─── Parameter summary table ───
 for cond, ecm_cond in ECM_FIT_RESULTS.items():

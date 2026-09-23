@@ -28,7 +28,8 @@ from config import Config, DEFAULT
 
 
 RUNNER = Path(__file__).with_name("Local EIS Pipeline Runner.py")
-FUNCS = ("_run_identity", "_cache_dir", "selected_conditions", "result_dir",
+FUNCS = ("condition_sort_key", "parse_conditions",
+         "_run_identity", "_cache_dir", "selected_conditions", "result_dir",
          "_legacy_snr_names", "describe_source")
 
 
@@ -42,7 +43,7 @@ def _namespace(tmp_path, condition="450A", mode="default", snr=0.0):
     ns["CONDITIONS"] = ["150A", "450A", "45A", "60A"]
     ns["EVALUATION_MODE"] = mode
     ns["F_MIN"], ns["F_MAX"], ns["MIN_SNR_DB"] = 0.15, 4500.0, snr
-    ns["_w"] = lambda n, d="": {"condition": condition}.get(n, d)
+    ns["_w"] = lambda n, d="": {"conditions": condition}.get(n, d)
 
     keys = re.search(r"_CACHE_IDENTITY_KEYS = \((.*?)\n\)", src, re.S)
     assert keys, "the cache identity key list moved or was renamed"
@@ -75,6 +76,23 @@ def test_only_the_selected_condition_is_returned(tmp_path) -> None:
 
 def test_all_means_all(tmp_path) -> None:
     ns = _namespace(tmp_path, condition="ALL")
+    assert ns["selected_conditions"]() == ["150A", "450A", "45A", "60A"]
+
+
+def test_a_multi_selection_returns_exactly_those_in_current_order(tmp_path) -> None:
+    """The multiselect widget hands back "450A,45A"; evaluate those two only,
+    lowest current first, whatever order they were ticked in."""
+    ns = _namespace(tmp_path, condition="450A,45A")
+    assert ns["selected_conditions"]() == ["45A", "450A"]
+
+
+def test_all_ticked_alongside_others_still_means_all(tmp_path) -> None:
+    ns = _namespace(tmp_path, condition="45A,ALL")
+    assert ns["selected_conditions"]() == ["150A", "450A", "45A", "60A"]
+
+
+def test_nothing_ticked_means_all(tmp_path) -> None:
+    ns = _namespace(tmp_path, condition="")
     assert ns["selected_conditions"]() == ["150A", "450A", "45A", "60A"]
 
 

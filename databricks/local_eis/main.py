@@ -275,7 +275,16 @@ def run_pipeline(cfg: Config, stop_after: str = "gold") -> dict:
 
     if cfg.source_format == "csv":
         import csv_pipeline
-        return csv_pipeline.run_csv(cfg, stop_after=stop_after)
+        manifest = csv_pipeline.run_csv(cfg, stop_after=stop_after)
+        # The CSV path used to return here and so never ran the Gamry
+        # comparison or the plausibility checks. Both only need the files
+        # run_csv has just written, so run them on a full (gold) run.
+        if stop_after == "gold" and isinstance(manifest, dict):
+            manifest.setdefault("stages", {})
+            whole_cell_and_plausibility(cfg, manifest,
+                                        utils.get_logger(cfg.verbose), sr=None)
+            utils.write_json(Path(cfg.out_dir) / "run_manifest.json", manifest)
+        return manifest
 
     log = utils.get_logger(cfg.verbose)
     t0 = time.time()
@@ -317,6 +326,32 @@ def run_pipeline(cfg: Config, stop_after: str = "gold") -> dict:
     gold.save(gr, sr, cfg, log)
     manifest["stages"]["gold"] = gr.stats
 
+    whole_cell_and_plausibility(cfg, manifest, log, sr=sr)
+
+    dt = time.time() - t0
+    utils.banner("DONE", log)
+    log.info(f"  {gr.stats['n_measured']}/{gr.stats['n_total']} segments "
+             f"measured, {gr.stats['n_inferred']} inferred, "
+             f"{gr.stats['n_bad']} hardware-bad")
+    if "R_ohmic" in gr.stats:
+        r = gr.stats["R_ohmic"]
+        log.info(f"  R_ohmic {1000*r['mean']:.1f} +/- {1000*r['sd']:.1f} "
+                 f"mOhm cm2, spread {r['spread']:.2f}x")
+    log.info(f"  {dt:.1f} s -> {cfg.out_dir}")
+
+    manifest["elapsed_s"] = dt
+    utils.write_json(Path(cfg.out_dir) / "run_manifest.json", manifest)
+    return manifest
+
+
+def whole_cell_and_plausibility(cfg: Config, manifest: dict, log,
+                                sr=None) -> None:
+    """Gamry cross-check, then plausibility -- shared by FAMOS and CSV paths.
+
+    `sr` is the SilverRun on the FAMOS path. On the CSV path there is none,
+    and plausibility is evaluated from the files the run wrote instead
+    (plausibility.check_from_disk).
+    """
     # ---- the whole-cell cross-check ---------------------------------------
     # Last, because it needs the aggregate silver has just written, and
     # non-fatal, because a missing or unreadable reference must not throw away
@@ -338,14 +373,13 @@ def run_pipeline(cfg: Config, stop_after: str = "gold") -> dict:
                 # the reference arm of the plausibility aggregate check, in
                 # the same ohm.cm2 the local side already uses
                 reference_asr = (comps[0].freq, comps[0].Z_ref)
-                # ... and its R_s, for the parallel-sum closure. The measured
-                # intercept when the sweep reached it, otherwise the
-                # extrapolation, which is what the local parallel sum should
-                # be compared against when neither curve crosses the axis.
-                import math
-                reference_hfr = (comps[0].hfr_ref
-                                 if math.isfinite(comps[0].hfr_ref)
-                                 else comps[0].hfr_ref_fit)
+                # ... and its R_s. ONLY the measured intercept. The old
+                # fallback to hfr_ref_fit (a straight-line extrapolation to
+                # Z''=0, biased low) was compared against a top-band mean
+                # (biased high) and failed on data with nothing wrong with
+                # it. With a sweep present, plausibility now uses the
+                # matched-band R_s check instead, so nothing is lost.
+                reference_hfr = comps[0].hfr_ref
             if cfg.write_png and comps:
                 gamry_compare.plot(
                     comps, Path(cfg.out_dir) / "gamry_comparison.png")
@@ -358,29 +392,19 @@ def run_pipeline(cfg: Config, stop_after: str = "gold") -> dict:
     # diagnostic that can end a run is a liability, not a safeguard.
     try:
         import plausibility
-        rep = plausibility.check_run(
-            sr, cfg, plate_key=cfg.plate, reference=reference_asr,
-            reference_hfr=reference_hfr)
+        if sr is not None:
+            rep = plausibility.check_run(
+                sr, cfg, plate_key=cfg.plate, reference=reference_asr,
+                reference_hfr=reference_hfr)
+        else:
+            rep = plausibility.check_from_disk(
+                cfg.out_dir, cfg, plate_key=cfg.plate,
+                reference=reference_asr, reference_hfr=reference_hfr)
         plausibility.report(rep, log)
         plausibility.save(rep, cfg.out_dir)
         manifest["stages"]["plausibility"] = rep.rows()
     except Exception as exc:                                # noqa: BLE001
         log.warning(f"  plausibility checks skipped: {exc}")
-
-    dt = time.time() - t0
-    utils.banner("DONE", log)
-    log.info(f"  {gr.stats['n_measured']}/{gr.stats['n_total']} segments "
-             f"measured, {gr.stats['n_inferred']} inferred, "
-             f"{gr.stats['n_bad']} hardware-bad")
-    if "R_ohmic" in gr.stats:
-        r = gr.stats["R_ohmic"]
-        log.info(f"  R_ohmic {1000*r['mean']:.1f} +/- {1000*r['sd']:.1f} "
-                 f"mOhm cm2, spread {r['spread']:.2f}x")
-    log.info(f"  {dt:.1f} s -> {cfg.out_dir}")
-
-    manifest["elapsed_s"] = dt
-    utils.write_json(Path(cfg.out_dir) / "run_manifest.json", manifest)
-    return manifest
 
 
 def self_test() -> int:

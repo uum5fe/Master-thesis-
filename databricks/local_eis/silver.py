@@ -1886,7 +1886,13 @@ def run(bronze_run: BronzeRun, cfg: Config = DEFAULT, log=None) -> SilverRun:
                         f"the COVERED area. Comparing it against a whole-cell "
                         f"instrument means comparing "
                         f"{100*np.nanmedian(cov):.0f} % of the plate against "
-                        f"100 % of it; use z_asr_full, or fill the gaps.")
+                        f"100 % of it, which holds only if the unmeasured "
+                        f"area behaves like the measured area. Do NOT switch "
+                        f"to z_asr_full for this: it divides the whole-plate "
+                        f"area by the admittance of the measured part only, "
+                        f"so it is inflated by 1/coverage. To close the gap, "
+                        f"measure more area or fill the missing segments "
+                        f"(fill_missing_from_neighbours).")
     else:
         f_cell, Z_cell, n_cell = cell_aggregate(spectra)
 

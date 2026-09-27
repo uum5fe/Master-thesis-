@@ -664,7 +664,7 @@ class Config:
     # says which architecture it uses, SET IT HERE.  A known answer beats a
     # weakly discriminated fit, and the consequences of guessing wrong are
     # large: the two nominal steps differ by a factor of ten at 16 channels.
-    skew_basis: str = "auto"
+    skew_basis: str = "slot"
 
     # PRESETS.  Config.preset("permissive") loosens every gate to roughly the
     # philosophy of a coherence-threshold pipeline: keep the point unless it

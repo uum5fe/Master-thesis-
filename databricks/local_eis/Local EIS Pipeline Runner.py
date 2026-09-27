@@ -695,235 +695,236 @@ else:
 # COMMAND ----------
 
 # DBTITLE 1,Datago Source: discover + read FAMOS waveforms from Delta table
-# ═══════════════════════════════════════════════════════════════════════════════
-# DATAGO SOURCE: FamosFile-compatible reader from Delta table
-#
-# Replaces the Volumes-based file reader with a datago query backend.
-# The pipeline (bronze.py) calls FamosFile(path) to get waveform data.
-# This cell provides DatagoFamosFile that has the SAME interface but
-# reads from ps_xplatform_dev.rvadvtec_ops.datago_advtec_values_delta.
-#
-# PERFORMANCE NOTE:
-#   Each card = 16 channels × 2.5M samples = 40M rows from Delta.
-#   ~30-60s per card vs ~5s from Volumes binary. Use Volumes when available.
-#   Toggle via DATA_SOURCE widget below.
-# ═══════════════════════════════════════════════════════════════════════════════
-import numpy as np
-import time
-from pathlib import Path
-from dataclasses import dataclass, field
- 
-_VAL_TBL = 'ps_xplatform_dev.rvadvtec_ops.datago_advtec_values_delta'
-_META_TBL = 'ps_xplatform_dev.rvadvtec_ops.datago_advtec_metadata'
-_GP_TBL = 'ps_xplatform_dev.rvadvtec_ops.datago_advtec_generalproperties'
- 
-# ─── Data source selection ───
-# Set to 'datago' to read from Delta table, 'volumes' for fast binary
-DATA_SOURCE = 'datago'  # <-- SWITCH HERE
- 
-print(f"  Data source: {DATA_SOURCE}")
- 
- 
-# ─── Discover FAMOS file_ids from datago ───
-def discover_famos_file_ids(leepa: str) -> dict:
-    """Find FAMOS card recordings in datago for a Leepa.
-    
-    Returns: {condition: [file_id_1, ..., file_id_5]} (one per card)
-    """
-    # Find NULL measurement_type entries (FAMOS files have no type set)
-    df = spark.sql(f"""
-        SELECT DISTINCT gp.file_id, gp.measurementBegin
-        FROM {_META_TBL} m
-        JOIN {_GP_TBL} gp ON m.measurement_id = gp.measurement_id
-        WHERE m.orderId = 'RO{leepa}'
-          AND gp.measurement_type IS NULL
-        ORDER BY gp.measurementBegin
-    """).toPandas()
-    
-    if df.empty:
-        return {}
-    
-    # Exclude TOM bench file (first one, usually much earlier timestamp)
-    # TOM bench has 80+ channels; FAMOS cards have exactly 16
-    # Heuristic: group by minute, groups of 5 = card sets
-    df['minute'] = df['measurementBegin'].dt.floor('min')
-    groups = df.groupby('minute')['file_id'].apply(list).to_dict()
-    
-    # Filter: only groups with exactly 5 files (= 5 cards per condition)
-    card_groups = {k: v for k, v in groups.items() if len(v) == 5}
-    
-    # Map to conditions by order (same order as Volumes naming)
-    # Try to determine condition from Volumes filenames if available
-    conditions_ordered = []
-    famos_root = Path('/Volumes/ps_xplatform_dev/rvadvtec_dev/ev_rvadvtec_dev/Famos')
-    try:
-        vol_files = sorted(famos_root.glob(f'Leepa_{leepa}_Current_*_Karte_1.DAT'))
-        conditions_ordered = [f.name.split('_')[3] for f in vol_files]
-    except Exception:
-        pass
-    
-    if not conditions_ordered:
-        conditions_ordered = ['150A', '450A', '45A', '60A']  # default order
-    
-    result = {}
-    for idx, (ts, file_ids) in enumerate(sorted(card_groups.items())):
-        cond = conditions_ordered[idx] if idx < len(conditions_ordered) else f'Cond-{idx+1}'
-        result[cond] = file_ids
-    
-    return result
- 
- 
-# ─── DatagoFamosFile: drop-in replacement for FamosFile ───
-class DatagoFamosFile:
-    """FamosFile-compatible reader that pulls waveform data from datago.
-    
-    Interface matches eis_local.FamosFile:
-        .path, .fs, .n_ch, .n_samples, .names,
-        .segment_names, .uc_names, .temp_names,
-        .channel(name) -> np.ndarray
-    """
-    
-    def __init__(self, file_id: str, card_label: str = 'datago'):
-        self.file_id = file_id
-        self.path = Path(f'/datago/{card_label}.DAT')  # fake path for compatibility
-        self._channels = {}  # lazy-loaded
-        self._metadata_loaded = False
-        self._load_metadata()
-    
-    def _load_metadata(self):
-        """Load channel list and sample counts (lightweight query)."""
-        df = spark.sql(f"""
-            SELECT channel, COUNT(*) as n_pts,
-                   MIN(CAST(time_value AS DOUBLE)) as t_min,
-                   MAX(CAST(time_value AS DOUBLE)) as t_max
-            FROM {_VAL_TBL}
-            WHERE file_id = '{self.file_id}'
-            GROUP BY channel
-            ORDER BY channel
-        """).toPandas()
-        
-        self.names = df['channel'].tolist()
-        self.n_ch = len(self.names)
-        
-        # Determine sampling rate from first channel
-        if not df.empty:
-            row0 = df.iloc[0]
-            duration = row0['t_max'] - row0['t_min']
-            self.n_samples = int(row0['n_pts'])
-            self.fs = round(self.n_samples / duration) if duration > 0 else 10000
-        else:
-            self.n_samples = 0
-            self.fs = 10000
-        
-        # Classify channels
-        self.segment_names = [n for n in self.names if n.isdigit()]
-        self.uc_names = [n for n in self.names if n.startswith('UC')]
-        self.temp_names = [n for n in self.names if n.startswith('Temp')]
-        
-        # Acquisition slot positions (channel index = multiplexing order)
-        # In real FAMOS, this is the binary header order. Here we approximate
-        # using the standard R2D2 card layout: UC first, then segments, then Temp
-        _ordered = self.uc_names + self.segment_names + self.temp_names
-        self._position_map = {name: idx for idx, name in enumerate(_ordered)}
-        self.positions = _ordered
-        self._metadata_loaded = True
-    
-    def position(self, channel_name: str) -> int:
-        """Return acquisition slot index for a channel (0-based)."""
-        return self._position_map.get(channel_name, 0)
-    
-    def channel(self, name: str) -> np.ndarray:
-        """Get waveform data for a channel (loads from datago on first access)."""
-        if name not in self._channels:
-            self._load_channel(name)
-        return self._channels[name]
-    
-    def _load_channel(self, name: str):
-        """Query datago for a single channel's waveform."""
-        df = spark.sql(f"""
-            SELECT CAST(time_value AS DOUBLE) as t,
-                   CAST(value AS DOUBLE) as v
-            FROM {_VAL_TBL}
-            WHERE file_id = '{self.file_id}'
-              AND channel = '{name}'
-            ORDER BY t
-        """).toPandas()
-        self._channels[name] = df['v'].values
-    
-    def load_all_channels(self):
-        """Bulk-load all channels at once (more efficient than one-by-one)."""
-        t0 = time.time()
-        df = spark.sql(f"""
-            SELECT channel,
-                   CAST(time_value AS DOUBLE) as t,
-                   CAST(value AS DOUBLE) as v
-            FROM {_VAL_TBL}
-            WHERE file_id = '{self.file_id}'
-            ORDER BY channel, t
-        """).toPandas()
-        
-        for ch_name, grp in df.groupby('channel'):
-            self._channels[ch_name] = grp['v'].values
-        
-        dt = time.time() - t0
-        print(f"    [{self.path.stem}] loaded {self.n_ch} channels, "
-              f"{self.n_samples:,} pts/ch in {dt:.1f}s")
-    
-    def __getitem__(self, name: str) -> np.ndarray:
-        """Array-style access: fam['UC2'] -> waveform."""
-        return self.channel(name)
- 
- 
-# ─── Discover for current Leepa ───
-DATAGO_FAMOS_MAP = discover_famos_file_ids(LEEPA)
- 
-if DATAGO_FAMOS_MAP:
-    print(f"\n  Datago FAMOS files for Leepa {LEEPA}:")
-    for cond, fids in sorted(DATAGO_FAMOS_MAP.items()):
-        print(f"    {cond}: {len(fids)} cards ({fids[0][:12]}...)")
-    print(f"  Total: {sum(len(v) for v in DATAGO_FAMOS_MAP.values())} files")
-else:
-    print(f"  No FAMOS data in datago for Leepa {LEEPA}")
- 
-# ─── Monkey-patch bronze.py to use datago when selected ───
-if DATA_SOURCE == 'datago' and DATAGO_FAMOS_MAP:
-    import bronze as _bronze_mod
-    _orig_FamosFile = _bronze_mod.FamosFile  # keep reference to original
-    
-    # Build a lookup: condition+card_index -> file_id
-    _DATAGO_CARD_LOOKUP = {}
-    for cond, fids in DATAGO_FAMOS_MAP.items():
-        for card_idx, fid in enumerate(fids, start=1):
-            _DATAGO_CARD_LOOKUP[(cond, card_idx)] = fid
-    
-    # Create a wrapper that intercepts FamosFile(path) calls
-    class _FamosFileDatagoShim:
-        """Intercepts FamosFile(path) and routes to datago if file_id known."""
-        def __new__(cls, path, *args, **kwargs):
-            path = Path(path)
-            # Try to extract condition + card from filename
-            # Expected: Leepa_2611976_Current_60A_Test_01_Karte_1.DAT
-            name = path.name
-            parts = name.split('_')
-            try:
-                cond = parts[3]           # e.g. '60A'
-                card = int(parts[-1].replace('.DAT', ''))  # e.g. 1
-                key = (cond, card)
-                if key in _DATAGO_CARD_LOOKUP:
-                    fid = _DATAGO_CARD_LOOKUP[key]
-                    reader = DatagoFamosFile(fid, card_label=f'Karte_{card}')
-                    reader.load_all_channels()  # pre-fetch everything
-                    return reader
-            except (IndexError, ValueError):
-                pass
-            # Fall back to original file-based reader
-            return _orig_FamosFile(path, *args, **kwargs)
-    
-    _bronze_mod.FamosFile = _FamosFileDatagoShim
-    print(f"\n   Bronze patched: FamosFile now reads from datago")
-    print(f"    (Note: ~30-60s per card due to Delta row scan)")
-else:
-    print(f"\n  Using Volumes path (fast binary read)")
+# MAGIC %skip
+# MAGIC # ═══════════════════════════════════════════════════════════════════════════════
+# MAGIC # DATAGO SOURCE: FamosFile-compatible reader from Delta table
+# MAGIC #
+# MAGIC # Replaces the Volumes-based file reader with a datago query backend.
+# MAGIC # The pipeline (bronze.py) calls FamosFile(path) to get waveform data.
+# MAGIC # This cell provides DatagoFamosFile that has the SAME interface but
+# MAGIC # reads from ps_xplatform_dev.rvadvtec_ops.datago_advtec_values_delta.
+# MAGIC #
+# MAGIC # PERFORMANCE NOTE:
+# MAGIC #   Each card = 16 channels × 2.5M samples = 40M rows from Delta.
+# MAGIC #   ~30-60s per card vs ~5s from Volumes binary. Use Volumes when available.
+# MAGIC #   Toggle via DATA_SOURCE widget below.
+# MAGIC # ═══════════════════════════════════════════════════════════════════════════════
+# MAGIC import numpy as np
+# MAGIC import time
+# MAGIC from pathlib import Path
+# MAGIC from dataclasses import dataclass, field
+# MAGIC  
+# MAGIC _VAL_TBL = 'ps_xplatform_dev.rvadvtec_ops.datago_advtec_values_delta'
+# MAGIC _META_TBL = 'ps_xplatform_dev.rvadvtec_ops.datago_advtec_metadata'
+# MAGIC _GP_TBL = 'ps_xplatform_dev.rvadvtec_ops.datago_advtec_generalproperties'
+# MAGIC  
+# MAGIC # ─── Data source selection ───
+# MAGIC # Set to 'datago' to read from Delta table, 'volumes' for fast binary
+# MAGIC DATA_SOURCE = 'datago'  # <-- SWITCH HERE
+# MAGIC  
+# MAGIC print(f"  Data source: {DATA_SOURCE}")
+# MAGIC  
+# MAGIC  
+# MAGIC # ─── Discover FAMOS file_ids from datago ───
+# MAGIC def discover_famos_file_ids(leepa: str) -> dict:
+# MAGIC     """Find FAMOS card recordings in datago for a Leepa.
+# MAGIC     
+# MAGIC     Returns: {condition: [file_id_1, ..., file_id_5]} (one per card)
+# MAGIC     """
+# MAGIC     # Find NULL measurement_type entries (FAMOS files have no type set)
+# MAGIC     df = spark.sql(f"""
+# MAGIC         SELECT DISTINCT gp.file_id, gp.measurementBegin
+# MAGIC         FROM {_META_TBL} m
+# MAGIC         JOIN {_GP_TBL} gp ON m.measurement_id = gp.measurement_id
+# MAGIC         WHERE m.orderId = 'RO{leepa}'
+# MAGIC           AND gp.measurement_type IS NULL
+# MAGIC         ORDER BY gp.measurementBegin
+# MAGIC     """).toPandas()
+# MAGIC     
+# MAGIC     if df.empty:
+# MAGIC         return {}
+# MAGIC     
+# MAGIC     # Exclude TOM bench file (first one, usually much earlier timestamp)
+# MAGIC     # TOM bench has 80+ channels; FAMOS cards have exactly 16
+# MAGIC     # Heuristic: group by minute, groups of 5 = card sets
+# MAGIC     df['minute'] = df['measurementBegin'].dt.floor('min')
+# MAGIC     groups = df.groupby('minute')['file_id'].apply(list).to_dict()
+# MAGIC     
+# MAGIC     # Filter: only groups with exactly 5 files (= 5 cards per condition)
+# MAGIC     card_groups = {k: v for k, v in groups.items() if len(v) == 5}
+# MAGIC     
+# MAGIC     # Map to conditions by order (same order as Volumes naming)
+# MAGIC     # Try to determine condition from Volumes filenames if available
+# MAGIC     conditions_ordered = []
+# MAGIC     famos_root = Path('/Volumes/ps_xplatform_dev/rvadvtec_dev/ev_rvadvtec_dev/Famos')
+# MAGIC     try:
+# MAGIC         vol_files = sorted(famos_root.glob(f'Leepa_{leepa}_Current_*_Karte_1.DAT'))
+# MAGIC         conditions_ordered = [f.name.split('_')[3] for f in vol_files]
+# MAGIC     except Exception:
+# MAGIC         pass
+# MAGIC     
+# MAGIC     if not conditions_ordered:
+# MAGIC         conditions_ordered = ['150A', '450A', '45A', '60A']  # default order
+# MAGIC     
+# MAGIC     result = {}
+# MAGIC     for idx, (ts, file_ids) in enumerate(sorted(card_groups.items())):
+# MAGIC         cond = conditions_ordered[idx] if idx < len(conditions_ordered) else f'Cond-{idx+1}'
+# MAGIC         result[cond] = file_ids
+# MAGIC     
+# MAGIC     return result
+# MAGIC  
+# MAGIC  
+# MAGIC # ─── DatagoFamosFile: drop-in replacement for FamosFile ───
+# MAGIC class DatagoFamosFile:
+# MAGIC     """FamosFile-compatible reader that pulls waveform data from datago.
+# MAGIC     
+# MAGIC     Interface matches eis_local.FamosFile:
+# MAGIC         .path, .fs, .n_ch, .n_samples, .names,
+# MAGIC         .segment_names, .uc_names, .temp_names,
+# MAGIC         .channel(name) -> np.ndarray
+# MAGIC     """
+# MAGIC     
+# MAGIC     def __init__(self, file_id: str, card_label: str = 'datago'):
+# MAGIC         self.file_id = file_id
+# MAGIC         self.path = Path(f'/datago/{card_label}.DAT')  # fake path for compatibility
+# MAGIC         self._channels = {}  # lazy-loaded
+# MAGIC         self._metadata_loaded = False
+# MAGIC         self._load_metadata()
+# MAGIC     
+# MAGIC     def _load_metadata(self):
+# MAGIC         """Load channel list and sample counts (lightweight query)."""
+# MAGIC         df = spark.sql(f"""
+# MAGIC             SELECT channel, COUNT(*) as n_pts,
+# MAGIC                    MIN(CAST(time_value AS DOUBLE)) as t_min,
+# MAGIC                    MAX(CAST(time_value AS DOUBLE)) as t_max
+# MAGIC             FROM {_VAL_TBL}
+# MAGIC             WHERE file_id = '{self.file_id}'
+# MAGIC             GROUP BY channel
+# MAGIC             ORDER BY channel
+# MAGIC         """).toPandas()
+# MAGIC         
+# MAGIC         self.names = df['channel'].tolist()
+# MAGIC         self.n_ch = len(self.names)
+# MAGIC         
+# MAGIC         # Determine sampling rate from first channel
+# MAGIC         if not df.empty:
+# MAGIC             row0 = df.iloc[0]
+# MAGIC             duration = row0['t_max'] - row0['t_min']
+# MAGIC             self.n_samples = int(row0['n_pts'])
+# MAGIC             self.fs = round(self.n_samples / duration) if duration > 0 else 10000
+# MAGIC         else:
+# MAGIC             self.n_samples = 0
+# MAGIC             self.fs = 10000
+# MAGIC         
+# MAGIC         # Classify channels
+# MAGIC         self.segment_names = [n for n in self.names if n.isdigit()]
+# MAGIC         self.uc_names = [n for n in self.names if n.startswith('UC')]
+# MAGIC         self.temp_names = [n for n in self.names if n.startswith('Temp')]
+# MAGIC         
+# MAGIC         # Acquisition slot positions (channel index = multiplexing order)
+# MAGIC         # In real FAMOS, this is the binary header order. Here we approximate
+# MAGIC         # using the standard R2D2 card layout: UC first, then segments, then Temp
+# MAGIC         _ordered = self.uc_names + self.segment_names + self.temp_names
+# MAGIC         self._position_map = {name: idx for idx, name in enumerate(_ordered)}
+# MAGIC         self.positions = _ordered
+# MAGIC         self._metadata_loaded = True
+# MAGIC     
+# MAGIC     def position(self, channel_name: str) -> int:
+# MAGIC         """Return acquisition slot index for a channel (0-based)."""
+# MAGIC         return self._position_map.get(channel_name, 0)
+# MAGIC     
+# MAGIC     def channel(self, name: str) -> np.ndarray:
+# MAGIC         """Get waveform data for a channel (loads from datago on first access)."""
+# MAGIC         if name not in self._channels:
+# MAGIC             self._load_channel(name)
+# MAGIC         return self._channels[name]
+# MAGIC     
+# MAGIC     def _load_channel(self, name: str):
+# MAGIC         """Query datago for a single channel's waveform."""
+# MAGIC         df = spark.sql(f"""
+# MAGIC             SELECT CAST(time_value AS DOUBLE) as t,
+# MAGIC                    CAST(value AS DOUBLE) as v
+# MAGIC             FROM {_VAL_TBL}
+# MAGIC             WHERE file_id = '{self.file_id}'
+# MAGIC               AND channel = '{name}'
+# MAGIC             ORDER BY t
+# MAGIC         """).toPandas()
+# MAGIC         self._channels[name] = df['v'].values
+# MAGIC     
+# MAGIC     def load_all_channels(self):
+# MAGIC         """Bulk-load all channels at once (more efficient than one-by-one)."""
+# MAGIC         t0 = time.time()
+# MAGIC         df = spark.sql(f"""
+# MAGIC             SELECT channel,
+# MAGIC                    CAST(time_value AS DOUBLE) as t,
+# MAGIC                    CAST(value AS DOUBLE) as v
+# MAGIC             FROM {_VAL_TBL}
+# MAGIC             WHERE file_id = '{self.file_id}'
+# MAGIC             ORDER BY channel, t
+# MAGIC         """).toPandas()
+# MAGIC         
+# MAGIC         for ch_name, grp in df.groupby('channel'):
+# MAGIC             self._channels[ch_name] = grp['v'].values
+# MAGIC         
+# MAGIC         dt = time.time() - t0
+# MAGIC         print(f"    [{self.path.stem}] loaded {self.n_ch} channels, "
+# MAGIC               f"{self.n_samples:,} pts/ch in {dt:.1f}s")
+# MAGIC     
+# MAGIC     def __getitem__(self, name: str) -> np.ndarray:
+# MAGIC         """Array-style access: fam['UC2'] -> waveform."""
+# MAGIC         return self.channel(name)
+# MAGIC  
+# MAGIC  
+# MAGIC # ─── Discover for current Leepa ───
+# MAGIC DATAGO_FAMOS_MAP = discover_famos_file_ids(LEEPA)
+# MAGIC  
+# MAGIC if DATAGO_FAMOS_MAP:
+# MAGIC     print(f"\n  Datago FAMOS files for Leepa {LEEPA}:")
+# MAGIC     for cond, fids in sorted(DATAGO_FAMOS_MAP.items()):
+# MAGIC         print(f"    {cond}: {len(fids)} cards ({fids[0][:12]}...)")
+# MAGIC     print(f"  Total: {sum(len(v) for v in DATAGO_FAMOS_MAP.values())} files")
+# MAGIC else:
+# MAGIC     print(f"  No FAMOS data in datago for Leepa {LEEPA}")
+# MAGIC  
+# MAGIC # ─── Monkey-patch bronze.py to use datago when selected ───
+# MAGIC if DATA_SOURCE == 'datago' and DATAGO_FAMOS_MAP:
+# MAGIC     import bronze as _bronze_mod
+# MAGIC     _orig_FamosFile = _bronze_mod.FamosFile  # keep reference to original
+# MAGIC     
+# MAGIC     # Build a lookup: condition+card_index -> file_id
+# MAGIC     _DATAGO_CARD_LOOKUP = {}
+# MAGIC     for cond, fids in DATAGO_FAMOS_MAP.items():
+# MAGIC         for card_idx, fid in enumerate(fids, start=1):
+# MAGIC             _DATAGO_CARD_LOOKUP[(cond, card_idx)] = fid
+# MAGIC     
+# MAGIC     # Create a wrapper that intercepts FamosFile(path) calls
+# MAGIC     class _FamosFileDatagoShim:
+# MAGIC         """Intercepts FamosFile(path) and routes to datago if file_id known."""
+# MAGIC         def __new__(cls, path, *args, **kwargs):
+# MAGIC             path = Path(path)
+# MAGIC             # Try to extract condition + card from filename
+# MAGIC             # Expected: Leepa_2611976_Current_60A_Test_01_Karte_1.DAT
+# MAGIC             name = path.name
+# MAGIC             parts = name.split('_')
+# MAGIC             try:
+# MAGIC                 cond = parts[3]           # e.g. '60A'
+# MAGIC                 card = int(parts[-1].replace('.DAT', ''))  # e.g. 1
+# MAGIC                 key = (cond, card)
+# MAGIC                 if key in _DATAGO_CARD_LOOKUP:
+# MAGIC                     fid = _DATAGO_CARD_LOOKUP[key]
+# MAGIC                     reader = DatagoFamosFile(fid, card_label=f'Karte_{card}')
+# MAGIC                     reader.load_all_channels()  # pre-fetch everything
+# MAGIC                     return reader
+# MAGIC             except (IndexError, ValueError):
+# MAGIC                 pass
+# MAGIC             # Fall back to original file-based reader
+# MAGIC             return _orig_FamosFile(path, *args, **kwargs)
+# MAGIC     
+# MAGIC     _bronze_mod.FamosFile = _FamosFileDatagoShim
+# MAGIC     print(f"\n   Bronze patched: FamosFile now reads from datago")
+# MAGIC     print(f"    (Note: ~30-60s per card due to Delta row scan)")
+# MAGIC else:
+# MAGIC     print(f"\n  Using Volumes path (fast binary read)")
 
 # COMMAND ----------
 

@@ -162,12 +162,17 @@ def coverage(measured: list[str], plate_key: str = "gen1") -> Check:
                           "as-built pad map for this plate")
 
 
-def describe_block(measured: list[str], plate_key: str = "gen1") -> Check:
-    """Name the measured set: the interior block, the perimeter, or neither.
+def describe_block(measured: list[str], plate_key: str = "gen1",
+                   max_missing: int = 3) -> Check:
+    """Name the measured set: whole plate, interior block, perimeter, or neither.
 
     Worth stating explicitly, because the two 36-segment blocks are not
     interchangeable and the difference does not show up in any per-point
     number.
+
+    A full plate, or a block with up to `max_missing` segments excluded, is
+    what was cabled and passes; the area lost to the exclusions is already
+    judged by `coverage`, so it is only named here, not penalised twice.
     """
     plate = r2d2_geometry.plate(plate_key)
     areas = {int(k): s.area_cm2 for k, s in plate.segments.items()}
@@ -175,20 +180,36 @@ def describe_block(measured: list[str], plate_key: str = "gen1") -> Check:
     if not have:
         return Check("measured block", NA, "nothing measured")
 
-    lo, hi = set(range(1, 37)), set(range(37, 73))
+    everything = set(areas)
+    lo = set(range(1, 37)) & everything
+    hi = set(range(37, 73)) & everything
     frac = sum(areas[n] for n in have) / sum(areas.values())
-    if have == lo:
+
+    def _missing(block: set[int]) -> str:
+        gone = sorted(block - have)
+        return (f"; {len(gone)} excluded ({', '.join(map(str, gone))})"
+                if gone else "")
+
+    # ---- the whole plate (or nearly) -------------------------------------
+    if len(everything - have) <= max_missing:
+        return Check("measured block", PASS,
+                     f"the WHOLE plate, {len(have)}/{len(everything)} "
+                     f"segments ({100 * frac:.1f} % of area)"
+                     f"{_missing(everything)}", frac)
+    # ---- the interior block (or nearly) -----------------------------------
+    if have <= lo and len(lo - have) <= max_missing:
         return Check("measured block", PASS,
                      f"segments 1-36, the plate INTERIOR "
-                     f"({100 * frac:.1f} % of area, the larger segments)",
-                     frac)
-    if have == hi:
+                     f"({100 * frac:.1f} % of area, the larger segments)"
+                     f"{_missing(lo)}", frac)
+    # ---- the perimeter block (or nearly) ----------------------------------
+    if have <= hi and len(hi - have) <= max_missing:
         return Check("measured block", WARN,
                      f"segments 37-72, the plate PERIMETER "
                      f"({100 * frac:.1f} % of area, the smaller segments) -- "
                      f"the weaker of the two blocks to extrapolate from, "
-                     f"being both less area and the least typical part of it",
-                     frac)
+                     f"being both less area and the least typical part of it"
+                     f"{_missing(hi)}", frac)
 
     runs = _contiguous_runs(sorted(have))
     shape = (f"one contiguous run {runs[0][0]}-{runs[0][1]}" if len(runs) == 1
@@ -569,6 +590,87 @@ def series_resistance_closure(r_ohmic: dict[str, float],
                           "and the two error classes separate")
 
 
+def _topband_re(freq: np.ndarray, Z: np.ndarray,
+                span_decades: float = 0.35) -> tuple[float, int]:
+    """Inverse-variance mean of Re Z over the top third-decade of a band.
+
+    The same rule silver uses for R_ohmic (silver.r_ohmic_topband), repeated
+    here with uniform weights so this module does not import the whole
+    silver stage. What matters is that BOTH sides of a comparison go through
+    this one function over the SAME frequencies.
+    """
+    f = np.asarray(freq, float)
+    z = np.asarray(Z, complex)
+    ok = np.isfinite(f) & (f > 0) & np.isfinite(z.real)
+    f, z = f[ok], z[ok]
+    if f.size < 3:
+        return float("nan"), 0
+    sel = f >= f.max() * 10.0 ** (-span_decades)
+    if sel.sum() < 3:
+        sel = np.zeros_like(f, bool)
+        sel[np.argsort(f)[-3:]] = True
+    return float(np.mean(z.real[sel])), int(sel.sum())
+
+
+def matched_series_resistance(freq: np.ndarray, Z_agg: np.ndarray,
+                              ref_freq: np.ndarray, ref_Z_asr: np.ndarray,
+                              area_fraction: float) -> Check:
+    """R_s of the local aggregate vs the whole cell, SAME estimator, SAME band.
+
+    WHY THIS REPLACES THE PARALLEL-SUM CLOSURE WHEN A SWEEP IS AVAILABLE
+    ------------------------------------------------------------------
+    `series_resistance_closure` compares the per-segment R_ohmic (a top-band
+    mean of Re Z, biased HIGH while the arc is still open) against the Gamry
+    HFR. When the Gamry sweep stops before Z'' = 0, main.py used to pass
+    `hfr_ref_fit` -- a straight-line extrapolation to Z'' = 0, biased LOW.
+    Two estimators with opposite biases disagree by 8-12 % on a synthetic
+    cell with NO real difference, which alone fails the 8 % full-plate
+    tolerance.
+
+    Here the local aggregate and the reference are put on the same
+    frequencies (the reference is interpolated onto the local points inside
+    the overlap) and read with the same top-band rule. Whatever arc remains
+    open biases both sides identically and cancels in the ratio.
+    """
+    f = np.asarray(freq, float)
+    z = np.asarray(Z_agg, complex)
+    rf = np.asarray(ref_freq, float)
+    rz = np.asarray(ref_Z_asr, complex)
+    name = "R_s matched-band closure"
+    if f.size == 0 or rf.size == 0:
+        return Check(name, NA, "one side has no points")
+    lo, hi = max(np.nanmin(f), np.nanmin(rf)), min(np.nanmax(f), np.nanmax(rf))
+    band = np.isfinite(z) & (f >= lo) & (f <= hi)
+    if band.sum() < 3:
+        return Check(name, NA, f"only {int(band.sum())} overlapping local "
+                               f"point(s) in {lo:.3g}-{hi:.3g} Hz")
+    fb = f[band]
+    zr = utils.interp_complex(fb, rf, rz)
+    r_loc, n_loc = _topband_re(fb, z[band])
+    r_ref, _ = _topband_re(fb, zr)
+    if not (np.isfinite(r_loc) and np.isfinite(r_ref)) or r_ref <= 0:
+        return Check(name, NA, "no finite top-band Re Z on one side")
+
+    dev = r_loc / r_ref - 1.0
+    tol = 0.08 + 0.32 * (1.0 - max(0.0, min(1.0, area_fraction)))
+    detail = (f"Re Z over the top {n_loc} shared point(s) up to "
+              f"{fb.max():.4g} Hz: local {1e3 * r_loc:.2f} vs whole cell "
+              f"{1e3 * r_ref:.2f} mohm.cm2 ({100 * dev:+.1f} %)")
+    if abs(dev) <= tol:
+        verdict = PASS
+    elif abs(dev) <= 2 * tol:
+        verdict = WARN
+        detail += f" -- outside the {100 * tol:.0f} % this coverage should hold to"
+    else:
+        verdict = FAIL
+        detail += (f" -- far outside the {100 * tol:.0f} %; suspect the shunt "
+                   f"calibration or a different operating point")
+    return Check(name, verdict, detail, dev,
+                 rests_on="both instruments recording the same operating point; "
+                          "the estimator bias cancels because both sides use "
+                          "the same rule over the same frequencies")
+
+
 # ===========================================================================
 # 5. The aggregate, against an instrument that shares nothing
 # ===========================================================================
@@ -648,18 +750,88 @@ def check_run(sr, cfg=None, plate_key: str = "gen1",
     checks.append(neighbour_smoothness(r_ohmic, plate_key))
     checks.append(flow_trend(r_ohmic, plate_key))
 
-    checks.append(series_resistance_closure(
-        r_ohmic, {s: sp.area_cm2 for s, sp in spectra.items()},
-        reference_hfr,
-        r_sd={s: sp.R_ohmic_sd for s, sp in spectra.items()},
-        area_fraction=float(cov.value)))
+    have_sweep = reference is not None and len(getattr(sr, "cell_freq", []))
 
-    if reference is not None and len(getattr(sr, "cell_freq", [])):
+    # R_s closure. With a whole-cell sweep, compare like with like (same
+    # estimator, same band). Without one, fall back to the parallel sum of
+    # the segment R_ohmic against a MEASURED Gamry intercept only -- main.py
+    # no longer passes the extrapolated hfr_ref_fit, whose opposite bias made
+    # this check fail on data with nothing wrong with it.
+    if have_sweep:
+        checks.append(matched_series_resistance(
+            sr.cell_freq, sr.Z_cell, reference[0], reference[1],
+            float(cov.value)))
+    else:
+        checks.append(series_resistance_closure(
+            r_ohmic, {s: sp.area_cm2 for s, sp in spectra.items()},
+            reference_hfr,
+            r_sd={s: getattr(sp, "R_ohmic_sd", float("nan"))
+                  for s, sp in spectra.items()},
+            area_fraction=float(cov.value)))
+
+    if have_sweep:
         checks.append(aggregate_vs_reference(
             sr.cell_freq, sr.Z_cell, reference[0], reference[1],
             float(cov.value)))
 
     return Report(checks)
+
+
+def check_from_disk(run_dir, cfg=None, plate_key: str = "gen1",
+                    reference: tuple[np.ndarray, np.ndarray] | None = None,
+                    reference_hfr: float = float("nan")) -> Report:
+    """The same checks as `check_run`, from files a finished run wrote.
+
+    The CSV path (csv_pipeline.run_csv) never builds a SilverRun, so it used
+    to skip plausibility altogether. It does write everything the checks need:
+
+        gold/plate_summary.csv      R_ohmic, j_dc, area_cm2 per segment
+        silver/spectra_clean.csv    the per-point impedance (for passivity)
+        silver/cell_aggregate.csv   the parallel-sum cell curve
+
+    so a light stand-in for the SilverRun is assembled from those and handed
+    to `check_run` unchanged.
+    """
+    import csv
+    from types import SimpleNamespace
+
+    run_dir = Path(run_dir)
+
+    def _rows(path: Path) -> list[dict]:
+        if not path.is_file():
+            return []
+        with path.open(newline="") as fh:
+            return list(csv.DictReader(fh))
+
+    def _f(row: dict, key: str) -> float:
+        try:
+            return float(row.get(key, "nan"))
+        except (TypeError, ValueError):
+            return float("nan")
+
+    summary = [r for r in _rows(run_dir / "gold" / "plate_summary.csv")
+               if r.get("measured", "1") not in ("0", "False", "false")]
+    points: dict[str, list[complex]] = {}
+    for r in _rows(run_dir / "silver" / "spectra_clean.csv"):
+        seg = str(int(float(r["segment"])))
+        points.setdefault(seg, []).append(
+            complex(_f(r, "z_re_mohm_cm2"), _f(r, "z_im_mohm_cm2")) / 1e3)
+
+    spectra = {}
+    for r in summary:
+        seg = str(int(float(r["segment"])))
+        spectra[seg] = SimpleNamespace(
+            j_dc=_f(r, "j_dc"), area_cm2=_f(r, "area_cm2"),
+            R_ohmic=_f(r, "R_ohmic"), R_ohmic_sd=float("nan"),
+            Z_corr=np.asarray(points.get(seg, []), complex))
+
+    agg = _rows(run_dir / "silver" / "cell_aggregate.csv")
+    cell_freq = np.array([_f(r, "freq_hz") for r in agg])
+    Z_cell = np.array([complex(_f(r, "z_re_mohm_cm2"), _f(r, "z_im_mohm_cm2"))
+                       for r in agg]) / 1e3
+    sr = SimpleNamespace(spectra=spectra, cell_freq=cell_freq, Z_cell=Z_cell)
+    return check_run(sr, cfg, plate_key=plate_key, reference=reference,
+                     reference_hfr=reference_hfr)
 
 
 def report(rep: Report, log=None) -> None:

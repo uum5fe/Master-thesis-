@@ -475,6 +475,35 @@ try:
     # has to be made deliberately and it is recorded in the cache key.
     dbutils.widgets.dropdown('fill_gaps', 'no', ['no', 'yes'],
                              'Fill unmeasured segments from neighbours')
+    # ── Gamry overlay options ──────────────────────────────────────────────
+    # DISPLAY ONLY. These change what the "Gamry vs Pipeline Overlay" cell
+    # draws and prints, never what the pipeline computes, so they are not in
+    # the cache key: switch them and re-run the overlay cell, no pipeline
+    # re-run needed.
+    #   gamry_kk       Kramers-Kronig check of the Gamry sweep itself.
+    #                  off  = draw the sweep as it is (as before)
+    #                  flag = draw it all, mark the points outside the
+    #                         KK-valid band with a grey x, print the band
+    #                  hide = draw only the KK-valid band
+    #                  At 450 A on RO2612030 the sweep is valid only down to
+    #                  23.9 Hz; below it the "zigzag" is the Gamry's noise.
+    #   gamry_kk_tol   residual allowed per point, in %. 1 % is below what a
+    #                  clean Gamry sweep achieves at its top point, so the
+    #                  choices start at 2.
+    #   raw_aggregate  also draw the aggregate built from the MEASURED points
+    #                  (dashed), next to the model curve cell_aggregate.csv
+    #                  holds, and print the two side by side per frequency.
+    #   like_for_like  yes = scale the aggregate by the DC-closure current
+    #                  error and strip the Gamry's series inductance (as
+    #                  before); no = both curves exactly as written to disk.
+    dbutils.widgets.dropdown('gamry_kk', 'off', ['off', 'flag', 'hide'],
+                             'Overlay: Gamry KK check')
+    dbutils.widgets.dropdown('gamry_kk_tol', '2', ['2', '3', '5'],
+                             'Overlay: Gamry KK tolerance (%)')
+    dbutils.widgets.dropdown('raw_aggregate', 'no', ['no', 'yes'],
+                             'Overlay: raw-point aggregate')
+    dbutils.widgets.dropdown('like_for_like', 'yes', ['yes', 'no'],
+                             'Overlay: I_err scale + Gamry L removal')
 except Exception:
     pass
  
@@ -581,7 +610,18 @@ def _seg_list(name):
 EXCLUDE_SEGMENTS = _seg_list('exclude_segments')
 SUBSTITUTE_SEGMENTS = _seg_list('substitute_segments')
 FILL_GAPS = _w('fill_gaps', 'no') == 'yes'
- 
+
+# Gamry overlay options (display only -- see the widget block above)
+GAMRY_KK = _w('gamry_kk', 'off')
+if GAMRY_KK not in ('off', 'flag', 'hide'):
+    GAMRY_KK = 'off'
+try:
+    GAMRY_KK_TOL = float(_w('gamry_kk_tol', '2')) / 100.0
+except ValueError:
+    GAMRY_KK_TOL = 0.02
+SHOW_RAW_AGG = _w('raw_aggregate', 'no') == 'yes'
+LIKE_FOR_LIKE = _w('like_for_like', 'yes') != 'no'
+
 # Select the plate for the whole session
 _plate = geom.use_plate(PLATE)
  
@@ -593,6 +633,10 @@ print(f"  Min SNR:   {MIN_SNR_DB} dB")
 print(f"  Stop:      {STOP_AFTER}")
 print(f"  Format:    {SOURCE_FORMAT}")
 print(f"  Plate:     {_plate.title}")
+print(f"  Overlay:   Gamry KK {GAMRY_KK}"
+      + (f" (tol {100*GAMRY_KK_TOL:g} %)" if GAMRY_KK != 'off' else '')
+      + f", raw aggregate {'yes' if SHOW_RAW_AGG else 'no'}"
+      + f", like-for-like {'yes' if LIKE_FOR_LIKE else 'no'}")
 
 # COMMAND ----------
 
@@ -2062,7 +2106,36 @@ try:
     _COND = dbutils.widgets.get('conditions')
 except Exception:
     _COND = 'ALL'
- 
+
+
+def _overlay_opt(name, glob, default):
+    """Widget-cell global if it ran, else the widget itself, else default."""
+    if glob in globals():
+        return globals()[glob]
+    try:
+        return dbutils.widgets.get(name)
+    except Exception:
+        return default
+
+
+# Display options from the widget bar (see the widgets cell). None of them
+# touches the pipeline or its cache -- change one and re-run this cell.
+_KK_MODE = str(_overlay_opt('gamry_kk', 'GAMRY_KK', 'off'))
+if _KK_MODE not in ('off', 'flag', 'hide'):
+    _KK_MODE = 'off'
+_KK_TOL = _overlay_opt('gamry_kk_tol', 'GAMRY_KK_TOL', 0.02)
+if isinstance(_KK_TOL, str):          # read straight from the widget, in %
+    _KK_TOL = float(_KK_TOL) / 100.0
+_SHOW_RAW = _overlay_opt('raw_aggregate', 'SHOW_RAW_AGG', False)
+_SHOW_RAW = _SHOW_RAW == 'yes' if isinstance(_SHOW_RAW, str) else bool(_SHOW_RAW)
+LIKE_FOR_LIKE = _overlay_opt('like_for_like', 'LIKE_FOR_LIKE', True)
+LIKE_FOR_LIKE = (LIKE_FOR_LIKE != 'no' if isinstance(LIKE_FOR_LIKE, str)
+                 else bool(LIKE_FOR_LIKE))
+print(f"  Overlay options: Gamry KK {_KK_MODE}"
+      + (f" (tol {100*_KK_TOL:g} %)" if _KK_MODE != 'off' else '')
+      + f" | raw aggregate {'yes' if _SHOW_RAW else 'no'}"
+      + f" | like-for-like {'yes' if LIKE_FOR_LIKE else 'no'}")
+
 A_CELL_CM2 = 304.92
 # Auto-detect Gamry folder for current Leepa
 # Priority: per-Leepa folder > common Gamry folder (files matching Leepa ID)
@@ -2238,8 +2311,38 @@ for cond in _conds:
  
     # Match Gamry condition
     gamry_df = _gamry.get(cond, None)
-    LIKE_FOR_LIKE = True          # set False to see the uncorrected overlay
     _I_err, _L, _lo, _hi = 0.0, 0.0, float('nan'), float('nan')
+
+    # ── Gamry KK check: on the WHOLE raw sweep, before anything is removed
+    # or cut, so the test sees every point the instrument wrote. The result
+    # travels with each row as kk_ok / kk_res.
+    _kk = None
+    if gamry_df is not None:
+        gamry_df = gamry_df.copy()
+        gamry_df['kk_ok'] = True
+        gamry_df['kk_res'] = np.nan
+        if _KK_MODE != 'off':
+            _kk = gamry_compare.kk_check(
+                gamry_df['freq_hz'].values,
+                gamry_df['z_re'].values + 1j * gamry_df['z_im'].values,
+                tol=_KK_TOL)
+            gamry_df['kk_ok'] = _kk['ok']
+            gamry_df['kk_res'] = _kk['residual']
+            if np.isfinite(_kk['f_valid']):
+                print(f"  {cond}: Gamry KK-valid {_kk['f_valid']:.3g} – "
+                      f"{_kk['f_max']:.3g} Hz (lin-KK M={_kk['M']}, RMS "
+                      f"{100*_kk['rms_in']:.2f} %, tol {100*_KK_TOL:g} %); "
+                      f"{int((~_kk['ok']).sum())} of {len(gamry_df)} points "
+                      f"outside it"
+                      + (f", RMS {100*_kk['rms_out']:.1f} % below "
+                         f"{_kk['f_valid']:.3g} Hz"
+                         if np.isfinite(_kk['rms_out']) else ''))
+            else:
+                print(f"  {cond}: Gamry sweep has NO KK-valid band at tol "
+                      f"{100*_KK_TOL:g} % (whole-sweep RMS "
+                      f"{100*_kk['rms_out']:.1f} %) -- it is not usable as "
+                      f"a reference at this tolerance")
+
     if LIKE_FOR_LIKE:
         # (1) shunt-calibration scale, from DC closure — NOT fitted to the Gamry
         _sp = {'45A':45., '60A':60., '150A':150., '450A':450.}.get(cond)
@@ -2258,8 +2361,10 @@ for cond in _conds:
             _fg = gamry_df['freq_hz'].values
             _k  = _fg >= _fg.max() / 10.0          # top decade
             if _k.sum() >= 4:
-                _w = 2 * np.pi * _fg[_k]
-                _L = float(np.sum(_w * gamry_df['z_im'].values[_k]) / np.sum(_w * _w))
+                # _om, not _w: _w is the widget reader every later cell uses,
+                # and assigning it here broke them after this cell had run.
+                _om = 2 * np.pi * _fg[_k]
+                _L = float(np.sum(_om * gamry_df['z_im'].values[_k]) / np.sum(_om * _om))
                 gamry_df = gamry_df.copy()
                 gamry_df['z_im'] = gamry_df['z_im'] - 2 * np.pi * _fg * _L
 
@@ -2271,7 +2376,73 @@ for cond in _conds:
                                 (gamry_df['freq_hz'] <= _hi)]
         print(f"  {cond}: I_err {100*_I_err:+.1f}% applied | "
               f"Gamry L {1e6*_L:.0f} nH.cm2 removed | band {_lo:.2f}-{_hi:.1f} Hz")
- 
+    else:
+        print(f"  {cond}: like-for-like OFF -- aggregate and Gamry exactly as "
+              f"written to disk (no I_err scale, Gamry L kept, full bands)")
+
+    # ── Gamry points outside the KK-valid band ──
+    _g_bad = None
+    if gamry_df is not None and _KK_MODE != 'off':
+        _g_bad = gamry_df[~gamry_df['kk_ok'].astype(bool)]
+        gamry_df = gamry_df[gamry_df['kk_ok'].astype(bool)]
+        if _KK_MODE == 'hide' or not len(_g_bad):
+            _g_bad = None
+
+    # ── aggregate from the MEASURED points (not the model) ──
+    # Same parallel sum as silver, over the segments that measured each rung;
+    # the model column is aggregated over exactly the same segments, so the
+    # two differ by the DRT model alone. Reconstructed segments are not
+    # measurements and are left out of both. Same I_err scale as the model
+    # aggregate, so the two are drawn on the same footing.
+    raw_agg = None
+    if _SHOW_RAW and {'z_re_mohm_cm2', 'z_im_mohm_cm2'} <= set(seg_df.columns):
+        _areas = {s: a.area_cm2 for s, a in geom.SEGMENTS.items()}
+        _ss = Path(src) / 'silver' / 'segments_summary.csv'
+        if _ss.exists():
+            _s = pd.read_csv(_ss)
+            if 'area_cm2' in _s.columns:
+                _areas.update({str(k): float(v) for k, v in
+                               zip(_s['segment'], _s['area_cm2'])})
+        _has_model = {'zmodel_re_mohm_cm2',
+                      'zmodel_im_mohm_cm2'} <= set(seg_df.columns)
+        _ra = gamry_compare.raw_aggregate(
+            seg_df['segment'].values, seg_df['freq_hz'].values,
+            seg_df['z_re_mohm_cm2'].values + 1j * seg_df['z_im_mohm_cm2'].values,
+            _areas,
+            z_model=(seg_df['zmodel_re_mohm_cm2'].values
+                     + 1j * seg_df['zmodel_im_mohm_cm2'].values)
+            if _has_model else None)
+        _sc = 1.0 + _I_err
+        raw_agg = pd.DataFrame({
+            'freq_hz': _ra['freq'], 'n_seg': _ra['n_seg'],
+            'z_re': _ra['z_raw'].real * _sc, 'z_im': _ra['z_raw'].imag * _sc,
+            'zm_re': _ra['z_model'].real * _sc,
+            'zm_im': _ra['z_model'].imag * _sc,
+        })
+        if agg_df is not None and len(agg_df):
+            raw_agg = raw_agg[(raw_agg['freq_hz'] >= agg_df['freq_hz'].min() * 0.999)
+                              & (raw_agg['freq_hz'] <= agg_df['freq_hz'].max() * 1.001)]
+        raw_agg = raw_agg.reset_index(drop=True)
+        print(f"\n  {cond}: aggregate from MEASURED points vs from the DRT model "
+              f"(same segments per rung; mohm.cm2"
+              + (f", x{_sc:.3f} I_err scale" if _I_err else '') + ")")
+        _t = pd.DataFrame({
+            'f_hz': raw_agg['freq_hz'].round(3), 'n_seg': raw_agg['n_seg'],
+            "Z'_raw": raw_agg['z_re'].round(1),
+            "-Z''_raw": (-raw_agg['z_im']).round(1),
+            "Z'_model": raw_agg['zm_re'].round(1),
+            "-Z''_model": (-raw_agg['zm_im']).round(1),
+            'raw-model %': (100 * np.abs(
+                (raw_agg['z_re'] - raw_agg['zm_re'])
+                + 1j * (raw_agg['z_im'] - raw_agg['zm_im']))
+                / np.abs(raw_agg['zm_re'] + 1j * raw_agg['zm_im'])).round(1),
+        }).sort_values('f_hz', ascending=False)
+        if not _has_model:
+            _t = _t.drop(columns=["Z'_model", "-Z''_model", 'raw-model %'])
+            print("    (this run's spectra_clean.csv carries no model columns "
+                  "-- raw aggregate only)")
+        print(_t.to_string(index=False))
+
     fig = make_subplots(rows=1, cols=3,
         subplot_titles=['Nyquist', '|Z|(f) Bode', 'Phase(f)'],
         horizontal_spacing=0.06)
@@ -2365,7 +2536,8 @@ for cond in _conds:
             x=gamry_df['z_re'], y=-gamry_df['z_im'],
             mode='lines+markers', line=dict(width=3.5, color='black'),
             marker=dict(size=6, color='black', symbol='diamond'),
-            name=f'Gamry {cond}', legendgroup='gamry',
+            name=f'Gamry {cond}' + (' (KK-valid)' if _kk is not None else ''),
+            legendgroup='gamry',
             customdata=gamry_df['freq_hz'].values,
             hovertemplate=f"Gamry {cond}<br>f=%{{customdata:.1f}} Hz<br>"
                 "Z'=%{x:.1f}<br>-Z''=%{y:.1f}<extra></extra>",
@@ -2378,7 +2550,51 @@ for cond in _conds:
             mode='lines+markers', line=dict(width=3.5, color='black'),
             marker=dict(size=5, color='black', symbol='diamond'),
             legendgroup='gamry', showlegend=False), row=1, col=3)
- 
+
+    # Gamry points outside the KK-valid band ('flag' mode): drawn, but grey
+    # and crossed, so nobody reads them as part of the reference.
+    if _g_bad is not None and len(_g_bad):
+        _Zb = _g_bad['z_re'].values + 1j * _g_bad['z_im'].values
+        _cd = np.column_stack([_g_bad['freq_hz'].values,
+                               100 * _g_bad['kk_res'].values])
+        _mk = dict(size=8, color='#888', symbol='x')
+        fig.add_trace(go.Scatter(
+            x=_g_bad['z_re'], y=-_g_bad['z_im'], mode='lines+markers',
+            line=dict(width=1, color='#aaa', dash='dot'), marker=_mk,
+            name=f'Gamry {cond}: fails KK', legendgroup='gamry_bad',
+            customdata=_cd,
+            hovertemplate=f"Gamry {cond} — FAILS KK<br>"
+                "f=%{customdata[0]:.2f} Hz<br>residual %{customdata[1]:.1f} %<br>"
+                "Z'=%{x:.1f}<br>-Z''=%{y:.1f}<extra></extra>",
+        ), row=1, col=1)
+        fig.add_trace(go.Scatter(x=_g_bad['freq_hz'], y=np.abs(_Zb),
+            mode='markers', marker=_mk, legendgroup='gamry_bad',
+            showlegend=False), row=1, col=2)
+        fig.add_trace(go.Scatter(x=_g_bad['freq_hz'], y=np.degrees(np.angle(_Zb)),
+            mode='markers', marker=_mk, legendgroup='gamry_bad',
+            showlegend=False), row=1, col=3)
+
+    # Aggregate from the MEASURED points (dashed), next to the model (red)
+    if raw_agg is not None and len(raw_agg) > 1:
+        _Zr = raw_agg['z_re'].values + 1j * raw_agg['z_im'].values
+        _ln = dict(width=2, color='#e67e22', dash='dash')
+        _cd = np.column_stack([raw_agg['freq_hz'].values, raw_agg['n_seg'].values])
+        fig.add_trace(go.Scatter(
+            x=raw_agg['z_re'], y=-raw_agg['z_im'], mode='lines+markers',
+            line=_ln, marker=dict(size=4, color='#e67e22'),
+            name='Aggregate of measured points', legendgroup='rawagg',
+            customdata=_cd,
+            hovertemplate="Aggregate of MEASURED points<br>"
+                "f=%{customdata[0]:.2f} Hz<br>%{customdata[1]:.0f} segments<br>"
+                "Z'=%{x:.1f}<br>-Z''=%{y:.1f}<extra></extra>",
+        ), row=1, col=1)
+        fig.add_trace(go.Scatter(x=raw_agg['freq_hz'], y=np.abs(_Zr),
+            mode='lines+markers', line=_ln, marker=dict(size=4, color='#e67e22'),
+            legendgroup='rawagg', showlegend=False), row=1, col=2)
+        fig.add_trace(go.Scatter(x=raw_agg['freq_hz'], y=np.degrees(np.angle(_Zr)),
+            mode='lines+markers', line=_ln, marker=dict(size=4, color='#e67e22'),
+            legendgroup='rawagg', showlegend=False), row=1, col=3)
+
     fig.update_xaxes(title_text="Z' [mohm.cm2]", row=1, col=1)
     fig.update_yaxes(title_text="-Z'' [mohm.cm2]", row=1, col=1)
     fig.update_xaxes(title_text="f [Hz]", type="log", row=1, col=2)
@@ -2397,6 +2613,10 @@ for cond in _conds:
                + ('' if _cov > 0.995 else
                   '; the Gamry measures 100 %, so this comparison is '
                   'short by the difference'))
+    if _kk is not None:
+        _covstr += (f' — Gamry KK-valid {_kk["f_valid"]:.3g}–{_kk["f_max"]:.3g} Hz'
+                    if np.isfinite(_kk['f_valid'])
+                    else ' — Gamry sweep fails KK everywhere')
     fig.update_layout(
         title=f'<b>Leepa {_LEEPA} / {cond}: {n_seg} measured'
               + (f' + {_nrec} rebuilt' if _nrec else '')
@@ -2414,7 +2634,32 @@ for cond in _conds:
     if _cov is not None:
         print(f"  aggregate covers {100*_cov:.1f} % of the plate area")
     if gamry_df is not None:
-        print(f"  Gamry: {len(gamry_df)} pts")
+        print(f"  Gamry: {len(gamry_df)} pts"
+              + (' inside the KK-valid band' if _kk is not None else ''))
+        # Equal-frequency comparison: a Nyquist plot hides frequency, so two
+        # curves can overlap there while disagreeing at every frequency.
+        # Gamry interpolated onto the aggregate's frequencies (log f), inside
+        # the Gamry points actually drawn -- no extrapolation.
+        if agg_df is not None and len(gamry_df) >= 2:
+            _gf = gamry_df.sort_values('freq_hz')
+            _af = agg_df[(agg_df['freq_hz'] >= _gf['freq_hz'].min())
+                         & (agg_df['freq_hz'] <= _gf['freq_hz'].max())]
+            if len(_af):
+                _x = np.log10(_af['freq_hz'].values)
+                _xg = np.log10(_gf['freq_hz'].values)
+                _Zg = (np.interp(_x, _xg, _gf['z_re'].values)
+                       + 1j * np.interp(_x, _xg, _gf['z_im'].values))
+                _Za = _af['z_re'].values + 1j * _af['z_im'].values
+                _rel = 100 * (np.abs(_Za) / np.abs(_Zg) - 1)
+                _dph = np.degrees(np.angle(_Za) - np.angle(_Zg))
+                print(f"  |Z| aggregate vs Gamry over {len(_af)} common "
+                      f"frequencies ({_af['freq_hz'].min():.3g}–"
+                      f"{_af['freq_hz'].max():.3g} Hz): median "
+                      f"{np.median(_rel):+.1f} % (range {_rel.min():+.1f} … "
+                      f"{_rel.max():+.1f} %), phase median "
+                      f"{np.median(_dph):+.1f} deg. A flat |Z| offset with "
+                      f"~0 deg phase is a gain/area error; a difference only "
+                      f"at low f is the operating point or the reference.")
 
 # COMMAND ----------
 

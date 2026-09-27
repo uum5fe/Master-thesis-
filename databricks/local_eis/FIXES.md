@@ -382,6 +382,41 @@ matplotlib has no `thermal`).  The ECM parameter maps use the same
 renderer instead of centroid dots.  `plate_viewer` (interactive, outside this
 folder) became optional.
 
+## Fix 12 — the Gamry overlay: is the reference itself valid?  (`gamry_compare.py`, `Local EIS Pipeline Runner.py`)
+
+On RO2612030 at 450 A the Gamry curve on the overlay zigzags below ~20 Hz
+while the aggregate stays smooth. The zigzag is the Gamry sweep itself, in
+correct frequency order -- not a plotting error. A lin-KK test on the raw
+`.dta` gives < 1 % residual from 30 kHz down to 23.9 Hz and 4-13 % below it,
+with -Z'' changing sign from point to point. The same point is where the
+file's own `Idc` column steps from 4.58 to 6.14 mA.
+
+The red aggregate is the sum of each segment's DRT model (`Z_model`), so it
+cannot show scatter whatever the data does.
+
+**New, all display-only (not in the cache key, no pipeline re-run needed):**
+
+| widget | choices | effect on the overlay cell |
+|---|---|---|
+| `gamry_kk` | off / flag / hide | lin-KK check of the Gamry sweep; `flag` greys out and crosses the points outside the KK-valid band, `hide` drops them. The band is printed and put in the figure subtitle |
+| `gamry_kk_tol` | 2 / 3 / 5 % | residual allowed per point |
+| `raw_aggregate` | no / yes | also draw the aggregate of the MEASURED points (dashed) and print it next to the model aggregate, per rung, over the same segments |
+| `like_for_like` | yes / no | the I_err scale and Gamry-L removal that were a hard-coded `True` |
+
+The overlay also prints |Z| and phase of the aggregate against the Gamry at
+equal frequency, over the KK-valid points only.
+
+- `gamry_compare.kk_check()` tests the BAND, not single points: the lowest
+  cut above which lin-KK holds (at most 5 % of points above tol, none above
+  2 x tol). Dropping points one by one fails on a half-noisy sweep -- the
+  noise drags the fit and the clean points get flagged. Model order is
+  2.5 Voigt elements per decade + 2; 1.5 rejected a valid low-frequency
+  inductive loop.
+- `gamry_compare.raw_aggregate()` is silver's parallel sum over the raw
+  points of the segments that measured each rung.
+- The overlay cell no longer assigns `_w` (it overwrote the widget reader
+  for every cell run after it).
+
 ## Still not fixed
 
 - **Detection gain is not estimation gain.**  The array recovers *which*

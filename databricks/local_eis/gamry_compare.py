@@ -703,6 +703,188 @@ def compare(freq_local: np.ndarray, Z_local: np.ndarray, sweep: CellSweep,
     )
 
 
+# ---------------------------------------------------------------------------
+# 3b. Is the reference itself a valid impedance?
+# ---------------------------------------------------------------------------
+
+def _linkk_fit(freq: np.ndarray, Z: np.ndarray, fit: np.ndarray,
+               M: int) -> np.ndarray:
+    """Boukamp lin-KK: R0 + jwL + M fixed Voigt elements, fitted on `fit`.
+
+    Proportional weighting (1/|Z|), no ridge. Returns the model at EVERY
+    frequency, so points outside `fit` can be read against it too.
+    """
+    w = 2 * np.pi * freq
+    taus = np.logspace(np.log10(1.0 / w[fit].max()),
+                       np.log10(1.0 / w[fit].min()), M)
+    A = np.column_stack([np.ones_like(w, dtype=complex), 1j * w]
+                        + [1.0 / (1.0 + 1j * w * t) for t in taus])
+    wt = 1.0 / np.abs(Z[fit])
+    Ar = np.vstack([A[fit].real * wt[:, None], A[fit].imag * wt[:, None]])
+    b = np.concatenate([Z[fit].real * wt, Z[fit].imag * wt])
+    p, *_ = np.linalg.lstsq(Ar, b, rcond=None)
+    return A @ p
+
+
+def _kk_order(freq: np.ndarray, fit: np.ndarray) -> int:
+    """Voigt elements for a band: 2.5 per decade plus two, 4..n/2.
+
+    Tied to the band width rather than chosen by the mu criterion, because mu
+    is exactly what breaks on a noisy sweep -- it stops at M = 3 and every
+    point then fails -- and an order that grows until the residual stops
+    falling fits the noise it is supposed to detect. 1.5 per decade was too
+    few: a valid spectrum with a low-frequency inductive loop (real PEM
+    physics, and KK-consistent) was rejected below 30 Hz. 2.5 passes it and
+    still finds the 450 A Gamry break at 23.9 Hz; 3 starts absorbing noise.
+    """
+    decades = np.log10(freq[fit].max() / freq[fit].min())
+    return int(min(max(4, round(2.5 * decades) + 2), max(4, fit.sum() // 2)))
+
+
+def kk_check(freq, Z, tol: float = 0.02, min_points: int = 8) -> dict:
+    """Which part of a sweep is a Kramers-Kronig-consistent impedance?
+
+    A reference is only a reference where it is a physically valid spectrum.
+    On RO2612030 at 450 A the Gamry sweep is KK-consistent to < 1 % from
+    30 kHz down to 23.9 Hz, and below that its points scatter by 5-13 %
+    with -Z'' changing sign from one point to the next -- the zigzag on the
+    overlay. Comparing the local aggregate against those points measures
+    the Gamry's noise, not the pipeline.
+
+    Point-by-point rejection does not work on such a sweep: the noisy half
+    drags the fit and the clean points end up flagged instead. So the test
+    is on the BAND. Candidate low-frequency cuts are tried from the bottom
+    up, lin-KK is fitted on everything above the cut, and the lowest cut
+    whose fit holds is the validated band:
+
+        at most 5 % of the band's points above `tol`, none above 2 * tol
+
+    (the 5 % allowance is for a single edge point: the top of a Gamry sweep
+    sits against the lin-KK tau grid and is routinely 2-3 % off on sweeps
+    with nothing wrong with them). Inside the band a point still fails if
+    its own residual exceeds 2 * tol; everything below the band fails.
+
+    Returns a dict:
+        ok        bool per point: inside the validated band and not a spike
+        residual  |Z - Z_kk| / |Z| per point (from the band fit inside the
+                  band, from a whole-sweep fit below it -- informational)
+        f_valid   lowest validated frequency, NaN if no band passed
+        f_max     highest frequency of the sweep
+        M         Voigt elements used for the band fit
+        rms_in, rms_out   RMS residual inside / below the band
+    """
+    freq = np.asarray(freq, float)
+    Z = np.asarray(Z, complex)
+    good = np.isfinite(freq) & (freq > 0) & np.isfinite(Z) & (Z != 0)
+    out = {"ok": np.zeros(freq.size, bool),
+           "residual": np.full(freq.size, np.nan),
+           "f_valid": float("nan"), "f_max": float("nan"), "M": 0,
+           "rms_in": float("nan"), "rms_out": float("nan"), "tol": tol}
+    if good.sum() < min_points:
+        return out
+    out["f_max"] = float(freq[good].max())
+
+    cuts = np.sort(freq[good])
+    for fc in cuts[:max(0, good.sum() - min_points + 1)]:
+        band = good & (freq >= fc)
+        M = _kk_order(freq, band)
+        res = np.abs(Z - _linkk_fit(freq, Z, band, M)) / np.abs(Z)
+        r = res[band]
+        if np.max(r) <= 2 * tol and np.mean(r > tol) <= 0.05:
+            ok = band & (res <= 2 * tol)
+            out.update(ok=ok, f_valid=float(fc), M=M,
+                       rms_in=float(np.sqrt(np.mean(r ** 2))))
+            below = good & (freq < fc)
+            if below.any():
+                full = np.abs(Z - _linkk_fit(freq, Z, good,
+                                             _kk_order(freq, good))) / np.abs(Z)
+                res = np.where(below, full, res)
+                out["rms_out"] = float(np.sqrt(np.mean(res[below] ** 2)))
+            out["residual"] = np.where(good, res, np.nan)
+            return out
+
+    # nothing passed: report the whole-sweep residual so the reader sees why
+    full = np.abs(Z - _linkk_fit(freq, Z, good, _kk_order(freq, good))) / np.abs(Z)
+    out["residual"] = np.where(good, full, np.nan)
+    out["rms_out"] = float(np.sqrt(np.mean(full[good] ** 2)))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 3c. The aggregate from the measured points, not from the model
+# ---------------------------------------------------------------------------
+
+def raw_aggregate(segment, freq, z_raw, areas: dict, z_model=None,
+                  rel_tol: float = 0.01) -> dict:
+    """The cell aggregate rebuilt from each segment's MEASURED points.
+
+    silver's cell_aggregate sums the fitted DRT curve (Z_model), which is
+    smooth and KK-shaped by construction: it cannot show scatter, and with
+    non-negative relaxation weights it cannot bend into a low-frequency
+    inductive loop either. Summing the raw points the same way shows what
+    the data itself says. Where the two agree, the model is only filtering
+    noise; where they part, the smooth red curve is the model's, not the
+    measurement's.
+
+    Same formula as silver (1/Z = sum A_s / z_s, normalised by the area that
+    contributed), but only over the segments that MEASURED each rung -- no
+    interpolation across a segment's gaps. When `z_model` is given it is
+    aggregated over exactly the same segments, so the two columns differ by
+    the model alone and not by which segments took part.
+
+    Frequencies are grouped into ladder rungs by relative gap (`rel_tol`),
+    since every segment carries its own float copy of the same rung.
+
+    Returns dict of arrays: freq (median of the rung), n_seg, area_used,
+    z_raw, z_model (NaN where no model was given). Units follow the input.
+    """
+    seg = np.asarray([str(s) for s in segment])
+    f = np.asarray(freq, float)
+    zr = np.asarray(z_raw, complex)
+    zm = (np.asarray(z_model, complex) if z_model is not None
+          else np.full(f.size, np.nan + 0j))
+    A = np.array([float(areas.get(s, np.nan)) for s in seg])
+    keep = (np.isfinite(f) & (f > 0) & np.isfinite(zr) & (zr != 0)
+            & np.isfinite(A) & (A > 0))
+    seg, f, zr, zm, A = seg[keep], f[keep], zr[keep], zm[keep], A[keep]
+    empty = {"freq": np.zeros(0), "n_seg": np.zeros(0, int),
+             "area_used": np.zeros(0), "z_raw": np.zeros(0, complex),
+             "z_model": np.zeros(0, complex)}
+    if not f.size:
+        return empty
+
+    o = np.argsort(f)
+    seg, f, zr, zm, A = seg[o], f[o], zr[o], zm[o], A[o]
+    rung = np.concatenate([[0], np.cumsum(f[1:] / f[:-1] - 1.0 > rel_tol)])
+
+    fo, n, au, Zr, Zm = [], [], [], [], []
+    for k in np.unique(rung):
+        i = rung == k
+        # one point per segment per rung: a segment seen twice keeps its mean
+        _, first = np.unique(seg[i], return_index=True)
+        segs = seg[i]
+        a_k, yr_k, ym_k = 0.0, 0j, 0j
+        model_ok = True
+        for s in segs[np.sort(first)]:
+            j = i & (seg == s)
+            a = A[j][0]
+            a_k += a
+            yr_k += a / np.mean(zr[j])
+            m = np.mean(zm[j])
+            if np.isfinite(m) and m != 0:
+                ym_k += a / m
+            else:
+                model_ok = False
+        fo.append(float(np.median(f[i])))
+        n.append(len(first))
+        au.append(a_k)
+        Zr.append(a_k / yr_k if yr_k != 0 else np.nan + 0j)
+        Zm.append(a_k / ym_k if (model_ok and ym_k != 0) else np.nan + 0j)
+    return {"freq": np.array(fo), "n_seg": np.array(n, int),
+            "area_used": np.array(au), "z_raw": np.array(Zr, complex),
+            "z_model": np.array(Zm, complex)}
+
+
 def read_cell_aggregate(path) -> tuple[np.ndarray, np.ndarray]:
     """Read the pipeline's own `cell_aggregate.csv` (mohm.cm2) as ohm.cm2.
 

@@ -393,3 +393,100 @@ def test_the_not_installed_advice_never_says_plain_pip_install_asammdf():
                   for ln in fix_lines), ("must not tell the reader to re-run "
                   "the exact command that failed")
     assert any("zstandard" in ln for ln in fix_lines)
+
+
+# ---------------------------------------------------------------------------
+# is the reference itself valid? (kk_check)
+# ---------------------------------------------------------------------------
+
+F_SWEEP = np.logspace(np.log10(0.19), np.log10(30000), 53)   # the 450 A grid
+
+
+def _noisy(Z, mask, level, seed=3):
+    rng = np.random.default_rng(seed)
+    Z = Z.copy()
+    n = int(mask.sum())
+    Z[mask] *= 1 + level * (rng.standard_normal(n) + 1j * rng.standard_normal(n))
+    return Z
+
+
+def test_a_clean_sweep_is_valid_over_its_whole_band():
+    for noise in (0.0, 0.005):
+        Z = _noisy(cell_asr(F_SWEEP), np.ones(F_SWEEP.size, bool), noise)
+        r = GC.kk_check(F_SWEEP, Z)
+        assert r["f_valid"] == pytest.approx(F_SWEEP.min())
+        assert r["ok"].all(), noise
+
+
+def test_low_frequency_scatter_is_cut_off_where_it_starts():
+    """The 450 A failure: clean down to ~20 Hz, 6 % scatter below."""
+    Z = _noisy(cell_asr(F_SWEEP), F_SWEEP < 20, 0.06)
+    r = GC.kk_check(F_SWEEP, Z)
+    assert 15 <= r["f_valid"] <= 30
+    assert not r["ok"][F_SWEEP < 15].any()
+    assert r["ok"][F_SWEEP >= 30].all()
+    assert r["rms_out"] > 3 * r["rms_in"]
+
+
+def test_a_low_frequency_inductive_loop_is_physics_not_noise():
+    """A PEM cell at high current can loop back below the real axis at low
+    frequency. That is KK-consistent and must pass -- this is what the
+    first choice of model order got wrong, rejecting it below 30 Hz."""
+    w = 2 * np.pi * F_SWEEP
+    Z = (1j * w * 2.6e-7 + 0.05 + 0.1 / (1 + (1j * w * 1e-3) ** 0.9)
+         + 0.3 / (1 + 1j * w * 0.5) - 0.03 / (1 + 1j * w * 3))
+    r = GC.kk_check(F_SWEEP, _noisy(Z, np.ones(F_SWEEP.size, bool), 0.005))
+    assert r["f_valid"] < 0.3
+    assert r["ok"].mean() > 0.95
+
+
+def test_a_sweep_that_is_noise_throughout_has_no_valid_band():
+    Z = _noisy(cell_asr(F_SWEEP), np.ones(F_SWEEP.size, bool), 0.08)
+    r = GC.kk_check(F_SWEEP, Z)
+    assert not np.isfinite(r["f_valid"])
+    assert not r["ok"].any()
+    assert np.isfinite(r["residual"]).all()     # still says why
+
+
+def test_too_few_points_is_refused_not_guessed():
+    r = GC.kk_check(F_SWEEP[:5], cell_asr(F_SWEEP[:5]))
+    assert not np.isfinite(r["f_valid"]) and not r["ok"].any()
+
+
+# ---------------------------------------------------------------------------
+# the aggregate from the measured points (raw_aggregate)
+# ---------------------------------------------------------------------------
+
+def test_raw_aggregate_is_the_area_weighted_parallel_sum():
+    f = np.array([1.0, 10.0, 100.0])
+    z1 = np.array([0.20, 0.15, 0.10]) + 0j
+    z2 = np.array([0.40, 0.30, 0.20]) - 0.01j
+    # each segment carries its own float copy of the same rung
+    r = GC.raw_aggregate(["1"] * 3 + ["2"] * 3,
+                         np.r_[f, f * (1 + 4e-4)], np.r_[z1, z2],
+                         {"1": 2.0, "2": 1.0})
+    assert r["freq"].size == 3
+    assert list(r["n_seg"]) == [2, 2, 2]
+    assert np.allclose(r["area_used"], 3.0)
+    assert np.allclose(r["z_raw"], 3.0 / (2.0 / z1 + 1.0 / z2))
+    assert np.isnan(r["z_model"]).all()          # no model was given
+
+
+def test_raw_and_model_use_the_same_segments_at_each_rung():
+    """Segment 2 did not measure 10 Hz. Neither column may use it there,
+    or the two would differ by coverage rather than by the model."""
+    seg = ["1", "1", "1", "2", "2"]
+    f = np.array([1.0, 10.0, 100.0, 1.0, 100.0])
+    zr = np.array([0.2, 0.15, 0.1, 0.4, 0.2]) + 0j
+    zm = zr * 1.01
+    r = GC.raw_aggregate(seg, f, zr, {"1": 1.0, "2": 1.0}, z_model=zm)
+    assert list(r["n_seg"]) == [2, 1, 2]
+    assert r["z_raw"][1] == pytest.approx(0.15)
+    assert np.allclose(r["z_model"], 1.01 * r["z_raw"])
+
+
+def test_a_segment_without_an_area_is_left_out_rather_than_weighted_one():
+    r = GC.raw_aggregate(["1", "9"], [5.0, 5.0], [0.2 + 0j, 0.01 + 0j],
+                         {"1": 1.0})
+    assert list(r["n_seg"]) == [1]
+    assert r["z_raw"][0] == pytest.approx(0.2)

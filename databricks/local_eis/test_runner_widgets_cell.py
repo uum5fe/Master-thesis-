@@ -229,3 +229,35 @@ def test_those_config_values_are_in_the_cache_key() -> None:
     block = block[:block.index("\n)")]
     for k in ("fit_common_delay", "silver_snr_gate_db", "silver_snr_floor_db"):
         assert f"'{k}'" in block, k
+
+
+# ---------------------------------------------------------------------------
+# the Gamry overlay options
+# ---------------------------------------------------------------------------
+
+
+def test_the_overlay_options_default_to_the_old_behaviour(volume) -> None:
+    ns = _run_cell(volume)
+    assert ns["GAMRY_KK"] == "off"
+    assert ns["GAMRY_KK_TOL"] == pytest.approx(0.02)
+    assert ns["SHOW_RAW_AGG"] is False
+    assert ns["LIKE_FOR_LIKE"] is True
+
+
+def test_the_overlay_options_parse(volume) -> None:
+    ns = _run_cell(volume, {"gamry_kk": "hide", "gamry_kk_tol": "5",
+                            "raw_aggregate": "yes", "like_for_like": "no"})
+    assert ns["GAMRY_KK"] == "hide"
+    assert ns["GAMRY_KK_TOL"] == pytest.approx(0.05)
+    assert ns["SHOW_RAW_AGG"] is True
+    assert ns["LIKE_FOR_LIKE"] is False
+
+
+def test_the_overlay_options_stay_out_of_the_cache_key() -> None:
+    """They change a figure, not a result. In the key they would split one
+    run into several cache entries and force re-runs for a display toggle."""
+    src = RUNNER.read_text()
+    block = src[src.index("_CACHE_IDENTITY_KEYS = ("):]
+    block = block[:block.index("\n)")]
+    for k in ("gamry_kk", "raw_aggregate", "like_for_like"):
+        assert k not in block, k

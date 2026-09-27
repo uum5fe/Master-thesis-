@@ -162,3 +162,23 @@ def test_silver_writes_the_file_the_cells_read(run_with_gaps, tmp_path) -> None:
     agg = pd.read_csv(tmp_path / "silver" / "cell_aggregate.csv")
     assert "area_coverage" in agg.columns
     assert float(agg["area_coverage"].median()) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_the_overlay_options_come_from_the_widget_bar() -> None:
+    """KK check, raw aggregate and like-for-like are chosen in the widget
+    bar, not by editing a hard-coded flag inside the cell."""
+    src = _cell("GAMRY vs PIPELINE OVERLAY")
+    assert "LIKE_FOR_LIKE = True " not in src
+    for widget in ("gamry_kk", "gamry_kk_tol", "raw_aggregate",
+                   "like_for_like"):
+        assert f"'{widget}'" in src, widget
+    assert "gamry_compare.kk_check(" in src
+    assert "gamry_compare.raw_aggregate(" in src
+
+
+def test_the_overlay_no_longer_overwrites_the_widget_reader() -> None:
+    """`_w` is the widget reader. The overlay used it as a scratch variable
+    for 2*pi*f, so every cell run after it called an array."""
+    import re
+    src = _cell("GAMRY vs PIPELINE OVERLAY")
+    assert not re.search(r"^\s*_w\s*=", src, re.M)

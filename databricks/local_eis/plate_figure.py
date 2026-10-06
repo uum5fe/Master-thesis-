@@ -63,6 +63,7 @@ FIELDS = {
     "T_degC":      ("Temperature", "°C", _JET, 2),
     "Z_mag_100Hz": ("|Z| at 100 Hz", "mΩ·cm²", _JET, 1),
     "phase_100Hz": ("Phase at 100 Hz", "°", _JET, 1),
+    "chain_tau_us": ("Current-chain lag τ", "µs", _JET, 0),
 }
 
 # Frame geometry in plate mm (x right, y DOWN, active area 0..W x 0..H).

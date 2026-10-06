@@ -168,6 +168,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="run the synthetic checks; needs no measurement data")
     g.add_argument("--stop-after", choices=["bronze", "silver", "gold"],
                    default="gold")
+    g.add_argument("--reevaluate", metavar="RUN_DIR",
+                   help="re-run silver and gold on a finished run's saved "
+                        "bronze tables (no .DAT needed), with the current "
+                        "code and settings; writes to --out, default "
+                        "RUN_DIR/reevaluated")
+    g.add_argument("--channel-lag", choices=["off", "report", "correct"],
+                   help="current-chain lag stage (default: correct)")
     return p
 
 
@@ -347,6 +354,59 @@ def run_pipeline(cfg: Config, stop_after: str = "gold") -> dict:
     return manifest
 
 
+def reevaluate(run_dir, out_dir=None, **overrides) -> dict:
+    """Silver -> gold -> plausibility again, on a finished FAMOS run.
+
+    Reads the run's config_used.json and bronze tables (bronze.load), applies
+    `overrides` on top (e.g. channel_lag="report", gain_file=...), and writes
+    a complete result set to `out_dir` (default RUN_DIR/reevaluated). The
+    .DAT files are not needed, so any campaign that kept its bronze/ folder
+    can be brought up to the current pipeline in seconds.
+
+    A gain file given here is applied to the saved Z, which is what bronze
+    would have done; a run whose bronze ALREADY applied one must not be given
+    it again.
+    """
+    import bronze
+    import silver
+    import gold
+    import r2d2_geometry as geom
+
+    run_dir = Path(run_dir)
+    cj = run_dir / "config_used.json"
+    cfg = Config.from_json(cj) if cj.is_file() else DEFAULT
+    out = Path(out_dir) if out_dir else run_dir / "reevaluated"
+    gain_file = overrides.pop("gain_file", None)
+    cfg = cfg.replace(out_dir=out, **overrides)
+    geom.use_plate(cfg.plate)
+    log = utils.get_logger(cfg.verbose)
+    utils.banner(f"RE-EVALUATION  --  {run_dir}", log)
+    out.mkdir(parents=True, exist_ok=True)
+
+    br = bronze.load(run_dir)
+    if gain_file:
+        gain = utils.load_gain(gain_file)
+        for seg, sp in br.spectra.items():
+            sp.Z_raw = sp.Z_raw / utils.gain_at(gain, seg, sp.freq)
+        cfg = cfg.replace(gain_file=Path(gain_file))
+        log.info(f"  chain response applied to the saved Z: {gain_file}")
+    cfg.save(out / "config_used.json")
+    bronze.save(br, cfg, log)
+    manifest = {"config": cfg.to_dict(), "plate": cfg.plate,
+                "reevaluated_from": str(run_dir), "stages": {
+                    "bronze": br.summary()}}
+    sr = silver.run(br, cfg, log)
+    silver.save(sr, cfg, log)
+    manifest["stages"]["silver"] = {"n_segments": len(sr.spectra),
+                                    "tiers": sr.tiers()}
+    gr = gold.run(sr, cfg, log)
+    gold.save(gr, sr, cfg, log)
+    manifest["stages"]["gold"] = gr.stats
+    whole_cell_and_plausibility(cfg, manifest, log, sr=sr)
+    utils.write_json(out / "run_manifest.json", manifest)
+    return manifest
+
+
 def whole_cell_and_plausibility(cfg: Config, manifest: dict, log,
                                 sr=None) -> None:
     """Gamry cross-check, then plausibility -- shared by FAMOS and CSV paths.
@@ -459,6 +519,13 @@ def main(argv=None) -> int:
 
     if a.self_test:
         return self_test()
+
+    if a.reevaluate:
+        over = {"channel_lag": a.channel_lag} if a.channel_lag else {}
+        if a.gain:
+            over["gain_file"] = Path(a.gain)
+        reevaluate(a.reevaluate, out_dir=a.out, **over)
+        return 0
 
     cfg = config_from_args(a)
     if a.print_config:

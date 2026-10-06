@@ -23,8 +23,9 @@ WHAT IT DOES
 ------------
 For each run folder (bronze/raw_spectra.csv + gold/plate_summary.csv):
 
-  * tau per segment: fit  arg(Z_seg / Z_ref) = -atan(w tau)  over
-    f_lo..f_hi, with Z_ref the plate median (real and imaginary separately);
+  * tau per segment from channel_lag.estimate -- the same code the pipeline
+    runs in silver -- on silver's kept points: arg(Z_seg / Z_ref) =
+    -atan(w tau) over f_lo..f_hi, Z_ref the plate median;
   * a diagnostic R_s per segment from a Randles-CPE fit to 100 Hz..f_hi,
     once on the raw spectrum and once with the lag removed, Z * (1 + j w tau);
   * across runs: tau side by side and their correlation (repeatability).
@@ -74,7 +75,12 @@ def _label(run: Path) -> str:
 
 
 def load_spectra(run: Path, f_max: float):
-    """(freq, Z[f, seg] in mOhm*cm2, segments) from bronze/raw_spectra.csv."""
+    """(freq, Z[f, seg] in mOhm*cm2, segments, usable[f, seg]).
+
+    `usable` is silver's verdict per point (silver/point_rejections.csv) when
+    the run has one, else every finite point: the lag must be fitted on the
+    points silver models, or the rejected top-of-band noise decides it.
+    """
     raw = pd.read_csv(run / "bronze" / "raw_spectra.csv")
     raw = raw[raw.freq_hz <= f_max]
     re_ = raw.pivot_table(index="freq_hz", columns="segment",
@@ -82,23 +88,20 @@ def load_spectra(run: Path, f_max: float):
     im_ = raw.pivot_table(index="freq_hz", columns="segment",
                           values="z_im_ohm_cm2")
     Z = (re_.values + 1j * im_.values) * 1e3
-    return re_.index.values.astype(float), Z, [str(s) for s in re_.columns]
+    usable = np.isfinite(Z)
+    pr = run / "silver" / "point_rejections.csv"
+    if pr.is_file():
+        k = pd.read_csv(pr)
+        k = k.assign(freq_hz=k.freq_hz.round(3)).pivot_table(
+            index="freq_hz", columns="segment", values="kept")
+        k = k.reindex(index=np.round(re_.index.values, 3), columns=re_.columns)
+        usable &= (k.values == 1)
+    return (re_.index.values.astype(float), Z, [str(s) for s in re_.columns],
+            usable)
 
 
 def plate_reference(Z: np.ndarray) -> np.ndarray:
     return np.nanmedian(Z.real, axis=1) + 1j * np.nanmedian(Z.imag, axis=1)
-
-
-def fit_tau(freq, z, ref, f_lo: float = 50.0) -> float:
-    """tau [s] with arg(z/ref) = -atan(w tau) over freq >= f_lo."""
-    from scipy.optimize import least_squares
-    m = (freq >= f_lo) & np.isfinite(z) & np.isfinite(ref)
-    if m.sum() < 3:
-        return float("nan")
-    w = 2 * np.pi * freq[m]
-    ph = np.angle(z[m] / ref[m])
-    r = least_squares(lambda t: -np.arctan(w * t[0]) - ph, [0.0])
-    return float(r.x[0])
 
 
 def fit_rs(freq, z, f_lo: float = 100.0) -> float:
@@ -121,19 +124,27 @@ def fit_rs(freq, z, f_lo: float = 100.0) -> float:
 
 
 def analyse_run(run, f_lo: float = 50.0, f_max: float = 1200.0) -> pd.DataFrame:
+    """Per segment: the pipeline's own lag estimate (channel_lag.estimate, in
+    "report" mode) and a diagnostic R_s with and without it."""
+    import channel_lag
+    from config import DEFAULT
     run = _find_run(run)
-    freq, Z, segs = load_spectra(run, f_max)
-    ref = plate_reference(Z)
-    w = 2 * np.pi * freq
+    freq, Z, segs, usable = load_spectra(run, f_max)
+    cfg = DEFAULT.replace(channel_lag="report", channel_lag_f_lo_hz=f_lo,
+                          f_max_hz=f_max)
+    lags = channel_lag.estimate(
+        {s: (freq, Z[:, j], usable[:, j]) for j, s in enumerate(segs)}, cfg)
     rows = []
     for j, s in enumerate(segs):
-        z = Z[:, j]
-        tau = fit_tau(freq, z, ref, f_lo)
-        zc = z * (1 + 1j * w * tau) if np.isfinite(tau) else z
-        i_top = int(np.nanargmax(np.where(np.isfinite(z), freq, -1)))
+        g = lags.get(s)
+        z = np.where(usable[:, j], Z[:, j], np.nan)
+        tau = g.tau_s if g is not None else float("nan")
+        zc = z * channel_lag.correction(freq, tau) if np.isfinite(tau) else z
         rows.append(dict(segment=s, tau_us=1e6 * tau,
-                         dphi_top_deg=float(np.degrees(np.angle(z[i_top] /
-                                                                ref[i_top]))),
+                         status=g.status if g is not None else "",
+                         resid_deg=g.resid_deg if g is not None else np.nan,
+                         dphi_top_deg=(g.dphi_top_deg if g is not None
+                                       else np.nan),
                          Rs_fit_raw=fit_rs(freq, z),
                          Rs_fit_lag_removed=fit_rs(freq, zc)))
     out = pd.DataFrame(rows).set_index("segment")

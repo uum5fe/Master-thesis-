@@ -1513,6 +1513,41 @@ def run_csv(cfg, stop_after: str = "gold") -> dict:
     return _finish_csv(spectra, sched, m, cfg, log, t0, stop_after)
 
 
+def _apply_channel_lag(spectra: dict, cfg, log) -> dict:
+    """channel_lag.estimate on CSV spectra; Z corrected in place. Returns the
+    per-segment results and writes silver/channel_lag.csv."""
+    import channel_lag
+    if channel_lag.mode(cfg) == "off" or len(spectra) < 5:
+        return {}
+    smax = float(getattr(cfg, "sigma_rel_max", np.inf))
+    items = {seg: (sp.freq, sp.Z,
+                   np.isfinite(sp.sigma_rel) & (sp.sigma_rel <= smax))
+             for seg, sp in spectra.items()}
+    log.info(f"  chain : current-chain lag per segment "
+             f"(mode {channel_lag.mode(cfg)})")
+    try:
+        lags = channel_lag.estimate(items, cfg, log)
+    except Exception as exc:                    # never end a run on this
+        log.warning(f"  chain : skipped ({type(exc).__name__}: {exc})")
+        return {}
+    for seg, g in lags.items():
+        sp = spectra[seg]
+        if g.applied_s:
+            sp.Z = sp.Z * channel_lag.correction(sp.freq, g.applied_s)
+            sp.flags.append(f"chain_lag_removed_{1e6 * g.applied_s:+.0f}us")
+        elif g.status in channel_lag.UNRELIABLE:
+            sp.flags.append(f"chain_phase_{g.status}")
+    out = Path(cfg.out_dir) / "silver"
+    out.mkdir(parents=True, exist_ok=True)
+    utils.write_table(out / "channel_lag.csv",
+                      [lags[s].row() for s in sorted(lags, key=_seg_key)])
+    return lags
+
+
+def _seg_key(s):
+    return (0, int(s)) if str(s).isdigit() else (1, str(s))
+
+
 def _finish_csv(spectra, sched, m, cfg, log, t0, stop_after, extra=None):
     """Validation, ECM, aggregation and output — shared by every CSV route.
 
@@ -1539,6 +1574,12 @@ def _finish_csv(spectra, sched, m, cfg, log, t0, stop_after, extra=None):
     if stop_after == "bronze":
         return {"stage": "bronze", "n_segments": len(spectra),
                 "schedule": sched, **(extra or {})}
+
+    # --- current-chain lag per segment (channel_lag.py) --------------------
+    # The same stage as the FAMOS path's silver: fit each segment's lag
+    # against the plate median on its usable points, and remove it before
+    # R_ohmic is read.
+    _apply_channel_lag(spectra, cfg, log)
 
     # --- validation --------------------------------------------------------
     kk = {seg: validate(sp, cfg) for seg, sp in spectra.items()}

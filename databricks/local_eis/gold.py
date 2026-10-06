@@ -268,6 +268,9 @@ def collect_parameters(sr: SilverRun, cfg: Config
         put("sigma_rel", s, sp.R_ohmic_sd / abs(sp.R_ohmic)
             if sp.R_ohmic else np.nan)
         put("hf_closure", s, sp.hf_closure)
+        # the current-chain lag found (and, in "correct" mode, removed) for
+        # this segment -- mapped so a wiring pattern is visible as one
+        put("chain_tau_us", s, 1e6 * getattr(sp, "chain_tau_est", np.nan))
         # |Z| and phase at the reference frequency
         f = sp.freq
         if len(f):

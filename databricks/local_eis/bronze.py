@@ -1841,6 +1841,92 @@ def run(cfg: Config = DEFAULT, log=None) -> BronzeRun:
 # ===========================================================================
 
 
+def load(run_dir) -> BronzeRun:
+    """Rebuild a BronzeRun from the tables `save` wrote.
+
+    Silver and gold can then be re-run on an old measurement -- with new
+    settings, a new gain file, the channel-lag stage -- without the .DAT
+    files, which are tens of GB and often no longer at hand. `run_dir` is the
+    run folder (holding bronze/) or the bronze/ folder itself.
+
+    What is not in the tables is not invented: channel and card inventories
+    come back empty (silver does not use them), the alignment comes back from
+    card_alignment.csv, and the plate sensor temperatures from the manifest.
+    """
+    import csv
+
+    d = Path(run_dir)
+    if (d / "bronze").is_dir():
+        d = d / "bronze"
+
+    def rows(name):
+        p = d / name
+        if not p.is_file():
+            return []
+        with p.open(newline="", encoding="utf-8") as fh:
+            return list(csv.DictReader(fh))
+
+    def num(x, default=np.nan):
+        try:
+            return float(x)
+        except (TypeError, ValueError):
+            return default
+
+    meta = {str(r["segment"]): r for r in rows("segment_meta.csv")}
+    if not meta:
+        raise FileNotFoundError(f"no segment_meta.csv in {d}")
+    pts: dict[str, list[dict]] = {}
+    for r in rows("raw_spectra.csv"):
+        pts.setdefault(str(r["segment"]), []).append(r)
+
+    spectra: dict[str, BronzeSpectrum] = {}
+    for seg, m in meta.items():
+        p = sorted(pts.get(seg, []), key=lambda r: num(r["freq_hz"]))
+        if not p:
+            continue
+        col = lambda k: np.array([num(r.get(k)) for r in p], float)  # noqa: E731
+        spectra[seg] = BronzeSpectrum(
+            segment=seg, card=m["card"], freq=col("freq_hz"),
+            Z_raw=col("z_re_ohm_cm2") + 1j * col("z_im_ohm_cm2"),
+            snr_ref_db=col("snr_ref_db"), snr_seg_db=col("snr_seg_db"),
+            snr_comb_db=col("snr_comb_db"), thd=col("thd"),
+            drift=col("drift"),
+            n_per_step=np.nan_to_num(col("n_samples")).astype(int),
+            on_grid=col("on_grid") == 1,
+            channel_slot=int(num(m.get("channel_slot"), -1)),
+            ref_slot=int(num(m.get("ref_slot"), 0)),
+            n_ch_on_card=int(num(m.get("n_ch_on_card"), 16)),
+            fs=num(m.get("fs_hz")), K=num(m.get("K")),
+            K_imputed=str(m.get("K_imputed", "0")) in ("1", "True", "true"),
+            T_degC=num(m.get("T_degC")), u_dc=num(m.get("u_dc_V")),
+            ref_name=m.get("ref_name", ""))
+
+    schedule = [Step(freq=num(r["freq_hz"]), start=int(num(r["start"], 0)),
+                     stop=int(num(r["stop"], 0)), amp=num(r.get("amp_V")),
+                     snr_db=num(r.get("snr_db")), thd=num(r.get("thd")),
+                     stationarity=num(r.get("drift")),
+                     window_source=r.get("window_source", "") or "detected")
+                for r in rows("schedule.csv")]
+    lags = {r["card"]: {"lag": int(num(r.get("lag_samples"), 0)),
+                        "corr": num(r.get("corr")),
+                        "prominence": num(r.get("prominence")),
+                        "applied": str(r.get("applied", "1")) == "1",
+                        "rescued": str(r.get("rescued", "0")) == "1",
+                        "refused_reason": r.get("refused_reason", "")}
+            for r in rows("card_alignment.csv") if r.get("card")}
+    man = {}
+    if (d / "bronze_manifest.json").is_file():
+        man = json.loads((d / "bronze_manifest.json").read_text())
+    return BronzeRun(
+        schedule=schedule, channels={}, spectra=spectra, cards={},
+        grid=dict(man.get("grid", {}) or {}),
+        config_digest=str(man.get("config_digest", "")),
+        input_digest=str(man.get("input_digest", "")),
+        n_files=int(man.get("n_files", 0) or 0), lags=lags,
+        sensor_T=dict(man.get("sensor_T_degC", {}) or {}),
+        excluded=frozenset(str(x) for x in man.get("excluded_segments", [])))
+
+
 def save(run_obj: BronzeRun, cfg: Config, log=None) -> Path:
     """Write bronze tables so silver can be re-run without touching .DAT."""
     log = log or utils.get_logger(cfg.verbose)

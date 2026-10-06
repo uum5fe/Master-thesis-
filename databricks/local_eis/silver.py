@@ -131,6 +131,7 @@ import eis_measurement_model as mm
 from eis_validation import lin_kk, z_hit
 
 import utils
+import channel_lag
 from config import Config, DEFAULT, A_CELL_CM2
 from bronze import BronzeRun, BronzeSpectrum
 
@@ -216,6 +217,12 @@ class SilverSpectrum:
     #: the better one when the arc does not close inside the band. Quoted
     #: beside R_ohmic so the two bracket the answer -- see r_ohmic_axis_fit.
     R_ohmic_xint: float = float("nan")
+    #: Current-chain lag of this segment against the plate (channel_lag.py):
+    #: what was fitted, what was removed from Z before R_ohmic was read, and
+    #: the verdict. nan / 0 / "" when the stage is off.
+    chain_tau_est: float = float("nan")
+    chain_tau_applied: float = 0.0
+    chain_status: str = ""
 
     @property
     def j_dc(self) -> float:
@@ -253,6 +260,11 @@ class SilverRun:
     fill_info: dict = field(default_factory=dict)
     #: The full aggregate, both normalisations and the coverage.
     aggregate: dict = field(default_factory=dict)
+    #: segment -> channel_lag.ChannelLag, every segment the stage looked at
+    channel_lag: dict = field(default_factory=dict)
+    #: card -> bronze's alignment verdict (lag, applied, corr, ...), carried
+    #: so the plausibility report can say when a card was never aligned
+    card_lags: dict = field(default_factory=dict)
 
     def reach(self) -> list[dict]:
         """Per segment: how far up in frequency it got, and what stopped it.
@@ -1226,16 +1238,14 @@ REJECT_REASONS = {
 }
 
 
-def process_segment(sp: BronzeSpectrum, skew: SkewModel, cfg: Config,
-                    log=None, ledger: list | None = None
-                    ) -> SilverSpectrum | None:
-    """De-skew, weight, model, validate and grade one segment.
+def gate_points(sp: BronzeSpectrum, cfg: Config) -> dict:
+    """The point-level gates of process_segment, on their own.
 
-    `ledger`, when given, is appended with one row per POINT recording which
-    gate removed it. Nine gates run in sequence and until now only their
-    totals were kept, so "my impedance stops at 400 Hz" and "this segment has
-    no spectrum at all" were unanswerable from the outputs -- the evidence was
-    computed and thrown away. The first gate to reject a point owns it.
+    Returns keep (bool per point), reason (first gate to reject each point),
+    and the arrays the gates computed. Factored out so that the channel-lag
+    stage estimates each chain's lag on exactly the points silver models --
+    on all recorded points, the rejected top-of-band noise dominates the
+    phase and the fit means nothing.
     """
     freq = np.asarray(sp.freq, float)
     Z = np.asarray(sp.Z_raw, complex)
@@ -1322,6 +1332,29 @@ def process_segment(sp: BronzeSpectrum, skew: SkewModel, cfg: Config,
     n_drop_cyc = int(np.sum(np.isfinite(cycles)
                             & (cycles < cfg.min_cycles_per_dwell)))
     n_drop_out = int(bad_z.sum())
+    return dict(freq=freq, Z=Z, keep=keep, reason=reason, snr=snr,
+                s_all=s_all, cycles=cycles, bad_z=bad_z, n_drop=n_drop,
+                n_drop_unc=n_drop_unc, n_drop_cyc=n_drop_cyc,
+                n_drop_out=n_drop_out)
+
+
+def process_segment(sp: BronzeSpectrum, skew: SkewModel, cfg: Config,
+                    log=None, ledger: list | None = None,
+                    chain: "channel_lag.ChannelLag | None" = None
+                    ) -> SilverSpectrum | None:
+    """De-skew, weight, model, validate and grade one segment.
+
+    `ledger`, when given, is appended with one row per POINT recording which
+    gate removed it. Nine gates run in sequence and until now only their
+    totals were kept, so "my impedance stops at 400 Hz" and "this segment has
+    no spectrum at all" were unanswerable from the outputs -- the evidence was
+    computed and thrown away. The first gate to reject a point owns it.
+    """
+    g = gate_points(sp, cfg)
+    freq, Z, keep, reason = g["freq"], g["Z"], g["keep"], g["reason"]
+    snr, s_all, cycles = g["snr"], g["s_all"], g["cycles"]
+    n_drop, n_drop_unc = g["n_drop"], g["n_drop_unc"]
+    n_drop_cyc, n_drop_out = g["n_drop_cyc"], g["n_drop_out"]
     def _emit(final_keep: np.ndarray, verdict: str) -> None:
         if ledger is None:
             return
@@ -1368,6 +1401,11 @@ def process_segment(sp: BronzeSpectrum, skew: SkewModel, cfg: Config,
     # ---- structural de-skew ------------------------------------------------
     dt = skew.dt_for(sp.channel_slot, sp.ref_slot) if skew.applied else 0.0
     z_corr = utils.apply_delay(f, z, dt)
+
+    # ---- current-chain lag (channel_lag.py), after the de-skew it was
+    # ---- measured on ------------------------------------------------------
+    if chain is not None and chain.applied_s:
+        z_corr = z_corr * channel_lag.correction(f, chain.applied_s)
 
     # ---- passivity, NOW that the phase is corrected ------------------------
     # Above passivity_gate_min_hz a passive cell has Re Z > 0.  Below it, a
@@ -1468,6 +1506,14 @@ def process_segment(sp: BronzeSpectrum, skew: SkewModel, cfg: Config,
         # kept deliberately - see Schneider et al. 2009
         flags.append(f"negative_ReZ_lf_{n_neg_lf}pts")
 
+    if chain is not None:
+        if chain.status == channel_lag.CORRECTED:
+            flags.append(f"chain_lag_removed_{1e6 * chain.applied_s:+.0f}us")
+        elif chain.status == channel_lag.REPORT_ONLY:
+            flags.append(f"chain_lag_{1e6 * chain.tau_s:+.0f}us_not_removed")
+        elif chain.status in channel_lag.UNRELIABLE:
+            flags.append(f"chain_phase_{chain.status}")
+
     cv = abs(R_sd_total / R_top) if (R_top and np.isfinite(R_sd_total)) else np.inf
     if np.isfinite(closure) and closure < 0.95:
         flags.append(f"hf_arc_open_{1000*arc_open:.0f}mohm")
@@ -1492,6 +1538,11 @@ def process_segment(sp: BronzeSpectrum, skew: SkewModel, cfg: Config,
         tier = "C"
     if sp.K_imputed and tier == "A":
         tier = "B"          # the shape is fine; the absolute level is not
+    # A channel whose high-frequency phase disagrees with the plate in a way
+    # that is not a first-order lag (typically a card read at the wrong
+    # time) cannot give a top-of-band R_ohmic worth mapping.
+    if chain is not None and chain.status in channel_lag.UNRELIABLE:
+        tier = "C"
 
     return SilverSpectrum(
         segment=sp.segment, card=sp.card, freq=f_m, Z_corr=z_m,
@@ -1516,7 +1567,29 @@ def process_segment(sp: BronzeSpectrum, skew: SkewModel, cfg: Config,
         snr_med_db=float(np.nanmedian(snr[keep])),
         thd_med=float(np.nanmedian(sp.thd[keep])),
         tier=tier, flags=flags,
+        chain_tau_est=(float(chain.tau_s) if chain is not None
+                       else float("nan")),
+        chain_tau_applied=float(chain.applied_s) if chain is not None else 0.0,
+        chain_status=chain.status if chain is not None else "",
     )
+
+
+def channel_lag_items(spectra: dict, skew: dict, cfg: Config) -> dict:
+    """segment -> (freq, de-skewed Z, usable) for channel_lag.estimate.
+
+    The same gates and the same de-skew as process_segment, so the lag is
+    measured on the points that will be modelled, in the frame they will be
+    modelled in.
+    """
+    items = {}
+    for seg, sp in spectra.items():
+        g = gate_points(sp, cfg)
+        sk = skew.get(sp.card)
+        dt = (sk.dt_for(sp.channel_slot, sp.ref_slot)
+              if sk is not None and sk.applied else 0.0)
+        items[seg] = (g["freq"], utils.apply_delay(g["freq"], g["Z"], dt),
+                      g["keep"])
+    return items
 
 
 # ===========================================================================
@@ -1802,6 +1875,20 @@ def run(bronze_run: BronzeRun, cfg: Config = DEFAULT, log=None) -> SilverRun:
                                    1.0 / (items[0].n_ch_on_card * fs),
                                    0.0, len(items), False, "disabled")
 
+    # ---- 1b. current-chain lag per segment (channel_lag.py) ----------------
+    lags: dict = {}
+    if channel_lag.mode(cfg) != "off":
+        utils.section(f"current-chain lag per segment  "
+                      f"(mode: {channel_lag.mode(cfg)})", log)
+        try:
+            measured = {s: bronze_run.spectra[s]
+                        for s in bronze_run.segments_measured()}
+            lags = channel_lag.estimate(
+                channel_lag_items(measured, skew, cfg), cfg, log)
+        except Exception as exc:            # a diagnostic must not end a run
+            log.warning(f"  channel lag skipped: {type(exc).__name__}: {exc}")
+            lags = {}
+
     # ---- 2. per segment ----------------------------------------------------
     utils.section("measurement model per segment", log)
     spectra: dict[str, SilverSpectrum] = {}
@@ -1812,7 +1899,7 @@ def run(bronze_run: BronzeRun, cfg: Config = DEFAULT, log=None) -> SilverRun:
         sp = bronze_run.spectra[seg]
         try:
             res = process_segment(sp, skew[sp.card], cfg, log,
-                                  ledger=point_ledger)
+                                  ledger=point_ledger, chain=lags.get(seg))
         except Exception as exc:                      # never lose the plate
             log.warning(f"    segment {seg}: {type(exc).__name__}: {exc}")
             res = None
@@ -1900,7 +1987,9 @@ def run(bronze_run: BronzeRun, cfg: Config = DEFAULT, log=None) -> SilverRun:
                      unwired=list(bronze_run.segments_missing()),
                      spectra=spectra, skew=skew, dc_closure=dcc,
                      cell_freq=f_cell, Z_cell=Z_cell, cell_n_seg=n_cell,
-                     filled=filled, fill_info=fill_info, aggregate=agg)
+                     filled=filled, fill_info=fill_info, aggregate=agg,
+                     channel_lag=lags,
+                     card_lags=dict(getattr(bronze_run, "lags", {}) or {}))
 
 
 def save(sr: SilverRun, cfg: Config, log=None) -> Path:
@@ -1923,6 +2012,16 @@ def save(sr: SilverRun, cfg: Config, log=None) -> Path:
             })
     utils.write_table(out / "spectra_clean.csv", rows)
 
+    # One row per segment the channel-lag stage looked at -- including the
+    # ones whose spectrum was later dropped, so "why was this not corrected"
+    # has an answer on disk.
+    lag_rows = getattr(sr, "channel_lag", {}) or {}
+    if lag_rows:
+        card_of = {s: sp.card for s, sp in sr.spectra.items()}
+        utils.write_table(out / "channel_lag.csv", [
+            lag_rows[s].row(card_of.get(s, ""))
+            for s in sorted(lag_rows, key=int)])
+
     utils.write_table(out / "segments_summary.csv", [{
         "segment": seg, "card": s.card, "tier": s.tier,
         "area_cm2": round(s.area_cm2, 5),
@@ -1943,6 +2042,10 @@ def save(sr: SilverRun, cfg: Config, log=None) -> Path:
         "L_nH": round(1e9 * s.L, 3),
         "tau_peak_s": f"{s.tau_peak:.4g}" if np.isfinite(s.tau_peak) else "",
         "dt_applied_us": round(1e6 * s.dt_applied, 3),
+        "chain_tau_est_us": (round(1e6 * s.chain_tau_est, 2)
+                             if np.isfinite(s.chain_tau_est) else ""),
+        "chain_tau_applied_us": round(1e6 * s.chain_tau_applied, 2),
+        "chain_status": s.chain_status,
         "T_degC": round(s.T_degC, 2),
         "j_dc_A_cm2": round(s.j_dc, 6),
         "kk_res_pct": round(100 * s.kk_res_max, 4)

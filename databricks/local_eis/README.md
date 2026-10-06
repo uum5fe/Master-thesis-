@@ -136,23 +136,47 @@ the dropdown switches parameter). `bench_plots.py` draws the MF4 test-bench
 channels as one figure: a parameter dropdown, a legend that toggles traces,
 hover values at the cursor, and the FAMOS plate sensors as °C reference lines.
 
-## Why neighbouring segments disagree on HFR, and the channel-lag check
+## Per-segment checks that run on every measurement
 
-`R_ohmic` is read as Re Z at the top of the kept band (~1.2 kHz on 2612030;
-everything above is SNR/THD-rejected). Some segment chains lag the cell
-voltage by a first-order time constant of up to ~110 µs (shunt L/R, wiring,
-amplifier): at 1.2 kHz that is ~37° of phase and a Re Z ~20 mΩ·cm² low, which
-is the 44 vs 66 mΩ·cm² between segments 19 and 14. The lag is identical at
-45 A and 60 A (correlation 1.00 over all segments), i.e. it belongs to the
-channel, not the cell.
+**Current-chain lag (`channel_lag.py`, silver and the CSV path).**
+`R_ohmic` is Re Z at the top of the kept band (~1.2 kHz on 2612030). Each
+segment's shunt/trace/amplifier chain can add a first-order time constant
+(shunt L/R); on 2612030 up to ~110 µs, i.e. 37° at 1.2 kHz and an R_ohmic
+~20 mΩ·cm² low — the 44 vs 66 mΩ·cm² between segments 19 and 14. Silver now
+fits τ for every segment against the plate median, on exactly the points it
+models, and removes it before R_ohmic is read. τ is accepted only if the phase
+really follows −atan(ωτ) (rms residual ≤ 10°); anything else (a card read at
+the wrong time, a scrambled channel) is left uncorrected, flagged and demoted
+to tier C. `CHANNEL_LAG` in the runner / `cfg.channel_lag`: `correct`
+(default), `report`, `off`.
+
+Outputs: `silver/channel_lag.csv` (τ, residual, status per segment), new
+columns in `segments_summary.csv`, `chain_tau_us` in `plate_summary.csv` and
+in the interactive map's dropdown, and two plausibility checks: **channel
+lag** and **card alignment** (FAIL when a card was never time-aligned).
+
+On 2612030 (re-evaluated): plate CV 9.1 → 6.2 % at 60 A, segments
+14/15/18/19/22/23 = 66.5/66.0/63.4/64.3/72.0/64.0 mΩ·cm² (were
+66.5/53.3/63.4/44.0/69.9/45.8), tier C 50 → 4 segments. τ repeats across
+45/60/150 A (r = 0.85–1.00).
+
+What it cannot remove: a lag or gain that EVERY channel shares. Against the
+Gamry sweep the plate still reads ~6.5 % high at low frequency and ~10
+mΩ·cm² high at 1.2 kHz — calibration (curr.csv K) and voltage-sense
+territory, for `cfg.gain_file` (now applied on the FAMOS path) and the
+Abgleich, not for this stage.
+
+**Re-evaluate an old run without its .DAT files.**
 
 ```bash
-python diagnose_channel_lag.py <run_45A> <run_60A> -o lag/ --write-gain lag/interim_gain.csv
+python main.py --reevaluate <run_dir> [--out <dir>] [--channel-lag report] [--gain g.csv]
 ```
 
-prints τ per segment, its repeatability across runs, and R_s with the lag
-removed; `--write-gain` writes the interim correction as a gain file. The
-FAMOS path now applies `cfg.gain_file` (it used to be accepted and ignored).
-The interim file is relative to the plate median; the calibration proper is
-the per-segment chain response (`gamry_dta.py` on the Abgleich `bode/`
-sweeps) or one signal fed to every input in parallel.
+`bronze.load()` rebuilds the bronze stage from `bronze/*.csv`; silver, gold,
+the Gamry comparison and plausibility then run with the current code. Name the
+output folder after the condition (`…/<leepa>/<cond>`) so the Gamry
+comparison finds its sweep.
+
+**Diagnostic across runs:** `python diagnose_channel_lag.py RUN [RUN ...] -o
+out/ [--write-gain g.csv]` — the same estimator, τ side by side per run and
+its repeatability.

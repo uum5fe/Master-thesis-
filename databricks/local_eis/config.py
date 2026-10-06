@@ -248,6 +248,24 @@ class Config:
     gain_file: Path | None = None    # ex-situ chain response: seg,f,re,im
     areas_file: Path | None = None   # optional per-segment area override CSV
 
+    # CURRENT-CHAIN LAG, MEASURED ON EVERY RUN (channel_lag.py).
+    # Each segment's shunt / trace / amplifier can lag the cell voltage by a
+    # first-order time constant; on 2612030 up to ~110 us, which at the
+    # 1.2 kHz top of band is 37 deg and an R_ohmic ~20 mOhm*cm2 low. Silver
+    # fits tau per segment against the plate median and removes it before
+    # R_ohmic is read. "report" fits and records without changing Z; "off"
+    # skips the stage. A tau is only used if the phase really follows
+    # -atan(w tau) (rms residual <= channel_lag_max_resid_deg) -- a card read
+    # at the wrong time does not, and is flagged instead of "corrected".
+    # Calibrated on 2612030 45/60/150 A and 2611976 45 A: good channels fit
+    # to 0.2-4 deg, lags -100..+180 us.
+    channel_lag: str = "correct"           # off | report | correct
+    channel_lag_f_lo_hz: float = 50.0      # below: no lag is visible
+    channel_lag_min_points: int = 4
+    channel_lag_min_us: float = 5.0        # smaller: left alone (noise)
+    channel_lag_max_us: float = 250.0      # larger: not a chain lag
+    channel_lag_max_resid_deg: float = 10.0
+
     # WHOLE-CELL REFERENCE.  A folder of Gamry .DTA sweeps of the same cell at
     # the same operating points, and optionally the bench MF4 log beside them.
     # The 72 segments in parallel must reproduce this; it is the one check that
@@ -1185,6 +1203,8 @@ PARAM_META = {
                         scale=1.0, cmap="plotly_jet"),
     "j_dc":        dict(label="DC current density", unit="A/cm\u00b2",
                         scale=1.0, cmap="plotly_jet"),
+    "chain_tau_us": dict(label="Current-chain lag \u03c4", unit="\u00b5s",
+                         scale=1.0, cmap="plotly_jet"),
     "tau_peak":    dict(label="Dominant relaxation time", unit="s",
                         scale=1.0, cmap="plotly_jet"),
     "sigma_rel":   dict(label="Relative uncertainty", unit="%",

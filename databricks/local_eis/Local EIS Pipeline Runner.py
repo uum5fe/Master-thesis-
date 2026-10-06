@@ -519,6 +519,11 @@ CSV_PATH = ''
 CSV_DIALECT = 'auto'
 CSV_TONES = ()
 GAIN_FILE = ''
+# Current-chain lag per segment (channel_lag.py), measured on every run:
+# 'correct' removes it before R_ohmic is read, 'report' only records it,
+# 'off' skips the stage. See silver/channel_lag.csv and the "channel lag"
+# plausibility check after each run.
+CHANNEL_LAG = 'correct'
 GAMRY_DIR = str(GAMRY_ROOT) if GAMRY_ROOT else ''
 # The build token that ties this order to its sweeps. It travels into the
 # Config, so the pipeline's own whole-cell comparison filters on it too --
@@ -1077,7 +1082,8 @@ def _run_identity(mode=None, f_min=None, f_max=None, snr=None):
         gamry_version=globals().get('GAMRY_VERSION', ''),
         exclude_segments=globals().get('EXCLUDE_SEGMENTS', frozenset()),
         substitute_segments=globals().get('SUBSTITUTE_SEGMENTS', frozenset()),
-        fill_missing_from_neighbours=globals().get('FILL_GAPS', False))
+        fill_missing_from_neighbours=globals().get('FILL_GAPS', False),
+        channel_lag=globals().get('CHANNEL_LAG', 'correct'))
     if mode and mode != 'default':
         base = base.preset(mode)
     # A set has no order, and json's default=str would spell the SAME
@@ -1705,6 +1711,7 @@ for cond in _conditions_to_run:
         csv_dialect=CSV_DIALECT,
         csv_tones=CSV_TONES,
         gain_file=Path(GAIN_FILE) if GAIN_FILE else None,
+        channel_lag=CHANNEL_LAG,
         gamry_dir=Path(GAMRY_DIR) if GAMRY_DIR else None,
         gamry_version=GAMRY_VERSION,
         bench_log=Path(BENCH_LOG) if BENCH_LOG else None,
@@ -2638,6 +2645,7 @@ _FIELD_DEFS = [
     ('Z_mag_100Hz',  '|Z| at 100 Hz',              'mΩ·cm²', 'viridis', 1),
     ('phase_100Hz',  'Phase at 100 Hz',            '°',      'humid',   1),
     ('T_degC',       'Temperature (FAMOS sensors)', '°C',    'coolwarm', 2),
+    ('chain_tau_us', 'Current-chain lag τ (removed)', 'µs',  'viridis', 0),
 ]
 
 

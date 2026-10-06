@@ -347,8 +347,11 @@ def neighbour_smoothness(values: dict[str, float], plate_key: str = "gen1",
                                 "channel map")
     else:
         verdict, extra = FAIL, (" -- indistinguishable from random placement; "
-                                "suspect the channel-to-segment mapping "
-                                "before interpreting this plate")
+                                "suspect the channel-to-segment mapping, or "
+                                "a per-channel gain (curr.csv K, or a card's "
+                                "UC reference) -- if the same pattern repeats "
+                                "across conditions it is the channels, not "
+                                "the cell")
     return Check(f"{param} smoothness", verdict, detail + extra, ratio,
                  rests_on=f"{param} being a spatially smooth property of the "
                           f"cell, which is true for ohmic resistance and "
@@ -728,6 +731,83 @@ def aggregate_vs_reference(freq: np.ndarray, Z_agg: np.ndarray,
 # 6. Running the lot
 # ===========================================================================
 
+def channel_lag_check(lags: dict) -> Check:
+    """Do the segment current chains see the same high-frequency phase?
+
+    `lags`: segment -> object with tau_s, applied_s, status (channel_lag.py).
+    PASS: every chain agrees with the plate to within the noise.
+    WARN: lags were found and removed -- the map is right, but the chains
+          differ, and a per-segment chain calibration (cfg.gain_file) is what
+          should be removing this; or a few channels are unreliable.
+    FAIL: a fifth or more of the channels do not follow a first-order lag at
+          all: their top-of-band phase, and the R_ohmic read there, is not
+          a measurement of the cell.
+    """
+    import math
+    if not lags:
+        return Check("channel lag", NA, "stage off or no segments")
+    rows = list(lags.values())
+    st = [str(getattr(g, "status", "")) for g in rows]
+    taus = [1e6 * float(g.tau_s) for g in rows
+            if math.isfinite(float(getattr(g, "tau_s", float("nan"))))]
+    removed = [1e6 * float(g.applied_s) for g in rows
+               if float(getattr(g, "applied_s", 0.0) or 0.0)]
+    bad = [str(g.segment) for g, x in zip(rows, st)
+           if x in ("not_first_order", "too_large")]
+    frac_bad = len(bad) / len(rows)
+    span = (f"tau {min(taus):+.0f}..{max(taus):+.0f} us over {len(taus)} "
+            f"segments" if taus else "no tau could be fitted")
+    rests = ("the plate median being a fair reference at high frequency, "
+             "i.e. most chains lag alike")
+    if frac_bad >= 0.2:
+        return Check("channel lag", FAIL,
+                     f"{len(bad)}/{len(rows)} channels do not follow a "
+                     f"first-order lag ({', '.join(sorted(bad, key=int)[:12])}"
+                     f"{' ...' if len(bad) > 12 else ''}) -- check the card "
+                     f"alignment; {span}", frac_bad, rests)
+    if bad:
+        return Check("channel lag", WARN,
+                     f"{len(bad)} channel(s) not first-order, left "
+                     f"uncorrected and demoted: {', '.join(sorted(bad, key=int))}"
+                     f"; {span}", frac_bad, rests)
+    big = max((abs(x) for x in removed), default=0.0)
+    if big >= 30.0:
+        return Check("channel lag", WARN,
+                     f"lag removed on {len(removed)} segment(s), up to "
+                     f"{big:.0f} us ({span}); the map is corrected, the "
+                     f"chains still differ -- calibrate them (gain_file)",
+                     big, rests)
+    return Check("channel lag", PASS,
+                 f"{span}; {len(removed)} small correction(s)", big, rests)
+
+
+def card_alignment_check(card_lags: dict) -> Check:
+    """Was every card shifted onto the common time base?
+
+    A card whose lag was not applied reads its step windows at the wrong
+    time: points from the wrong frequency step, rejected or -- worse --
+    kept with the wrong phase.
+    """
+    if not card_lags:
+        return Check("card alignment", NA, "no alignment record")
+    def _short(c):
+        c = str(c)
+        return c.split("_")[-2] + "_" + c.split("_")[-1] if "_" in c else c
+    off = [c for c, v in card_lags.items()
+           if not bool((v or {}).get("applied", True))]
+    if off:
+        return Check("card alignment", FAIL,
+                     f"{len(off)}/{len(card_lags)} card(s) NOT time-aligned "
+                     f"to the others: {', '.join(_short(c) for c in sorted(off))}"
+                     f" -- their segments' windows may come from the wrong "
+                     f"step; treat their maps with care or re-run",
+                     len(off) / len(card_lags),
+                     "bronze's cross-correlation of the shared UC channel")
+    return Check("card alignment", PASS,
+                 f"all {len(card_lags)} cards aligned", 0.0,
+                 "bronze's cross-correlation of the shared UC channel")
+
+
 def check_run(sr, cfg=None, plate_key: str = "gen1",
               reference: tuple[np.ndarray, np.ndarray] | None = None,
               reference_hfr: float = float("nan")) -> Report:
@@ -745,6 +825,8 @@ def check_run(sr, cfg=None, plate_key: str = "gen1",
         setpoint, plate_key))
 
     checks.append(passivity(spectra))
+    checks.append(card_alignment_check(getattr(sr, "card_lags", {}) or {}))
+    checks.append(channel_lag_check(getattr(sr, "channel_lag", {}) or {}))
 
     r_ohmic = {s: sp.R_ohmic for s, sp in spectra.items()}
     checks.append(neighbour_smoothness(r_ohmic, plate_key))
@@ -829,7 +911,19 @@ def check_from_disk(run_dir, cfg=None, plate_key: str = "gen1",
     cell_freq = np.array([_f(r, "freq_hz") for r in agg])
     Z_cell = np.array([complex(_f(r, "z_re_mohm_cm2"), _f(r, "z_im_mohm_cm2"))
                        for r in agg]) / 1e3
-    sr = SimpleNamespace(spectra=spectra, cell_freq=cell_freq, Z_cell=Z_cell)
+    lags = {}
+    for r in _rows(run_dir / "silver" / "channel_lag.csv"):
+        lags[str(r["segment"])] = SimpleNamespace(
+            segment=str(r["segment"]), status=r.get("status", ""),
+            tau_s=_f(r, "tau_us") * 1e-6,
+            applied_s=(_f(r, "applied_us") * 1e-6
+                       if r.get("applied_us", "") != "" else 0.0))
+    card_lags = {r["card"]: {"applied": str(r.get("applied", "1")).strip()
+                             in ("1", "True", "true")}
+                 for r in _rows(run_dir / "bronze" / "card_alignment.csv")
+                 if r.get("card")}
+    sr = SimpleNamespace(spectra=spectra, cell_freq=cell_freq, Z_cell=Z_cell,
+                         channel_lag=lags, card_lags=card_lags)
     return check_run(sr, cfg, plate_key=plate_key, reference=reference,
                      reference_hfr=reference_hfr)
 

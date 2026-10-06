@@ -129,7 +129,7 @@ def draw_flow_plate(values: dict, param: str, title: str = "",
     from matplotlib.colors import Normalize
     from matplotlib.patches import FancyBboxPatch, Rectangle, Circle, Polygon
 
-    f_label, f_unit, f_ramp, f_dec = FIELDS.get(param, (param, "", "viridis", 1))
+    f_label, f_unit, f_ramp, f_dec = FIELDS.get(param, (param, "", _JET, 1))
     label = label or f_label
     unit = f_unit if unit is None else unit
     cm = _cmap(cmap or f_ramp)

@@ -135,3 +135,24 @@ interactive map, the ECM maps and the numbering map) takes its look from
 the dropdown switches parameter). `bench_plots.py` draws the MF4 test-bench
 channels as one figure: a parameter dropdown, a legend that toggles traces,
 hover values at the cursor, and the FAMOS plate sensors as °C reference lines.
+
+## Why neighbouring segments disagree on HFR, and the channel-lag check
+
+`R_ohmic` is read as Re Z at the top of the kept band (~1.2 kHz on 2612030;
+everything above is SNR/THD-rejected). Some segment chains lag the cell
+voltage by a first-order time constant of up to ~110 µs (shunt L/R, wiring,
+amplifier): at 1.2 kHz that is ~37° of phase and a Re Z ~20 mΩ·cm² low, which
+is the 44 vs 66 mΩ·cm² between segments 19 and 14. The lag is identical at
+45 A and 60 A (correlation 1.00 over all segments), i.e. it belongs to the
+channel, not the cell.
+
+```bash
+python diagnose_channel_lag.py <run_45A> <run_60A> -o lag/ --write-gain lag/interim_gain.csv
+```
+
+prints τ per segment, its repeatability across runs, and R_s with the lag
+removed; `--write-gain` writes the interim correction as a gain file. The
+FAMOS path now applies `cfg.gain_file` (it used to be accepted and ignored).
+The interim file is relative to the plate median; the calibration proper is
+the per-segment chain response (`gamry_dta.py` on the Abgleich `bode/`
+sweeps) or one signal fed to every input in parallel.

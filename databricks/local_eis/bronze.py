@@ -1508,7 +1508,8 @@ def process_card(fp: Path, cal: PlateCalibration, schedule: list[Step],
                  grid: dict, cfg: Config, log=None,
                  T_seg: dict[str, float] | None = None,
                  lag: int = 0,
-                 ref_pool: tuple[np.ndarray, np.ndarray, dict] | None = None
+                 ref_pool: tuple[np.ndarray, np.ndarray, dict] | None = None,
+                 gain: dict | None = None,
                  ) -> dict[str, BronzeSpectrum]:
     """Raw phasors for every segment on one card.
 
@@ -1525,6 +1526,9 @@ def process_card(fp: Path, cal: PlateCalibration, schedule: list[Step],
     frequency and every gate stay exactly as they were; only A_ref and its
     SNR change, and `ref_slot` is then recorded as 0 so that silver's
     structural skew model still reads a consistent geometry.
+
+    `gain` is the chain response from cfg.gain_file (utils.load_gain): each
+    segment's Z is divided by its G(f), exactly as the CSV path does.
     """
     log = log or utils.get_logger(cfg.verbose)
     fam = FamosFile(fp)
@@ -1703,6 +1707,12 @@ def process_card(fp: Path, cal: PlateCalibration, schedule: list[Step],
         # WEIGHTED MEDIAN over the low decade rather than a mean, and by
         # requiring the evidence to be decisive: a couple of negative points
         # in an otherwise positive low-frequency spectrum will not flip it.
+        # The current-measurement chain's own response (shunt + amplifier,
+        # cfg.gain_file). This used to be read only by the CSV path: on the
+        # FAMOS path a gain file was accepted, reported as applied, and never
+        # used.
+        if gain:
+            Z = Z / utils.gain_at(gain, seg, freqs)
         with np.errstate(invalid="ignore"):
             Z = _fix_polarity(Z, freqs, utils.combine_snr_db(snr_r, snr_s), cfg)
 
@@ -1768,6 +1778,14 @@ def run(cfg: Config = DEFAULT, log=None) -> BronzeRun:
     ref_pool = (pooled_reference_phasors(files, cards, schedule, cfg,
                                          lags=lags, log=log)
                 if getattr(cfg, "hf_pool_reference", False) else None)
+    gain = utils.load_gain(cfg.gain_file) if cfg.gain_file else {}
+    if gain:
+        log.info(f"  chain response: {Path(cfg.gain_file).name}, "
+                 f"{len(gain)} curve(s)"
+                 + (" incl. a shared one" if {"all", "0"} & set(gain) else ""))
+    else:
+        log.info("  chain response: none (cfg.gain_file not set) -- each "
+                 "channel's own shunt/amplifier response stays in Z")
     spectra: dict[str, BronzeSpectrum] = {}
     for fp in files:
         if fp.stem not in cards:
@@ -1776,7 +1794,8 @@ def run(cfg: Config = DEFAULT, log=None) -> BronzeRun:
         info = lags.get(fp.stem, {})
         shift = int(info.get("lag", 0)) if info.get("applied") else 0
         got = process_card(fp, cal, schedule, grid, cfg, log,
-                           T_seg=T_seg, lag=shift, ref_pool=ref_pool)
+                           T_seg=T_seg, lag=shift, ref_pool=ref_pool,
+                           gain=gain)
         for seg, sp in got.items():
             if seg in spectra:
                 # two cards claim the same segment: keep the better SNR

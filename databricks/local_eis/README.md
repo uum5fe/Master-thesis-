@@ -124,11 +124,12 @@ interactive map, the ECM maps and the numbering map) takes its look from
   draws the plate from the other side instead; the whole drawing mirrors, so
   the ports stay beside the segments they feed. CSV coordinates stay in plate
   coordinates;
-- **ports**: gas inlets/outlets and the coolant inlet/outlet on their ends.
-  The coolant end is `config.COOLANT_INLET_END = "xW"`: in at the air-inlet
-  end (right), out on the left. The FAMOS plate sensors read warmest at that
-  end, which a coolant inlet alone would not cause -- confirm against the
-  manifold drawing.
+- **ports**: a column of three at each end -- gas outlet above the coolant,
+  gas inlet below it: AIR OUT / COOLANT OUT / H₂ IN on the left, H₂ OUT /
+  COOLANT IN / AIR IN on the right. `config.COOLANT_INLET_END = "xW"` (coolant
+  in at the air-inlet end) is read from the MF4 log (the anode outlet follows
+  a coolant-inlet dip, the cathode outlet does not) and the FAMOS plate
+  sensors; confirm against the manifold drawing.
 
 `plate_plotly.py` draws the interactive map (hover a segment for its value,
 the dropdown switches parameter). `bench_plots.py` draws the MF4 test-bench

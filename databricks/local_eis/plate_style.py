@@ -194,6 +194,20 @@ def end_streams() -> dict[str, list[tuple[str, str, str]]]:
     return {"x0": x0, "xW": xw}
 
 
+def port_slot(label: str) -> str:
+    """Where a port sits in its end's column: the coolant in the middle, the
+    gas outlet above it and the gas inlet below it."""
+    if label.startswith("COOLANT"):
+        return "mid"
+    return "top" if label.endswith("OUT") else "bottom"
+
+
+def port_kind(label: str) -> str:
+    """'anode', 'cathode' or 'coolant'."""
+    return ("coolant" if label.startswith("COOLANT")
+            else "anode" if label.startswith("H") else "cathode")
+
+
 def _arrow(stream_from: str) -> str:
     """'left to right' / 'right to left' for a stream entering at an end."""
     return ("left to right" if screen_side(stream_from) == "left"
@@ -223,12 +237,9 @@ def annotate_ends(ax, width_mm: float, height_mm: float,
     for end, x in (("x0", -gap_mm), ("xW", width_mm + gap_mm)):
         ha = outward_ha(end)
         for lab, role, col in end_streams()[end]:
-            # gas outlets at the top and inlets at the bottom, as plumbed;
-            # the coolant between them
-            if lab.startswith("COOLANT"):
-                y = height_mm * 0.5
-            else:
-                y = height_mm * (0.12 if "OUT" in lab else 0.88)
+            # gas outlet above the coolant, gas inlet below it
+            y = height_mm * {"top": 0.12, "mid": 0.5,
+                             "bottom": 0.88}[port_slot(lab)]
             ax.text(x, y, f"{lab}\n{role}", ha=ha, va="center",
                     fontsize=fontsize, fontweight="bold", color=col,
                     linespacing=1.15, zorder=7)

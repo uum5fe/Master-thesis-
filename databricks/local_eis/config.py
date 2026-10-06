@@ -96,19 +96,28 @@ FLOW_DESCRIPTION = {
 }
 
 # WHICH END THE COOLANT ENTERS: "x0" (pad column 1, the H2-inlet / air-outlet
-# end) or "xW" (pad column 45, the air-inlet end).
+# end) or "xW" (pad column 45, the air-inlet / H2-outlet end).  Each end
+# carries a column of three ports on the maps: gas outlet above the coolant,
+# gas inlet below it -- x0: AIR OUT / COOLANT / H2 IN, xW: H2 OUT / COOLANT /
+# AIR IN.
 #
-# "xW" is the layout set on the plate drawing: coolant in at the air-inlet
-# end (right), out at the H2-inlet / air-outlet end (left) -- coolant
-# co-flowing with the air. Note that the four FAMOS plate sensors (temp1 at
-# x = 0 ... temp4 at x = 252 mm) read WARMEST at x = 252 in three of the four
-# runs evaluated (2612030 45A +1.07 K, 60A +1.02 K, 2611976 45A +0.80 K).
-# Coolant picks up heat along its path, so its inlet end should be the cool
-# one; with the inlet at x = 252 that gradient has to come from something
-# else, e.g. the hot inlet air (T_Si_C runs above the plate) at the same end.
-# Worth confirming against the manifold drawing; a coolant-inlet temperature
-# step settles it (the sensor that responds first is at the coolant inlet).
-# The maps redraw the coolant ports from this.
+# "xW" -- coolant in with the air inlet, coolant co-flowing with the air --
+# is read off the data, not a drawing:
+#   * bench log 2611976 (MF4): at t ~ 1.5 min the coolant inlet T_Si_CL dips
+#     by ~6 K. The ANODE outlet T_So_A dips with it (~1.5 K, same instant);
+#     the cathode outlet T_So_C does not move. The H2 outlet port therefore
+#     sits at the coolant-inlet end, and on a counter-flow plate that is the
+#     air-inlet end. (The step at ~23 min is the gas inlet heaters: each
+#     outlet follows its own inlet, so it says nothing about position.)
+#   * FAMOS plate sensors (temp1 at x = 0 ... temp4 at x = 252): warmest at
+#     x = 252 at 45 A and 60 A (+0.8..1.1 K), flat at 150 A. Coolant warming
+#     from x = 0 would make that gradient GROW with current; coolant entering
+#     at x = 252, next to the hot inlet air (T_Si_C runs 10-20 K above the
+#     plate), cancels it as the reaction heat grows -- which is what 150 A
+#     shows.
+# Neither is a drawing; confirm against the manifold drawing when there is
+# one. A coolant-inlet temperature step settles it: the sensor that responds
+# first is at the coolant inlet.
 COOLANT_INLET_END = "xW"
 
 # HOW THE PLATE IS DRAWN.  False: as the pad map is numbered, pad column 1 on

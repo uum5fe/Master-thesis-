@@ -164,3 +164,20 @@ def test_interactive_plate_hover_dropdown_and_view(view):
     assert (rng[0] > rng[1]) == view
     ann = " ".join(a.text for a in fig.layout.annotations)
     assert "COOLANT IN" in ann and "AIR IN" in ann
+
+
+def test_each_end_is_a_column_gas_out_above_coolant_gas_in_below(monkeypatch):
+    monkeypatch.setattr(config, "PLATE_VIEW_MIRRORED", False)
+    monkeypatch.setattr(config, "COOLANT_INLET_END", "xW")
+    fig = plate_figure.draw_flow_plate(_vals(), "R_ohmic")
+    pos = {t.get_text(): t.get_position() for t in fig.axes[0].texts}
+    W = geom.PLATE_W_MM
+    right = ("H₂ OUT", "COOLANT IN", "AIR IN")
+    left = ("AIR OUT", "COOLANT OUT", "H₂ IN")
+    for column, outside in ((right, lambda x: x > W), (left, lambda x: x < 0)):
+        xs = [pos[lab][0] for lab in column]
+        ys = [pos[lab][1] for lab in column]
+        assert all(outside(x) for x in xs), column
+        assert max(xs) - min(xs) < 1e-6, f"{column} not stacked in one column"
+        assert ys[0] < ys[1] < ys[2], f"{column} not top-to-bottom (y down)"
+    plt.close(fig)

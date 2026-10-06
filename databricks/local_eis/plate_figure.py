@@ -3,11 +3,12 @@
 plate_figure.py
 ===============
 Static plate heat map in the style of the interactive plate viewer: the
-metal frame with its bolts, the gasket border, the four manifold ports with
-their flow arrows (in plate coordinates: O2 OUT top / H2 IN bottom at x = 0,
-H2 OUT top / AIR IN bottom at x = 252), the coolant inlet and outlet on the
-two ends, the temperature-sensor pins T1..T4 on the top edge, the plate
-dimensions -- and every segment filled with its value.
+metal frame with its bolts, the gasket border, the six manifold ports with
+their flow arrows -- a column at each end, gas outlet above the coolant and
+gas inlet below it (x = 0: AIR OUT / COOLANT / H2 IN; x = 252: H2 OUT /
+COOLANT / AIR IN; the coolant direction is config.COOLANT_INLET_END) -- the
+temperature-sensor pins T1..T4 on the top edge, the plate dimensions -- and
+every segment filled with its value.
 
 Colours, text sizes and the view direction come from plate_style: plotly's
 Jet scale for every parameter, the value large and the segment number small,
@@ -64,20 +65,15 @@ FIELDS = {
     "phase_100Hz": ("Phase at 100 Hz", "°", _JET, 1),
 }
 
-# Frame geometry in plate mm (x right, y DOWN, active area 0..W x 0..H);
-# the numbers are the viewer's, so the two drawings match.
-_ANODE, _CATHODE = "#a5341f", "#2c455d"
-PORTS = [  # label, side, corner, rect (x, y, w, h), arrow (x0, x1, y); plate mm
-    ("H₂ IN", "anode", "bl", (8.0, 129.0, 62.0, 16.0), (-38.0, 2.0, 137.0)),
-    ("H₂ OUT", "anode", "tr", (182.0, -24.0, 62.0, 16.0), (250.0, 290.0, -16.0)),
-    ("AIR / O₂ IN", "cathode", "br", (182.0, 129.0, 62.0, 16.0), (290.0, 250.0, 137.0)),
-    ("O₂ OUT", "cathode", "tl", (8.0, -24.0, 62.0, 16.0), (2.0, -38.0, -16.0)),
-]
-
-
-# Coolant ports, one on each end at mid-height, between the side bolts:
-# rect (x, y, w, h) on the x = 0 end; the x = W end is its mirror image.
-_COOLANT_RECT = (-21.0, 47.5, 13.0, 26.0)
+# Frame geometry in plate mm (x right, y DOWN, active area 0..W x 0..H).
+_ANODE, _CATHODE = style.ANODE_COLOUR, style.CATHODE_COLOUR
+#: the frame reaches this far beyond each end of the active area
+_FRAME_X = 42.0
+#: each end carries a column of three manifold ports, centred this far
+#: outside the active area: gas outlet on top, coolant in the middle, gas
+#: inlet at the bottom (plate_style.port_slot)
+_PORT_CX, _PORT_W, _PORT_H = 24.0, 18.0, 34.0
+_PORT_Y = {"top": 0.0, "mid": 43.5, "bottom": 87.0}
 
 
 def _cmap(name: str):
@@ -159,10 +155,11 @@ def draw_flow_plate(values: dict, param: str, title: str = "",
     ax.set_facecolor("#f2f2f3")
 
     # ---- frame, gasket, active area --------------------------------------
-    ax.add_patch(FancyBboxPatch((-24, -28), 300, 177,
+    ax.add_patch(FancyBboxPatch((-_FRAME_X, -28), W + 2 * _FRAME_X, 177,
                                 boxstyle="round,pad=0,rounding_size=7",
                                 fc="#e1e3e6", ec="#8b9097", lw=1.0, zorder=0))
-    ax.add_patch(FancyBboxPatch((-18.5, -22.5), 289, 166,
+    ax.add_patch(FancyBboxPatch((-_FRAME_X + 5.5, -22.5),
+                                W + 2 * _FRAME_X - 11, 166,
                                 boxstyle="round,pad=0,rounding_size=4",
                                 fc="none", ec="#8b9097", lw=0.6, alpha=0.65,
                                 zorder=0.5))
@@ -234,90 +231,65 @@ def draw_flow_plate(values: dict, param: str, title: str = "",
         ax.plot([x, x], [-9, -1.5], color="#1d1f20", lw=0.9, zorder=5)
         ax.add_patch(Circle((x, -10.6), 1.7, fc="#f2f2f3", ec="#1d1f20",
                             lw=0.9, zorder=5))
-        # T1 sits under the O2 OUT port, so its tag goes beside the pin
-        first = i == 0
-        ax.text(x - 3.2 if first else x, -10.6 if first else -15.2,
-                f"T{i + 1}", ha=style.outward_ha("x0") if first else "center",
-                va="center",
+        ax.text(x, -15.2, f"T{i + 1}", ha="center", va="center",
                 fontsize=6.5, family="monospace", fontweight="bold",
                 color="#1d1f20", zorder=7)
 
     # ---- ports and flow arrows ---------------------------------------------
+    # One column per end (plate_style.end_streams): gas outlet above the
+    # coolant, gas inlet below it. Inlet arrows point at the port, outlet
+    # arrows away from it.
     def arrow(x0, x1, y, w=2.4, hw=6.2, hl=9.0):
         d = 1 if x1 > x0 else -1
         n_ = x1 - d * hl
         return [(x0, y - w), (n_, y - w), (n_, y - hw), (x1, y), (n_, y + hw),
                 (n_, y + w), (x0, y + w)]
 
-    for lab, sd, corner, (x, y, w, h), (a0, a1, ay) in PORTS:
-        live = 1.0 if sd == side else 0.3
-        col = _ANODE if sd == "anode" else _CATHODE
-        ax.add_patch(FancyBboxPatch((x, y), w, h,
-                                    boxstyle="round,pad=0,rounding_size=4",
-                                    fc="#3b3f44", ec=col, lw=1.6, alpha=live,
-                                    zorder=5))
-        ax.add_patch(FancyBboxPatch((x + 2, y + 2), w - 4, h - 4,
-                                    boxstyle="round,pad=0,rounding_size=3",
-                                    fc="#25282c", ec="none", alpha=live,
-                                    zorder=5))
-        for bx in (x + 13, x + w - 13):
-            ax.add_patch(Circle((bx, y + h / 2), 2.6, fc="#b7b7ba",
-                                ec="#7a7a7d", lw=0.5, alpha=live, zorder=6))
-            ax.add_patch(Circle((bx, y + h / 2), 1.5, fc="#4a4d52",
-                                alpha=live, zorder=6))
-        ax.add_patch(Polygon(arrow(a0, a1, ay), closed=True, fc=col,
-                             ec="none", alpha=live, zorder=5))
-        top = corner[0] == "t"
-        ax.text(x + w / 2, (y - 12 if top else y + h + 12), lab,
-                ha="center", va="center", fontsize=12.5,
-                fontweight="bold", color=col, alpha=live, zorder=6)
-        ax.text(x + w / 2, (y - 7.5 if top else y + h + 16.8),
-                ("anode " if sd == "anode" else "cathode ")
-                + ("inlet" if "IN" in lab else "outlet"),
-                ha="center", va="center", fontsize=6.5, family="monospace",
-                color="#5d5d60", alpha=live, zorder=6)
-
-    # ---- coolant ports (config.COOLANT_INLET_END) -------------------------
-    cx, cy, cw, ch = _COOLANT_RECT
-    for end, (lab, role, col) in (
-            (e, st) for e, sts in style.end_streams().items() for st in sts
-            if st[0].startswith("COOLANT")):
-        x = cx if end == "x0" else W - cx - cw
-        ax.add_patch(FancyBboxPatch((x, cy), cw, ch,
-                                    boxstyle="round,pad=0,rounding_size=3",
-                                    fc="#3b3f44", ec=col, lw=1.6, zorder=5))
-        ax.add_patch(FancyBboxPatch((x + 2, cy + 2), cw - 4, ch - 4,
-                                    boxstyle="round,pad=0,rounding_size=2",
-                                    fc="#25282c", ec="none", zorder=5))
-        # arrow along x, outside the frame: into the port at the inlet, out
-        # of it at the outlet
-        out_x = -46.0 if end == "x0" else W + 46.0
-        port_x = x if end == "x0" else x + cw
-        a0, a1 = (out_x, port_x) if lab.endswith(" IN") else (port_x, out_x)
-        ax.add_patch(Polygon(arrow(a0, a1, cy + ch / 2), closed=True, fc=col,
-                             ec="none", zorder=5))
-        tx = (out_x + port_x) / 2
-        ax.text(tx, cy - 6.5, lab, ha="center", va="center", fontsize=10.5,
-                fontweight="bold", color=col, zorder=6)
-        ax.text(tx, cy + ch + 5.5, role, ha="center", va="center",
-                fontsize=6.5, family="monospace", color="#5d5d60", zorder=6)
+    for end, streams in style.end_streams().items():
+        sgn = -1.0 if end == "x0" else 1.0          # outward along x
+        cx = (0.0 if end == "x0" else W) + sgn * _PORT_CX
+        for lab, role, col in streams:
+            kind = style.port_kind(lab)
+            live = 1.0 if kind in (side, "coolant") else 0.3
+            y = _PORT_Y[style.port_slot(lab)]
+            x = cx - _PORT_W / 2
+            ax.add_patch(FancyBboxPatch((x, y), _PORT_W, _PORT_H,
+                                        boxstyle="round,pad=0,rounding_size=4",
+                                        fc="#3b3f44", ec=col, lw=1.6,
+                                        alpha=live, zorder=5))
+            ax.add_patch(FancyBboxPatch((x + 2, y + 2), _PORT_W - 4,
+                                        _PORT_H - 4,
+                                        boxstyle="round,pad=0,rounding_size=3",
+                                        fc="#25282c", ec="none", alpha=live,
+                                        zorder=5))
+            for by in (y + 8, y + _PORT_H - 8):
+                ax.add_patch(Circle((cx, by), 2.6, fc="#b7b7ba",
+                                    ec="#7a7a7d", lw=0.5, alpha=live,
+                                    zorder=6))
+                ax.add_patch(Circle((cx, by), 1.5, fc="#4a4d52",
+                                    alpha=live, zorder=6))
+            ym = y + _PORT_H / 2
+            near = cx + sgn * (_PORT_W / 2 + 1.0)
+            far = cx + sgn * (_PORT_W / 2 + 36.0)
+            a0, a1 = (far, near) if lab.endswith(" IN") else (near, far)
+            ax.add_patch(Polygon(arrow(a0, a1, ym), closed=True, fc=col,
+                                 ec="none", alpha=live, zorder=5))
+            tx = (near + far) / 2
+            ax.text(tx, ym - 9.5, lab, ha="center", va="center",
+                    fontsize=11, fontweight="bold", color=col, alpha=live,
+                    zorder=6)
+            ax.text(tx, ym + 9.5, role, ha="center", va="center",
+                    fontsize=6.5, family="monospace", color="#5d5d60",
+                    alpha=live, zorder=6)
 
     # ---- bolts ----------------------------------------------------------------
-    for i in range(10):
+    n_b = 11
+    for i in range(n_b):
+        bx = -_FRAME_X + 10 + i * (W + 2 * _FRAME_X - 20) / (n_b - 1)
         for by in (-19.5, 140.5):
-            bx = -14 + i * 31.1
-            if any(px - 2 < bx < px + pw + 2 and py - 2 < by < py + ph + 2
-                   for _, _, _, (px, py, pw, ph), _ in PORTS):
-                continue
             ax.add_patch(Circle((bx, by), 2.6, fc="#b7b7ba", ec="#7a7a7d",
                                 lw=0.5, zorder=5))
             ax.add_patch(Circle((bx, by), 1.5, fc="#4a4d52", zorder=5))
-    for i in range(4):
-        for bx in (-14, 266):
-            ax.add_patch(Circle((bx, 6 + i * 36.3), 2.6, fc="#b7b7ba",
-                                ec="#7a7a7d", lw=0.5, zorder=5))
-            ax.add_patch(Circle((bx, 6 + i * 36.3), 1.5, fc="#4a4d52",
-                                zorder=5))
 
     # ---- dimensions ---------------------------------------------------------
     ax.text(W / 2, 172, f"{W:.1f} × {H:.1f} mm · 45 × 20 pads   |   "
@@ -325,7 +297,7 @@ def draw_flow_plate(values: dict, param: str, title: str = "",
             ha="center", va="center", fontsize=7.5, family="monospace",
             color="#5d5d60")
 
-    ax.set_xlim(*style.xlim(-50, W + 50))
+    ax.set_xlim(*style.xlim(-84, W + 84))
     ax.set_ylim(177, -44)
     ax.set_aspect("equal")
     ax.axis("off")

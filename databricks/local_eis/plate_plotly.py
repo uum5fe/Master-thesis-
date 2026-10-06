@@ -222,10 +222,8 @@ def _end_annotations(W: float, H: float) -> list[dict]:
             # the arrow sits on the side of the label the stream moves to
             text = (f"<b>{lab} {arrow}</b>" if right
                     else f"<b>{arrow} {lab}</b>")
-            if lab.startswith("COOLANT"):
-                y = H * 0.5
-            else:
-                y = H * (0.10 if "OUT" in lab else 0.90)
+            y = H * {"top": 0.10, "mid": 0.5,
+                     "bottom": 0.90}[style.port_slot(lab)]
             ann.append(dict(x=x, y=y, xref="x", yref="y", showarrow=False,
                             xanchor=xanchor, yanchor="middle",
                             text=f"{text}<br><span style='font-size:10px;"

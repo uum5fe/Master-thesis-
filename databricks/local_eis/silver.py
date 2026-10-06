@@ -132,6 +132,7 @@ from eis_validation import lin_kk, z_hit
 
 import utils
 import channel_lag
+import card_gain
 from config import Config, DEFAULT, A_CELL_CM2
 from bronze import BronzeRun, BronzeSpectrum
 
@@ -265,6 +266,13 @@ class SilverRun:
     #: card -> bronze's alignment verdict (lag, applied, corr, ...), carried
     #: so the plausibility report can say when a card was never aligned
     card_lags: dict = field(default_factory=dict)
+    #: bronze's UC check: {channel: {card: card_gain.CardReference}}
+    card_ref: dict = field(default_factory=dict)
+
+    def card_factors(self) -> dict:
+        """card -> card_gain.CardFactor: |Z| per band and j_dc vs the plate."""
+        return card_gain.impedance_factors(
+            self.spectra, voltage=uc_gain_pct(self.card_ref))
 
     def reach(self) -> list[dict]:
         """Per segment: how far up in frequency it got, and what stopped it.
@@ -1989,7 +1997,19 @@ def run(bronze_run: BronzeRun, cfg: Config = DEFAULT, log=None) -> SilverRun:
                      cell_freq=f_cell, Z_cell=Z_cell, cell_n_seg=n_cell,
                      filled=filled, fill_info=fill_info, aggregate=agg,
                      channel_lag=lags,
-                     card_lags=dict(getattr(bronze_run, "lags", {}) or {}))
+                     card_lags=dict(getattr(bronze_run, "lags", {}) or {}),
+                     card_ref=dict(getattr(bronze_run, "card_ref", {}) or {}))
+
+
+def uc_gain_pct(card_ref: dict) -> dict[str, float]:
+    """card -> gain in % of the UC channel its Z divides by, AFTER whatever
+    correction bronze applied (so 0 after a correction)."""
+    out = {}
+    for d in (card_ref or {}).values():
+        for c, r in d.items():
+            if getattr(r, "used_for_Z", False) and np.isfinite(r.gain):
+                out[c] = 100.0 * (r.gain / (r.applied or 1.0) - 1.0)
+    return out
 
 
 def save(sr: SilverRun, cfg: Config, log=None) -> Path:
@@ -2021,6 +2041,14 @@ def save(sr: SilverRun, cfg: Config, log=None) -> Path:
         utils.write_table(out / "channel_lag.csv", [
             lag_rows[s].row(card_of.get(s, ""))
             for s in sorted(lag_rows, key=int)])
+
+    try:
+        cf = sr.card_factors()
+        if cf:
+            utils.write_table(out / "card_factors.csv",
+                              [cf[c].row() for c in sorted(cf)])
+    except Exception as exc:                                # noqa: BLE001
+        log.warning(f"  card factors not written: {exc}")
 
     utils.write_table(out / "segments_summary.csv", [{
         "segment": seg, "card": s.card, "tier": s.tier,

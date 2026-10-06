@@ -276,6 +276,7 @@ def find_cell_sweeps(root, pattern: str = "*.dta",
 #: Channels worth reporting next to a comparison, and the label to print.
 BENCH_CHANNELS: dict[str, str] = {
     "I_S": "I [A]",
+    "I_S_set": "I_set [A]",
     "U_S": "U_cell [V]",
     "n_Cells": "cells",
     # cathode gas, in and out -- both ends, because the plate sits between them
@@ -619,6 +620,9 @@ class Comparison:
             "phase_diff_max_deg": (float(np.max(np.abs(self.phase_diff_deg)))
                                    if self.n_points else float("nan")),
             "notes": "; ".join(self.notes),
+            # the bench at the sweep, for the DC current closure
+            **{f"bench_{k}": float(v) for k, v in (self.bench or {}).items()
+               if k in ("I_S", "I_S_set", "U_S", "n_Cells")},
         }
 
 

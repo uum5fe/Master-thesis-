@@ -76,6 +76,7 @@ import utils
 import eis_local
 import gamry_sync
 import channel_lag
+import card_gain
 import bronze
 import silver
 import gold
@@ -97,10 +98,12 @@ import plate_plotly
 import bench_plots
 import polcurve
 import ecm_drt
+import plausibility
+import dc_closure
  
 # Force reload during development (plate_style before the maps that use it)
-for mod in [config, utils, eis_local, gamry_sync, channel_lag, bronze, silver,
-            gold, pipeline_main,
+for mod in [config, utils, eis_local, gamry_sync, channel_lag, card_gain,
+            bronze, silver, gold, plausibility, dc_closure, pipeline_main,
             geom, csv_source, csv_pipeline, gamry_dta, gamry_compare, abgleich,
             ladder_snap, tone_estimation, eis_measurement_model,
             figure_panels, plate_style, plate_maps, plate_figure, plate_plotly,
@@ -540,6 +543,16 @@ CHANNEL_LAG = 'correct'
 # re-locates misplaced high-frequency windows (verified by a CFAR test);
 # 'frequency' does the first two; 'report' only writes bronze/gamry_sync.csv.
 GAMRY_SYNC = 'guide'
+# Card voltage gain (card_gain.py): every card records the same cell voltage
+# on UC2, and each card's Z divides by ITS OWN UC2 -- so a card whose voltage
+# chain reads 3 % high puts +3 % on all its segments. 'report' measures each
+# card's UC2 against the median card (bronze/card_reference.csv, needs the
+# .DAT files), 'correct' also divides that card's Z by it when the gain is
+# flat over the band and under 10 %, 'off' skips it.
+CARD_GAIN = 'report'
+# The current-closure check compares the segment currents with the bench's
+# measured I_S at the Gamry sweep; without a readable bench log it uses the
+# current in the condition name (45A -> 45 A). Nothing to set here.
 GAMRY_DIR = str(GAMRY_ROOT) if GAMRY_ROOT else ''
 # The build token that ties this order to its sweeps. It travels into the
 # Config, so the pipeline's own whole-cell comparison filters on it too --
@@ -1178,7 +1191,8 @@ def _run_identity(mode=None, f_min=None, f_max=None, snr=None):
         substitute_segments=globals().get('SUBSTITUTE_SEGMENTS', frozenset()),
         fill_missing_from_neighbours=globals().get('FILL_GAPS', False),
         channel_lag=globals().get('CHANNEL_LAG', 'correct'),
-        gamry_sync=globals().get('GAMRY_SYNC', 'guide'))
+        gamry_sync=globals().get('GAMRY_SYNC', 'guide'),
+        card_gain=globals().get('CARD_GAIN', 'report'))
     if mode and mode != 'default':
         base = base.preset(mode)
     # A set has no order, and json's default=str would spell the SAME
@@ -1808,6 +1822,7 @@ for cond in _conditions_to_run:
         gain_file=Path(GAIN_FILE) if GAIN_FILE else None,
         channel_lag=CHANNEL_LAG,
         gamry_sync=GAMRY_SYNC,
+        card_gain=CARD_GAIN,
         gamry_dir=Path(GAMRY_DIR) if GAMRY_DIR else None,
         gamry_version=GAMRY_VERSION,
         bench_log=Path(BENCH_LOG) if BENCH_LOG else None,
@@ -1915,6 +1930,87 @@ print(f"  PIPELINE COMPLETE — {_n_ok} condition(s) available "
 if _n_cached and RUN_MODE != 'rerun':
     print(f"  Set the Run mode widget to 'rerun' to recompute the cached ones.")
 print(f"{'═'*75}")
+ 
+
+# COMMAND ----------
+
+# DBTITLE 1,Card voltage gain and DC current closure (all conditions)
+# ═══════════════════════════════════════════════════════════════════════════════
+# 1. CARD VOLTAGE GAIN -- per condition, from bronze/card_reference.csv:
+#    each card's UC2 against the median of the cards. All cards record the
+#    same cell voltage, so anything but 0 % is that card's voltage chain, and
+#    it sits on every segment of the card (each card divides by its own UC2).
+# 2. CARD IMPEDANCE FACTOR -- per condition, from silver/card_factors.csv:
+#    the card's |Z| against the plate in four frequency bands and its j_dc.
+#    A scale error is the same in every band with j_dc off the other way.
+# 3. DC CURRENT CLOSURE across every condition run (45 / 60 / 150 / 450 A):
+#    the plate current from the segments against the bench current, fitted as
+#    I_plate = a * I_bench + b. a - 1 is the current-scale error, and it is in
+#    every impedance too; b is a zero offset, which is not.
+# ═══════════════════════════════════════════════════════════════════════════════
+importlib.reload(card_gain)
+importlib.reload(dc_closure)
+
+_cg_runs = [Path(pr['out_dir']) for pr in PIPELINE_RESULTS.values()
+            if pr and pr.get('out_dir')]
+for _rd in _cg_runs:
+    print(f"\n── {_rd.name} ──")
+    _cr = _rd / 'bronze' / 'card_reference.csv'
+    if _cr.is_file():
+        _t = pd.read_csv(_cr)
+        _t['card'] = _t['card'].map(card_gain.short)
+        print("  UC channels, card against the median card "
+              "(gain_pct: what Z carries if 'applied' is 1):")
+        print(_t[['channel', 'card', 'used_for_Z', 'gain_pct', 'flat_pct',
+                  'dt_us', 'dc_V', 'applied', 'status']]
+              .to_string(index=False))
+    else:
+        print("  no bronze/card_reference.csv -- this result predates the UC "
+              "check or came from the cache; re-run with Run mode 'rerun'")
+    _cf = _rd / 'silver' / 'card_factors.csv'
+    if _cf.is_file():
+        _t = pd.read_csv(_cf)
+        _t['card'] = _t['card'].map(card_gain.short)
+        print("  |Z| per card against the plate [%], by band, and j_dc [%]:")
+        print(_t.to_string(index=False))
+
+if _cg_runs:
+    _bench = Path(BENCH_LOG) if BENCH_LOG else None
+    if _bench is None and GAMRY_DIR:
+        try:
+            _bench = gamry_compare.find_bench_log(
+                GAMRY_DIR, order_id=LEEPA, version=GAMRY_VERSION or None)
+        except Exception:                                   # noqa: BLE001
+            _bench = None
+    _dcc = dc_closure.analyse(_cg_runs, bench_log=_bench,
+                              gamry_dir=GAMRY_DIR or None)
+    _dcc_dir = _TMP_BASE / LEEPA / 'dc_closure'
+    _dcc_dir.mkdir(parents=True, exist_ok=True)
+    utils.write_table(_dcc_dir / 'dc_closure.csv', _dcc['rows'])
+    utils.write_table(_dcc_dir / 'dc_closure_cards.csv', _dcc['cards'])
+    dc_closure.plot(_dcc, _dcc_dir / 'dc_closure.png')
+    print(f"\n{'═'*75}\n  DC CURRENT CLOSURE across {len(_cg_runs)} condition(s)"
+          f"\n{'═'*75}")
+    _t = pd.DataFrame(_dcc['rows'])[['condition', 'i_ref_A', 'i_ref_source',
+                                     'i_full_A', 'dev_pct']]
+    print(_t.round(2).to_string(index=False))
+    if 'scale' in _dcc:
+        print(f"\n  I_plate = {_dcc['scale']:.4f} * I_bench "
+              f"{_dcc['offset_A']:+.2f} A  -> current scale "
+              f"{_dcc['scale_pct']:+.2f} % (in every impedance as "
+              f"{-_dcc['scale_pct']:+.2f} %), zero offset "
+              f"{_dcc['offset_A']:+.2f} A (not in the impedance)")
+    _ct = pd.DataFrame(_dcc['cards'])
+    if not _ct.empty:
+        print("\n  card current density against the plate [%] -- a K error on "
+              "a card is the same at every current:")
+        _pv = _ct.pivot_table(index='card', columns='condition',
+                              values='j_vs_plate_pct')
+        _pv = _pv[sorted(_pv.columns, key=card_gain.current_of)]
+        print(_pv.round(2).to_string())
+    if (_dcc_dir / 'dc_closure.png').is_file():
+        display(IPImage(filename=str(_dcc_dir / 'dc_closure.png')))
+    print(f"\n  written to {_dcc_dir}")
  
 
 # COMMAND ----------

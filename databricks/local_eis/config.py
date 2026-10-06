@@ -275,6 +275,21 @@ class Config:
     channel_lag_min_us: float = 5.0        # smaller: left alone (noise)
     channel_lag_max_us: float = 250.0      # larger: not a chain lag
     channel_lag_max_resid_deg: float = 10.0
+    # CARD VOLTAGE GAIN, MEASURED ON EVERY RUN (card_gain.py).
+    # Z = K * A_UC / A_seg, and with the reference pool off every card divides
+    # by its OWN UC channel: a card whose voltage chain reads 3 % high puts
+    # +3 % on every segment it carries. All cards record the same cell voltage
+    # on UC2, so each card's UC phasor against the median card IS its gain.
+    # "report" measures and writes bronze/card_reference.csv; "correct" also
+    # divides each card's Z by that gain when it is flat over the band (low vs
+    # high band within card_gain_flat_pct) and within card_gain_max_pct --
+    # larger is a different tap or a wiring fault, and is reported instead.
+    card_gain: str = "report"              # off | report | correct
+    card_gain_min_snr_db: float = 20.0     # steps below: not used
+    card_gain_min_steps: int = 5
+    card_gain_tol_pct: float = 1.0         # within: "ok"
+    card_gain_flat_pct: float = 2.0        # low vs high band, else "not flat"
+    card_gain_max_pct: float = 10.0        # beyond: not a gain tolerance
 
     # WHOLE-CELL REFERENCE.  A folder of Gamry .DTA sweeps of the same cell at
     # the same operating points, and optionally the bench MF4 log beside them.

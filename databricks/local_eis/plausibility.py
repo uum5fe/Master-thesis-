@@ -238,9 +238,34 @@ def _contiguous_runs(nums: list[int]) -> list[tuple[int, int]]:
 # 3. Current closure -- the one check nothing was fitted to
 # ===========================================================================
 
+def resolve_current(cfg=None, bench: dict | None = None
+                    ) -> tuple[float | None, str]:
+    """The plate current to close against, and where it came from.
+
+    In order: an explicit cfg.i_setpoint_a; the bench's MEASURED stack
+    current I_S at the Gamry sweep (the FAMOS recording runs alongside it);
+    the bench setpoint I_S_set; the current in the condition name ("45A").
+    The bench holds the current to within 0.1 A of the setpoint on 2612030
+    (45.00 / 60.00 / 149.99 / 449.97 A), so the name is a sound fallback.
+    """
+    import card_gain
+    sp = getattr(cfg, "i_setpoint_a", None) if cfg is not None else None
+    if sp:
+        return float(sp), "given setpoint"
+    for key, label in (("I_S", "bench I_S (measured)"),
+                       ("I_S_set", "bench I_S_set")):
+        v = (bench or {}).get(key)
+        if v is not None and np.isfinite(v) and v > 0:
+            return float(v), label
+    c = card_gain.current_of(getattr(cfg, "condition", "") if cfg else "")
+    if np.isfinite(c) and c > 0:
+        return c, "condition name"
+    return None, ""
+
+
 def current_closure(j_dc: dict[str, float], areas: dict[str, float],
                     setpoint_a: float | None,
-                    plate_key: str = "gen1") -> Check:
+                    plate_key: str = "gen1", source: str = "setpoint") -> Check:
     """Sum(j_s * A_s) over the measured area, scaled to the whole plate.
 
     Nothing upstream is fitted to the load current, so this is the only fully
@@ -268,13 +293,14 @@ def current_closure(j_dc: dict[str, float], areas: dict[str, float],
     if not setpoint_a:
         return Check("current closure", NA,
                      f"{i_meas:.1f} A over {a_meas:.1f} cm2 -> {i_full:.1f} A "
-                     f"full plate, but no setpoint given to compare against "
-                     f"(pass --i-setpoint)", i_full)
+                     f"full plate, but no current to compare against: no "
+                     f"bench log, no setpoint (--current) and no current in "
+                     f"the condition name", i_full)
 
     dev = i_full / setpoint_a - 1.0
     detail = (f"{i_meas:.1f} A measured over {a_meas:.1f} cm2 -> "
-              f"{i_full:.1f} A full plate vs {setpoint_a:.1f} A setpoint "
-              f"({100 * dev:+.1f} %)")
+              f"{i_full:.1f} A full plate vs {setpoint_a:.1f} A "
+              f"[{source}] ({100 * dev:+.1f} %)")
     if abs(dev) <= 0.10:
         verdict = PASS
     elif abs(dev) <= 0.30:
@@ -808,13 +834,97 @@ def card_alignment_check(card_lags: dict) -> Check:
                  "bronze's cross-correlation of the shared UC channel")
 
 
+def card_voltage_check(card_ref: dict) -> Check:
+    """Do the cards read the same cell voltage on their UC channel?
+
+    `card_ref`: {channel: {card: card_gain.CardReference}}.  Judged on the
+    channel Z divides by, after whatever correction was applied.
+    PASS: every card within card_gain_tol_pct of the median card.
+    WARN: a card off by a flat gain that was NOT removed (mode "report"), or a
+          gain that changes over the band (a timing or filter difference).
+    FAIL: a card more than card_gain_max_pct off -- not a gain tolerance; a
+          different voltage tap or a wiring fault.
+    """
+    import card_gain as cg
+    rests = "all cards' UC channels being wired to the same cell voltage"
+    used = {c: r for d in (card_ref or {}).values() for c, r in d.items()
+            if getattr(r, "used_for_Z", False)}
+    if not used:
+        return Check("card voltage gain", NA,
+                     "no UC comparison (needs the .DAT files: a re-evaluation "
+                     "from saved bronze tables of an older run has none)")
+    def after(r):
+        return 100 * (r.gain / (r.applied or 1.0) - 1) if np.isfinite(r.gain) \
+            else float("nan")
+    txt = ", ".join(f"{cg.short(c)} {after(r):+.2f} %"
+                    + (f" (removed {100 * (r.applied - 1):+.2f} %)"
+                       if r.applied != 1.0 else "")
+                    for c, r in sorted(used.items()))
+    worst = max((abs(after(r)) for r in used.values()
+                 if np.isfinite(after(r))), default=float("nan"))
+    big = [cg.short(c) for c, r in used.items() if r.status == cg.TOO_LARGE]
+    flat = [cg.short(c) for c, r in used.items() if r.status == cg.NOT_FLAT]
+    off = [cg.short(c) for c, r in used.items()
+           if r.status == cg.OFF and r.applied == 1.0]
+    ch = next(iter({r.channel for r in used.values()}))
+    if big:
+        return Check("card voltage gain", FAIL,
+                     f"{ch}: {', '.join(big)} more than 10 % from the other "
+                     f"cards -- a different voltage tap or a wiring fault, "
+                     f"not a gain tolerance; {txt}", worst, rests)
+    if off or flat:
+        why = []
+        if off:
+            why.append(f"{', '.join(off)} off by a flat gain that is still in "
+                       f"their Z (card_gain='correct' removes it)")
+        if flat:
+            why.append(f"{', '.join(flat)} with a gain that changes over the "
+                       f"band (timing or filter, not a scale)")
+        return Check("card voltage gain", WARN,
+                     f"{ch}: " + "; ".join(why) + f"; {txt}", worst, rests)
+    return Check("card voltage gain", PASS, f"{ch}: {txt}", worst, rests)
+
+
+def card_factor_check(factors: dict) -> Check:
+    """Is any card's impedance level a scale error rather than the cell?
+
+    `factors`: card -> card_gain.CardFactor.  A card whose |Z| sits off the
+    plate by the same percentage in every frequency band, with its j_dc off
+    the other way, looks like a current-scale (K) or voltage-gain error.
+    """
+    import card_gain as cg
+    if len([c for c in (factors or {}) if c]) < 2:
+        return Check("card impedance factor", NA,
+                     "fewer than two cards named in the results")
+    rows = sorted(factors.values(), key=lambda f: f.card)
+    txt = "; ".join(
+        f"{cg.short(f.card)} |Z| {f.level_pct:+.1f} % (bands "
+        + "/".join(f"{f.bands_pct.get(b, np.nan):+.0f}" for b, _l, _h in cg.BANDS)
+        + f"), j_dc {f.j_dc_pct:+.1f} %"
+        for f in rows if np.isfinite(f.level_pct))
+    gl = [f for f in rows if f.verdict == "gain_like"]
+    worst = max((abs(f.level_pct) for f in rows if np.isfinite(f.level_pct)),
+                default=float("nan"))
+    rests = ("a real regional difference changing with frequency, which a "
+             "gain error cannot")
+    if gl:
+        return Check("card impedance factor", WARN,
+                     f"{', '.join(cg.short(f.card) for f in gl)}: the same "
+                     f"factor at every frequency with j_dc off the other way "
+                     f"-- looks like a scale error on the card, not the cell; "
+                     f"{txt}", worst, rests)
+    return Check("card impedance factor", PASS,
+                 f"no card looks like a pure scale error; {txt}", worst, rests)
+
+
 def check_run(sr, cfg=None, plate_key: str = "gen1",
               reference: tuple[np.ndarray, np.ndarray] | None = None,
-              reference_hfr: float = float("nan")) -> Report:
+              reference_hfr: float = float("nan"),
+              bench: dict | None = None) -> Report:
     """Every check that the available data supports, on a finished SilverRun."""
     spectra = sr.spectra
     measured = list(spectra)
-    setpoint = getattr(cfg, "i_setpoint_a", None) if cfg else None
+    setpoint, source = resolve_current(cfg, bench)
 
     cov = coverage(measured, plate_key)
     checks = [cov, describe_block(measured, plate_key)]
@@ -822,11 +932,20 @@ def check_run(sr, cfg=None, plate_key: str = "gen1",
     checks.append(current_closure(
         {s: sp.j_dc for s, sp in spectra.items()},
         {s: sp.area_cm2 for s, sp in spectra.items()},
-        setpoint, plate_key))
+        setpoint, plate_key, source=source))
 
     checks.append(passivity(spectra))
     checks.append(card_alignment_check(getattr(sr, "card_lags", {}) or {}))
     checks.append(channel_lag_check(getattr(sr, "channel_lag", {}) or {}))
+    card_ref = getattr(sr, "card_ref", {}) or {}
+    checks.append(card_voltage_check(card_ref))
+    try:
+        import card_gain
+        import silver
+        checks.append(card_factor_check(card_gain.impedance_factors(
+            spectra, voltage=silver.uc_gain_pct(card_ref), cfg=cfg)))
+    except Exception as exc:                                # noqa: BLE001
+        checks.append(Check("card impedance factor", NA, f"not run: {exc}"))
 
     r_ohmic = {s: sp.R_ohmic for s, sp in spectra.items()}
     checks.append(neighbour_smoothness(r_ohmic, plate_key))
@@ -861,7 +980,8 @@ def check_run(sr, cfg=None, plate_key: str = "gen1",
 
 def check_from_disk(run_dir, cfg=None, plate_key: str = "gen1",
                     reference: tuple[np.ndarray, np.ndarray] | None = None,
-                    reference_hfr: float = float("nan")) -> Report:
+                    reference_hfr: float = float("nan"),
+                    bench: dict | None = None) -> Report:
     """The same checks as `check_run`, from files a finished run wrote.
 
     The CSV path (csv_pipeline.run_csv) never builds a SilverRun, so it used
@@ -899,13 +1019,21 @@ def check_from_disk(run_dir, cfg=None, plate_key: str = "gen1",
         points.setdefault(seg, []).append(
             complex(_f(r, "z_re_mohm_cm2"), _f(r, "z_im_mohm_cm2")) / 1e3)
 
+    freqs: dict[str, list[float]] = {}
+    for r in _rows(run_dir / "silver" / "spectra_clean.csv"):
+        freqs.setdefault(str(int(float(r["segment"]))), []).append(
+            _f(r, "freq_hz"))
+    card_of = {str(int(float(r["segment"]))): r.get("card", "")
+               for r in _rows(run_dir / "silver" / "segments_summary.csv")}
     spectra = {}
     for r in summary:
         seg = str(int(float(r["segment"])))
         spectra[seg] = SimpleNamespace(
             j_dc=_f(r, "j_dc"), area_cm2=_f(r, "area_cm2"),
             R_ohmic=_f(r, "R_ohmic"), R_ohmic_sd=float("nan"),
-            Z_corr=np.asarray(points.get(seg, []), complex))
+            Z_corr=np.asarray(points.get(seg, []), complex),
+            freq=np.asarray(freqs.get(seg, []), float),
+            card=card_of.get(seg, ""))
 
     agg = _rows(run_dir / "silver" / "cell_aggregate.csv")
     cell_freq = np.array([_f(r, "freq_hz") for r in agg])
@@ -922,10 +1050,13 @@ def check_from_disk(run_dir, cfg=None, plate_key: str = "gen1",
                              in ("1", "True", "true")}
                  for r in _rows(run_dir / "bronze" / "card_alignment.csv")
                  if r.get("card")}
+    import card_gain
+    card_ref = card_gain.load_reference(run_dir)
     sr = SimpleNamespace(spectra=spectra, cell_freq=cell_freq, Z_cell=Z_cell,
-                         channel_lag=lags, card_lags=card_lags)
+                         channel_lag=lags, card_lags=card_lags,
+                         card_ref=card_ref)
     return check_run(sr, cfg, plate_key=plate_key, reference=reference,
-                     reference_hfr=reference_hfr)
+                     reference_hfr=reference_hfr, bench=bench)
 
 
 def report(rep: Report, log=None) -> None:

@@ -73,6 +73,7 @@ from eis_local import (FamosFile, PlateCalibration, detect_schedule,
 import hf_schedule
 import ladder_snap
 import gamry_sync
+import card_gain
 
 import tone_estimation
 import utils
@@ -185,6 +186,9 @@ class BronzeRun:
     sensor_T: dict = field(default_factory=dict)
     #: Segments left out on purpose, from cfg.exclude_segments.
     excluded: frozenset = field(default_factory=frozenset)
+    #: {UC channel: {card: card_gain.CardReference}} -- each card's voltage
+    #: chain against the others (card_gain.measure_reference)
+    card_ref: dict = field(default_factory=dict)
 
     def segments_measured(self) -> list[str]:
         return sorted(self.spectra, key=int)
@@ -1622,6 +1626,7 @@ def process_card(fp: Path, cal: PlateCalibration, schedule: list[Step],
                  lag: int = 0,
                  ref_pool: tuple[np.ndarray, np.ndarray, dict] | None = None,
                  gain: dict | None = None,
+                 v_gain: float = 1.0,
                  ) -> dict[str, BronzeSpectrum]:
     """Raw phasors for every segment on one card.
 
@@ -1641,6 +1646,10 @@ def process_card(fp: Path, cal: PlateCalibration, schedule: list[Step],
 
     `gain` is the chain response from cfg.gain_file (utils.load_gain): each
     segment's Z is divided by its G(f), exactly as the CSV path does.
+
+    `v_gain` is this card's voltage-chain gain against the other cards
+    (card_gain.py, cfg.card_gain = "correct"); every Z on the card is divided
+    by it. 1.0 leaves Z alone.
     """
     log = log or utils.get_logger(cfg.verbose)
     fam = FamosFile(fp)
@@ -1825,6 +1834,8 @@ def process_card(fp: Path, cal: PlateCalibration, schedule: list[Step],
         # used.
         if gain:
             Z = Z / utils.gain_at(gain, seg, freqs)
+        if v_gain and np.isfinite(v_gain) and v_gain != 1.0:
+            Z = Z / v_gain
         with np.errstate(invalid="ignore"):
             Z = _fix_polarity(Z, freqs, utils.combine_snr_db(snr_r, snr_s), cfg)
 
@@ -1890,6 +1901,26 @@ def run(cfg: Config = DEFAULT, log=None) -> BronzeRun:
     ref_pool = (pooled_reference_phasors(files, cards, schedule, cfg,
                                          lags=lags, log=log)
                 if getattr(cfg, "hf_pool_reference", False) else None)
+    # Each card's voltage chain against the others: the five UC2 channels
+    # record one cell voltage, so their step phasors must agree. Non-fatal --
+    # a diagnostic must not end a run.
+    card_ref, v_gains = {}, {}
+    if card_gain.mode(cfg) != "off":
+        utils.section("card voltage gain (UC channels, card against card)", log)
+        try:
+            card_ref = card_gain.measure_reference(files, cards, schedule, cfg,
+                                                   lags=lags, log=log)
+            v_gains = card_gain.applied_gains(card_ref)
+            if ref_pool is not None and any(g != 1.0 for g in v_gains.values()):
+                log.info("  reference pool on: Z divides by the pooled UC "
+                         "phasor, so the per-card gain is reported, not applied")
+                for d in card_ref.values():
+                    for r in d.values():
+                        r.applied = 1.0
+                v_gains = {}
+        except Exception as exc:                            # noqa: BLE001
+            log.warning(f"  card gain check skipped: {exc}")
+            card_ref, v_gains = {}, {}
     gain = utils.load_gain(cfg.gain_file) if cfg.gain_file else {}
     if gain:
         log.info(f"  chain response: {Path(cfg.gain_file).name}, "
@@ -1907,7 +1938,7 @@ def run(cfg: Config = DEFAULT, log=None) -> BronzeRun:
         shift = int(info.get("lag", 0)) if info.get("applied") else 0
         got = process_card(fp, cal, schedule, grid, cfg, log,
                            T_seg=T_seg, lag=shift, ref_pool=ref_pool,
-                           gain=gain)
+                           gain=gain, v_gain=v_gains.get(fp.stem, 1.0))
         for seg, sp in got.items():
             if seg in spectra:
                 # two cards claim the same segment: keep the better SNR
@@ -1926,6 +1957,7 @@ def run(cfg: Config = DEFAULT, log=None) -> BronzeRun:
         input_digest=_digest([f"{p.name}:{p.stat().st_size}" for p in files]),
         n_files=len(files), lags=lags, sensor_T=sensor_T,
         excluded=frozenset(str(x) for x in (cfg.exclude_segments or ())),
+        card_ref=card_ref,
     )
 
     miss = run_obj.segments_missing()
@@ -2026,6 +2058,7 @@ def load(run_dir) -> BronzeRun:
                         "rescued": str(r.get("rescued", "0")) == "1",
                         "refused_reason": r.get("refused_reason", "")}
             for r in rows("card_alignment.csv") if r.get("card")}
+    card_ref = card_gain.load_reference(d)
     man = {}
     if (d / "bronze_manifest.json").is_file():
         man = json.loads((d / "bronze_manifest.json").read_text())
@@ -2036,7 +2069,8 @@ def load(run_dir) -> BronzeRun:
         input_digest=str(man.get("input_digest", "")),
         n_files=int(man.get("n_files", 0) or 0), lags=lags,
         sensor_T=dict(man.get("sensor_T_degC", {}) or {}),
-        excluded=frozenset(str(x) for x in man.get("excluded_segments", [])))
+        excluded=frozenset(str(x) for x in man.get("excluded_segments", [])),
+        card_ref=card_ref)
 
 
 def save(run_obj: BronzeRun, cfg: Config, log=None) -> Path:
@@ -2136,6 +2170,11 @@ def save(run_obj: BronzeRun, cfg: Config, log=None) -> Path:
                        if isinstance(v.get("drift"), dict)
                        and v["drift"].get("ok") else "")}
         for k, v in sorted(run_obj.lags.items())])
+
+    if run_obj.card_ref:
+        utils.write_table(out / "card_reference.csv", [
+            r.row() for ch in sorted(run_obj.card_ref)
+            for _c, r in sorted(run_obj.card_ref[ch].items())])
 
     utils.write_json(out / "bronze_manifest.json", run_obj.summary())
     log.info(f"  bronze written to {out}")

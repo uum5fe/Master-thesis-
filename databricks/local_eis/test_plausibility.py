@@ -136,7 +136,7 @@ def test_no_setpoint_is_not_a_pass() -> None:
     c = P.current_closure(_uniform_j(segs), {str(n): AREAS[n] for n in segs},
                           None)
     assert c.verdict == P.NA
-    assert "--i-setpoint" in c.detail
+    assert "no current to compare against" in c.detail
 
 
 def test_the_closure_check_names_its_assumption() -> None:

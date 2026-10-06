@@ -175,6 +175,11 @@ def build_parser() -> argparse.ArgumentParser:
                         "RUN_DIR/reevaluated")
     g.add_argument("--channel-lag", choices=["off", "report", "correct"],
                    help="current-chain lag stage (default: correct)")
+    g.add_argument("--card-gain", choices=["off", "report", "correct"],
+                   help="per-card UC voltage-gain check (default: report)")
+    g.add_argument("--dc-closure", nargs="+", metavar="RUN_DIR",
+                   help="the DC current closure over several finished runs "
+                        "(one per condition), against the bench current")
     return p
 
 
@@ -217,6 +222,10 @@ def config_from_args(a) -> Config:
         kw["condition"] = a.condition
     if a.current is not None:
         kw["i_setpoint_a"] = a.current
+    if getattr(a, "channel_lag", None):
+        kw["channel_lag"] = a.channel_lag
+    if getattr(a, "card_gain", None):
+        kw["card_gain"] = a.card_gain
     if a.f_min is not None:
         kw["f_min_hz"] = a.f_min
     if a.f_max is not None:
@@ -390,6 +399,7 @@ def reevaluate(run_dir, out_dir=None, **overrides) -> dict:
             sp.Z_raw = sp.Z_raw / utils.gain_at(gain, seg, sp.freq)
         cfg = cfg.replace(gain_file=Path(gain_file))
         log.info(f"  chain response applied to the saved Z: {gain_file}")
+    _reapply_card_gain(br, cfg, log)
     cfg.save(out / "config_used.json")
     bronze.save(br, cfg, log)
     manifest = {"config": cfg.to_dict(), "plate": cfg.plate,
@@ -407,6 +417,38 @@ def reevaluate(run_dir, out_dir=None, **overrides) -> dict:
     return manifest
 
 
+def _reapply_card_gain(br, cfg: Config, log) -> None:
+    """Bring the saved Z to what cfg.card_gain asks for.
+
+    The saved table says what each card's Z was divided by ("applied"); the
+    target is the measured gain under "correct" (when it is correctable) and
+    1.0 otherwise, so a run saved in "report" can be corrected here and one
+    saved corrected can be put back.
+    """
+    import card_gain
+    if not br.card_ref:
+        if card_gain.mode(cfg) == "correct":
+            log.info("  card gain: this run has no card_reference.csv (bronze "
+                     "predates the UC check) -- nothing to apply")
+        return
+    want_correct = card_gain.mode(cfg) == "correct"
+    for d in br.card_ref.values():
+        for card, r in d.items():
+            if not r.used_for_Z:
+                continue
+            target = (r.gain if want_correct and card_gain.correctable(r)
+                      else 1.0)
+            k = target / (r.applied or 1.0)
+            if abs(k - 1.0) < 1e-12:
+                continue
+            for sp in br.spectra.values():
+                if sp.card == card:
+                    sp.Z_raw = sp.Z_raw / k
+            log.info(f"  card gain: {card_gain.short(card)} Z divided by "
+                     f"{target:.4f} (was {r.applied:.4f})")
+            r.applied = target
+
+
 def whole_cell_and_plausibility(cfg: Config, manifest: dict, log,
                                 sr=None) -> None:
     """Gamry cross-check, then plausibility -- shared by FAMOS and CSV paths.
@@ -421,6 +463,7 @@ def whole_cell_and_plausibility(cfg: Config, manifest: dict, log,
     # a run that is otherwise complete.
     reference_asr = None
     reference_hfr = float("nan")
+    bench_state: dict = {}
     if cfg.gamry_dir:
         utils.banner("WHOLE-CELL REFERENCE  --  local aggregate vs Gamry", log)
         try:
@@ -443,6 +486,9 @@ def whole_cell_and_plausibility(cfg: Config, manifest: dict, log,
                 # it. With a sweep present, plausibility now uses the
                 # matched-band R_s check instead, so nothing is lost.
                 reference_hfr = comps[0].hfr_ref
+                # the bench at the sweep: its measured current is what the
+                # segment currents must add up to
+                bench_state = dict(getattr(comps[0], "bench", {}) or {})
             if cfg.write_png and comps:
                 gamry_compare.plot(
                     comps, Path(cfg.out_dir) / "gamry_comparison.png")
@@ -458,11 +504,12 @@ def whole_cell_and_plausibility(cfg: Config, manifest: dict, log,
         if sr is not None:
             rep = plausibility.check_run(
                 sr, cfg, plate_key=cfg.plate, reference=reference_asr,
-                reference_hfr=reference_hfr)
+                reference_hfr=reference_hfr, bench=bench_state)
         else:
             rep = plausibility.check_from_disk(
                 cfg.out_dir, cfg, plate_key=cfg.plate,
-                reference=reference_asr, reference_hfr=reference_hfr)
+                reference=reference_asr, reference_hfr=reference_hfr,
+                bench=bench_state)
         plausibility.report(rep, log)
         plausibility.save(rep, cfg.out_dir)
         manifest["stages"]["plausibility"] = rep.rows()
@@ -520,8 +567,15 @@ def main(argv=None) -> int:
     if a.self_test:
         return self_test()
 
+    if a.dc_closure:
+        import dc_closure
+        dc_closure.main(a.dc_closure + (["-o", str(a.out)] if a.out else []))
+        return 0
+
     if a.reevaluate:
         over = {"channel_lag": a.channel_lag} if a.channel_lag else {}
+        if a.card_gain:
+            over["card_gain"] = a.card_gain
         if a.gain:
             over["gain_file"] = Path(a.gain)
         reevaluate(a.reevaluate, out_dir=a.out, **over)

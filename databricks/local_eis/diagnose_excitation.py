@@ -200,8 +200,8 @@ def run_file(path: str, channel: str | None) -> int:
         if not fam.uc_names:
             print("  no UC reference channel; pass --channel explicitly")
             return 2
-        channel = max(fam.uc_names,
-                      key=lambda c: float(np.std(fam.channel(c)[::10])))
+        from eis_local import pick_reference_channel
+        channel = pick_reference_channel(fam)
     print(f"  analysing channel  {channel}")
     x = fam.channel(channel)
     r = occupancy_test(x, fam.fs)

@@ -223,7 +223,10 @@ def fit3(y: np.ndarray, fs: float, f: float, detrend: bool = True
         return complex("nan"), np.nan, np.nan
     t = np.arange(n) / fs
     D = _design3(t, f, detrend)
-    p, *_ = np.linalg.lstsq(D, y, rcond=None)
+    try:
+        p, *_ = np.linalg.lstsq(D, y, rcond=None)
+    except np.linalg.LinAlgError:
+        return complex("nan"), np.nan, np.nan
     resid = y - D @ p
     A = complex(p[0], -p[1])
     r_rms = float(np.sqrt(np.mean(resid ** 2)))
@@ -257,7 +260,10 @@ def fit4(y: np.ndarray, fs: float, f0: float, n_iter: int = 12,
             cols.append(t - t.mean())
         cols.append(t * (-a * s_ + b * c_))
         D = np.column_stack(cols)
-        p, *_ = np.linalg.lstsq(D, y, rcond=None)
+        try:
+            p, *_ = np.linalg.lstsq(D, y, rcond=None)
+        except np.linalg.LinAlgError:
+            break
         a, b = p[0], p[1]
         dw = float(np.clip(p[-1], -0.05 * w, 0.05 * w))
         w_new = w + dw
@@ -351,7 +357,11 @@ def fit7_joint(y_ref: np.ndarray, y_sig: np.ndarray, fs: float, f0: float,
                               + [t * (-a_s * s_ + b_s * c_)])
         D = np.vstack([top, bot])
         rhs = np.concatenate([y_ref, y_sig])
-        p, *_ = np.linalg.lstsq(D, rhs, rcond=None)
+        try:
+            p, *_ = np.linalg.lstsq(D, rhs, rcond=None)
+        except np.linalg.LinAlgError:
+            return JointFit(f0, complex("nan"), complex("nan"),
+                            np.nan, np.nan, n, it, False)
         a_r, b_r = p[0], p[1]
         a_s, b_s = p[nb], p[nb + 1]
         dw = float(np.clip(p[-1], -0.05 * w, 0.05 * w))
@@ -717,7 +727,10 @@ def geometric_grid_fit(freqs, tol: float = 0.01) -> dict:
             continue
         # refit  ln f = ln f0 - k lr
         Amat = np.column_stack([np.ones_like(k), -k])
-        sol, *_ = np.linalg.lstsq(Amat, ln, rcond=None)
+        try:
+            sol, *_ = np.linalg.lstsq(Amat, ln, rcond=None)
+        except np.linalg.LinAlgError:
+            continue
         ln_f0, lr_fit = sol
         if lr_fit <= 1e-6:
             continue
@@ -761,6 +774,23 @@ def interp_complex(f_new: np.ndarray, f: np.ndarray, Z: np.ndarray
     o = np.argsort(f[ok])
     lf, z = np.log(f[ok][o]), Z[ok][o]
     lx = np.log(np.clip(np.atleast_1d(f_new), f[ok].min(), f[ok].max()))
+    return (np.interp(lx, lf, z.real) + 1j * np.interp(lx, lf, z.imag))
+    
+def extrap_complex(f_new: np.ndarray, f: np.ndarray, Z: np.ndarray,
+                   extrapolate: str = "clamp") -> np.ndarray:
+    fn = np.atleast_1d(np.asarray(f_new, float))
+    if extrapolate == "nan":
+        # Outside this segment's own band, return NaN instead of holding the
+        # endpoint flat. Clamping inflates a cell aggregate at the top of the
+        # band, because |Z| falls with f and the held value is too large.
+        out = np.full(fn.shape, np.nan + 0j)
+        inside = (fn >= f[ok].min()) & (fn <= f[ok].max())
+        if inside.any():
+            lx = np.log(fn[inside])
+            out[inside] = (np.interp(lx, lf, z.real)
+                           + 1j * np.interp(lx, lf, z.imag))
+        return out
+    lx = np.log(np.clip(fn, f[ok].min(), f[ok].max()))
     return (np.interp(lx, lf, z.real) + 1j * np.interp(lx, lf, z.imag))
 
 

@@ -417,14 +417,15 @@ def aggregate_asr(freq, Z_by_seg: dict, areas: dict, A_cell: float) -> np.ndarra
     validation, and when it does not, it is still the correct cell spectrum.
     """
     Y = np.zeros(len(freq), dtype=complex)
-    A_used = 0.0
+    A_used = np.zeros(len(freq))        # area contributing AT EACH FREQUENCY
     for s, z in Z_by_seg.items():
         a = areas.get(s)
         if a is None or z is None or len(z) != len(freq):
-            continue
+            continue 
+        ok = np.isfinite(z) & (z != 0)
         with np.errstate(divide="ignore", invalid="ignore"):
-            Y += np.where(np.isfinite(z) & (z != 0), a / z, 0.0)
-        A_used += a
+            Y += np.where(ok, a / z, 0.0)
+            A_used += np.where(ok, a, 0.0)
     with np.errstate(divide="ignore", invalid="ignore"):
         return np.where(Y != 0, A_used / Y, np.nan)
 

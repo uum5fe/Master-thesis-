@@ -784,8 +784,11 @@ def write_csv(path=None, plate_name: str | None = None) -> Path:
 
 def plot_map(path="segment_map.png", value: dict[str, float] | None = None,
              label: str = "area  [cm$^2$]", title: str | None = None,
-             plate_name: str | None = None):
-    """Draw the plate.  Colour = `value` per segment, default = area."""
+             plate_name: str | None = None,
+             limits: tuple[float, float] | None = None):
+    """Draw the plate.  Colour = `value` per segment, default = area.
+
+    `limits` fixes the colour scale (vmin, vmax); default = min..max."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -795,14 +798,15 @@ def plot_map(path="segment_map.png", value: dict[str, float] | None = None,
     segments = p.segments
     value = value or {k: s.area_cm2 for k, s in segments.items()}
     vals = [v for v in value.values()]
-    vmin, vmax = min(vals), max(vals)
+    vmin, vmax = limits if limits is not None else (min(vals), max(vals))
     cmap = plt.get_cmap("viridis")
 
     fig, ax = plt.subplots(figsize=(13, 7))
     for n in sorted(segments, key=int):
         s = segments[n]
         v = value.get(n)
-        col = "0.85" if v is None else cmap((v - vmin) / (vmax - vmin + 1e-30))
+        col = "0.85" if v is None else cmap(
+            min(max((v - vmin) / (vmax - vmin + 1e-30), 0.0), 1.0))
         # One patch per horizontal pad run, so a staircase segment is drawn as
         # the shape it is.  Drawing the bounding box instead would overlap its
         # neighbours and quietly misreport which pads carry which value.

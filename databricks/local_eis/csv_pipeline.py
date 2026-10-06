@@ -1182,11 +1182,18 @@ def cell_aggregate(spectra: dict[str, SegmentSpectrum], areas: dict,
         ok = np.isfinite(Zi.real) & np.isfinite(Zi.imag) & (np.abs(Zi) > 0)
         Y[ok] += A / Zi[ok]
         A_used[ok] += A
+    # Normalise by the area that actually contributed AT EACH FREQUENCY, not
+    # by the whole plate. Dividing by a_cell treats every unmeasured segment
+    # as if it carried no current, which inflates the area-specific result by
+    # 1/coverage: x1.46 for segments 1-36 and x3.2 for 37-72 on gen1.
+    # This matches silver.cell_aggregate / mm.aggregate_asr (the FAMOS path).
     with np.errstate(divide="ignore", invalid="ignore"):
-        Z = np.where(np.abs(Y) > 0, a_cell / Y, np.nan)
+        Z = np.where(np.abs(Y) > 0, A_used / Y, np.nan)
     info = {"n_freq": int(grid.size),
             "area_used_cm2": float(np.nanmedian(A_used)),
-            "area_total_cm2": float(a_cell)}
+            "area_total_cm2": float(a_cell),
+            "area_used_per_freq": A_used,
+            "area_coverage": float(np.nanmedian(A_used)) / float(a_cell)}
     return grid, Z, info
 
 
@@ -1298,9 +1305,13 @@ def write_outputs(spectra, ecm, agg, cfg, log, extra: dict) -> dict:
     utils.write_table(out / "gold" / "plate_summary.csv", summary)
 
     if agg[0].size:
+        a_used = agg[2].get("area_used_per_freq", np.full(agg[0].size, np.nan))
+        a_tot = agg[2].get("area_total_cm2", np.nan)
         cell_rows = [{"freq_hz": f, "z_re_mohm_cm2": 1000 * Z.real,
-                      "z_im_mohm_cm2": 1000 * Z.imag}
-                     for f, Z in zip(agg[0], agg[1])]
+                      "z_im_mohm_cm2": 1000 * Z.imag,
+                      "area_used_cm2": round(float(a), 3),
+                      "area_coverage": round(float(a) / float(a_tot), 4)}
+                     for f, Z, a in zip(agg[0], agg[1], a_used)]
         utils.write_table(out / "csv" / "cell_aggregate.csv", cell_rows)
         # Also where the whole-cell check and the viewer look for it.
         utils.write_table(out / "silver" / "cell_aggregate.csv", cell_rows)
@@ -1310,6 +1321,7 @@ def write_outputs(spectra, ecm, agg, cfg, log, extra: dict) -> dict:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        import config as _config        # fixed heat-map scales
 
         for param, key, unit in (("R_ohmic", "R_ohmic", "mΩ·cm²"),
                                  ("R_ct", "R_ct", "mΩ·cm²"),
@@ -1321,6 +1333,7 @@ def write_outputs(spectra, ecm, agg, cfg, log, extra: dict) -> dict:
                 continue
             p = geom.plot_map(out / f"map_{param}.png", vals,
                               label=f"{param}  [{unit}]",
+                              limits=_config.heatmap_limits(param),
                               title=f"{geom.ACTIVE_PLATE.title} — {param} "
                                     f"({len(vals)} segments, CSV source)")
             maps[param] = str(p)

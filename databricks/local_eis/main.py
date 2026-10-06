@@ -127,12 +127,33 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--skew", choices=["structural", "per_card", "none"],
                    default=None,
                    help="acquisition-skew model (default: structural)")
-    g.add_argument("--phasor", choices=["joint7", "independent"], default=None,
-                   help="sine-fit estimator (default: joint7)")
+    g.add_argument("--phasor", choices=["card_ml", "joint7", "independent"],
+                   default=None,
+                   help="sine-fit estimator (default: card_ml = one frequency "
+                        "per card and step from all channels, "
+                        "tone_estimation.py; joint7 = previous behaviour)")
     g.add_argument("--preset", choices=["default", "permissive", "strict"],
                    default=None,
                    help="gate preset; 'permissive' keeps almost everything, "
                         "for comparing against a coherence-threshold pipeline")
+    g.add_argument("--prune-ladder", action="store_true",
+                   help="drop detections that miss the sweep's fitted "
+                        "geometric ladder. OFF by default because it is the "
+                        "only step that can REMOVE a step the old path kept, "
+                        "and on one campaign it cost a decade of band; on "
+                        "another it takes 13 spurious steps to 0. Read "
+                        "off_ladder_hz in the manifest to see what it took")
+    g.add_argument("--ensemble", action="store_true",
+                   help="detect the schedule on the stacked segment ensemble "
+                        "instead of the cell-voltage channel. Worth it where "
+                        "the cell voltage has collapsed and the band is short "
+                        "(RO2612025 at 150 A); it made a working result WORSE "
+                        "on RO2611976, where the record is mostly not swept "
+                        "and the extra sensitivity fills the idle stretches "
+                        "with candidates. A/B it per campaign")
+    g.add_argument("--pool-reference", action="store_true",
+                   help="average the cards' UC channels into one reference "
+                        "phasor. Not validated against field data")
     g.add_argument("--no-drt", action="store_true",
                    help="skip the DRT; loses the process split and tau maps")
     g.add_argument("--no-spatial", action="store_true",
@@ -199,6 +220,12 @@ def config_from_args(a) -> Config:
         kw["skew_model"] = a.skew
     if a.phasor:
         kw["phasor_method"] = a.phasor
+    if a.prune_ladder:
+        kw["hf_ladder_prune"] = True
+    if a.ensemble:
+        kw["hf_use_ensemble"] = True
+    if a.pool_reference:
+        kw["hf_pool_reference"] = True
     if a.no_drt:
         kw["drt_enable"] = False
     if a.no_spatial:
@@ -251,7 +278,16 @@ def run_pipeline(cfg: Config, stop_after: str = "gold") -> dict:
 
     if cfg.source_format == "csv":
         import csv_pipeline
-        return csv_pipeline.run_csv(cfg, stop_after=stop_after)
+        manifest = csv_pipeline.run_csv(cfg, stop_after=stop_after)
+        # The CSV path used to return here and so never ran the Gamry
+        # comparison or the plausibility checks. Both only need the files
+        # run_csv has just written, so run them on a full (gold) run.
+        if stop_after == "gold" and isinstance(manifest, dict):
+            manifest.setdefault("stages", {})
+            whole_cell_and_plausibility(cfg, manifest,
+                                        utils.get_logger(cfg.verbose), sr=None)
+            utils.write_json(Path(cfg.out_dir) / "run_manifest.json", manifest)
+        return manifest
 
     log = utils.get_logger(cfg.verbose)
     t0 = time.time()
@@ -293,54 +329,7 @@ def run_pipeline(cfg: Config, stop_after: str = "gold") -> dict:
     gold.save(gr, sr, cfg, log)
     manifest["stages"]["gold"] = gr.stats
 
-    # ---- the whole-cell cross-check ---------------------------------------
-    # Last, because it needs the aggregate silver has just written, and
-    # non-fatal, because a missing or unreadable reference must not throw away
-    # a run that is otherwise complete.
-    reference_asr = None
-    reference_hfr = float("nan")
-    if cfg.gamry_dir:
-        utils.banner("WHOLE-CELL REFERENCE  --  local aggregate vs Gamry", log)
-        try:
-            import gamry_compare
-            comps = gamry_compare.run(
-                cfg.out_dir, cfg.gamry_dir, geom_area(cfg),
-                out_dir=cfg.out_dir, bench_path=cfg.bench_log,
-                chain_applied=cfg.gain_file is not None,
-                only=cfg.condition, order_id=cfg.leepa, log=log)
-            manifest["stages"]["gamry"] = [c.summary() for c in comps]
-            if comps and comps[0].freq.size:
-                # the reference arm of the plausibility aggregate check, in
-                # the same ohm.cm2 the local side already uses
-                reference_asr = (comps[0].freq, comps[0].Z_ref)
-                # ... and its R_s, for the parallel-sum closure. The measured
-                # intercept when the sweep reached it, otherwise the
-                # extrapolation, which is what the local parallel sum should
-                # be compared against when neither curve crosses the axis.
-                import math
-                reference_hfr = (comps[0].hfr_ref
-                                 if math.isfinite(comps[0].hfr_ref)
-                                 else comps[0].hfr_ref_fit)
-            if cfg.write_png and comps:
-                gamry_compare.plot(
-                    comps, Path(cfg.out_dir) / "gamry_comparison.png")
-        except Exception as exc:                            # noqa: BLE001
-            log.warning(f"  whole-cell comparison skipped: {exc}")
-
-    # ---- does the finished plate hold together as physics? ----------------
-    # After gold, because it judges the assembled map rather than any single
-    # point, and non-fatal for the same reason the cross-check is: a
-    # diagnostic that can end a run is a liability, not a safeguard.
-    try:
-        import plausibility
-        rep = plausibility.check_run(
-            sr, cfg, plate_key=cfg.plate, reference=reference_asr,
-            reference_hfr=reference_hfr)
-        plausibility.report(rep, log)
-        plausibility.save(rep, cfg.out_dir)
-        manifest["stages"]["plausibility"] = rep.rows()
-    except Exception as exc:                                # noqa: BLE001
-        log.warning(f"  plausibility checks skipped: {exc}")
+    whole_cell_and_plausibility(cfg, manifest, log, sr=sr)
 
     dt = time.time() - t0
     utils.banner("DONE", log)
@@ -356,6 +345,69 @@ def run_pipeline(cfg: Config, stop_after: str = "gold") -> dict:
     manifest["elapsed_s"] = dt
     utils.write_json(Path(cfg.out_dir) / "run_manifest.json", manifest)
     return manifest
+
+
+def whole_cell_and_plausibility(cfg: Config, manifest: dict, log,
+                                sr=None) -> None:
+    """Gamry cross-check, then plausibility -- shared by FAMOS and CSV paths.
+
+    `sr` is the SilverRun on the FAMOS path. On the CSV path there is none,
+    and plausibility is evaluated from the files the run wrote instead
+    (plausibility.check_from_disk).
+    """
+    # ---- the whole-cell cross-check ---------------------------------------
+    # Last, because it needs the aggregate silver has just written, and
+    # non-fatal, because a missing or unreadable reference must not throw away
+    # a run that is otherwise complete.
+    reference_asr = None
+    reference_hfr = float("nan")
+    if cfg.gamry_dir:
+        utils.banner("WHOLE-CELL REFERENCE  --  local aggregate vs Gamry", log)
+        try:
+            import gamry_compare
+            comps = gamry_compare.run(
+                cfg.out_dir, cfg.gamry_dir, geom_area(cfg),
+                out_dir=cfg.out_dir, bench_path=cfg.bench_log,
+                chain_applied=cfg.gain_file is not None,
+                only=cfg.condition, order_id=cfg.leepa,
+                version=getattr(cfg, "gamry_version", "") or None, log=log)
+            manifest["stages"]["gamry"] = [c.summary() for c in comps]
+            if comps and comps[0].freq.size:
+                # the reference arm of the plausibility aggregate check, in
+                # the same ohm.cm2 the local side already uses
+                reference_asr = (comps[0].freq, comps[0].Z_ref)
+                # ... and its R_s. ONLY the measured intercept. The old
+                # fallback to hfr_ref_fit (a straight-line extrapolation to
+                # Z''=0, biased low) was compared against a top-band mean
+                # (biased high) and failed on data with nothing wrong with
+                # it. With a sweep present, plausibility now uses the
+                # matched-band R_s check instead, so nothing is lost.
+                reference_hfr = comps[0].hfr_ref
+            if cfg.write_png and comps:
+                gamry_compare.plot(
+                    comps, Path(cfg.out_dir) / "gamry_comparison.png")
+        except Exception as exc:                            # noqa: BLE001
+            log.warning(f"  whole-cell comparison skipped: {exc}")
+
+    # ---- does the finished plate hold together as physics? ----------------
+    # After gold, because it judges the assembled map rather than any single
+    # point, and non-fatal for the same reason the cross-check is: a
+    # diagnostic that can end a run is a liability, not a safeguard.
+    try:
+        import plausibility
+        if sr is not None:
+            rep = plausibility.check_run(
+                sr, cfg, plate_key=cfg.plate, reference=reference_asr,
+                reference_hfr=reference_hfr)
+        else:
+            rep = plausibility.check_from_disk(
+                cfg.out_dir, cfg, plate_key=cfg.plate,
+                reference=reference_asr, reference_hfr=reference_hfr)
+        plausibility.report(rep, log)
+        plausibility.save(rep, cfg.out_dir)
+        manifest["stages"]["plausibility"] = rep.rows()
+    except Exception as exc:                                # noqa: BLE001
+        log.warning(f"  plausibility checks skipped: {exc}")
 
 
 def self_test() -> int:

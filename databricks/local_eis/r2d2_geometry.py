@@ -788,20 +788,25 @@ def plot_map(path="segment_map.png", value: dict[str, float] | None = None,
              limits: tuple[float, float] | None = None):
     """Draw the plate.  Colour = `value` per segment, default = area.
 
-    `limits` fixes the colour scale (vmin, vmax); default = min..max."""
+    `limits` fixes the colour scale (vmin, vmax); default = min..max.
+    Drawn in the same view as every heat map (plate_style: plotly Jet,
+    mirrored when config.PLATE_VIEW_MIRRORED is set, inlets / outlets /
+    coolant labelled on the two ends), so the numbering checked here is the
+    numbering the heat maps show."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.patches import Rectangle
+    import plate_style as style
 
     p = plate(plate_name) if plate_name else ACTIVE_PLATE
     segments = p.segments
     value = value or {k: s.area_cm2 for k, s in segments.items()}
     vals = [v for v in value.values()]
     vmin, vmax = limits if limits is not None else (min(vals), max(vals))
-    cmap = plt.get_cmap("viridis")
+    cmap = style.mpl_cmap()
 
-    fig, ax = plt.subplots(figsize=(13, 7))
+    fig, ax = plt.subplots(figsize=(15, 7))
     for n in sorted(segments, key=int):
         s = segments[n]
         v = value.get(n)
@@ -816,10 +821,16 @@ def plot_map(path="segment_map.png", value: dict[str, float] | None = None,
                                    facecolor=col, edgecolor=col, lw=0.0))
         ax.add_patch(Rectangle((s.x0_mm, s.y0_mm), s.w_mm, s.h_mm,
                                facecolor="none", edgecolor="none"))
-        txt = n if v is None else f"{n}\n{v:.3g}"
-        ax.text(s.cx_mm, s.cy_mm, txt, ha="center", va="center", fontsize=6.5,
-                color="w" if (v is not None and (v - vmin) /
-                              (vmax - vmin + 1e-30) < 0.6) else "k")
+        tc = "k" if v is None else style.ink(col)
+        if v is None:
+            ax.text(s.cx_mm, s.cy_mm, n, ha="center", va="center",
+                    fontsize=style.NUMBER_FONT, color=tc)
+        else:
+            ax.text(s.cx_mm, s.cy_mm + style.NUMBER_DY_MM, n, ha="center",
+                    va="center", fontsize=style.NUMBER_FONT, color=tc)
+            ax.text(s.cx_mm, s.cy_mm + style.VALUE_DY_MM, f"{v:.3g}",
+                    ha="center", va="center", fontsize=style.VALUE_FONT_NARROW,
+                    fontweight="bold", color=tc)
     # Segment boundaries: draw the edge between two pads that belong to
     # different segments.  This traces every staircase exactly.
     owner = {}
@@ -836,8 +847,10 @@ def plot_map(path="segment_map.png", value: dict[str, float] | None = None,
     for x in TEMP_SENSOR_X_MM.values():
         ax.axvline(x, color="tab:red", ls=":", lw=1)
 
-    ax.set(xlim=(-2, PLATE_W_MM + 2), ylim=(PLATE_H_MM + 2, -2),
-           xlabel="x [mm]  (temp1 .. temp4 dotted)", ylabel="y [mm]",
+    style.annotate_ends(ax, PLATE_W_MM, PLATE_H_MM, fontsize=7.5)
+    ax.set(xlim=style.xlim(-40, PLATE_W_MM + 40), ylim=(PLATE_H_MM + 2, -2),
+           xlabel=("x [mm]  (temp1 .. temp4 dotted)   |   "
+                   + style.flow_note()), ylabel="y [mm]",
            title=title or f"{p.title} — segment numbering and active area")
     ax.set_aspect("equal")
     sm = plt.cm.ScalarMappable(cmap=cmap,

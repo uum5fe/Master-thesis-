@@ -111,7 +111,9 @@ def _cell(marker: str) -> str:
 def test_the_heatmap_cell_draws_labelled_maps_without_plate_viewer(
         tmp_path, monkeypatch) -> None:
     pytest.importorskip("IPython")
+    pytest.importorskip("plotly")
     import IPython.display as ipd
+    import plate_figure
     rng = np.random.default_rng(0)
     rows = [dict(segment=int(s), **{"class": "measured"},
                  R_ohmic=65 + rng.standard_normal(),
@@ -123,17 +125,17 @@ def test_the_heatmap_cell_draws_labelled_maps_without_plate_viewer(
     gold_dir.mkdir()
     pd.DataFrame(rows).to_csv(gold_dir / "plate_summary.csv", index=False)
 
-    shown, ramps = [], {}
+    shown, html, ramps = [], [], {}
     monkeypatch.setattr(ipd, "display", lambda obj: shown.append(obj))
-    _draw = plate_maps.draw_value_map
+    _draw = plate_figure.draw_flow_plate
 
-    def _spy(vals, label, *a, **k):
-        ramps[label] = k.get("cmap")
-        return _draw(vals, label, *a, **k)
+    def _spy(vals, param, *a, **k):
+        ramps[param] = k.get("cmap")
+        return _draw(vals, param, *a, **k)
 
-    monkeypatch.setattr(plate_maps, "draw_value_map", _spy)
+    monkeypatch.setattr(plate_figure, "draw_flow_plate", _spy)
     ns = {"plate_maps": plate_maps, "MIN_SNR_DB": 5.0,
-          "EVALUATION_MODE": "default", "displayHTML": lambda h: None,
+          "EVALUATION_MODE": "default", "displayHTML": html.append,
           "_widget": lambda *a, default='': "2612030",
           "selected_conditions": lambda: ["150A"],
           "result_dir": lambda leepa, cond: (tmp_path, "this session's run"),
@@ -143,12 +145,14 @@ def test_the_heatmap_cell_draws_labelled_maps_without_plate_viewer(
         assert (gold_dir / f"plate_{col}.png").is_file(), col
     assert len(shown) == 4
     rs_ax = shown[0].axes[0]
-    assert "HFR (Rs)" in rs_ax.get_title(loc="left")
-    # each map keeps its original ramp; HFR is viridis again
-    assert ramps == {"HFR (Rs)": "viridis",
-                     "R_ct (charge transfer)": "inferno",
-                     "R_mt (mass transport)": "magma",
-                     "R_pol (total polarisation)": "magma"}
+    assert "HFR (Rs)" in rs_ax.get_title(loc="left") or any(
+        "HFR (Rs)" in t.get_text() for t in shown[0].texts)
+    # one scale for every map: nothing overrides plate_style's Jet
+    assert ramps == {"R_ohmic": None, "R_ct": None, "R_mt": None,
+                     "R_pol": None}
     assert f"{rows[0]['R_ohmic']:.1f}" in _texts(rs_ax)
+    # the interactive plate_plotly map, in the same scale, with a dropdown
+    assert (gold_dir / "plate_maps_interactive.html").is_file()
+    assert html and "rgb(0,0,131)" in html[0]
     for f in shown:
         plt.close(f)

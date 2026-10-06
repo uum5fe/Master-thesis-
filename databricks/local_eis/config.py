@@ -86,11 +86,40 @@ FLOW_CHANNEL_Y_MM = (30.25, 60.50, 90.75)
 # Set to "co" (both inlets at x = 0) or "counter" for the rebuild being
 # evaluated; the maps and the trend diagnostic annotate themselves from it.
 FLOW_ARRANGEMENT = "counter"
+# These describe the plate in PLATE coordinates (x = 0 at pad column 1). The
+# maps print plate_style.flow_note() instead, which also follows the view
+# switch below.
 FLOW_DESCRIPTION = {
     "counter": "counter-flow: H2 left to right, air right to left",
     "co": "co-flow: both gases left to right",
     "unknown": "flow arrangement not recorded",
 }
+
+# WHICH END THE COOLANT ENTERS: "x0" (pad column 1, the H2-inlet / air-outlet
+# end) or "xW" (pad column 45, the air-inlet end).
+#
+# "x0" is INFERRED, not read off a drawing. The four FAMOS plate sensors
+# (temp1 at x = 0 ... temp4 at x = 252 mm) rise monotonically from x = 0 to
+# x = 252 in three of the four runs evaluated (2612030 45A +1.07 K, 60A
+# +1.02 K, 2611976 45A +0.80 K), and the bench log has the coolant leaving
+# warmer than it enters -- so the coolant picks up heat travelling from x = 0
+# towards x = 252. A hot air inlet (T_Si_C runs above the plate) at x = 252
+# would warm the same end, so confirm against the plate's coolant manifold
+# drawing; a coolant-inlet temperature step settles it too (the sensor that
+# responds first is at the coolant inlet). Change it here if it is the other
+# end: the maps redraw the coolant ports from this.
+COOLANT_INLET_END = "x0"
+
+# HOW THE PLATE IS DRAWN.  False: as the pad map is numbered, pad column 1 on
+# the left (H2 in and air out on the left, air in on the right).  True: seen
+# from the other side, mirrored left <-> right, so the air (cathode) inlet is
+# on the LEFT and the H2 inlet on the right.
+#
+# The whole plate mirrors -- segments, numbers, ports, coolant, sensors -- so
+# the air inlet stays next to the segments it really feeds. Only the picture
+# changes; every coordinate in the CSVs (cx_mm, cy_mm) stays in plate
+# coordinates.
+PLATE_VIEW_MIRRORED = True
 
 
 # ===========================================================================
@@ -797,7 +826,7 @@ class Config:
     heatmap_params: tuple[str, ...] = (
         "R_ohmic", "R_ct", "R_mt", "Z_mag_100Hz", "phase_100Hz", "j_dc",
     )
-    heatmap_colormap: str = "RdYlBu_r"
+    heatmap_colormap: str = "plotly_jet"   # plate_style.JET_STOPS
     verbose: bool = True
     report_steps: bool = False       # print the full per-step table
 
@@ -1133,23 +1162,23 @@ SEGMENT_CLASS_STYLE = {
 # Units and human labels for every scalar the gold layer can map.
 PARAM_META = {
     "R_ohmic":     dict(label="R\u03a9 (HF intercept)", unit="m\u03a9\u00b7cm\u00b2",
-                        scale=1000.0, cmap="RdYlBu_r"),
+                        scale=1000.0, cmap="plotly_jet"),
     "R_ct":        dict(label="R_ct (charge transfer)", unit="m\u03a9\u00b7cm\u00b2",
-                        scale=1000.0, cmap="RdYlBu_r"),
+                        scale=1000.0, cmap="plotly_jet"),
     "R_mt":        dict(label="R_mt (mass transport)", unit="m\u03a9\u00b7cm\u00b2",
-                        scale=1000.0, cmap="RdYlBu_r"),
+                        scale=1000.0, cmap="plotly_jet"),
     "R_pol":       dict(label="R_pol (total polarisation)", unit="m\u03a9\u00b7cm\u00b2",
-                        scale=1000.0, cmap="RdYlBu_r"),
+                        scale=1000.0, cmap="plotly_jet"),
     "Z_mag_100Hz": dict(label="|Z| @ 100 Hz", unit="m\u03a9\u00b7cm\u00b2",
-                        scale=1000.0, cmap="RdYlBu_r"),
+                        scale=1000.0, cmap="plotly_jet"),
     "phase_100Hz": dict(label="Phase @ 100 Hz", unit="\u00b0",
-                        scale=1.0, cmap="RdYlBu_r"),
+                        scale=1.0, cmap="plotly_jet"),
     "j_dc":        dict(label="DC current density", unit="A/cm\u00b2",
-                        scale=1.0, cmap="viridis"),
+                        scale=1.0, cmap="plotly_jet"),
     "tau_peak":    dict(label="Dominant relaxation time", unit="s",
-                        scale=1.0, cmap="plasma"),
+                        scale=1.0, cmap="plotly_jet"),
     "sigma_rel":   dict(label="Relative uncertainty", unit="%",
-                        scale=100.0, cmap="Greys"),
+                        scale=100.0, cmap="plotly_jet"),
 }
 
 # ---- FIXED HEAT-MAP COLOUR SCALES -----------------------------------------

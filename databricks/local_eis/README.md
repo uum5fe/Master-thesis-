@@ -109,3 +109,26 @@ It cross-checks the bode index against the calibration rows first and refuses
 a pairing that does not hang together. On the Naboo delivery it does not
 (r = +0.41): use `--shared` there, which writes the index-free plate median and
 still removes the common roll-off.
+
+## Plate maps and bench parameters
+
+Every plate heat map (gold `map_*.png/.html`, `plate_*.png`, the runner's
+interactive map, the ECM maps and the numbering map) takes its look from
+`plate_style.py`:
+
+- **colours**: plotly's Jet scale, stop for stop, the same as the bench's
+  intensity plots;
+- **text**: the value large and bold, the segment number small above it;
+- **view**: `config.PLATE_VIEW_MIRRORED = True` draws the plate from the other
+  side (air inlet on the left, H2 inlet on the right). The whole drawing
+  mirrors, so the ports stay beside the segments they feed; CSV coordinates
+  stay in plate coordinates;
+- **ports**: gas inlets/outlets and the coolant inlet/outlet on their ends.
+  The coolant end is `config.COOLANT_INLET_END` — inferred from the FAMOS
+  plate sensors (temp1 at x = 0 coldest, temp4 at x = 252 mm warmest), so
+  confirm it against the manifold drawing.
+
+`plate_plotly.py` draws the interactive map (hover a segment for its value,
+the dropdown switches parameter). `bench_plots.py` draws the MF4 test-bench
+channels as one figure: a parameter dropdown, a legend that toggles traces,
+hover values at the cursor, and the FAMOS plate sensors as °C reference lines.

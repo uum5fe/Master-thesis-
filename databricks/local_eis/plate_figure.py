@@ -4,9 +4,15 @@ plate_figure.py
 ===============
 Static plate heat map in the style of the interactive plate viewer: the
 metal frame with its bolts, the gasket border, the four manifold ports with
-their flow arrows (O2 OUT top left, H2 OUT top right, H2 IN bottom left,
-AIR / O2 IN bottom right), the temperature-sensor pins T1..T4 on the top
-edge, the plate dimensions -- and every segment filled with its value.
+their flow arrows (in plate coordinates: O2 OUT top / H2 IN bottom at x = 0,
+H2 OUT top / AIR IN bottom at x = 252), the coolant inlet and outlet on the
+two ends, the temperature-sensor pins T1..T4 on the top edge, the plate
+dimensions -- and every segment filled with its value.
+
+Colours, text sizes and the view direction come from plate_style: plotly's
+Jet scale for every parameter, the value large and the segment number small,
+and config.PLATE_VIEW_MIRRORED to draw the plate from the other side (the
+whole drawing mirrors, so the ports stay beside the segments they feed).
 
 Why a static copy of the viewer: the viewer (plate_viewer, outside this
 folder) is interactive HTML and scales each field to its own run. A report,
@@ -28,11 +34,13 @@ from __future__ import annotations
 
 import numpy as np
 
+import plate_style as style
 import r2d2_geometry as geom
 from r2d2_geometry import PAD_W_MM, PAD_H_MM
 
-# Colour ramps of the interactive viewer, so a static map and the viewer
-# show the same field in the same colours.
+# Colour ramps of the interactive viewer. No longer the default: every map is
+# drawn in plate_style's Jet scale (the reference plots' colours). Kept so a
+# caller can still pass cmap="viridis" etc. explicitly.
 RAMPS = {
     "viridis": ["#440154", "#414487", "#2a788e", "#22a884", "#7ad151", "#fde725"],
     "inferno": ["#040414", "#420a68", "#932667", "#dd513a", "#fca50a", "#fcffa4"],
@@ -43,19 +51,23 @@ RAMPS = {
     "humid":   ["#ffffd9", "#c7e9b4", "#41b6c4", "#225ea8", "#081d58"],
 }
 
-# Parameter -> (label, unit, ramp, decimals). The ramps are the viewer's.
+# Parameter -> (label, unit, ramp, decimals). One ramp for all of them.
+_JET = style.HEATMAP_CMAP
 FIELDS = {
-    "R_ohmic": ("HFR (Rs)", "mΩ·cm²", "viridis", 1),
-    "R_ct":    ("R_ct (charge transfer)", "mΩ·cm²", "inferno", 1),
-    "R_mt":    ("R_mt (mass transport)", "mΩ·cm²", "magma", 1),
-    "R_pol":   ("R_pol (total polarisation)", "mΩ·cm²", "thermal", 1),
-    "j_dc":    ("Current density", "A/cm²", "cividis", 3),
+    "R_ohmic":     ("HFR (Rs)", "mΩ·cm²", _JET, 1),
+    "R_ct":        ("R_ct (charge transfer)", "mΩ·cm²", _JET, 1),
+    "R_mt":        ("R_mt (mass transport)", "mΩ·cm²", _JET, 1),
+    "R_pol":       ("R_pol (total polarisation)", "mΩ·cm²", _JET, 1),
+    "j_dc":        ("Current density", "A/cm²", _JET, 3),
+    "T_degC":      ("Temperature", "°C", _JET, 2),
+    "Z_mag_100Hz": ("|Z| at 100 Hz", "mΩ·cm²", _JET, 1),
+    "phase_100Hz": ("Phase at 100 Hz", "°", _JET, 1),
 }
 
 # Frame geometry in plate mm (x right, y DOWN, active area 0..W x 0..H);
 # the numbers are the viewer's, so the two drawings match.
 _ANODE, _CATHODE = "#a5341f", "#2c455d"
-PORTS = [  # label, side, corner, rect (x, y, w, h), arrow (x0, x1, y)
+PORTS = [  # label, side, corner, rect (x, y, w, h), arrow (x0, x1, y); plate mm
     ("H₂ IN", "anode", "bl", (8.0, 129.0, 62.0, 16.0), (-38.0, 2.0, 137.0)),
     ("H₂ OUT", "anode", "tr", (182.0, -24.0, 62.0, 16.0), (250.0, 290.0, -16.0)),
     ("AIR / O₂ IN", "cathode", "br", (182.0, 129.0, 62.0, 16.0), (290.0, 250.0, 137.0)),
@@ -63,20 +75,19 @@ PORTS = [  # label, side, corner, rect (x, y, w, h), arrow (x0, x1, y)
 ]
 
 
+# Coolant ports, one on each end at mid-height, between the side bolts:
+# rect (x, y, w, h) on the x = 0 end; the x = W end is its mirror image.
+_COOLANT_RECT = (-21.0, 47.5, 13.0, 26.0)
+
+
 def _cmap(name: str):
     from matplotlib.colors import LinearSegmentedColormap
-    import matplotlib.pyplot as plt
     if name in RAMPS:
         return LinearSegmentedColormap.from_list(name, RAMPS[name])
-    return plt.get_cmap(name)
+    return style.mpl_cmap(name)
 
 
-def _ink(rgba) -> str:
-    """Label colour that stays legible on the fill (viewer's rule)."""
-    lin = [c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
-           for c in rgba[:3]]
-    lum = 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2]
-    return "#141414" if lum > 0.42 else "#ffffff"
+_ink = style.ink
 
 
 def _limits(param, vals, limits):
@@ -200,15 +211,22 @@ def draw_flow_plate(values: dict, param: str, title: str = "",
               if p is geom.ACTIVE_PLATE and n in geom.LABEL_ROW else s.cy_mm)
         if narrow:
             lx, ly = s.cx_mm, s.cy_mm
+        # the value is what the map is for: large and bold; the segment
+        # number small above it
         with_val = show_values and v is not None
-        ax.text(lx, ly - (1.8 if with_val else 0), n, ha="center", va="center",
-                fontsize=(6.2 if narrow else 8.4), fontweight="bold",
-                family="monospace", color=tc, zorder=6)
+        ax.text(lx, ly + (style.NUMBER_DY_MM if with_val else 0), n,
+                ha="center", va="center",
+                fontsize=(style.NUMBER_FONT_NARROW if narrow
+                          else style.NUMBER_FONT),
+                family="monospace", color=tc, alpha=0.9, zorder=6)
         if with_val:
             est = classes.get(n, "measured") not in ("", "measured")
-            ax.text(lx, ly + 2.0, f"{v:.{dec}f}" + ("*" if est else ""),
-                    ha="center", va="center", fontsize=(5.0 if narrow else 6.6),
-                    color=tc, zorder=6)
+            ax.text(lx, ly + style.VALUE_DY_MM,
+                    f"{v:.{dec}f}" + ("*" if est else ""),
+                    ha="center", va="center",
+                    fontsize=(style.VALUE_FONT_NARROW if narrow
+                              else style.VALUE_FONT),
+                    fontweight="bold", color=tc, zorder=6)
 
     # ---- temperature sensors ----------------------------------------------
     for i, (name, x) in enumerate(sorted(geom.TEMP_SENSOR_X_MM.items(),
@@ -219,7 +237,8 @@ def draw_flow_plate(values: dict, param: str, title: str = "",
         # T1 sits under the O2 OUT port, so its tag goes beside the pin
         first = i == 0
         ax.text(x - 3.2 if first else x, -10.6 if first else -15.2,
-                f"T{i + 1}", ha="right" if first else "center", va="center",
+                f"T{i + 1}", ha=style.outward_ha("x0") if first else "center",
+                va="center",
                 fontsize=6.5, family="monospace", fontweight="bold",
                 color="#1d1f20", zorder=7)
 
@@ -258,6 +277,31 @@ def draw_flow_plate(values: dict, param: str, title: str = "",
                 ha="center", va="center", fontsize=6.5, family="monospace",
                 color="#5d5d60", alpha=live, zorder=6)
 
+    # ---- coolant ports (config.COOLANT_INLET_END) -------------------------
+    cx, cy, cw, ch = _COOLANT_RECT
+    for end, (lab, role, col) in (
+            (e, st) for e, sts in style.end_streams().items() for st in sts
+            if st[0].startswith("COOLANT")):
+        x = cx if end == "x0" else W - cx - cw
+        ax.add_patch(FancyBboxPatch((x, cy), cw, ch,
+                                    boxstyle="round,pad=0,rounding_size=3",
+                                    fc="#3b3f44", ec=col, lw=1.6, zorder=5))
+        ax.add_patch(FancyBboxPatch((x + 2, cy + 2), cw - 4, ch - 4,
+                                    boxstyle="round,pad=0,rounding_size=2",
+                                    fc="#25282c", ec="none", zorder=5))
+        # arrow along x, outside the frame: into the port at the inlet, out
+        # of it at the outlet
+        out_x = -46.0 if end == "x0" else W + 46.0
+        port_x = x if end == "x0" else x + cw
+        a0, a1 = (out_x, port_x) if lab.endswith(" IN") else (port_x, out_x)
+        ax.add_patch(Polygon(arrow(a0, a1, cy + ch / 2), closed=True, fc=col,
+                             ec="none", zorder=5))
+        tx = (out_x + port_x) / 2
+        ax.text(tx, cy - 6.5, lab, ha="center", va="center", fontsize=10.5,
+                fontweight="bold", color=col, zorder=6)
+        ax.text(tx, cy + ch + 5.5, role, ha="center", va="center",
+                fontsize=6.5, family="monospace", color="#5d5d60", zorder=6)
+
     # ---- bolts ----------------------------------------------------------------
     for i in range(10):
         for by in (-19.5, 140.5):
@@ -276,13 +320,12 @@ def draw_flow_plate(values: dict, param: str, title: str = "",
                                 zorder=5))
 
     # ---- dimensions ---------------------------------------------------------
-    ax.text(W / 2, 172, f"{W:.1f} mm · 45 pads   |   {FLOW_NOTE}",
+    ax.text(W / 2, 172, f"{W:.1f} × {H:.1f} mm · 45 × 20 pads   |   "
+            f"{style.flow_note()}",
             ha="center", va="center", fontsize=7.5, family="monospace",
             color="#5d5d60")
-    ax.text(272, H / 2, f"{H:.1f} mm · 20 pads", rotation=-90, ha="center",
-            va="center", fontsize=6.5, family="monospace", color="#5d5d60")
 
-    ax.set_xlim(-46, 298)
+    ax.set_xlim(*style.xlim(-50, W + 50))
     ax.set_ylim(177, -44)
     ax.set_aspect("equal")
     ax.axis("off")
@@ -331,11 +374,12 @@ def _fixed(param) -> bool:
         return False
 
 
-try:
-    from config import FLOW_ARRANGEMENT, FLOW_DESCRIPTION
-    FLOW_NOTE = FLOW_DESCRIPTION.get(FLOW_ARRANGEMENT, "")
-except Exception:                                           # noqa: BLE001
-    FLOW_NOTE = ""
+def __getattr__(name):
+    # FLOW_NOTE used to be a module constant from config.FLOW_DESCRIPTION;
+    # it now follows the view switch, so it is computed when asked for.
+    if name == "FLOW_NOTE":
+        return style.flow_note()
+    raise AttributeError(name)
 
 
 def write_condition_maps(summary_csv, out_dir, title: str = "",

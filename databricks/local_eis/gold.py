@@ -66,12 +66,8 @@ except ImportError:       # flat layout (Databricks, notebooks): already there
 import r2d2_geometry as geom
 
 import utils
-import config as _config            # heatmap_limits: read at call time
-from config import (Config, DEFAULT, COLORS, SEGMENT_CLASS_STYLE, PARAM_META,
-                    FAULT_RULES, PLATE_W_CM, PLATE_H_CM, PLATE_W_MM,
-                    PLATE_H_MM, FLOW_CHANNEL_Y_MM, N_COLS, N_ROWS,
-                    PAD_W_MM, PAD_H_MM, KNOWN_BAD_SEGMENTS,
-                    FLOW_ARRANGEMENT, FLOW_DESCRIPTION)
+from config import (Config, DEFAULT, PARAM_META, FAULT_RULES, PLATE_W_MM,
+                    KNOWN_BAD_SEGMENTS)
 from silver import SilverRun, SilverSpectrum
 
 
@@ -410,157 +406,67 @@ def label_faults(records: dict[str, SegmentRecord]) -> None:
 # ===========================================================================
 
 
-def _plate_background(ax, cfg: Config) -> None:
-    from matplotlib.patches import Rectangle
-    ax.add_patch(Rectangle((0, 0), PLATE_W_CM, PLATE_H_CM,
-                           facecolor=COLORS["plate"],
-                           edgecolor=COLORS["plate_edge"], lw=2.5, zorder=1))
-    for c in range(N_COLS):
-        for r in range(N_ROWS):
-            vx = (c * PAD_W_MM + PAD_W_MM / 2) / 10.0
-            vy = (r * PAD_H_MM + PAD_H_MM / 2) / 10.0
-            ax.add_patch(Rectangle((vx - 0.25, vy - 0.27), 0.50, 0.54,
-                                   facecolor=COLORS["plate"],
-                                   edgecolor=COLORS["via"], lw=0.4, zorder=2))
-    for y_mm in FLOW_CHANNEL_Y_MM:
-        ax.plot([0, PLATE_W_CM], [y_mm / 10.0, y_mm / 10.0],
-                c=COLORS["channel_line"], lw=0.8, alpha=0.5, zorder=3)
-
-
 def plate_heatmap(records: dict[str, SegmentRecord], param: str, cfg: Config,
                   title_extra: str = ""):
-    """Static plate map with every segment drawn, measured or inferred."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    from matplotlib.patches import Rectangle
-    from matplotlib.colors import Normalize
-    from matplotlib.cm import ScalarMappable
+    """Static plate map with every segment drawn, measured or inferred.
 
-    meta = PARAM_META.get(param, dict(label=param, unit="", scale=1.0,
-                                      cmap=cfg.heatmap_colormap))
+    Drawn by plate_figure, so map_<param>.png and plate_<param>.png are the
+    same drawing: true segment outlines (this used to draw bounding boxes,
+    which overlap on the staircase edge segments), pad row 1 at the top (this
+    used to draw the plate upside down relative to every other map), the
+    plate_style colours (plotly Jet), value large and number small, and the
+    gas and coolant ports on their ends.
+    """
+    import plate_figure
+
+    meta = PARAM_META.get(param, dict(label=param, unit="", scale=1.0))
     scale = meta.get("scale", 1.0)
     vals = {s: r.values.get(param, np.nan) * scale
             for s, r in records.items()}
-    finite = np.array([v for v in vals.values() if np.isfinite(v)])
-    if finite.size == 0:
+    if not any(np.isfinite(v) for v in vals.values()):
         return None
-
-    # fixed scale per parameter (config.HEATMAP_LIMITS) so every condition
-    # shares one colour -> value mapping; automatic min..max otherwise
-    lim = _config.heatmap_limits(param)
-    if lim is not None:
-        norm = Normalize(vmin=lim[0], vmax=lim[1])
-    else:
-        span = (float(np.ptp(finite))
-                or max(abs(float(np.mean(finite))) * 0.06, 1e-6))
-        norm = Normalize(vmin=finite.min() - 0.03 * span,
-                         vmax=finite.max() + 0.03 * span)
-    cmap = plt.get_cmap(meta.get("cmap", cfg.heatmap_colormap))
-
-    fig, ax = plt.subplots(figsize=(18, 8.5))
-    fig.patch.set_facecolor("white")
-    ax.set_facecolor("white")
-    ax.set_aspect("equal")
-    _plate_background(ax, cfg)
-
-    for s, r in records.items():
-        v = vals.get(s, np.nan)
-        g = geom.SEGMENTS[s]
-        x0, y0 = g.x0_mm / 10.0, g.y0_mm / 10.0
-        w, h = g.w_mm / 10.0, g.h_mm / 10.0
-        style = SEGMENT_CLASS_STYLE.get(r.cls, SEGMENT_CLASS_STYLE["measured"])
-        face = cmap(norm(v)) if np.isfinite(v) else (0.6, 0.6, 0.6, 1.0)
-        edge = (COLORS["measured_edge"] if r.cls == "measured"
-                else COLORS["bad_edge"] if r.cls in ("bad", "excluded")
-                else COLORS["inferred_edge"])
-        ax.add_patch(Rectangle((x0, y0), w, h, facecolor=face,
-                               alpha=style["alpha"], edgecolor=edge,
-                               lw=style["linewidth"], hatch=style["hatch"],
-                               zorder=5))
-        big = int(s) <= 36
-        txt = f"{s}\n{v:.1f}" if np.isfinite(v) else s
-        ax.text(g.cx_mm / 10.0, g.cy_mm / 10.0, txt, ha="center", va="center",
-                fontsize=(8.5 if big else 6.5), color="white",
-                fontweight="bold", zorder=8)
-
-    sm = ScalarMappable(cmap=cmap, norm=norm)
-    sm.set_array([])
-    below = bool(finite.min() < norm.vmin)
-    above = bool(finite.max() > norm.vmax)
-    cb = fig.colorbar(sm, ax=ax, fraction=0.025, pad=0.015,
-                      extend=("both" if below and above else "min" if below
-                              else "max" if above else "neither"))
-    unit = meta.get("unit", "")
-    cb.set_label(f"{meta.get('label', param)}" + (f"  [{unit}]" if unit else ""),
-                 fontsize=12, labelpad=10)
-
-    n_inf = sum(1 for r in records.values() if r.cls != "measured")
-    ax.set_xlim(-0.1, PLATE_W_CM + 0.1)
-    ax.set_ylim(-0.1, PLATE_H_CM + 0.1)
-    ax.axis("off")
-    ax.set_title(f"{meta.get('label', param)}{title_extra}\n"
-                 f"{len(records) - n_inf} measured, {n_inf} not measured "
-                 f"(hatched) - "
-                 + FLOW_DESCRIPTION.get(FLOW_ARRANGEMENT,
-                                        FLOW_DESCRIPTION['unknown']),
-                 fontsize=13, fontweight="bold", pad=12)
-    fig.tight_layout()
-    return fig
+    dec = plate_figure.FIELDS.get(param, (None, None, None, None))[3]
+    if dec is None:
+        dec = 3 if abs(np.nanmedian(list(vals.values()))) < 10 else 1
+    return plate_figure.draw_flow_plate(
+        vals, param, classes={s: r.cls for s, r in records.items()},
+        title=(f"{cfg.leepa or ''} / {cfg.condition or ''}".strip(" /")
+               + title_extra),
+        label=meta.get("label", param), unit=meta.get("unit", ""),
+        decimals=dec)
 
 
 def plate_heatmap_interactive(records: dict[str, SegmentRecord], param: str,
                               cfg: Config):
-    """Plotly version: same map, with per-segment hover carrying the caveats."""
+    """Plotly version: same map, with per-segment hover carrying the caveats.
+
+    plate_plotly draws the real segment shapes in the same colours and view
+    as the PNG; hover anywhere on a segment for its value, sd, class, tier,
+    area, fault and flags.
+    """
     try:
-        import plotly.graph_objects as go
+        import plate_plotly
     except ImportError:
         return None
-    meta = PARAM_META.get(param, dict(label=param, unit="", scale=1.0,
-                                      cmap=cfg.heatmap_colormap))
+    meta = PARAM_META.get(param, dict(label=param, unit="", scale=1.0))
     scale = meta.get("scale", 1.0)
-    fig = go.Figure()
-    xs, ys, zs, texts = [], [], [], []
+    notes = {}
     for s, r in records.items():
-        g = geom.SEGMENTS[s]
-        v = r.values.get(param, np.nan) * scale
-        sd = r.sd.get(param, np.nan) * scale
-        xs.append(g.cx_mm / 10.0)
-        ys.append(g.cy_mm / 10.0)
-        zs.append(v)
-        texts.append(
-            f"<b>segment {s}</b><br>"
-            f"{meta.get('label', param)} = {v:.3g} {meta.get('unit','')}"
-            + (f" &plusmn; {sd:.2g}" if np.isfinite(sd) else "")
-            + f"<br>class: {r.cls} (tier {r.tier})"
-            + f"<br>area: {r.area_cm2:.3f} cm&sup2;"
-            + (f"<br>fault: {r.fault}" if r.fault else "")
-            + (f"<br>flags: {', '.join(r.flags)}" if r.flags else "")
-        )
-    sizes = [26 if int(s) <= 36 else 16 for s in records]
-    symbols = ["square" if r.cls == "measured" else "square-open"
-               for r in records.values()]
-    lim = _config.heatmap_limits(param)
-    fig.add_trace(go.Scatter(
-        x=xs, y=ys, mode="markers+text",
-        marker=dict(size=sizes, color=zs, colorscale="RdYlBu_r",
-                    **(dict(cmin=lim[0], cmax=lim[1]) if lim else {}),
-                    symbol=symbols, line=dict(width=1.5, color="white"),
-                    colorbar=dict(title=f"{meta.get('label',param)}<br>"
-                                        f"{meta.get('unit','')}")),
-        text=[s for s in records], textposition="middle center",
-        textfont=dict(size=8, color="white"),
-        hovertext=texts, hoverinfo="text", name=param))
-    fig.update_layout(
-        title=f"{meta.get('label', param)} - open squares are inferred, "
-              f"not measured",
-        xaxis=dict(title=f"x [cm] — {FLOW_DESCRIPTION.get(FLOW_ARRANGEMENT, '')}",
-                   range=[-0.3, PLATE_W_CM + 0.3],
-                   constrain="domain"),
-        yaxis=dict(title="y [cm]", range=[-0.3, PLATE_H_CM + 0.3],
-                   scaleanchor="x", scaleratio=1),
-        plot_bgcolor="white", height=620, width=1400)
-    return fig
+        notes[s] = (f"tier {r.tier} · area {r.area_cm2:.3f} cm\u00b2"
+                    + (f"<br>fault: {r.fault}" if r.fault else "")
+                    + (f"<br>flags: {', '.join(r.flags)}" if r.flags else ""))
+    vals = {s: r.values.get(param, np.nan) * scale for s, r in records.items()}
+    if not any(np.isfinite(v) for v in vals.values()):
+        return None
+    fd = plate_plotly.Field(
+        key=param, label=meta.get("label", param), unit=meta.get("unit", ""),
+        values=vals, classes={s: r.cls for s, r in records.items()},
+        sd={s: r.sd.get(param, np.nan) * scale for s, r in records.items()},
+        notes=notes,
+        decimals=3 if abs(np.nanmedian(list(vals.values()))) < 10 else 1)
+    return plate_plotly.interactive_plate(
+        [fd], title=f"{cfg.leepa or ''} / {cfg.condition or ''}".strip(" /"),
+        subtitle="hatched / value* = rebuilt, not measured")
 
 
 def nyquist_figure(sr: SilverRun, cfg: Config):

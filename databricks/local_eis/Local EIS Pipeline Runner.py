@@ -88,16 +88,20 @@ import ladder_snap
 import tone_estimation
 import eis_measurement_model
 import figure_panels
+import plate_style
 import plate_maps
 import plate_figure
+import plate_plotly
+import bench_plots
 import polcurve
 import ecm_drt
  
-# Force reload during development
+# Force reload during development (plate_style before the maps that use it)
 for mod in [config, utils, eis_local, bronze, silver, gold, pipeline_main,
             geom, csv_source, csv_pipeline, gamry_dta, gamry_compare, abgleich,
             ladder_snap, tone_estimation, eis_measurement_model,
-            figure_panels, plate_maps, plate_figure, polcurve, ecm_drt]:
+            figure_panels, plate_style, plate_maps, plate_figure, plate_plotly,
+            bench_plots, polcurve, ecm_drt]:
     importlib.reload(mod)
 
 # ─── ONE PLOT PER FIGURE ───
@@ -2580,6 +2584,15 @@ for cond, fn in DTA.items():
 # Nothing is drawn for a condition that was not selected, and a selected
 # condition with no results says so instead of a neighbour's map appearing in
 # its place.
+#
+# LOOK: every map here -- the interactive one and the static PNGs -- is drawn
+# from plate_style: plotly's Jet scale (the bench reference plots' colours),
+# the VALUE large and bold with the segment number small above it, the plate
+# mirrored when config.PLATE_VIEW_MIRRORED is set (air inlet on the left), and
+# the gas inlets/outlets and the coolant inlet/outlet on their ends.
+# The interactive map is plate_plotly (hover a segment for its value, the
+# dropdown switches parameter). The external plate_viewer draws in its own
+# ramps, so it is only used when USE_PLATE_VIEWER is set below.
 # ═══════════════════════════════════════════════════════════════════════════════
 import sys, html
 import numpy as np
@@ -2591,15 +2604,21 @@ _map_dir = '/Workspace/Users/uum5fe@bosch.com/master_thesis/map'
 if _map_dir not in sys.path:
     sys.path.insert(0, _map_dir)
 
-# The interactive viewer lives outside this folder. It is optional: the
-# static maps below are drawn by plate_maps (beside this notebook), which
-# needs nothing but r2d2_geometry.
-try:
-    from plate_viewer import write_html, Field
-except Exception as _pv_err:                               # noqa: BLE001
-    write_html = Field = None
-    print(f'  plate_viewer not importable ({type(_pv_err).__name__}); '
-          f'interactive viewer skipped, static maps still drawn')
+import plate_plotly
+import plate_figure
+import plate_style
+
+# The external plate_viewer (outside this folder) draws in its own colour
+# ramps, not the reference Jet scale. Off by default; set True to show it
+# as well as the plate_plotly map.
+USE_PLATE_VIEWER = False
+write_html = Field = None
+if USE_PLATE_VIEWER:
+    try:
+        from plate_viewer import write_html, Field
+    except Exception as _pv_err:                           # noqa: BLE001
+        print(f'  plate_viewer not importable ({type(_pv_err).__name__}); '
+              f'its viewer is skipped, the plate_plotly map is still drawn')
 
 import matplotlib
 matplotlib.use('Agg')
@@ -2607,15 +2626,17 @@ import matplotlib.pyplot as plt
 
 _CACHE_VOL = Path('/Volumes/ps_xplatform_dev/rvadvtec_dev/ev_rvadvtec_dev/EIS_Results')
 
+# (column, label, unit, plate_viewer ramp, decimals). The ramp is only for
+# the optional plate_viewer; every map drawn here uses plate_style's Jet.
 _FIELD_DEFS = [
-    ('R_ohmic',      'HFR (Rs)',                   'mohm.cm2', 'viridis', 1),
-    ('R_ct',         'R_ct (charge transfer)',     'mohm.cm2', 'inferno', 1),
-    ('R_mt',         'R_mt (mass transport)',      'mohm.cm2', 'magma',   1),
-    ('R_pol',        'R_pol (total polarisation)', 'mohm.cm2', 'thermal', 1),
-    ('j_dc',         'Current density',            'A/cm2',    'cividis', 3),
-    ('Z_mag_100Hz',  '|Z| at 100 Hz',              'mohm.cm2', 'viridis', 1),
-    ('phase_100Hz',  'Phase at 100 Hz',            'deg',      'humid',   1),
-    ('T_degC',       'Temperature variation',       '°C',       'coolwarm', 1),
+    ('R_ohmic',      'HFR (Rs)',                   'mΩ·cm²', 'viridis', 1),
+    ('R_ct',         'R_ct (charge transfer)',     'mΩ·cm²', 'inferno', 1),
+    ('R_mt',         'R_mt (mass transport)',      'mΩ·cm²', 'magma',   1),
+    ('R_pol',        'R_pol (total polarisation)', 'mΩ·cm²', 'thermal', 1),
+    ('j_dc',         'Current density',            'A/cm²',  'cividis', 3),
+    ('Z_mag_100Hz',  '|Z| at 100 Hz',              'mΩ·cm²', 'viridis', 1),
+    ('phase_100Hz',  'Phase at 100 Hz',            '°',      'humid',   1),
+    ('T_degC',       'Temperature (FAMOS sensors)', '°C',    'coolwarm', 2),
 ]
 
 
@@ -2695,7 +2716,9 @@ for cond, (gold_csv, prov) in sorted(_COND_GOLD.items()):
     _out_dir = gold_csv.parent
     _cols = set(df.columns)
 
-    fields = []
+    _classes = ({str(int(r['segment'])): str(r['class'])
+                 for _, r in df.iterrows()} if 'class' in _cols else {})
+    fields, _pfields = [], []
     for col, label, unit, ramp, dec in _FIELD_DEFS:
         if col not in _cols:
             continue
@@ -2707,8 +2730,20 @@ for cond, (gold_csv, prov) in sorted(_COND_GOLD.items()):
             # whose segments lost their sub-16 Hz points.
             print(f'  {col}: no finite values on any segment -- not mapped')
             continue
+        _pfields.append(plate_plotly.Field(col, label, unit, vals, _classes,
+                                           decimals=dec))
         if Field is not None:
             fields.append(Field(col, label, unit, ramp, dec, vals))
+
+    # ── Interactive map: hover any segment, dropdown picks the parameter ──
+    if _pfields:
+        _pfig = plate_plotly.interactive_plate(
+            _pfields, title=f'{_LEEPA} / {cond} / SNR {_SNR or "default"}',
+            subtitle=f'mode {EVALUATION_MODE}')
+        _pl_out = _out_dir / 'plate_maps_interactive.html'
+        _pfig.write_html(str(_pl_out), include_plotlyjs='cdn')
+        displayHTML(_pfig.to_html(full_html=False, include_plotlyjs='cdn'))
+        print(f'  Interactive plate map: {_pl_out}')
 
     if fields and write_html is not None:
         _html_out = _out_dir / 'plate_interactive.html'
@@ -2729,9 +2764,8 @@ for cond, (gold_csv, prov) in sorted(_COND_GOLD.items()):
                     f'style="border:none;"></iframe>')
 
     # ── Static maps, one per parameter, VALUE PRINTED IN EVERY SEGMENT ──
-    # Each map keeps its own ramp from _FIELD_DEFS (HFR viridis, R_ct
-    # inferno, R_mt magma; R_pol's 'thermal' is not a matplotlib ramp, so it
-    # is drawn in magma). The colour scale is FIXED per parameter, the same
+    # All in plate_style's Jet scale. The colour scale is FIXED per
+    # parameter, the same
     # for every condition: config.HEATMAP_LIMITS (change it there, or
     # override it here, e.g. config.HEATMAP_LIMITS['R_ct'] = (20, 250)).
     # With config.HEATMAP_FIXED_SCALE = False it falls back to the 5th..95th
@@ -2741,25 +2775,22 @@ for cond, (gold_csv, prov) in sorted(_COND_GOLD.items()):
     # in the colours, which is how the HFR map looked. Values outside the
     # percentile range keep the end colour, are printed as measured, and the
     # colour bar gets an arrow for them.
-    _classes = ({str(int(r['segment'])): str(r['class'])
-                 for _, r in df.iterrows()} if 'class' in _cols else {})
     _defs = {d[0]: d for d in _FIELD_DEFS}
     for col in ('R_ohmic', 'R_ct', 'R_mt', 'R_pol', 'T_degC'):
         if col not in _cols or col not in _defs:
             continue
-        _, label, unit, ramp, dec = _defs[col]
-        if ramp not in plt.colormaps():
-            ramp = 'magma'
+        _, label, unit, _ramp, dec = _defs[col]
         vals = {int(r['segment']): float(r[col]) for _, r in df.iterrows()
                 if pd.notna(r[col]) and np.isfinite(r[col])}
         if not vals:
             continue
         # Plate drawn as in the interactive viewer: frame, bolts, the four
-        # ports with flow arrows (O2 OUT top left, H2 OUT top right, H2 IN
-        # bottom left, AIR / O2 IN bottom right), sensors T1..T4, and the
-        # fixed colour scale from config.HEATMAP_LIMITS. plate_figure.py.
+        # gas ports and the two coolant ports with flow arrows, sensors
+        # T1..T4, and the fixed colour scale from config.HEATMAP_LIMITS.
+        # Which side each port is on follows config.PLATE_VIEW_MIRRORED and
+        # config.COOLANT_INLET_END. plate_figure.py.
         fig = plate_figure.draw_flow_plate(
-            vals, col, classes=_classes,
+            vals, col, classes=_classes, label=label, unit=unit, decimals=dec,
             title=f'{_LEEPA} / {cond} / SNR {_SNR or "default"}')
         _png_out = _out_dir / f'plate_{col}.png'
         fig.savefig(str(_png_out), dpi=200, bbox_inches='tight',
@@ -2776,29 +2807,43 @@ for cond, (gold_csv, prov) in sorted(_COND_GOLD.items()):
 # MF4 TEST-STAND PARAMETERS — every recorded channel for the selected order
 #
 # Reads the .mf4 measurement file(s) from the Gamry Volume, filters by the
-# selected Leepa order ID, and plots all parameters grouped by category:
-#   1. Electrical  (voltage, current, power, HFR)
-#   2. Temperature (inlet/outlet anode, cathode, coolant)
-#   3. Flow rates  (H2, air, N2, coolant)
-#   4. Pressure    (inlet/outlet anode, cathode, coolant)
-#   5. Humidity    (RH anode/cathode, dew points)
+# selected Leepa order ID, and draws ONE interactive figure (bench_plots.py):
+#
+#   * the "parameter" dropdown (top right) picks what is drawn: a single
+#     parameter, e.g. "Temperature · Coolant inlet (T_Si_CL)", or a whole
+#     group that shares a unit, e.g. "Temperature — all [°C]"
+#       1. Electrical  (voltage, current, power, HFR)
+#       2. Temperature (inlet/outlet anode, cathode, coolant)
+#       3. Flow rates  (H2, air, N2, coolant)
+#       4. Pressure    (inlet/outlet anode, cathode, coolant)
+#       5. Humidity    (RH anode/cathode, dew points)
+#       6. Other channels in the file (MF4_INCLUDE_ALL_CHANNELS)
+#   * the legend toggles: click an entry to hide/show it, double-click to see
+#     it alone
+#   * move the cursor over the plot to read every visible value at that time;
+#     drag the range slider under it to zoom in time
+#
+# The FAMOS plate temperature sensors (temp1..temp4, from bronze for each
+# selected condition) are drawn as dotted reference lines on every °C view,
+# so the plate temperature can be read against the bench's coolant and gas
+# temperatures directly. temp1 sits at x = 0 (H2-inlet / air-outlet end),
+# temp4 at x = 252 mm (air-inlet end) -- see config.COOLANT_INLET_END.
 # ═══════════════════════════════════════════════════════════════════════════════
 try:
-    from asammdf import MDF as _MDF
+    import asammdf  # noqa: F401
 except ImportError:
     import subprocess, sys
     subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q', 'asammdf'])
-    from asammdf import MDF as _MDF
 
-import numpy as np
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
+import json
 from pathlib import Path
-from IPython.display import display
+
+import bench_plots
 
 _MF4_DIR = Path('/Volumes/ps_xplatform_dev/rvadvtec_dev/ev_rvadvtec_dev/Gamry')
 _LEEPA_MF4 = str(_widget('leepa_id', 'LEEPA', 'leepa'))
+MF4_INCLUDE_ALL_CHANNELS = True   # False: only the channels in the groups above
+MF4_MAX_POINTS = 3000             # per channel; min/max kept, spikes survive
 
 # ── Find MF4 files for the selected order ─────────────────────────────────────
 _mf4_files = sorted(
@@ -2816,110 +2861,47 @@ else:
     # Use the LARGEST file (the main measurement, not Anfang/Ende snapshots)
     _main_mf4 = max(_mf4_files, key=lambda f: f.stat().st_size)
     print(f'\n  Reading: {_main_mf4.name}')
+    _t0 = bench_plots.mf4_start_time(_main_mf4)
 
-    # ── Channel groups to plot ────────────────────────────────────────────────
-    _CHANNEL_GROUPS = {
-        'Electrical': [
-            ('U_S',       'Stack voltage',    'V'),
-            ('I_S',       'Stack current',    'A'),
-            ('P_S_el',    'Electrical power', 'W'),
-            ('R_S_HFR',   'HFR',              'mΩ'),
-            ('U_CVM001',  'Cell voltage 1',   'V'),
-            ('U_CVM002',  'Cell voltage 2',   'V'),
-        ],
-        'Temperature': [
-            ('T_Si_A',    'Inlet anode',      '°C'),
-            ('T_Si_C',    'Inlet cathode',    '°C'),
-            ('T_So_A',    'Outlet anode',     '°C'),
-            ('T_So_C',    'Outlet cathode',   '°C'),
-            ('T_Si_CL',   'Coolant inlet',    '°C'),
-            ('T_So_CL',   'Coolant outlet',   '°C'),
-            ('T_Ti_CL',   'CL pre-heater',    '°C'),
-            ('T_To_CL',   'CL post-heater',   '°C'),
-        ],
-        'Flow Rates': [
-            ('FN_Si_H2_A',    'H₂ anode',       'Nl/min'),
-            ('FN_Si_Air_C',   'Air cathode',     'Nl/min'),
-            ('FN_Si_N2_A',    'N₂ anode',        'Nl/min'),
-            ('FN_Si_CL',      'Coolant',         'l/min'),
-        ],
-        'Pressure': [
-            ('p_Si_A',    'Inlet anode',      'bara'),
-            ('p_Si_C',    'Inlet cathode',    'bara'),
-            ('p_So_A',    'Outlet anode',     'bara'),
-            ('p_So_C',    'Outlet cathode',   'bara'),
-            ('p_Ti_CL',   'Coolant inlet',    'bara'),
-            ('p_To_CL',   'Coolant outlet',   'bara'),
-        ],
-        'Humidity': [
-            ('RH_Si_A_gas',  'RH anode',         '%'),
-            ('RH_Si_C_gas',  'RH cathode',       '%'),
-            ('DPT_Si_A',     'Dew point anode',   '°C'),
-            ('DPT_Si_C',     'Dew point cathode', '°C'),
-        ],
-    }
+    _chans = bench_plots.read_mf4(_main_mf4,
+                                  include_others=MF4_INCLUDE_ALL_CHANNELS,
+                                  max_points=MF4_MAX_POINTS)
+    _by_group = {}
+    for _c in _chans:
+        _by_group.setdefault(_c.group, []).append(_c.name)
+    for _g, _names in _by_group.items():
+        print(f'  {_g}: {len(_names)} channel(s)')
+    _wanted = {n for _g in bench_plots.CHANNEL_GROUPS.values() for n, _, _ in _g}
+    _absent = sorted(_wanted - {c.name for c in _chans})
+    if _absent:
+        print(f'  not in this file: {", ".join(_absent)}')
 
-    _mdf = _MDF(str(_main_mf4))
+    # ── FAMOS plate sensors for the selected condition(s), as °C references ──
+    _refs = []
+    for _cond in selected_conditions():
+        try:
+            _d, _ = result_dir(_LEEPA_MF4, _cond)
+            _man = Path(_d) / 'bronze' / 'bronze_manifest.json' if _d else None
+            _sens = (json.loads(_man.read_text()).get('sensor_T_degC', {})
+                     if _man is not None and _man.is_file() else {})
+        except Exception as _e:                                # noqa: BLE001
+            _sens = {}
+        for _k in sorted(_sens):
+            _x = geom.TEMP_SENSOR_X_MM.get(_k)
+            _refs.append((f'FAMOS {_k} ({_x:.0f} mm) — {_cond}'
+                          if _x is not None else f'FAMOS {_k} — {_cond}',
+                          '°C', float(_sens[_k])))
+    if _refs:
+        print(f'  FAMOS plate sensors overlaid: {len(_refs)} line(s) '
+              f'({", ".join(selected_conditions())})')
 
-    # Build a lookup: channel name -> (group_index, channel_index)
-    _ch_lookup = {}
-    for gi, grp in enumerate(_mdf.groups):
-        for ci, ch in enumerate(grp.channels):
-            if ch.name not in ('t', 'Time'):
-                _ch_lookup[ch.name] = gi
-
-    # ── Plot each category ────────────────────────────────────────────────────
-    for _cat_name, _channels in _CHANNEL_GROUPS.items():
-        # Filter to channels that actually exist in this file
-        _avail = [(name, label, unit) for name, label, unit in _channels
-                  if name in _ch_lookup]
-        if not _avail:
-            print(f'  {_cat_name}: no channels found in this file')
-            continue
-
-        n = len(_avail)
-        fig, axes = plt.subplots(n, 1, figsize=(16, 2.5 * n + 1),
-                                 sharex=True, squeeze=False)
-        fig.suptitle(f'{_LEEPA_MF4} — {_cat_name}',
-                     fontsize=14, fontweight='bold', y=1.0)
-
-        for i, (ch_name, ch_label, ch_unit) in enumerate(_avail):
-            ax = axes[i, 0]
-            try:
-                sig = _mdf.get(ch_name, group=_ch_lookup[ch_name])
-                t = sig.timestamps
-                v = sig.samples
-                # Filter out sentinel values (e.g. -1e12 in R_S_HFR)
-                mask = np.isfinite(v) & (np.abs(v) < 1e10)
-                t, v = t[mask], v[mask]
-                if len(t) > 1:
-                    ax.plot(t / 60.0, v, linewidth=0.8, label=ch_label)
-                    ax.set_ylabel(f'{ch_label}\n[{ch_unit}]', fontsize=9)
-                    # Show min/max/mean in legend
-                    ax.legend([f'{ch_label}  (mean={np.mean(v):.2f}, '
-                               f'min={np.min(v):.2f}, max={np.max(v):.2f})'],
-                              fontsize=8, loc='upper right')
-                else:
-                    ax.text(0.5, 0.5, f'{ch_label}: constant or no data',
-                            transform=ax.transAxes, ha='center', va='center',
-                            fontsize=9, color='grey')
-                    ax.set_ylabel(f'{ch_label}\n[{ch_unit}]', fontsize=9)
-            except Exception as _e:
-                ax.text(0.5, 0.5, f'{ch_label}: error ({_e})',
-                        transform=ax.transAxes, ha='center', va='center',
-                        fontsize=9, color='red')
-                ax.set_ylabel(f'{ch_label}\n[{ch_unit}]', fontsize=9)
-            ax.grid(True, alpha=0.3)
-            ax.tick_params(labelsize=8)
-
-        axes[-1, 0].set_xlabel('Time [min]', fontsize=10)
-        fig.tight_layout()
-        display(fig)
-        plt.close(fig)
-        print(f'  {_cat_name}: {n} channels plotted')
-
-    _mdf.close()
-    print(f'\n  Done — {_main_mf4.name}')
+    _fig = bench_plots.bench_figure(
+        _chans, start='Temperature', reference_lines=_refs,
+        title=(f'{_LEEPA_MF4} — {_main_mf4.name}'
+               + (f' (start {_t0:%Y-%m-%d %H:%M:%S})' if _t0 else '')))
+    displayHTML(_fig.to_html(full_html=False, include_plotlyjs='cdn'))
+    print(f'\n  Done — {_main_mf4.name}: {len(_chans)} channels; pick one in '
+          f'the "parameter" dropdown, click legend entries to toggle them')
 
 # COMMAND ----------
 
@@ -3375,10 +3357,10 @@ for cond, blob in ECM_ALL.items():
 # The same ECM parameters, laid out on the plate.  Driven off ECM_ALL, so the
 # maps and the Nyquist overlays can never disagree about what was fitted.
 #
-# Drawn with plate_figure (the viewer's plate layout with ports and flow
-# arrows): the real segment outlines, the fitted VALUE printed
-# inside every segment, and the same ramps (Rs viridis) on the same FIXED
-# scale as the pipeline's own maps above (config.HEATMAP_LIMITS) -- so an
+# Drawn with plate_figure (the viewer's plate layout with gas and coolant
+# ports and flow arrows): the real segment outlines, the fitted VALUE printed
+# inside every segment, and the same Jet colours (plate_style) on the same
+# FIXED scale as the pipeline's own maps above (config.HEATMAP_LIMITS) -- so an
 # ECM Rs map and a pipeline HFR map can be read side by side. (This cell used to draw one dot
 # per segment centroid on an RdYlGn ramp, which showed neither the segment
 # shapes nor the numbers.)
@@ -3395,12 +3377,12 @@ for cond, blob in ECM_ALL.items():
         continue
  
     _maps = [
-        ('Rs (ECM)',    {s: r['params']['Rs'] * 1000 for s, r in seg_fits.items()}, 'viridis'),
-        ('R_ct (ECM)',  {s: r['R_ct'] * 1000        for s, r in seg_fits.items()}, 'inferno'),
-        ('R_pol (ECM)', {s: r['R_pol'] * 1000       for s, r in seg_fits.items()}, 'magma'),
+        ('Rs (ECM)',    {s: r['params']['Rs'] * 1000 for s, r in seg_fits.items()}),
+        ('R_ct (ECM)',  {s: r['R_ct'] * 1000        for s, r in seg_fits.items()}),
+        ('R_pol (ECM)', {s: r['R_pol'] * 1000       for s, r in seg_fits.items()}),
     ]
  
-    for param_name, param_map, ramp in _maps:
+    for param_name, param_map in _maps:
         param_map = {str(k): v for k, v in param_map.items()
                      if str(k) in geom.SEGMENTS and np.isfinite(v)}
         if len(param_map) < 3:

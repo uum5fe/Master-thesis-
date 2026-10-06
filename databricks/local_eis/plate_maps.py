@@ -35,20 +35,22 @@ Rebuilt / inferred segments (class != "measured") are hatched, so an
 estimate is never mistaken for a measurement.
 
 The orientation is the one `r2d2_geometry.plot_map` uses (and the numbering
-cell of the runner shows): pad row 1 at the top.
+cell of the runner shows): pad row 1 at the top, mirrored left <-> right when
+config.PLATE_VIEW_MIRRORED is set. Colours (plotly Jet), text sizes (value
+large, number small) and the inlet / outlet / coolant labels on the two ends
+come from plate_style, like every other plate map.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
+import plate_style as style
 import r2d2_geometry as geom
 from r2d2_geometry import PAD_W_MM, PAD_H_MM, PLATE_W_MM, PLATE_H_MM
 
-try:
-    from config import FLOW_ARRANGEMENT, FLOW_DESCRIPTION
-except Exception:                                           # noqa: BLE001
-    FLOW_ARRANGEMENT, FLOW_DESCRIPTION = "unknown", {"unknown": ""}
+#: room left beside each end of the plate for the inlet / outlet labels (mm)
+_END_MARGIN_MM = 40.0
 
 
 def _finite(values: dict) -> dict[str, float]:
@@ -92,14 +94,11 @@ def robust_limits(values: dict, pct=(5.0, 95.0)) -> tuple[float, float]:
     return lo, hi
 
 
-def _text_colour(rgba) -> str:
-    r, g, b = rgba[:3]
-    lum = 0.2126 * r + 0.7152 * g + 0.0722 * b
-    return "black" if lum > 0.55 else "white"
+_text_colour = style.ink
 
 
 def draw_value_map(values: dict, label: str, unit: str = "",
-                   cmap: str = "magma", decimals: int = 1,
+                   cmap: str | None = None, decimals: int = 1,
                    title: str | None = None, classes: dict | None = None,
                    pct=(5.0, 95.0), limits: tuple[float, float] | None = None,
                    plate_name: str | None = None, figsize=(15, 7.8),
@@ -108,6 +107,8 @@ def draw_value_map(values: dict, label: str, unit: str = "",
 
     values   segment -> value (already in display units)
     classes  segment -> "measured" | "substituted" | "inferred" | ...
+    cmap     None = the plate_style scale (plotly Jet); a matplotlib name
+             to override it
     pct      percentile range for the colour scale; None = min..max
     limits   explicit (vmin, vmax), overrides pct
     Returns (fig, ax).
@@ -125,7 +126,7 @@ def draw_value_map(values: dict, label: str, unit: str = "",
 
     vmin, vmax = limits if limits is not None else robust_limits(vals, pct)
     norm = Normalize(vmin=vmin, vmax=vmax)
-    cm = plt.get_cmap(cmap)
+    cm = style.mpl_cmap(cmap)
 
     fig, ax = plt.subplots(figsize=figsize)
     fig.patch.set_facecolor("white")
@@ -156,15 +157,18 @@ def draw_value_map(values: dict, label: str, unit: str = "",
             if p is geom.ACTIVE_PLATE and n in geom.LABEL_ROW else s.cy_mm
         if narrow:
             lx, ly = s.cx_mm, s.cy_mm
-        ax.text(lx, ly - (1.9 if v is not None else 0), n, ha="center",
-                va="center", fontsize=(5.5 if narrow else 6.5), color=tc,
-                alpha=0.85, zorder=6)
+        ax.text(lx, ly + (style.NUMBER_DY_MM if v is not None else 0), n,
+                ha="center", va="center",
+                fontsize=(style.NUMBER_FONT_NARROW if narrow
+                          else style.NUMBER_FONT),
+                color=tc, alpha=0.85, zorder=6)
         if v is not None:
-            ax.text(lx, ly + 1.6, f"{v:.{decimals}f}"
+            ax.text(lx, ly + style.VALUE_DY_MM, f"{v:.{decimals}f}"
                     + ("*" if estimated else ""),
                     ha="center", va="center",
-                    fontsize=(6.3 if narrow else 8.6), fontweight="bold",
-                    color=tc, zorder=6)
+                    fontsize=(style.VALUE_FONT_NARROW if narrow
+                              else style.VALUE_FONT),
+                    fontweight="bold", color=tc, zorder=6)
 
     # segment outlines: an edge between two pads owned by different segments
     owner = {pad: n for n, seg in segments.items() for pad in seg.pads}
@@ -179,15 +183,15 @@ def draw_value_map(values: dict, label: str, unit: str = "",
     ax.add_patch(Rectangle((0, 0), PLATE_W_MM, PLATE_H_MM, facecolor="none",
                            edgecolor="#444", lw=1.6, zorder=5))
 
-    ax.set_xlim(-2, PLATE_W_MM + 2)
+    style.annotate_ends(ax, PLATE_W_MM, PLATE_H_MM)
+    ax.set_xlim(*style.xlim(-_END_MARGIN_MM, PLATE_W_MM + _END_MARGIN_MM))
     ax.set_ylim(PLATE_H_MM + 2, -2)
     ax.set_aspect("equal")
     ax.set_xticks([])
     ax.set_yticks([])
     for sp_ in ax.spines.values():
         sp_.set_visible(False)
-    ax.set_xlabel(FLOW_DESCRIPTION.get(FLOW_ARRANGEMENT, ""), fontsize=10,
-                  color="#555")
+    ax.set_xlabel(style.flow_note(), fontsize=10, color="#555")
 
     fin = np.array(list(vals.values()), float)
     below = bool(fin.size and fin.min() < vmin - 1e-12)

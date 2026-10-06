@@ -181,3 +181,12 @@ def test_each_end_is_a_column_gas_out_above_coolant_gas_in_below(monkeypatch):
         assert max(xs) - min(xs) < 1e-6, f"{column} not stacked in one column"
         assert ys[0] < ys[1] < ys[2], f"{column} not top-to-bottom (y down)"
     plt.close(fig)
+
+
+def test_every_port_is_drawn_solid_by_default():
+    fig = plate_figure.draw_flow_plate(_vals(), "R_ohmic")
+    alphas = {t.get_text(): t.get_alpha() for t in fig.axes[0].texts}
+    for lab in ("H₂ IN", "H₂ OUT", "AIR IN", "AIR OUT",
+                "COOLANT IN", "COOLANT OUT"):
+        assert alphas[lab] in (None, 1.0), lab
+    plt.close(fig)

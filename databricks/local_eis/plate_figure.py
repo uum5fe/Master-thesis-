@@ -109,7 +109,7 @@ def draw_flow_plate(values: dict, param: str, title: str = "",
                     limits: tuple[float, float] | None = None,
                     label: str | None = None, unit: str | None = None,
                     cmap: str | None = None, decimals: int | None = None,
-                    side: str = "cathode", show_values: bool = True,
+                    side: str | None = None, show_values: bool = True,
                     plate_name: str | None = None, figsize=(16, 9.4)):
     """One plate heat map in the viewer's layout. Returns the figure.
 
@@ -119,8 +119,9 @@ def draw_flow_plate(values: dict, param: str, title: str = "",
     classes   segment -> "measured" | "substituted" | "inferred" | ...;
               anything but "measured" is hatched and its value starred
     limits    explicit (vmin, vmax); default = config.heatmap_limits(param)
-    side      "cathode" or "anode": that side's ports are drawn solid, the
-              other side's faded (as the viewer does)
+    side      None (default): every port drawn solid. "cathode" or "anode":
+              that side's ports solid and the other gas's faded, as the
+              interactive viewer does
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -250,7 +251,7 @@ def draw_flow_plate(values: dict, param: str, title: str = "",
         cx = (0.0 if end == "x0" else W) + sgn * _PORT_CX
         for lab, role, col in streams:
             kind = style.port_kind(lab)
-            live = 1.0 if kind in (side, "coolant") else 0.3
+            live = 1.0 if side is None or kind in (side, "coolant") else 0.3
             y = _PORT_Y[style.port_slot(lab)]
             x = cx - _PORT_W / 2
             ax.add_patch(FancyBboxPatch((x, y), _PORT_W, _PORT_H,
@@ -356,7 +357,7 @@ def __getattr__(name):
 
 def write_condition_maps(summary_csv, out_dir, title: str = "",
                          params=("R_ohmic", "R_ct", "R_mt", "R_pol"),
-                         dpi: int = 200, side: str = "cathode") -> dict:
+                         dpi: int = 200, side: str | None = None) -> dict:
     """Draw plate_<param>.png for every param from a gold plate_summary.csv."""
     import csv
     from pathlib import Path

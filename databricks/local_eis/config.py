@@ -98,28 +98,29 @@ FLOW_DESCRIPTION = {
 # WHICH END THE COOLANT ENTERS: "x0" (pad column 1, the H2-inlet / air-outlet
 # end) or "xW" (pad column 45, the air-inlet end).
 #
-# "x0" is INFERRED, not read off a drawing. The four FAMOS plate sensors
-# (temp1 at x = 0 ... temp4 at x = 252 mm) rise monotonically from x = 0 to
-# x = 252 in three of the four runs evaluated (2612030 45A +1.07 K, 60A
-# +1.02 K, 2611976 45A +0.80 K), and the bench log has the coolant leaving
-# warmer than it enters -- so the coolant picks up heat travelling from x = 0
-# towards x = 252. A hot air inlet (T_Si_C runs above the plate) at x = 252
-# would warm the same end, so confirm against the plate's coolant manifold
-# drawing; a coolant-inlet temperature step settles it too (the sensor that
-# responds first is at the coolant inlet). Change it here if it is the other
-# end: the maps redraw the coolant ports from this.
-COOLANT_INLET_END = "x0"
+# "xW" is the layout set on the plate drawing: coolant in at the air-inlet
+# end (right), out at the H2-inlet / air-outlet end (left) -- coolant
+# co-flowing with the air. Note that the four FAMOS plate sensors (temp1 at
+# x = 0 ... temp4 at x = 252 mm) read WARMEST at x = 252 in three of the four
+# runs evaluated (2612030 45A +1.07 K, 60A +1.02 K, 2611976 45A +0.80 K).
+# Coolant picks up heat along its path, so its inlet end should be the cool
+# one; with the inlet at x = 252 that gradient has to come from something
+# else, e.g. the hot inlet air (T_Si_C runs above the plate) at the same end.
+# Worth confirming against the manifold drawing; a coolant-inlet temperature
+# step settles it (the sensor that responds first is at the coolant inlet).
+# The maps redraw the coolant ports from this.
+COOLANT_INLET_END = "xW"
 
 # HOW THE PLATE IS DRAWN.  False: as the pad map is numbered, pad column 1 on
-# the left (H2 in and air out on the left, air in on the right).  True: seen
-# from the other side, mirrored left <-> right, so the air (cathode) inlet is
-# on the LEFT and the H2 inlet on the right.
+# the left -- O2 out top left, H2 out top right, H2 in bottom left, air in
+# bottom right; with COOLANT_INLET_END = "xW", coolant out left, in right.
+# True: seen from the other side, mirrored left <-> right.
 #
-# The whole plate mirrors -- segments, numbers, ports, coolant, sensors -- so
-# the air inlet stays next to the segments it really feeds. Only the picture
-# changes; every coordinate in the CSVs (cx_mm, cy_mm) stays in plate
-# coordinates.
-PLATE_VIEW_MIRRORED = True
+# Either way the whole plate is drawn together -- segments, numbers, ports,
+# coolant, sensors -- so every port stays next to the segments it really
+# feeds. Only the picture changes; every coordinate in the CSVs (cx_mm,
+# cy_mm) stays in plate coordinates.
+PLATE_VIEW_MIRRORED = False
 
 
 # ===========================================================================

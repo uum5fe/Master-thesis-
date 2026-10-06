@@ -29,8 +29,10 @@ r2d2_geometry's pad map is in PLATE coordinates: x = 0 at pad column 1,
 y = 0 at pad row 1, y pointing down. The gases and the coolant are fixed to
 those coordinates (config.py, "WHICH WAY THE GASES ACTUALLY GO"):
 
-    x = 0     (pad column 1)  : H2 in (bottom), air out (top), coolant in
-    x = 252   (pad column 45) : air in (bottom), H2 out (top), coolant out
+    x = 0     (pad column 1)  : H2 in (bottom), air out (top), coolant out
+    x = 252   (pad column 45) : air in (bottom), H2 out (top), coolant in
+
+(the coolant end is config.COOLANT_INLET_END).
 
 config.PLATE_VIEW_MIRRORED draws the plate seen from the other side, i.e.
 mirrored left <-> right. EVERYTHING mirrors together -- segments, numbers,
@@ -158,10 +160,10 @@ def coolant_inlet_end() -> str:
     """'x0' or 'xW': the plate end the coolant enters at (config)."""
     try:
         import config
-        end = getattr(config, "COOLANT_INLET_END", "x0")
+        end = getattr(config, "COOLANT_INLET_END", "xW")
     except Exception:                                       # noqa: BLE001
-        end = "x0"
-    return end if end in ("x0", "xW") else "x0"
+        end = "xW"
+    return end if end in ("x0", "xW") else "xW"
 
 
 def flow_arrangement() -> str:

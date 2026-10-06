@@ -119,14 +119,16 @@ interactive map, the ECM maps and the numbering map) takes its look from
 - **colours**: plotly's Jet scale, stop for stop, the same as the bench's
   intensity plots;
 - **text**: the value large and bold, the segment number small above it;
-- **view**: `config.PLATE_VIEW_MIRRORED = True` draws the plate from the other
-  side (air inlet on the left, H2 inlet on the right). The whole drawing
-  mirrors, so the ports stay beside the segments they feed; CSV coordinates
-  stay in plate coordinates;
+- **view**: pad column 1 on the left -- O₂ out top left, H₂ out top right,
+  H₂ in bottom left, air in bottom right. `config.PLATE_VIEW_MIRRORED = True`
+  draws the plate from the other side instead; the whole drawing mirrors, so
+  the ports stay beside the segments they feed. CSV coordinates stay in plate
+  coordinates;
 - **ports**: gas inlets/outlets and the coolant inlet/outlet on their ends.
-  The coolant end is `config.COOLANT_INLET_END` — inferred from the FAMOS
-  plate sensors (temp1 at x = 0 coldest, temp4 at x = 252 mm warmest), so
-  confirm it against the manifold drawing.
+  The coolant end is `config.COOLANT_INLET_END = "xW"`: in at the air-inlet
+  end (right), out on the left. The FAMOS plate sensors read warmest at that
+  end, which a coolant inlet alone would not cause -- confirm against the
+  manifold drawing.
 
 `plate_plotly.py` draws the interactive map (hover a segment for its value,
 the dropdown switches parameter). `bench_plots.py` draws the MF4 test-bench

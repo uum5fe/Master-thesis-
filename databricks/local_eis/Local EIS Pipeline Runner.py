@@ -2588,7 +2588,8 @@ for cond, fn in DTA.items():
 # LOOK: every map here -- the interactive one and the static PNGs -- is drawn
 # from plate_style: plotly's Jet scale (the bench reference plots' colours),
 # the VALUE large and bold with the segment number small above it, the plate
-# mirrored when config.PLATE_VIEW_MIRRORED is set (air inlet on the left), and
+# O2 out / H2 out on top, H2 in / air in at the bottom (mirrored only when
+# config.PLATE_VIEW_MIRRORED is set), and
 # the gas inlets/outlets and the coolant inlet/outlet on their ends.
 # The interactive map is plate_plotly (hover a segment for its value, the
 # dropdown switches parameter). The external plate_viewer draws in its own
@@ -2827,7 +2828,8 @@ for cond, (gold_csv, prov) in sorted(_COND_GOLD.items()):
 # selected condition) are drawn as dotted reference lines on every °C view,
 # so the plate temperature can be read against the bench's coolant and gas
 # temperatures directly. temp1 sits at x = 0 (H2-inlet / air-outlet end),
-# temp4 at x = 252 mm (air-inlet end) -- see config.COOLANT_INLET_END.
+# temp4 at x = 252 mm (air-inlet and coolant-inlet end) -- see
+# config.COOLANT_INLET_END.
 # ═══════════════════════════════════════════════════════════════════════════════
 try:
     import asammdf  # noqa: F401

@@ -188,6 +188,38 @@ def read_bode_folder(folder, skip_raw: bool = True) -> dict[str, GamrySweep]:
     return out
 
 
+def find_abgleich_dirs(roots, max_depth: int = 6) -> list[Path]:
+    """Folders that look like an Abgleich delivery: a `bode/` holding
+    per-segment sweeps (`*_#<n>.DTA`) next to `coefficients/curr.csv`.
+
+    Walks at most `max_depth` levels below each root, without following
+    into the folders it is looking for, so a large Volume stays cheap.
+    """
+    hits: list[Path] = []
+    for root in roots or []:
+        root = Path(root)
+        if not root.is_dir():
+            continue
+        frontier = [(root, 0)]
+        while frontier:
+            d, depth = frontier.pop()
+            try:
+                if (d / "bode").is_dir() and any(
+                        re.search(r"#\d+\.DTA$", p.name, re.I)
+                        for p in (d / "bode").iterdir()):
+                    hits.append(d)
+                    continue
+                if depth >= max_depth:
+                    continue
+                frontier += [(c, depth + 1) for c in d.iterdir()
+                             if c.is_dir() and not c.name.startswith(".")]
+            except (PermissionError, OSError):
+                continue
+    return sorted(set(hits),
+                  key=lambda p: (not (p / "coefficients" / "curr.csv").is_file(),
+                                 str(p)))
+
+
 # ---------------------------------------------------------------------------
 # Chain response export
 # ---------------------------------------------------------------------------

@@ -691,8 +691,47 @@ if PLATE == 'gen2':
 # data, how much of the in-situ lag the ex-situ chain explains; whatever it
 # does not explain stays with the in-situ stage (CHANNEL_LAG = 'correct').
 # ═══════════════════════════════════════════════════════════════════════════════
-ABGLEICH_DIR = ''      # e.g. '/Volumes/.../R2D2_green_Kashyyyk/Abgleichdaten/Kashyyyk'
- 
+# THE FOLDER TO PUT HERE is the plate's calibration ("Abgleich") delivery --
+# the one that holds BOTH of these sub-folders:
+#
+#     <ABGLEICH_DIR>/
+#         coefficients/curr.csv        72 rows "c0;c1"  (the same kind of file
+#         coefficients/temp.csv         4 rows           as your curr.csv)
+#         bode/<name>_100kHz_1Hz_500mA_#1.DTA   one Gamry sweep per segment,
+#         bode/<name>_100kHz_1Hz_500mA_#2.DTA   #1 .. #72 (the "_Raw.DTA"
+#         ...                                   files beside them are ignored)
+#         Step1_<T>Grad.csv, Step2_...          (the DC calibration steps)
+#
+# e.g. '/Volumes/.../R2D2_green_Kashyyyk/Abgleichdaten/Kashyyyk' for the gen1
+# (green / Kashyyyk) plate. Point it at the folder ABOVE bode/, not at bode/.
+# Left empty, the roots below are searched and every match is listed.
+ABGLEICH_DIR = ''
+ABGLEICH_SEARCH_ROOTS = [
+    '/Volumes/ps_xplatform_dev/rvadvtec_dev/ev_rvadvtec_dev',
+    '/Workspace/Users/uum5fe@bosch.com',
+]
+
+if not ABGLEICH_DIR:
+    _cand = gamry_dta.find_abgleich_dirs(ABGLEICH_SEARCH_ROOTS)
+    if _cand:
+        print(f"  ABGLEICH_DIR is empty; found {len(_cand)} candidate(s) "
+              f"(a bode/ with per-segment #n.DTA sweeps):")
+        for _c in _cand:
+            _ok = (_c / 'coefficients' / 'curr.csv').is_file()
+            _n = len([p for p in (_c / 'bode').glob('*.DTA')
+                      if not p.stem.endswith('_Raw')])
+            print(f"    {_c}   ({_n} sweeps, coefficients/curr.csv "
+                  f"{'present' if _ok else 'MISSING'})")
+        _ready = [c for c in _cand
+                  if (c / 'coefficients' / 'curr.csv').is_file()]
+        if len(_ready) == 1:
+            ABGLEICH_DIR = str(_ready[0])
+            print(f"  -> using the only complete one: {ABGLEICH_DIR}")
+        else:
+            print("  -> more than one (or none complete): copy the right path "
+                  "into ABGLEICH_DIR above and re-run this cell. For gen1 it "
+                  "is the green / Kashyyyk delivery.")
+
 if ABGLEICH_DIR:
     import csv
     _ab = Path(ABGLEICH_DIR)
@@ -755,9 +794,12 @@ if ABGLEICH_DIR:
           f"constant to {100*_ia.get('cv', float('nan')):.2f} % across segments"
           f"{'' if not _ia.get('outliers') else '  — outliers: ' + ', '.join(_ia['outliers'])}")
 else:
-    print("  ABGLEICH_DIR is empty — skipping. Set it to build a chain-response "
-          "file; without one the top decade of the band carries -11° of "
-          "uncorrected phase.")
+    print("  ABGLEICH_DIR is empty and no Abgleich delivery (a folder with "
+          "bode/*_#<n>.DTA and coefficients/curr.csv) was found under "
+          f"{ABGLEICH_SEARCH_ROOTS} -- skipping. Ask for / upload the plate's "
+          "calibration delivery and set ABGLEICH_DIR to it; without it the "
+          "top decade of the band carries -11 deg of uncorrected phase "
+          "(the in-situ CHANNEL_LAG stage still runs).")
 
 # COMMAND ----------
 

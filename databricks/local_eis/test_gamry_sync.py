@@ -241,3 +241,18 @@ def test_bode_tau_uses_the_in_situ_model_and_sign():
     rng = np.random.default_rng(0)
     other = {s: 1e-6 * rng.normal(0, 50) for s in taus}
     assert gamry_dta.compare_chain_tau(got, other)["explained"] < 0.5
+
+
+def test_the_abgleich_delivery_is_found_by_its_layout(tmp_path):
+    import gamry_dta
+    good = tmp_path / "R2D2_green_Kashyyyk" / "Abgleichdaten" / "Kashyyyk"
+    (good / "bode").mkdir(parents=True)
+    (good / "coefficients").mkdir()
+    (good / "coefficients" / "curr.csv").write_text("0.45;0.1\n")
+    (good / "bode" / "plate_100kHz_1Hz_500mA_#1.DTA").write_text("x")
+    half = tmp_path / "other" / "x"
+    (half / "bode").mkdir(parents=True)
+    (half / "bode" / "a_#2.DTA").write_text("x")
+    (tmp_path / "noise" / "bode").mkdir(parents=True)     # no #n sweeps
+    hits = gamry_dta.find_abgleich_dirs([tmp_path])
+    assert hits == [good, half]                 # complete delivery first

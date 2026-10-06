@@ -315,6 +315,49 @@ def write_gain_csv(sweeps: dict[str, GamrySweep], path,
     return path
 
 
+def chain_tau(sweeps: dict[str, GamrySweep], f_lo: float = 50.0,
+              f_hi: float = 1200.0) -> dict[str, float]:
+    """Per segment: the first-order time constant tau [s] of its chain,
+    from arg H = atan(w tau) over f_lo..f_hi -- the same model and the same
+    sign as channel_lag.py fits in situ (Z_meas = Z_true / H, H = 1 + j w tau),
+    so the two can be compared segment by segment."""
+    import channel_lag
+    out = {}
+    for seg, sw in sweeps.items():
+        s = sw.sorted()
+        H = _normalised(s, None)
+        m = (s.freq >= f_lo) & (s.freq <= f_hi) & np.isfinite(H)
+        if m.sum() < 3:
+            continue
+        # fit_tau fits phase = -atan(w tau); arg H = +atan(w tau)
+        tau, _res = channel_lag.fit_tau(s.freq[m], -np.angle(H[m]), 1e-3)
+        out[str(seg)] = tau
+    return out
+
+
+def compare_chain_tau(bode_tau: dict[str, float],
+                      insitu_tau: dict[str, float]) -> dict:
+    """Does the ex-situ chain explain the in-situ per-segment lag?
+
+    Both are compared about their own plate median (the in-situ one is only
+    known relative to it). `explained` is the fraction of the in-situ spread
+    that the bode spread accounts for, and `r` their correlation.
+    """
+    common = sorted(set(bode_tau) & set(insitu_tau), key=int)
+    if len(common) < 5:
+        return {"ok": False, "n": len(common)}
+    b = np.array([bode_tau[s] for s in common]) * 1e6
+    i = np.array([insitu_tau[s] for s in common]) * 1e6
+    b, i = b - np.median(b), i - np.median(i)
+    r = float(np.corrcoef(b, i)[0, 1]) if b.std() > 0 and i.std() > 0 else 0.0
+    resid = i - b
+    return {"ok": True, "n": len(common), "r": r,
+            "sd_bode_us": float(b.std(ddof=1)),
+            "sd_insitu_us": float(i.std(ddof=1)),
+            "sd_after_us": float(resid.std(ddof=1)),
+            "explained": float(1 - resid.var(ddof=1) / i.var(ddof=1))}
+
+
 def chain_summary(sweeps: dict[str, GamrySweep],
                   at_hz=(1e3, 4.5e3, 1e4, 1e5)) -> list[dict]:
     """Median |H| and phase across segments at a few frequencies.

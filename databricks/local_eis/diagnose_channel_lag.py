@@ -188,6 +188,9 @@ def main(argv=None) -> int:
                          "SNR/THD-rejected anyway")
     ap.add_argument("--write-gain", type=Path,
                     help="write the median tau per segment as a gain file")
+    ap.add_argument("--bode", type=Path,
+                    help="Abgleich bode/ folder: compare each segment's "
+                         "ex-situ chain tau with the in-situ one")
     a = ap.parse_args(argv)
     a.out.mkdir(parents=True, exist_ok=True)
 
@@ -210,6 +213,20 @@ def main(argv=None) -> int:
     if T.shape[1] > 1:
         print("\n  tau repeatability (correlation between runs):")
         print(T.corr().round(2).to_string())
+    if a.bode:
+        import gamry_dta
+        bt = gamry_dta.chain_tau(gamry_dta.read_bode_folder(a.bode),
+                                 a.f_lo, a.f_max)
+        med = (T.median(axis=1) * 1e-6).to_dict()
+        c = gamry_dta.compare_chain_tau(bt, med)
+        if c.get("ok"):
+            print(f"\n  bode (ex-situ) vs in-situ tau over {c['n']} segments:"
+                  f" r = {c['r']:+.2f}; spread bode {c['sd_bode_us']:.1f} us, "
+                  f"in situ {c['sd_insitu_us']:.1f} us, left after removing "
+                  f"the bode part {c['sd_after_us']:.1f} us "
+                  f"({100 * c['explained']:.0f} % explained)")
+        else:
+            print(f"\n  bode comparison: only {c.get('n', 0)} common segments")
     if a.write_gain:
         med = T.median(axis=1) * 1e-6
         rows = gain_rows(med.to_dict())

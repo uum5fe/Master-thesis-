@@ -180,3 +180,34 @@ comparison finds its sweep.
 **Diagnostic across runs:** `python diagnose_channel_lag.py RUN [RUN ...] -o
 out/ [--write-gain g.csv]` — the same estimator, τ side by side per run and
 its repeatability.
+
+## The Gamry clock (`gamry_sync.py`)
+
+The FAMOS cards record the cell's response to the Gamry's OWN sweep: on
+2612030 every FAMOS window from 0.3 Hz to 1.2 kHz ends at t_gamry + 99.24 s
+(60 A; 106.94 s at 45 A), spread 0.44 s — the .dta's one-second stamps. So the
+.dta for the condition (found under `gamry_dir` like the whole-cell
+comparison) gives every step's exact frequency and time.
+
+| `GAMRY_SYNC` / `cfg.gamry_sync` | what it does |
+| --- | --- |
+| `report` (CLI default) | measure the offset; `bronze/gamry_sync.csv`: per Gamry point ok / misplaced / missing |
+| `frequency` | + the Gamry's exact frequencies (the ladder snap was up to 1 % off); a REFUSED card lag that the Gamry clock corroborates is applied (`bronze/gamry_card_sync.csv`) |
+| `guide` (runner default) | + misplaced and missing windows re-located inside their Gamry slot, each verified by hf_schedule's CFAR and rank-1 tests — a prediction alone is never accepted, and a slot without the tone drops the wrong window |
+
+What it found on 2612030 / 60 A: 1.5–4.7 kHz misplaced by 6–96 s (placed by
+interpolation), 5.9–9.5 kHz never detected — the band the HFR arc closes in.
+It refuses (and changes nothing) when fewer than 5 confidently detected steps
+agree on one offset, as at 150 A where two cards were never aligned.
+It needs the raw .DAT: `--reevaluate` cannot apply it to saved spectra.
+
+## Chain calibration from the Abgleich bode sweeps
+
+Set `ABGLEICH_DIR` in the "Chain response" cell and run it once: the gain file
+is written to `CHAIN_GAIN_DEFAULT` (beside curr.csv), `GAIN_FILE` is set, and
+every later session picks it up. It removes the roll-off every segment shares
+(−2.5° at 1 kHz, −11° at 4.5 kHz). On the delivered sweeps the segments differ
+by only ~2° at 4.5 kHz (~1 µs), far less than the in-situ lags (±40–110 µs),
+so the in-situ stage (`CHANNEL_LAG`) stays on;
+`diagnose_channel_lag.py RUN… --bode <bode/>` and the cell itself report how
+much of the in-situ lag the ex-situ chain explains.

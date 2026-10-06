@@ -74,6 +74,8 @@ import pandas as pd
 import config
 import utils
 import eis_local
+import gamry_sync
+import channel_lag
 import bronze
 import silver
 import gold
@@ -97,7 +99,8 @@ import polcurve
 import ecm_drt
  
 # Force reload during development (plate_style before the maps that use it)
-for mod in [config, utils, eis_local, bronze, silver, gold, pipeline_main,
+for mod in [config, utils, eis_local, gamry_sync, channel_lag, bronze, silver,
+            gold, pipeline_main,
             geom, csv_source, csv_pipeline, gamry_dta, gamry_compare, abgleich,
             ladder_snap, tone_estimation, eis_measurement_model,
             figure_panels, plate_style, plate_maps, plate_figure, plate_plotly,
@@ -518,12 +521,25 @@ SOURCE_FORMAT = _w('source_format', 'famos')
 CSV_PATH = ''
 CSV_DIALECT = 'auto'
 CSV_TONES = ()
-GAIN_FILE = ''
+# The per-segment chain response, built ONCE by the "Chain response" cell from
+# the Abgleich bode/ sweeps and kept beside curr.csv. If it exists it is used
+# on every run (bronze divides each segment's Z by it); set GAIN_FILE = '' to
+# switch it off, or to another path to override it.
+CHAIN_GAIN_DEFAULT = Path('/Workspace/Users/uum5fe@bosch.com') / f'chain_gain_{PLATE}.csv'
+GAIN_FILE = (globals().get('GAIN_FILE')
+             or (str(CHAIN_GAIN_DEFAULT) if CHAIN_GAIN_DEFAULT.is_file() else ''))
+print(f"  chain response: {GAIN_FILE or 'NONE -- run the Chain response cell once'}")
 # Current-chain lag per segment (channel_lag.py), measured on every run:
 # 'correct' removes it before R_ohmic is read, 'report' only records it,
 # 'off' skips the stage. See silver/channel_lag.csv and the "channel lag"
 # plausibility check after each run.
 CHANNEL_LAG = 'correct'
+# Gamry clock (gamry_sync.py): the FAMOS cards record the Gamry's own sweep,
+# so its .dta gives every step's exact frequency and time. 'guide' uses the
+# exact frequencies, applies a refused card lag the Gamry corroborates, and
+# re-locates misplaced high-frequency windows (verified by a CFAR test);
+# 'frequency' does the first two; 'report' only writes bronze/gamry_sync.csv.
+GAMRY_SYNC = 'guide'
 GAMRY_DIR = str(GAMRY_ROOT) if GAMRY_ROOT else ''
 # The build token that ties this order to its sweeps. It travels into the
 # Config, so the pipeline's own whole-cell comparison filters on it too --
@@ -662,12 +678,23 @@ if PLATE == 'gen2':
 # the default analysis band, so this is the same order as the acquisition skew
 # the pipeline works hard to remove, and unlike a skew it moves |Z| too.
 #
-# Set ABGLEICH_DIR to the folder holding coefficients/ and bode/, run this
-# cell once, and paste the resulting path into the 'Chain-response CSV' widget.
+# Set ABGLEICH_DIR to the folder holding coefficients/ and bode/ and run this
+# cell ONCE. The file is written beside curr.csv (CHAIN_GAIN_DEFAULT) and
+# GAIN_FILE is set to it, here and -- because the settings cell looks for it
+# -- in every later session. Nothing to paste.
+#
+# WHAT IT FIXES AND WHAT IT DOES NOT. It removes the chain roll-off every
+# segment shares (-2.5 deg at 1 kHz, -11 deg at 4.5 kHz). The per-segment
+# lags the in-situ stage measures (channel_lag.py, up to ~100 us on 2612030)
+# are another matter: on the delivered sweeps the segments differ by only
+# ~2 deg at 4.5 kHz, i.e. ~1 us. The comparison printed below says, on your
+# data, how much of the in-situ lag the ex-situ chain explains; whatever it
+# does not explain stays with the in-situ stage (CHANNEL_LAG = 'correct').
 # ═══════════════════════════════════════════════════════════════════════════════
 ABGLEICH_DIR = ''      # e.g. '/Volumes/.../R2D2_green_Kashyyyk/Abgleichdaten/Kashyyyk'
  
 if ABGLEICH_DIR:
+    import csv
     _ab = Path(ABGLEICH_DIR)
     _sweeps = gamry_dta.read_bode_folder(_ab / 'bode')
     print(f"  {len(_sweeps)} segment sweeps")
@@ -686,10 +713,35 @@ if ABGLEICH_DIR:
         print('  Writing the index-free plate median instead, which still '
               'removes the common roll-off.')
  
-    _gain_out = Path(tempfile.gettempdir()) / f'chain_gain_{PLATE}.csv'
+    _gain_out = Path(CHAIN_GAIN_DEFAULT)
     gamry_dta.write_gain_csv(_sweeps, _gain_out,
                              curr_csv=_curr, shared=not _chk_g['ok'])
-    print(f"  written: {_gain_out}   ← paste this into the widget")
+    GAIN_FILE = str(_gain_out)
+    print(f"  written: {_gain_out}  -> GAIN_FILE is set; every run from now "
+          f"on applies it")
+
+    # per segment: the chain's own time constant, to set beside the in-situ
+    # lag of a finished run (silver/channel_lag.csv, CHANNEL_LAG stage)
+    _btau = gamry_dta.chain_tau(_sweeps)
+    if _btau:
+        _bt = np.array(list(_btau.values())) * 1e6
+        print(f"  ex-situ chain tau over {len(_bt)} segments: median "
+              f"{np.median(_bt):+.1f} us, spread (sd) {np.std(_bt):.1f} us")
+        _lag_csvs = sorted(Path('/Volumes/ps_xplatform_dev/rvadvtec_dev/'
+                                'ev_rvadvtec_dev/EIS_Results').rglob(
+                                    'silver/channel_lag.csv'))[-1:] \
+            if Path('/Volumes/ps_xplatform_dev/rvadvtec_dev/ev_rvadvtec_dev/'
+                    'EIS_Results').exists() else []
+        for _lc in _lag_csvs:
+            _ins = {r['segment']: float(r['tau_us']) * 1e-6
+                    for r in csv.DictReader(open(_lc))
+                    if r.get('tau_us') not in ('', None)}
+            _c = gamry_dta.compare_chain_tau(_btau, _ins)
+            if _c.get('ok'):
+                print(f"  vs in-situ lag of {_lc.parent.parent.name}: "
+                      f"r = {_c['r']:+.2f}, in-situ spread "
+                      f"{_c['sd_insitu_us']:.0f} us, {100*_c['explained']:.0f} % "
+                      f"explained by the ex-situ chain")
  
     # And check the DC calibration itself while we are here.
     _rep = abgleich.verify(_ab, _curr, _ab / 'coefficients' / 'temp.csv')
@@ -1083,7 +1135,8 @@ def _run_identity(mode=None, f_min=None, f_max=None, snr=None):
         exclude_segments=globals().get('EXCLUDE_SEGMENTS', frozenset()),
         substitute_segments=globals().get('SUBSTITUTE_SEGMENTS', frozenset()),
         fill_missing_from_neighbours=globals().get('FILL_GAPS', False),
-        channel_lag=globals().get('CHANNEL_LAG', 'correct'))
+        channel_lag=globals().get('CHANNEL_LAG', 'correct'),
+        gamry_sync=globals().get('GAMRY_SYNC', 'guide'))
     if mode and mode != 'default':
         base = base.preset(mode)
     # A set has no order, and json's default=str would spell the SAME
@@ -1712,6 +1765,7 @@ for cond in _conditions_to_run:
         csv_tones=CSV_TONES,
         gain_file=Path(GAIN_FILE) if GAIN_FILE else None,
         channel_lag=CHANNEL_LAG,
+        gamry_sync=GAMRY_SYNC,
         gamry_dir=Path(GAMRY_DIR) if GAMRY_DIR else None,
         gamry_version=GAMRY_VERSION,
         bench_log=Path(BENCH_LOG) if BENCH_LOG else None,

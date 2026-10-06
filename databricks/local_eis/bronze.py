@@ -72,6 +72,7 @@ from eis_local import (FamosFile, PlateCalibration, detect_schedule,
                        pick_reference_channel, Step)
 import hf_schedule
 import ladder_snap
+import gamry_sync
 
 import tone_estimation
 import utils
@@ -1014,6 +1015,34 @@ def consensus_schedule(files: list[Path], cards: dict[str, CardInfo],
                  f"({steps[0].freq:.3f}..{steps[-1].freq:.1f} Hz)"
                  if steps else f"  {stem}: nothing found")
 
+    # ---- the Gamry clock: corroborate refused card lags --------------------
+    gs_mode = gamry_sync.mode(cfg)
+    timeline = gamry_sync.find_timeline(cfg, log) if gs_mode != "off" else None
+    card_sync = []
+    if timeline is not None and lags is not None:
+        f_top = min((cfg.f_hi(v) for v in fs_seen.values()), default=np.inf)
+        card_sync = gamry_sync.corroborate_card_lags(
+            per_card, lags, fs_seen, timeline, cfg.f_min_hz, f_top)
+        for row in card_sync:
+            c = row["card"]
+            if not row.get("corroborated"):
+                continue
+            msg = (f"  {c}: refused lag {row['measured_lag_s']:+.4f} s is "
+                   f"corroborated by the Gamry clock "
+                   f"({row['gamry_implied_lag_s']:+.3f} s)")
+            if gs_mode in ("frequency", "guide"):
+                d = int(lags[c].get("lag", 0))
+                lags[c]["applied"] = True
+                lags[c]["corroborated_by"] = list(
+                    lags[c].get("corroborated_by", []) or []) + ["gamry"]
+                per_card[c] = [ladder_snap._rebuild(Step, st,
+                                                    start=st.start - d,
+                                                    stop=st.stop - d)
+                               for st in per_card[c]]
+                log.info(msg + " -- APPLIED")
+            else:
+                log.info(msg + " -- not applied (gamry_sync = report)")
+
     # ---- cluster across cards ---------------------------------------------
     allsteps: list[tuple[str, Step]] = [(c, s) for c, ss in per_card.items()
                                         for s in ss]
@@ -1184,6 +1213,15 @@ def consensus_schedule(files: list[Path], cards: dict[str, CardInfo],
             kept = fixed
             grid["window_sanity"] = win_info
 
+    # ---- the Gamry clock: exact frequencies, misplaced windows ------------
+    if timeline is not None and kept:
+        kept, gs_info = _gamry_guided(kept, timeline, files, cards, cfg, lags,
+                                      fs_seen, gs_mode, log)
+        gs_info["cards"] = card_sync
+        grid["gamry_sync"] = gs_info
+        if gs_info.get("ok") and gs_mode in ("frequency", "guide"):
+            grid["gamry_freqs"] = [float(f) for f in timeline.freq]
+
     log.info(f"  consensus: {len(kept)} steps "
              f"({kept[0].freq:.3f}..{kept[-1].freq:.1f} Hz), "
              f"{n_votes_kept} by card agreement, "
@@ -1299,7 +1337,81 @@ def _finite_median(values) -> float:
     return float(np.median(a)) if a.size else float("nan")
 
 
+def _gamry_guided(kept, tl, files, cards, cfg, lags, fs_seen, gs_mode, log):
+    """gamry_sync on the consensus schedule: report, exact frequencies, and
+    (guide) misplaced / missing windows re-located in their Gamry slot."""
+    utils.section(f"Gamry clock  (gamry_sync = {gs_mode}, {tl.path.name})",
+                  log)
+    fs_ref = float(np.median(list(fs_seen.values()))) if fs_seen else 25000.0
+    f_top = min((cfg.f_hi(v) for v in fs_seen.values()), default=np.inf)
+    res = gamry_sync.align(kept, tl, fs_ref, cfg.f_min_hz, f_top)
+    info = {"mode": gs_mode, "sweep": tl.path.name,
+            "started": str(tl.started) if tl.started else None,
+            **res.summary(), "rows": res.rows}
+    if not res.ok:
+        log.warning(f"  not synchronised: {res.reason} -- schedule unchanged")
+        return kept, info
+    v = res.summary()["verdicts"]
+    log.info(f"  FAMOS = Gamry + {res.offset_s:.2f} s (spread "
+             f"{res.spread_s:.2f} s over {res.n_voters} detected steps); "
+             f"in band: {v.get('ok', 0)} ok, {v.get('misplaced', 0)} "
+             f"misplaced, {v.get('missing', 0)} missing")
+    for r in res.rows:
+        if r["verdict"] != "ok":
+            log.info(f"    {r['f_gamry_hz']:9.2f} Hz  {r['verdict']}"
+                     + (f"  (window ends {r['time_resid_s']:+.1f} s from the "
+                        f"Gamry slot, {r['window_source']})"
+                        if r["verdict"] == "misplaced" else ""))
+    if gs_mode == "report":
+        return kept, info
+
+    def rebuild(st, **kw):
+        return ladder_snap._rebuild(Step, st, **kw)
+
+    kept, n_f = gamry_sync.apply_frequencies(kept, res, rebuild)
+    info["n_frequency_corrected"] = n_f
+    log.info(f"  {n_f} step frequencies set to the Gamry's exact values")
+    if gs_mode != "guide":
+        return kept, info
+
+    # one card carries the search: aligned, with the most segment channels
+    best = None
+    for fp in files:
+        c = cards.get(fp.stem)
+        lg = (lags or {}).get(fp.stem, {})
+        if c is None or not (lg.get("applied") or int(lg.get("lag", 0)) == 0):
+            continue
+        fam = FamosFile(fp)
+        n = len(fam.segment_names)
+        if best is None or n > best[2]:
+            best = (fp, fam, n, int(lg.get("lag", 0)) if lg.get("applied")
+                    else 0)
+    if best is None or best[2] < 3:
+        log.warning("  guide: no aligned card with segment channels to "
+                    "search on -- windows unchanged")
+        return kept, info
+    fp, fam, _n, lag = best
+    log.info(f"  re-locating on {fp.stem} ({_n} segment channels):")
+
+    def make_step(f, a, b, snr):
+        return Step(freq=f, start=a, stop=b, amp=float("nan"), snr_db=snr,
+                    thd=float("nan"), stationarity=float("nan"),
+                    window_source="gamry")
+
+    kept, moved = gamry_sync.relocate(
+        kept, res, tl, hf_schedule.LazyChannels(fam), float(fam.fs), lag,
+        rebuild, make_step, log=log)
+    info["relocated"] = moved
+    return kept, info
+
+
 def _on_grid(f: float, grid: dict, tol: float) -> bool:
+    # A frequency the Gamry reports having applied IS a step of the sweep,
+    # whether or not it sits on the geometric ladder (its synthesiser does
+    # not produce one exactly).
+    gf = grid.get("gamry_freqs")
+    if gf and min(abs(f / g - 1.0) for g in gf) <= 1e-3:
+        return True
     # A grid that the fitter REJECTED is not evidence of anything.  Without
     # this check a discarded fit still set on_grid, which then swapped the
     # SNR gate for the far looser snr_floor_db on those points.
@@ -1932,6 +2044,17 @@ def save(run_obj: BronzeRun, cfg: Config, log=None) -> Path:
     log = log or utils.get_logger(cfg.verbose)
     out = Path(cfg.out_dir) / "bronze"
     out.mkdir(parents=True, exist_ok=True)
+
+    gsi = (run_obj.grid or {}).get("gamry_sync") or {}
+    if gsi.get("rows"):
+        moved = {r["gamry_index"]: r for r in gsi.get("relocated", []) or []}
+        utils.write_table(out / "gamry_sync.csv", [
+            {**{k: (round(v, 6) if isinstance(v, float) else v)
+                for k, v in r.items()},
+             "relocation": moved.get(r["gamry_index"], {}).get("result", "")}
+            for r in gsi["rows"]])
+    if gsi.get("cards"):
+        utils.write_table(out / "gamry_card_sync.csv", gsi["cards"])
 
     rows = []
     for seg in run_obj.segments_measured():

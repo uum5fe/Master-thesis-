@@ -259,6 +259,16 @@ class Config:
     # at the wrong time does not, and is flagged instead of "corrected".
     # Calibrated on 2612030 45/60/150 A and 2611976 45 A: good channels fit
     # to 0.2-4 deg, lags -100..+180 us.
+    # THE GAMRY CLOCK (gamry_sync.py). The FAMOS cards record the cell's
+    # response to the Gamry's own sweep, so the .dta for this condition (found
+    # under gamry_dir like the whole-cell comparison does) knows the exact
+    # frequency and the time of every step. "report": measure the clock offset
+    # and list misplaced / missing steps (bronze/gamry_sync.csv). "frequency":
+    # also use the Gamry's exact frequencies, and apply a refused card lag
+    # that the Gamry clock corroborates. "guide": also re-locate misplaced and
+    # missing windows inside their Gamry slot, each verified by a CFAR test.
+    # On 2612030 / 60 A: offset 99.24 s, spread 0.44 s; 1.5-4.7 kHz misplaced.
+    gamry_sync: str = "report"             # off | report | frequency | guide
     channel_lag: str = "correct"           # off | report | correct
     channel_lag_f_lo_hz: float = 50.0      # below: no lag is visible
     channel_lag_min_points: int = 4

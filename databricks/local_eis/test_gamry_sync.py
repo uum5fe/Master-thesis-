@@ -163,6 +163,34 @@ def test_a_slot_without_the_tone_drops_the_wrong_window():
     assert "dropped" in r["result"]
 
 
+def test_an_interpolated_window_inside_the_tolerance_is_still_searched():
+    """2612030 / 45 A and 450 A: the 1884 and 2391 Hz windows were guessed by
+    window sanity, landed within the Gamry's time tolerance ("ok"), and still
+    missed the tone -- drift-rejected in every segment, band cut at 1.5 kHz."""
+    det = []
+    for s in _detected():
+        if abs(s.freq - 1884.2 * 1.003) < 1:
+            f, a, b = [x for x in _truth() if abs(x[0] - 1884.2) < 1][0]
+            # half a second late: inside the 1.5 s tolerance, mostly on the
+            # next (1516 Hz) dwell
+            s = _step(s.freq, a + 0.15, b + 0.15, snr=-12, src="interpolated")
+        det.append(s)
+    res = gs.align(det, _timeline(), FS)
+    r = [r for r in res.rows if round(r["f_gamry_hz"]) == 1884][0]
+    assert r["verdict"] == "ok" and r["window_source"] == "interpolated"
+    steps, rows = gs.relocate(
+        list(det), res, _timeline(), _chans(), FS, 0, _rebuild,
+        lambda f, a, b, snr: _step(f, a / FS, b / FS, snr=snr, src="gamry"))
+    s = min(steps, key=lambda x: abs(x.freq - 1884.2))
+    _f, ta, tb = [x for x in _truth() if abs(x[0] - 1884.2) < 1][0]
+    assert s.window_source == "gamry"
+    assert ta - 0.01 <= s.start / FS and s.stop / FS <= tb + 0.01
+    row = [r for r in rows if round(r["f_gamry_hz"]) == 1884][0]
+    assert row["was"] == "interpolated" and row["result"] == "relocated"
+    # a detected "ok" window is left alone
+    assert not [r for r in rows if r["was"] == "ok"]
+
+
 def test_a_refused_card_lag_is_corroborated_by_the_gamry_clock():
     tl = _timeline()
     good = _detected()

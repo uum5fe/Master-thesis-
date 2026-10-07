@@ -856,6 +856,13 @@ def card_voltage_check(card_ref: dict) -> Check:
     def after(r):
         return 100 * (r.gain / (r.applied or 1.0) - 1) if np.isfinite(r.gain) \
             else float("nan")
+    if not any(np.isfinite(after(r)) for r in used.values()):
+        return Check("card voltage gain", NA,
+                     "no card's UC gain could be measured (too few clean steps "
+                     "and no DC level)", float("nan"), rests)
+    srcs = {getattr(r, "source", "") for r in used.values()} - {""}
+    how = (" (from the DC level)" if srcs == {"dc"} else
+           " (from the step phasors)" if srcs == {"ac"} else "")
     txt = ", ".join(f"{cg.short(c)} {after(r):+.2f} %"
                     + (f" (removed {100 * (r.applied - 1):+.2f} %)"
                        if r.applied != 1.0 else "")
@@ -866,7 +873,7 @@ def card_voltage_check(card_ref: dict) -> Check:
     flat = [cg.short(c) for c, r in used.items() if r.status == cg.NOT_FLAT]
     off = [cg.short(c) for c, r in used.items()
            if r.status == cg.OFF and r.applied == 1.0]
-    ch = next(iter({r.channel for r in used.values()}))
+    ch = next(iter({r.channel for r in used.values()})) + how
     if big:
         return Check("card voltage gain", FAIL,
                      f"{ch}: {', '.join(big)} more than 10 % from the other "

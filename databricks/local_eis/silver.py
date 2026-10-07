@@ -1414,6 +1414,10 @@ def process_segment(sp: BronzeSpectrum, skew: SkewModel, cfg: Config,
     # ---- measured on ------------------------------------------------------
     if chain is not None and chain.applied_s:
         z_corr = z_corr * channel_lag.correction(f, chain.applied_s)
+    # ---- the UC taps' own series resistance (cfg.uc_series_mohm_cm2) -----
+    r_tap = float(getattr(cfg, "uc_series_mohm_cm2", 0.0) or 0.0)
+    if r_tap:
+        z_corr = z_corr - r_tap / 1000.0
 
     # ---- passivity, NOW that the phase is corrected ------------------------
     # Above passivity_gate_min_hz a passive cell has Re Z > 0.  Below it, a

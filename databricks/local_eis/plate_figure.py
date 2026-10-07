@@ -56,6 +56,7 @@ RAMPS = {
 _JET = style.HEATMAP_CMAP
 FIELDS = {
     "R_ohmic":     ("HFR (Rs)", "mΩ·cm²", _JET, 1),
+    "ReZ_1kHz":    ("Re Z at 1 kHz", "mΩ·cm²", _JET, 1),
     "R_ct":        ("R_ct (charge transfer)", "mΩ·cm²", _JET, 1),
     "R_mt":        ("R_mt (mass transport)", "mΩ·cm²", _JET, 1),
     "R_pol":       ("R_pol (total polarisation)", "mΩ·cm²", _JET, 1),

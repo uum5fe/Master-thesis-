@@ -91,6 +91,11 @@ class CardReference:
     used_for_Z: bool = False           # this is the channel Z divides by
     applied: float = 1.0               # what Z was divided by
     status: str = ""
+    #: "ac": gain from the step phasors; "dc": from the DC level, used when
+    #: too few steps carry an AC phasor clean enough (on 2612030 the UC2 AC
+    #: response sits at 0-20 dB per step, while the DC level is ~0.8 V and
+    #: is read to 1e-4 over the whole record)
+    source: str = ""
 
     @property
     def gain_pct(self) -> float:
@@ -110,7 +115,8 @@ class CardReference:
                 "flat_pct": r(self.flat_pct, 2),
                 "phase_deg": r(self.phase_deg, 3), "dt_us": r(self.dt_us, 2),
                 "dc_V": r(self.dc_V, 5), "dc_ratio": r(self.dc_ratio, 5),
-                "applied": r(self.applied, 5), "status": self.status}
+                "applied": r(self.applied, 5), "status": self.status,
+                "source": self.source}
 
 
 def _band(freq, vals, lo, hi):
@@ -141,13 +147,18 @@ def compare_phasors(freq: np.ndarray, A: dict[str, np.ndarray],
     S = np.vstack([np.asarray(snr[c], float) for c in cards])
     good = np.isfinite(M) & np.isfinite(S) & (S >= snr_min) & (np.abs(M) > 0)
     Mg = np.where(good, M, np.nan)
-    with np.errstate(invalid="ignore", divide="ignore"):
+    import warnings
+    with np.errstate(invalid="ignore", divide="ignore"), \
+            warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
         mag_ref = np.nanmedian(np.abs(Mg), axis=0)
         unit = np.where(good, M / np.abs(np.where(good, M, 1)), 0)
         ph_ref = np.angle(unit.sum(axis=0))
         ratio = Mg / (mag_ref * np.exp(1j * ph_ref))
     Dc = np.vstack([np.asarray(dc[c], float) for c in cards])
-    dc_card = np.nanmedian(Dc, axis=1)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        dc_card = np.nanmedian(Dc, axis=1)
     dc_ref = float(np.nanmedian(dc_card)) if np.isfinite(dc_card).any() \
         else float("nan")
 
@@ -164,9 +175,17 @@ def compare_phasors(freq: np.ndarray, A: dict[str, np.ndarray],
         if len(cards) < 3:
             ref.status = TWO_CARDS
         if m.sum() < n_min:
-            ref.status = ref.status or TOO_FEW
+            if not ref.status and np.isfinite(ref.dc_ratio):
+                # the DC level: same cell voltage on every card, read over
+                # the whole record -- a gain to 1e-4, no flatness test
+                ref.gain, ref.source = ref.dc_ratio, "dc"
+                ref.status = (TOO_LARGE if abs(ref.gain_pct) > big else
+                              OFF if abs(ref.gain_pct) > tol else OK)
+            else:
+                ref.status = ref.status or TOO_FEW
             out[c] = ref
             continue
+        ref.source = "ac"
         g = np.abs(r)
         ph = np.angle(r)
         ref.gain = float(np.median(g[m]))
@@ -296,7 +315,8 @@ def load_reference(run_dir) -> dict[str, dict[str, CardReference]]:
                 phase_deg=num(r.get("phase_deg")), dt_us=num(r.get("dt_us")),
                 dc_V=num(r.get("dc_V")), dc_ratio=num(r.get("dc_ratio")),
                 used_for_Z=str(r.get("used_for_Z", "0")) == "1",
-                applied=num(r.get("applied"), 1.0), status=r.get("status", ""))
+                applied=num(r.get("applied"), 1.0), status=r.get("status", ""),
+                source=r.get("source", "") or "")
             out.setdefault(cr.channel, {})[cr.card] = cr
     return out
 
@@ -322,7 +342,10 @@ def _log(out, m, log) -> None:
                 parts.append(f"{short(c)} -- ({r.status})")
         tag = " [Z divides by this]" if any(r.used_for_Z
                                            for r in refs.values()) else ""
-        log.info(f"  {name} gain vs the median of {len(refs)} cards{tag}: "
+        srcs = {r.source for r in refs.values() if r.source}
+        how = (" from the DC level" if srcs == {"dc"} else
+               " from the step phasors" if srcs == {"ac"} else "")
+        log.info(f"  {name} gain vs the median of {len(refs)} cards{how}{tag}: "
                  + ", ".join(parts))
         dcs = [f"{short(c)} {1e3 * r.dc_V:.1f}" for c, r in sorted(refs.items())
                if np.isfinite(r.dc_V)]

@@ -114,6 +114,28 @@ def read_timeline(path) -> Timeline:
     return Timeline(path, f[ok], t[ok], started, iac)
 
 
+def read_vdc(path) -> float:
+    """Median of the Vdc column of a Gamry .dta ZCURVE table (the cell's DC
+    voltage at the Gamry's own sense leads), nan when there is none."""
+    path = Path(path)
+    lines = path.read_text(encoding="latin-1").splitlines()
+    try:
+        k = next(i for i, ln in enumerate(lines) if ln.startswith("ZCURVE"))
+        head = [h.strip() for h in lines[k + 1].split("\t")]
+        i_v = head.index("Vdc")
+    except (StopIteration, ValueError):
+        return float("nan")
+    v = []
+    for ln in lines[k + 3:]:
+        p = ln.split("\t")
+        if len(p) <= i_v or not ln.strip():
+            break
+        v.append(_num(p[i_v]))
+    v = np.asarray(v, float)
+    v = v[np.isfinite(v)]
+    return float(np.median(v)) if v.size else float("nan")
+
+
 def find_timeline(cfg, log=None) -> Timeline | None:
     """The sweep for cfg.condition under cfg.gamry_dir (same rules as the
     whole-cell comparison: order and build token decide the campaign)."""
@@ -312,7 +334,15 @@ def relocate(steps, sync: SyncResult, tl: Timeline, chans, fs: float,
              lag: int, rebuild, make_step, log=None,
              slot_before_s: float = 2.0, slot_after_s: float = 1.0
              ) -> tuple[list, list]:
-    """Re-locate misplaced and missing steps in their Gamry slot.
+    """Re-locate misplaced and missing steps in their Gamry slot -- and every
+    window that was only interpolated.
+
+    An interpolated window (bronze's window sanity guessed it from its
+    neighbours) can sit inside the Gamry's time tolerance and still miss the
+    tone: on 2612030 at 45 A and 450 A the 1884 and 2391 Hz windows passed
+    as "ok" and were then rejected for drift in all 67 segments, which cut
+    the band at 1.5 kHz. Such a window is searched for like a misplaced one;
+    if nothing verifiable is found it is kept as it was.
 
     `chans`: the segment channels of ONE card (hf_schedule.LazyChannels or a
     dict), in that card's own sample index; `lag` is that card's shift onto
@@ -326,12 +356,16 @@ def relocate(steps, sync: SyncResult, tl: Timeline, chans, fs: float,
     by_index = {r["gamry_index"]: r for r in sync.rows}
     order = sorted(by_index)                  # Gamry measurement order
     # common-base windows of the points already trusted, for the bounds
+    def guessed(r):
+        return r["verdict"] == "ok" and r.get("window_source") == "interpolated"
+
     trusted = {g: (steps[r["step_index"]].start, steps[r["step_index"]].stop)
-               for g, r in by_index.items() if r["verdict"] == "ok"}
+               for g, r in by_index.items()
+               if r["verdict"] == "ok" and not guessed(r)}
     out_rows, drop = [], set()
     for g in order:
         r = by_index[g]
-        if r["verdict"] == "ok":
+        if r["verdict"] == "ok" and not guessed(r):
             continue
         f = r["f_gamry_hz"]
         T = r["pred_end_s"] * fs                         # common base
@@ -344,7 +378,8 @@ def relocate(steps, sync: SyncResult, tl: Timeline, chans, fs: float,
         if nxt:
             hi = min(hi, min(nxt))
         lo, hi = int(lo + lag), int(hi + lag)            # card's own index
-        row = {"gamry_index": g, "f_gamry_hz": f, "was": r["verdict"],
+        was = "interpolated" if guessed(r) else r["verdict"]
+        row = {"gamry_index": g, "f_gamry_hz": f, "was": was,
                "search_s": (round((lo - lag) / fs, 3), round((hi - lag) / fs, 3))}
         win = locate(chans, fs, f, lo, hi) if hi > lo else None
         if win is None:
@@ -364,7 +399,7 @@ def relocate(steps, sync: SyncResult, tl: Timeline, chans, fs: float,
             else:
                 snr = hf_schedule._median_channel_snr_db(chans, fs, f, a, b)
                 a_c, b_c = a - lag, b - lag
-                if r["verdict"] == "misplaced":
+                if r["verdict"] in ("misplaced", "ok"):
                     i = r["step_index"]
                     steps[i] = rebuild(steps[i], freq=float(f), start=int(a_c),
                                        stop=int(b_c), snr_db=float(snr),
@@ -379,9 +414,11 @@ def relocate(steps, sync: SyncResult, tl: Timeline, chans, fs: float,
         if win is None and r["verdict"] == "misplaced":
             drop.add(r["step_index"])
             row["result"] = row["result"] + "; wrong window dropped"
+        elif win is None and guessed(r):
+            row["result"] = row["result"] + "; interpolated window kept"
         out_rows.append(row)
         if log is not None:
-            log.info(f"    {f:9.2f} Hz ({r['verdict']}): {row['result']}")
+            log.info(f"    {f:9.2f} Hz ({was}): {row['result']}")
     steps = [s for i, s in enumerate(steps) if i not in drop]
     steps.sort(key=lambda s: s.freq)
     return steps, out_rows

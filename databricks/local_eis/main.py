@@ -386,6 +386,9 @@ def reevaluate(run_dir, out_dir=None, **overrides) -> dict:
     cfg = Config.from_json(cj) if cj.is_file() else DEFAULT
     out = Path(out_dir) if out_dir else run_dir / "reevaluated"
     gain_file = overrides.pop("gain_file", None)
+    # maps added since the run was made are drawn too
+    overrides.setdefault("heatmap_params", tuple(dict.fromkeys(
+        tuple(cfg.heatmap_params) + tuple(DEFAULT.heatmap_params))))
     cfg = cfg.replace(out_dir=out, **overrides)
     geom.use_plate(cfg.plate)
     log = utils.get_logger(cfg.verbose)

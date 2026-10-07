@@ -271,6 +271,12 @@ def collect_parameters(sr: SilverRun, cfg: Config
         # the current-chain lag found (and, in "correct" mode, removed) for
         # this segment -- mapped so a wiring pattern is visible as one
         put("chain_tau_us", s, 1e6 * getattr(sp, "chain_tau_est", np.nan))
+        # Re Z at ONE common frequency. R_ohmic is Re Z at the top of each
+        # segment's kept band, so it moves with how far that band reaches
+        # (on 2612030 the plate median ran 59..69 mOhm*cm2 over four currents
+        # for that reason alone, while Re Z at 1 kHz agreed to 2 %). This one
+        # compares segments and conditions like for like.
+        put("ReZ_1kHz", s, re_at(sp.freq, sp.Z_corr, 1000.0))
         # |Z| and phase at the reference frequency
         f = sp.freq
         if len(f):
@@ -279,6 +285,26 @@ def collect_parameters(sr: SilverRun, cfg: Config
                 put("Z_mag_100Hz", s, abs(sp.Z_model[i]))
                 put("phase_100Hz", s, np.degrees(np.angle(sp.Z_model[i])))
     return vals, sds
+
+
+def re_at(freq, Z, f0: float) -> float:
+    """Re Z at f0 from the kept points, interpolated in log f; nan when f0
+    is outside them or the nearest points are more than a third of a decade
+    away (no extrapolation)."""
+    f = np.asarray(freq, float)
+    z = np.asarray(Z, complex)
+    ok = np.isfinite(f) & np.isfinite(z) & (f > 0)
+    f, z = f[ok], z[ok]
+    if f.size < 2 or not (f.min() <= f0 <= f.max()):
+        return float("nan")
+    o = np.argsort(f)
+    f, z = f[o], z[o]
+    k = int(np.searchsorted(f, f0))
+    k = min(max(k, 1), f.size - 1)
+    if np.log10(f[k] / f[k - 1]) > 1.0 / 3.0:
+        return float("nan")
+    return float(np.interp(np.log(f0), np.log(f[[k - 1, k]]),
+                           z.real[[k - 1, k]]))
 
 
 # ===========================================================================

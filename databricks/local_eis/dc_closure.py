@@ -24,6 +24,13 @@ conditions:
 One condition cannot separate the two; two can; four can also say whether
 a straight line is the right model (the residual).
 
+With --gamry it also compares the VOLTAGE: each card's UC2 DC level against
+the Gamry's own Vdc at the same condition. Two sense points that differ by a
+resistance R_x read  UC2 - Vdc = -I * R_x . On 2612030 that is a straight
+line through 45..450 A with 0.1 mV residual and R_x = 44 uOhm = 13.4
+mOhm*cm2 over the plate: every segment's Z carries that much more series
+resistance than the Gamry's. cfg.uc_series_mohm_cm2 subtracts it.
+
 Per card it also writes the card's mean current density against the plate's
 at each condition. A K error on a card is the same percentage at 45 A and at
 450 A; a real regional difference changes with load.
@@ -107,6 +114,45 @@ def bench_current(run: Path, bench_log=None, gamry_dir=None,
     return (c, "condition name") if np.isfinite(c) else (float("nan"), "")
 
 
+def uc2_dc(run: Path) -> float:
+    """Median over the cards of the UC2 DC level (bronze/card_reference.csv)."""
+    v = [_f(r.get("dc_V")) for r in _rows(run / "bronze" / "card_reference.csv")
+         if r.get("channel") == "UC2"]
+    v = [x for x in v if np.isfinite(x)]
+    return float(np.median(v)) if v else float("nan")
+
+
+def gamry_vdc(gamry_dir, condition: str) -> float:
+    if not gamry_dir:
+        return float("nan")
+    try:
+        import gamry_compare as gc
+        import gamry_sync as gs
+        for s in gc.find_cell_sweeps(gamry_dir):
+            if s.condition.upper() == str(condition).upper():
+                return gs.read_vdc(s.path)
+    except Exception:                                       # noqa: BLE001
+        pass
+    return float("nan")
+
+
+def sense_offset(rows: list[dict], plate_key: str = "gen1") -> dict:
+    """Fit UC2 - Vdc = b - I * R_x over the conditions."""
+    import r2d2_geometry
+    pts = [(r["i_ref_A"], r["uc2_V"] - r["gamry_vdc_V"]) for r in rows
+           if np.isfinite(r.get("uc2_V", np.nan))
+           and np.isfinite(r.get("gamry_vdc_V", np.nan))
+           and np.isfinite(r.get("i_ref_A", np.nan))]
+    if len(pts) < 2:
+        return {"n": len(pts)}
+    x, y = np.array(pts).T
+    a, b = np.polyfit(x, y, 1)
+    area = sum(s.area_cm2 for s in r2d2_geometry.plate(plate_key).segments.values())
+    return {"n": len(pts), "R_x_uohm": float(-1e6 * a),
+            "R_x_mohm_cm2": float(-1e3 * a * area), "offset_mV": float(1e3 * b),
+            "resid_mV": float(1e3 * np.std(y - (a * x + b)))}
+
+
 def analyse(runs, bench_log=None, gamry_dir=None, plate_key=None) -> dict:
     rows, cards = [], []
     for run in runs:
@@ -124,7 +170,9 @@ def analyse(runs, bench_log=None, gamry_dir=None, plate_key=None) -> dict:
                      "area_measured_cm2": round(a_meas, 2),
                      "i_measured_A": round(i_meas, 3),
                      "i_full_A": round(i_full, 3),
-                     "i_ref_A": i_ref, "i_ref_source": src})
+                     "i_ref_A": i_ref, "i_ref_source": src,
+                     "uc2_V": uc2_dc(run),
+                     "gamry_vdc_V": gamry_vdc(gamry_dir, cond)})
         jp = i_meas / a_meas if a_meas else float("nan")
         by: dict[str, list] = {}
         for r in meta:
@@ -140,6 +188,7 @@ def analyse(runs, bench_log=None, gamry_dir=None, plate_key=None) -> dict:
                                              if ac and jp else "")})
     fit = card_gain.dc_closure_table(rows)
     fit["cards"] = cards
+    fit["sense"] = sense_offset(rows, plate_key or "gen1")
     return fit
 
 
@@ -179,6 +228,19 @@ def plot(res: dict, path: Path) -> None:
     plt.close(fig)
 
 
+def print_sense(res: dict) -> None:
+    se = res.get("sense") or {}
+    if "R_x_uohm" not in se:
+        return
+    print(f"\n  UC2 DC vs the Gamry's Vdc over {se['n']} condition(s): "
+          f"UC2 - Vdc = {se['offset_mV']:+.1f} mV - I x {se['R_x_uohm']:.1f} "
+          f"uOhm (residual {se['resid_mV']:.1f} mV)")
+    print(f"  -> every segment's Z carries {se['R_x_mohm_cm2']:+.1f} mOhm*cm2 "
+          f"of series resistance the Gamry does not see; set "
+          f"uc_series_mohm_cm2 = {se['R_x_mohm_cm2']:.1f} to put the maps on "
+          f"the Gamry's reference plane")
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("runs", nargs="+", type=Path,
@@ -209,6 +271,7 @@ def main(argv=None) -> int:
               f"{res['resid_A']:.2f} A)")
         print(f"  -> every impedance carries {-res['scale_pct']:+.1f} % from "
               f"the current scale; the offset does not reach the impedance")
+    print_sense(res)
     print(f"\n  written to {a.out}")
     return 0
 

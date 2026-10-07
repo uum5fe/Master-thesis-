@@ -100,10 +100,12 @@ import polcurve
 import ecm_drt
 import plausibility
 import dc_closure
+import segment_scale
  
 # Force reload during development (plate_style before the maps that use it)
 for mod in [config, utils, eis_local, gamry_sync, channel_lag, card_gain,
-            bronze, silver, gold, plausibility, dc_closure, pipeline_main,
+            bronze, silver, gold, plausibility, dc_closure, segment_scale,
+            pipeline_main,
             geom, csv_source, csv_pipeline, gamry_dta, gamry_compare, abgleich,
             ladder_snap, tone_estimation, eis_measurement_model,
             figure_panels, plate_style, plate_maps, plate_figure, plate_plotly,
@@ -550,6 +552,12 @@ GAMRY_SYNC = 'guide'
 # .DAT files), 'correct' also divides that card's Z by it when the gain is
 # flat over the band and under 10 %, 'off' skips it.
 CARD_GAIN = 'report'
+# Series resistance between the FAMOS UC taps and the Gamry's sense leads,
+# in mOhm*cm2, subtracted from every segment's Re Z (config.uc_series_mohm_cm2).
+# The "Card voltage gain and DC current closure" cell measures it from UC2 DC
+# against the Gamry Vdc over all conditions: 13.4 on 2612030. 0 = Z as the UC
+# taps see it (the default); 13.4 = on the Gamry's reference plane.
+UC_SERIES_MOHM_CM2 = 0.0
 # The current-closure check compares the segment currents with the bench's
 # measured I_S at the Gamry sweep; without a readable bench log it uses the
 # current in the condition name (45A -> 45 A). Nothing to set here.
@@ -1192,7 +1200,8 @@ def _run_identity(mode=None, f_min=None, f_max=None, snr=None):
         fill_missing_from_neighbours=globals().get('FILL_GAPS', False),
         channel_lag=globals().get('CHANNEL_LAG', 'correct'),
         gamry_sync=globals().get('GAMRY_SYNC', 'guide'),
-        card_gain=globals().get('CARD_GAIN', 'report'))
+        card_gain=globals().get('CARD_GAIN', 'report'),
+        uc_series_mohm_cm2=float(globals().get('UC_SERIES_MOHM_CM2', 0.0)))
     if mode and mode != 'default':
         base = base.preset(mode)
     # A set has no order, and json's default=str would spell the SAME
@@ -1823,6 +1832,7 @@ for cond in _conditions_to_run:
         channel_lag=CHANNEL_LAG,
         gamry_sync=GAMRY_SYNC,
         card_gain=CARD_GAIN,
+        uc_series_mohm_cm2=float(UC_SERIES_MOHM_CM2),
         gamry_dir=Path(GAMRY_DIR) if GAMRY_DIR else None,
         gamry_version=GAMRY_VERSION,
         bench_log=Path(BENCH_LOG) if BENCH_LOG else None,
@@ -1950,6 +1960,7 @@ print(f"{'═'*75}")
 # ═══════════════════════════════════════════════════════════════════════════════
 importlib.reload(card_gain)
 importlib.reload(dc_closure)
+importlib.reload(segment_scale)
 
 _cg_runs = [Path(pr['out_dir']) for pr in PIPELINE_RESULTS.values()
             if pr and pr.get('out_dir')]
@@ -2000,6 +2011,7 @@ if _cg_runs:
               f"{_dcc['scale_pct']:+.2f} % (in every impedance as "
               f"{-_dcc['scale_pct']:+.2f} %), zero offset "
               f"{_dcc['offset_A']:+.2f} A (not in the impedance)")
+    dc_closure.print_sense(_dcc)
     _ct = pd.DataFrame(_dcc['cards'])
     if not _ct.empty:
         print("\n  card current density against the plate [%] -- a K error on "
@@ -2010,6 +2022,28 @@ if _cg_runs:
         print(_pv.round(2).to_string())
     if (_dcc_dir / 'dc_closure.png').is_file():
         display(IPImage(filename=str(_dcc_dir / 'dc_closure.png')))
+
+    # 4. PER-SEGMENT SCALE (segment_scale.py): is a segment's |Z| off by one
+    #    constant factor at every frequency AND every current? That is a
+    #    scale error in its current path (K in situ, or the area it really
+    #    collects from), not the cell -- and on 2612030 it is most of the
+    #    neighbour-to-neighbour HFR scatter. Written as a gain file, NOT
+    #    applied: trace it first (swap two channels' cables).
+    _ss_runs = [r for r in _cg_runs
+                if (r / 'silver' / 'spectra_clean.csv').is_file()]
+    if len(_ss_runs) >= 2:
+        _ssr = segment_scale.analyse(_ss_runs)
+        print(f"\n{'═'*75}\n  PER-SEGMENT SCALE FACTOR across "
+              f"{len(_ss_runs)} condition(s)\n{'═'*75}")
+        segment_scale.report(_ssr, log=lambda m: print(m))
+        _ssr['table'].to_csv(_dcc_dir / 'segment_scale.csv')
+        _ss_gain = segment_scale.write_gain(
+            _dcc_dir / 'segment_scale_gain.csv', _ssr['table'].scale,
+            note=', '.join(_ssr['conditions']))
+        print(f"  factors as a gain file (NOT applied): {_ss_gain}")
+        print("  to test it on these results without the .DAT files:\n"
+              "    pipeline_main.reevaluate(<run_dir>, out_dir=<new_dir>, "
+              "gain_file=<that file>)")
     print(f"\n  written to {_dcc_dir}")
  
 
@@ -2830,6 +2864,7 @@ _CACHE_VOL = Path('/Volumes/ps_xplatform_dev/rvadvtec_dev/ev_rvadvtec_dev/EIS_Re
 # the optional plate_viewer; every map drawn here uses plate_style's Jet.
 _FIELD_DEFS = [
     ('R_ohmic',      'HFR (Rs)',                   'mΩ·cm²', 'viridis', 1),
+    ('ReZ_1kHz',     'Re Z at 1 kHz (same frequency everywhere)', 'mΩ·cm²', 'viridis', 1),
     ('R_ct',         'R_ct (charge transfer)',     'mΩ·cm²', 'inferno', 1),
     ('R_mt',         'R_mt (mass transport)',      'mΩ·cm²', 'magma',   1),
     ('R_pol',        'R_pol (total polarisation)', 'mΩ·cm²', 'thermal', 1),

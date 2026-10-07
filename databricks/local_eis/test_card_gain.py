@@ -272,3 +272,54 @@ def test_dc_closure_tool_reads_run_folders(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "scale -2.00 %" in out
     assert (tmp_path / "o" / "dc_closure_cards.csv").is_file()
+
+
+def test_noisy_steps_fall_back_to_the_dc_level():
+    """2612030: the UC2 AC response is 0-20 dB per step, so no card had five
+    clean steps and every gain came out nan. The DC level decides then."""
+    f = np.array(FREQS)
+    A = {c: np.exp(1j * 0.3) * np.ones(f.size) for c in GAIN}
+    snr = {c: np.full(f.size, 6.0) for c in GAIN}            # all too noisy
+    dc = {c: np.full(f.size, 0.815 * g) for c, g in GAIN.items()}
+    out = card_gain.compare_phasors(f, A, snr, dc, DEFAULT,
+                                    used_for_Z={c: True for c in GAIN})
+    assert out["Karte_3"].source == "dc"
+    assert out["Karte_3"].gain == pytest.approx(1.04, abs=1e-6)
+    assert out["Karte_3"].status == card_gain.OFF
+    assert out["Karte_1"].status == card_gain.OK
+    c = plausibility.card_voltage_check({"UC2": out})
+    assert c.verdict == plausibility.WARN and "DC level" in c.detail
+
+
+def test_nothing_measurable_is_not_a_pass():
+    refs = {"UC2": {c: card_gain.CardReference(card=c, channel="UC2",
+                                               used_for_Z=True,
+                                               status=card_gain.TOO_FEW)
+                    for c in GAIN}}
+    assert plausibility.card_voltage_check(refs).verdict == plausibility.NA
+
+
+def test_re_z_at_one_frequency_does_not_extrapolate():
+    import gold
+    f = np.array([300.0, 946.5, 1194.0, 1516.5])
+    z = np.array([80, 68, 66, 64]) + 0j
+    assert gold.re_at(f, z, 1000.0) == pytest.approx(67.6, abs=0.1)
+    assert np.isnan(gold.re_at(f, z, 2000.0))
+    assert np.isnan(gold.re_at(np.array([100.0, 1500.0]), z[:2], 1000.0))
+
+
+def test_the_tap_resistance_is_measured_and_subtracted():
+    import dc_closure
+    import silver
+    from test_channel_lag_stage import _run_obj, _cfg
+    rows = [{"i_ref_A": i, "uc2_V": 0.82 - 0.0016 - i * 44e-6 - 0.0003 * i / 45,
+             "gamry_vdc_V": 0.82 - 0.0003 * i / 45} for i in (45., 60., 150., 450.)]
+    se = dc_closure.sense_offset(rows)
+    assert se["R_x_uohm"] == pytest.approx(44.0, abs=0.1)
+    assert se["R_x_mohm_cm2"] == pytest.approx(13.4, abs=0.1)
+    br = _run_obj()
+    a = silver.run(br, _cfg(channel_lag="off"))
+    b = silver.run(br, _cfg(channel_lag="off", uc_series_mohm_cm2=13.4))
+    s = "14"
+    assert 1e3 * (a.spectra[s].R_ohmic - b.spectra[s].R_ohmic) == pytest.approx(
+        13.4, abs=0.3)

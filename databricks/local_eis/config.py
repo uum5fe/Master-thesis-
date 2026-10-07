@@ -285,6 +285,15 @@ class Config:
     # high band within card_gain_flat_pct) and within card_gain_max_pct --
     # larger is a different tap or a wiring fault, and is reported instead.
     card_gain: str = "report"              # off | report | correct
+    # SERIES RESISTANCE BETWEEN THE UC TAP AND THE REFERENCE'S SENSE LEADS.
+    # Every card's UC2 and the Gamry's Vdc measure the cell voltage at
+    # different points. On 2612030 UC2 - Vdc = -1.6 mV - I x 44 uOhm over
+    # 45..450 A (residual 0.1 mV): the UC2 taps include 44 uOhm the Gamry's do
+    # not, i.e. 13.4 mOhm*cm2 over the 304.9 cm2 plate, in EVERY segment's Z.
+    # dc_closure.py measures it (needs the Gamry .dta files and two or more
+    # conditions). Set it here to subtract it from Re Z in silver and put the
+    # maps on the Gamry's reference plane; 0 leaves Z as the UC taps see it.
+    uc_series_mohm_cm2: float = 0.0
     card_gain_min_snr_db: float = 20.0     # steps below: not used
     card_gain_min_steps: int = 5
     card_gain_tol_pct: float = 1.0         # within: "ok"
@@ -378,7 +387,12 @@ class Config:
     # A 2 s ceiling silently fails to find the largest real offset, so the
     # search window must be generous -- a wrong lag is caught by the
     # correlation peak height, not by clipping the search.
-    align_max_lag_s: float = 12.0
+    # 2612030 / 150 A: cards 1 and 2 started 18.1 s after the others (the
+    # Gamry clock measured it on 26 and 16 steps). With a 12 s ceiling the
+    # true peak was outside the search, a spurious one at 8.6 s (corr 0.08)
+    # was found and refused, and both cards ran on the wrong windows. The
+    # records are ~280 s long, so 30 s still leaves most of them overlapping.
+    align_max_lag_s: float = 30.0
     # A lag is accepted on how far its correlation peak stands above the rest
     # of the curve, not on the peak's absolute height.  Height alone does not
     # separate right from wrong here: on the 45 A set the known-correct
@@ -877,7 +891,8 @@ class Config:
     write_html: bool = True
     write_png: bool = True
     heatmap_params: tuple[str, ...] = (
-        "R_ohmic", "R_ct", "R_mt", "Z_mag_100Hz", "phase_100Hz", "j_dc",
+        "R_ohmic", "ReZ_1kHz", "R_ct", "R_mt", "Z_mag_100Hz", "phase_100Hz",
+        "j_dc",
     )
     heatmap_colormap: str = "plotly_jet"   # plate_style.JET_STOPS
     verbose: bool = True
@@ -1222,6 +1237,9 @@ PARAM_META = {
                         scale=1000.0, cmap="plotly_jet"),
     "R_pol":       dict(label="R_pol (total polarisation)", unit="m\u03a9\u00b7cm\u00b2",
                         scale=1000.0, cmap="plotly_jet"),
+    "ReZ_1kHz":    dict(label="Re Z @ 1 kHz (band-independent HF)",
+                        unit="m\u03a9\u00b7cm\u00b2", scale=1000.0,
+                        cmap="plotly_jet"),
     "Z_mag_100Hz": dict(label="|Z| @ 100 Hz", unit="m\u03a9\u00b7cm\u00b2",
                         scale=1000.0, cmap="plotly_jet"),
     "phase_100Hz": dict(label="Phase @ 100 Hz", unit="\u00b0",
@@ -1263,6 +1281,7 @@ PARAM_META = {
 HEATMAP_FIXED_SCALE = True
 HEATMAP_LIMITS = {
     "R_ohmic": (40.0, 80.0),     # HFR / Rs
+    "ReZ_1kHz": (45.0, 85.0),    # Re Z at 1 kHz: R_ohmic plus the open arc
     "R_ct":    (25.0, 225.0),    # charge transfer
     "R_mt":    (0.0, 300.0),     # mass transport
     "R_pol":   (50.0, 450.0),    # total polarisation = R_ct + R_mt (+ R_hf_extra)

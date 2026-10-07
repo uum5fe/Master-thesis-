@@ -159,7 +159,11 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--no-spatial", action="store_true",
                    help="do not infer unmeasured segments")
     g.add_argument("--keep-L", action="store_true",
-                   help="leave the series inductance in the output curves")
+                   help="keep the fitted series inductance in the output "
+                        "(the default now; kept for old scripts)")
+    g.add_argument("--remove-L", action="store_true",
+                   help="subtract the fitted series inductance jwL per "
+                        "segment from the output spectrum")
 
     g = p.add_argument_group("other")
     g.add_argument("--config", help="JSON config file; CLI flags win over it")
@@ -248,6 +252,8 @@ def config_from_args(a) -> Config:
         kw["infer_missing_segments"] = False
     if a.keep_L:
         kw["remove_inductance"] = False
+    if getattr(a, "remove_L", False):
+        kw["remove_inductance"] = True
     if a.no_png:
         kw["write_png"] = False
     if a.no_html:

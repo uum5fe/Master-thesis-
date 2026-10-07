@@ -40,7 +40,7 @@ def _z(seg: str, f=F) -> np.ndarray:
     w = 2 * np.pi * f
     z = _rs_true(seg) + 1.0 / (1.0 / 150.0 + 2e-3 * (1j * w) ** 0.9)
     tau = 1e-6 * LAG_US.get(seg, 0.0)
-    z = z / (1 + 1j * w * tau)
+    z = z * np.exp(-1j * w * tau)          # the channel samples late
     if seg == BROKEN:
         rng = np.random.default_rng(1)
         hf = f > 100
@@ -238,3 +238,29 @@ def test_reevaluate_runs_silver_and_gold_from_saved_bronze(tmp_path):
     rows = {r["segment"]: r for r in csv.DictReader(
         open(tmp_path / "rep" / "silver" / "channel_lag.csv"))}
     assert rows["19"]["status"] == channel_lag.REPORT_ONLY
+
+
+def test_two_card_groups_far_apart_are_both_brought_onto_the_plate():
+    """2612030 / 150 A: cards 1-2 and cards 3-5 sample ~60 us apart (a pure
+    delay). With the band at 3.8 kHz a first-order model left them tens of
+    degrees apart; the delay model brings every segment onto the plate."""
+    f = np.geomspace(50, 3800, 22)
+    w = 2 * np.pi * f
+    rng = np.random.default_rng(4)
+    items, true = {}, {}
+    for k in range(30):
+        s = str(k + 1)
+        tau = (25e-6 if k < 12 else -40e-6) + 3e-6 * rng.standard_normal()
+        z = (0.065 + 0.15 / (1 + 1j * w * 0.15 * 0.02)) * np.exp(-1j * w * tau)
+        items[s] = (f, z, np.ones(f.size, bool))
+        true[s] = tau
+    def spread_after(n_iter):
+        lags = channel_lag.estimate(items, _cfg().replace(
+            channel_lag_iterations=n_iter, f_max_hz=4000.0))
+        top = [np.degrees(np.angle(items[s][1][-1] * channel_lag.correction(
+            f[-1], lags[s].applied_s))) for s in items]
+        return np.ptp(top), lags
+    three, lags = spread_after(3)
+    assert three < 3.0
+    rel = [1e6 * (lags[s].tau_s - true[s]) for s in items]
+    assert np.ptp(rel) < 2.0          # one common offset left, nothing else

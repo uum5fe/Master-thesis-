@@ -30,8 +30,26 @@ WHAT IT DOES
        * |tau| <= `channel_lag_max_us`;
      and correct only if |tau| >= `channel_lag_min_us`.
   4. Correct:  Z <- Z * (1 + j w tau), i.e. divide by H = 1/(1 + j w tau).
+  5. Repeat 1-4 on the corrected spectra (`channel_lag_iterations`, default
+     3) and add up the lags. The plate median is only a fair reference when
+     most channels already agree: on 2612030 the cards sit in two groups
+     ~60 us apart, and with the band reaching 3.8 kHz (80 deg between the
+     groups) the component-wise median of the raw spectra fell between them,
+     shifting every fitted lag by ~20 us and leaving cards 3-5 rotated by
+     25-50 deg at 3.8 kHz. After one correction the population is one group
+     and the median is a real reference; the second pass finds the rest.
 
 cfg.channel_lag = "off" | "report" | "correct" (default "correct").
+
+cfg.channel_lag_model = "delay" (default) | "first_order".
+A channel that samples late by tau is a pure DELAY, exp(-j w tau): phase
+linear in f, |Z| untouched. 2612030 shows exactly that between cards (card 4
+against card 1: 16 deg at 947 Hz, 34 deg at 1.9 kHz, |ratio| flat), while a
+first-order lag 1/(1 + j w tau) predicts 30 deg at 1.9 kHz and 50 instead of
+82 deg at 3.8 kHz, and changes |Z| by up to 30 %. The two agree below ~1.5
+kHz, which is where the band used to end; once it reached 3.8 kHz the
+first-order correction left cards rotated by tens of degrees, which silver
+then took for (and removed as) a series inductance.
 
 WHAT IT CANNOT DO
 -----------------
@@ -50,6 +68,7 @@ from dataclasses import dataclass
 import numpy as np
 
 MODES = ("off", "report", "correct")
+MODELS = ("delay", "first_order")
 
 #: statuses written per segment
 CORRECTED = "corrected"
@@ -74,6 +93,7 @@ class ChannelLag:
     dphi_top_deg: float = float("nan")   # phase vs plate at the top point
     f_top_hz: float = float("nan")
     status: str = ""
+    model: str = "delay"
 
     def row(self, card: str = "") -> dict:
         def r(x, k=3):
@@ -84,7 +104,8 @@ class ChannelLag:
                 "resid_deg": r(self.resid_deg, 2),
                 "dphi_top_deg": r(self.dphi_top_deg, 2),
                 "f_top_hz": r(self.f_top_hz, 1),
-                "n_points": self.n_points, "status": self.status}
+                "n_points": self.n_points, "status": self.status,
+                "model": self.model}
 
 
 def _opt(cfg, name: str, default):
@@ -100,9 +121,26 @@ def _key(f: float) -> float:
     return float(f"{float(f):.6g}")
 
 
-def correction(freq, tau_s: float) -> np.ndarray:
-    """The factor that removes a first-order lag: Z_true = Z_meas * this."""
-    return 1.0 + 1j * 2 * np.pi * np.asarray(freq, float) * float(tau_s)
+def lag_model(cfg) -> str:
+    m = str(_opt(cfg, "channel_lag_model", "delay") or "delay").lower()
+    return m if m in MODELS else "delay"
+
+
+def correction(freq, tau_s: float, model: str = "delay") -> np.ndarray:
+    """The factor that removes the channel's lag: Z_true = Z_meas * this.
+
+    "delay": exp(+j w tau) -- phase only. "first_order": 1 + j w tau."""
+    w = 2 * np.pi * np.asarray(freq, float)
+    if model == "first_order":
+        return 1.0 + 1j * w * float(tau_s)
+    return np.exp(1j * w * float(tau_s))
+
+
+def predicted_phase(freq, tau_s, model: str = "delay"):
+    w = 2 * np.pi * np.asarray(freq, float)
+    if model == "first_order":
+        return -np.arctan(w * tau_s)
+    return -w * tau_s
 
 
 def plate_reference(items: dict) -> dict[float, complex]:
@@ -121,23 +159,29 @@ def plate_reference(items: dict) -> dict[float, complex]:
             for f, v in by_f.items() if len(v) >= need}
 
 
-def fit_tau(freq: np.ndarray, phase: np.ndarray, tau_max: float
-            ) -> tuple[float, float]:
-    """(tau, rms residual in deg) for phase = -atan(w tau), |tau| <= tau_max."""
-    w = 2 * np.pi * np.asarray(freq, float)
+def fit_tau(freq: np.ndarray, phase: np.ndarray, tau_max: float,
+            model: str = "first_order") -> tuple[float, float]:
+    """(tau, rms residual in deg) for phase = predicted_phase(f, tau),
+    |tau| <= tau_max. The residual is wrapped, so a delay that turns the top
+    point past 180 deg is still fitted; a coarse grid finds the basin first."""
+    f = np.asarray(freq, float)
     ph = np.asarray(phase, float)
 
     def cost(t):
-        return float(np.sum((ph + np.arctan(w * t)) ** 2))
+        d = np.angle(np.exp(1j * (ph - predicted_phase(f, t, model))))
+        return float(np.sum(d ** 2))
 
+    grid = np.linspace(-tau_max, tau_max, 1201)
+    tau = float(grid[int(np.argmin([cost(t) for t in grid]))])
+    step = grid[1] - grid[0]
     try:
         from scipy.optimize import minimize_scalar
-        r = minimize_scalar(cost, bounds=(-tau_max, tau_max), method="bounded",
-                            options={"xatol": 1e-8})
-        tau = float(r.x)
+        r = minimize_scalar(cost, bounds=(tau - step, tau + step),
+                            method="bounded", options={"xatol": 1e-9})
+        if cost(float(r.x)) <= cost(tau):
+            tau = float(r.x)
     except Exception:                                       # noqa: BLE001
-        grid = np.linspace(-tau_max, tau_max, 4001)
-        tau = float(grid[np.argmin([cost(t) for t in grid])])
+        pass
     resid = np.degrees(np.sqrt(cost(tau) / max(len(ph), 1)))
     return tau, float(resid)
 
@@ -147,12 +191,15 @@ def estimate(items: dict, cfg=None, log=None) -> dict[str, ChannelLag]:
     m = mode(cfg)
     if m == "off" or not items:
         return {}
+    model = lag_model(cfg)
     f_lo = float(_opt(cfg, "channel_lag_f_lo_hz", 50.0))
     f_hi = float(_opt(cfg, "f_max_hz", np.inf))
     n_min = int(_opt(cfg, "channel_lag_min_points", 4))
     t_min = 1e-6 * float(_opt(cfg, "channel_lag_min_us", 5.0))
     t_max = 1e-6 * float(_opt(cfg, "channel_lag_max_us", 250.0))
     r_max = float(_opt(cfg, "channel_lag_max_resid_deg", 10.0))
+
+    n_iter = max(1, int(_opt(cfg, "channel_lag_iterations", 3)))
 
     band = {}
     for seg, (freq, Z, usable) in items.items():
@@ -161,26 +208,68 @@ def estimate(items: dict, cfg=None, log=None) -> dict[str, ChannelLag]:
         u = (np.asarray(usable, bool) & np.isfinite(freq) & np.isfinite(Z)
              & (freq >= f_lo) & (freq <= f_hi))
         band[seg] = (freq, Z, u)
-    ref = plate_reference(band)
+
+    def fit_all(acc):
+        """One pass: reference from the spectra corrected by `acc`, then the
+        lag left in each segment against it."""
+        cur = {s: (f, Z * correction(f, acc.get(s, 0.0), model), u)
+               for s, (f, Z, u) in band.items()}
+        ref = plate_reference(cur)
+        res = {}
+        for seg, (freq, Z, u) in cur.items():
+            idx = [i for i in np.flatnonzero(u) if _key(freq[i]) in ref]
+            if len(idx) < n_min:
+                res[seg] = (len(idx), None)
+                continue
+            f = freq[idx]
+            r = np.array([ref[_key(x)] for x in f])
+            ph = np.angle(Z[idx] / r)
+            # 1.2 x the limit as the search bound, so "at the limit" shows
+            d, resid = fit_tau(f, ph, 1.2 * t_max, model)
+            res[seg] = (len(idx), (d, resid, f, ph))
+        return res
+
+    acc: dict[str, float] = {}
+    for _ in range(n_iter):
+        res = fit_all(acc)
+        moved = 0.0
+        for seg, (_n, fit) in res.items():
+            if fit is None:
+                continue
+            d, resid = fit[0], fit[1]
+            new = acc.get(seg, 0.0) + d
+            # only a channel that looks like a lag steers the reference
+            if resid <= r_max and abs(new) <= t_max:
+                acc[seg] = new
+                moved = max(moved, abs(d))
+        if moved < 0.2e-6:
+            break
+    # The frame: the median segment. tau is relative to the plate median,
+    # and the median of a population split into card groups 60 us apart is
+    # not any segment's phase -- on 2612030 / 150 A it put every lag +10 us
+    # off the frame the other conditions used. Re-centring makes the median
+    # segment the reference in every run.
+    if acc:
+        shift = float(np.median(list(acc.values())))
+        acc = {s: t - shift for s, t in acc.items()}
+    res = fit_all(acc)
 
     out: dict[str, ChannelLag] = {}
-    for seg, (freq, Z, u) in band.items():
-        lag = ChannelLag(segment=str(seg))
-        idx = [i for i in np.flatnonzero(u) if _key(freq[i]) in ref]
-        lag.n_points = len(idx)
-        if len(idx) < n_min:
+    for seg, (n_pts, fit) in res.items():
+        lag = ChannelLag(segment=str(seg), model=model)
+        lag.n_points = n_pts
+        if fit is None:
             lag.status = TOO_FEW
             out[str(seg)] = lag
             continue
-        f = freq[idx]
-        r = np.array([ref[_key(x)] for x in f])
-        ph = np.angle(Z[idx] / r)
-        # 1.2 x the limit as the search bound, so "at the limit" is visible
-        tau, resid = fit_tau(f, ph, 1.2 * t_max)
+        d, resid, f, ph = fit
+        tau = acc.get(seg, 0.0) + d
         top = int(np.argmax(f))
         lag.tau_s, lag.resid_deg = tau, resid
         lag.f_top_hz = float(f[top])
-        lag.dphi_top_deg = float(np.degrees(ph[top]))
+        # phase against the plate before this channel's own correction
+        lag.dphi_top_deg = float(np.degrees(
+            ph[top] + predicted_phase(f[top], acc.get(seg, 0.0), model)))
         if resid > r_max:
             lag.status = NOT_FIRST_ORDER
         elif abs(tau) > t_max:

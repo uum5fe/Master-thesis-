@@ -27,13 +27,13 @@ For each run folder (bronze/raw_spectra.csv + gold/plate_summary.csv):
     runs in silver -- on silver's kept points: arg(Z_seg / Z_ref) =
     -atan(w tau) over f_lo..f_hi, Z_ref the plate median;
   * a diagnostic R_s per segment from a Randles-CPE fit to 100 Hz..f_hi,
-    once on the raw spectrum and once with the lag removed, Z * (1 + j w tau);
+    once on the raw spectrum and once with the lag removed, Z * exp(j w tau);
   * across runs: tau side by side and their correlation (repeatability).
 
   python diagnose_channel_lag.py RUN [RUN ...] -o out_dir [--write-gain g.csv]
 
 `--write-gain` writes the median tau per segment as a pipeline gain file
-(segment,freq_hz,gain_real,gain_imag with G = 1/(1 + j w tau)); set it as
+(segment,freq_hz,gain_real,gain_imag with G = exp(-j w tau)); set it as
 cfg.gain_file and bronze divides each segment's Z by it.
 
 WHAT IT IS NOT
@@ -139,7 +139,7 @@ def analyse_run(run, f_lo: float = 50.0, f_max: float = 1200.0) -> pd.DataFrame:
         g = lags.get(s)
         z = np.where(usable[:, j], Z[:, j], np.nan)
         tau = g.tau_s if g is not None else float("nan")
-        zc = z * channel_lag.correction(freq, tau) if np.isfinite(tau) else z
+        zc = z * channel_lag.correction(freq, tau, g.model) if np.isfinite(tau) else z
         rows.append(dict(segment=s, tau_us=1e6 * tau,
                          status=g.status if g is not None else "",
                          resid_deg=g.resid_deg if g is not None else np.nan,
@@ -159,13 +159,14 @@ def analyse_run(run, f_lo: float = 50.0, f_max: float = 1200.0) -> pd.DataFrame:
 
 
 def gain_rows(tau_s: dict[str, float], f_min=0.1, f_max=1e4, n=200):
-    """Gain-file rows G = 1/(1 + j w tau) per segment, on a log grid."""
+    """Gain-file rows G = exp(-j w tau) (the channel delay) per segment, on
+    a log grid."""
     f = np.geomspace(f_min, f_max, n)
     rows = []
     for s, t in sorted(tau_s.items(), key=lambda kv: int(kv[0])):
         if not np.isfinite(t):
             continue
-        g = 1.0 / (1.0 + 1j * 2 * np.pi * f * t)
+        g = np.exp(-1j * 2 * np.pi * f * t)
         rows += [(s, fi, gi.real, gi.imag) for fi, gi in zip(f, g)]
     return rows
 
@@ -232,7 +233,7 @@ def main(argv=None) -> int:
         rows = gain_rows(med.to_dict())
         with open(a.write_gain, "w", encoding="utf-8") as fh:
             fh.write("# interim chain response from diagnose_channel_lag.py: "
-                     "G = 1/(1 + j w tau), tau relative to the plate median "
+                     "G = exp(-j w tau), tau relative to the plate median "
                      f"of {', '.join(T.columns)}\n")
             fh.write("segment,freq_hz,gain_real,gain_imag\n")
             for s, f, gr, gi in rows:

@@ -40,7 +40,7 @@ def _run(tmp_path, label="60A"):
     (run / "gold").mkdir()
     rows, ps = [], []
     for s, tau in TAU.items():
-        z = _true_z(F) / (1 + 1j * 2 * np.pi * F * tau)       # chain lag
+        z = _true_z(F) * np.exp(-1j * 2 * np.pi * F * tau)    # chain delay
         rows += [dict(segment=int(s), freq_hz=f, z_re_ohm_cm2=zz.real / 1e3,
                       z_im_ohm_cm2=zz.imag / 1e3) for f, zz in zip(F, z)]
         # what silver reports: Re Z at the top of the band
@@ -75,8 +75,8 @@ def test_the_gain_file_round_trips_through_the_pipeline_reader(tmp_path):
                  + "".join(f"{s},{f},{gr},{gi}\n" for s, f, gr, gi in rows))
     gain = utils.load_gain(p)
     g = utils.gain_at(gain, "19", F)
-    assert np.allclose(g, 1 / (1 + 1j * 2 * np.pi * F * 105e-6), rtol=2e-3)
-    measured = _true_z(F) / (1 + 1j * 2 * np.pi * F * 105e-6)
+    assert np.allclose(g, np.exp(-1j * 2 * np.pi * F * 105e-6), rtol=2e-3)
+    measured = _true_z(F) * np.exp(-1j * 2 * np.pi * F * 105e-6)
     assert np.allclose(measured / g, _true_z(F), rtol=2e-3)
 
 

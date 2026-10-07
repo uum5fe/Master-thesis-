@@ -1413,7 +1413,8 @@ def process_segment(sp: BronzeSpectrum, skew: SkewModel, cfg: Config,
     # ---- current-chain lag (channel_lag.py), after the de-skew it was
     # ---- measured on ------------------------------------------------------
     if chain is not None and chain.applied_s:
-        z_corr = z_corr * channel_lag.correction(f, chain.applied_s)
+        z_corr = z_corr * channel_lag.correction(f, chain.applied_s,
+                                               getattr(chain, "model", "delay"))
     # ---- the UC taps' own series resistance (cfg.uc_series_mohm_cm2) -----
     r_tap = float(getattr(cfg, "uc_series_mohm_cm2", 0.0) or 0.0)
     if r_tap:

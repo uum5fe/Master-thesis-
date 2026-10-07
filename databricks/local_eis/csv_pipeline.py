@@ -1533,7 +1533,7 @@ def _apply_channel_lag(spectra: dict, cfg, log) -> dict:
     for seg, g in lags.items():
         sp = spectra[seg]
         if g.applied_s:
-            sp.Z = sp.Z * channel_lag.correction(sp.freq, g.applied_s)
+            sp.Z = sp.Z * channel_lag.correction(sp.freq, g.applied_s, g.model)
             sp.flags.append(f"chain_lag_removed_{1e6 * g.applied_s:+.0f}us")
         elif g.status in channel_lag.UNRELIABLE:
             sp.flags.append(f"chain_phase_{g.status}")

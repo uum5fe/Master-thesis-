@@ -272,9 +272,13 @@ class Config:
     channel_lag: str = "correct"           # off | report | correct
     channel_lag_f_lo_hz: float = 50.0      # below: no lag is visible
     channel_lag_min_points: int = 4
-    channel_lag_min_us: float = 5.0        # smaller: left alone (noise)
+    # smaller: left alone. 1 us, not 5: with the band at 3.8 kHz a 5 us
+    # delay is 7 deg at the top, and a delay fit is good to ~1 us there
+    channel_lag_min_us: float = 1.0
     channel_lag_max_us: float = 250.0      # larger: not a chain lag
     channel_lag_max_resid_deg: float = 10.0
+    channel_lag_iterations: int = 3        # correct, re-reference, refit
+    channel_lag_model: str = "delay"       # delay | first_order
     # CARD VOLTAGE GAIN, MEASURED ON EVERY RUN (card_gain.py).
     # Z = K * A_UC / A_seg, and with the reference pool off every card divides
     # by its OWN UC channel: a card whose voltage chain reads 3 % high puts
@@ -817,7 +821,13 @@ class Config:
     mu_crit: float = 0.85            # Schoenleber, Klotz, Ivers-Tiffee (2014)
     kk_tol: float = 0.02             # residual gate, 2 %
     kk_ridge: float = 1e-3
-    remove_inductance: bool = True   # cable + plate L is not electrochemistry
+    # Subtract the fitted series inductance jwL from the output spectrum?
+    # Off: on 2612030 the fitted L is 0 on every segment at 45, 60 and 450 A,
+    # and non-zero only where channel distortion is left above ~2 kHz (cards
+    # 1-2 at 150 A, 1.2-1.3 uH). Subtracting it rotated those spectra by up
+    # to 35 deg at 3.8 kHz -- removing an artefact as if it were a cable. L is
+    # still fitted and reported per segment (L_nH); set True to subtract it.
+    remove_inductance: bool = False
     min_points_per_spectrum: int = 8
 
     # ---- uncertainty ------------------------------------------------------

@@ -181,6 +181,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="current-chain lag stage (default: correct)")
     g.add_argument("--card-gain", choices=["off", "report", "correct"],
                    help="per-card UC voltage-gain check (default: report)")
+    g.add_argument("--freq-response", choices=["off", "report"],
+                   help="frequency response of the measuring chain after "
+                        "each run (default: report)")
+    g.add_argument("--bode", dest="abgleich_bode_dir", type=Path,
+                   help="Abgleich bode/ folder for the ex-situ response "
+                        "(default: read it from the chain gain file)")
     g.add_argument("--dc-closure", nargs="+", metavar="RUN_DIR",
                    help="the DC current closure over several finished runs "
                         "(one per condition), against the bench current")
@@ -230,6 +236,10 @@ def config_from_args(a) -> Config:
         kw["channel_lag"] = a.channel_lag
     if getattr(a, "card_gain", None):
         kw["card_gain"] = a.card_gain
+    if getattr(a, "freq_response", None):
+        kw["freq_response"] = a.freq_response
+    if getattr(a, "abgleich_bode_dir", None):
+        kw["abgleich_bode_dir"] = a.abgleich_bode_dir
     if a.f_min is not None:
         kw["f_min_hz"] = a.f_min
     if a.f_max is not None:
@@ -504,6 +514,25 @@ def whole_cell_and_plausibility(cfg: Config, manifest: dict, log,
         except Exception as exc:                            # noqa: BLE001
             log.warning(f"  whole-cell comparison skipped: {exc}")
 
+    # ---- frequency response of the measuring chain -----------------------
+    # Ex-situ (the Abgleich amplifier sweeps) and in-situ (each segment
+    # against the plate median, before and after the timing correction).
+    # A diagnostic on the files just written: it never changes Z.
+    fr_checks = []
+    if getattr(cfg, "freq_response", "report") != "off":
+        utils.banner("FREQUENCY RESPONSE  --  measuring chain", log)
+        try:
+            import frequency_response
+            frs = frequency_response.run(
+                cfg.out_dir, gain_file=cfg.gain_file,
+                bode_dir=getattr(cfg, "abgleich_bode_dir", None),
+                write_png=cfg.write_png,
+                f_top=min(cfg.f_max_hz, 4000.0), log=log)
+            manifest["stages"]["frequency_response"] = frs
+            fr_checks = frequency_response.checks(frs)
+        except Exception as exc:                            # noqa: BLE001
+            log.warning(f"  frequency response skipped: {exc}")
+
     # ---- does the finished plate hold together as physics? ----------------
     # After gold, because it judges the assembled map rather than any single
     # point, and non-fatal for the same reason the cross-check is: a
@@ -519,6 +548,7 @@ def whole_cell_and_plausibility(cfg: Config, manifest: dict, log,
                 cfg.out_dir, cfg, plate_key=cfg.plate,
                 reference=reference_asr, reference_hfr=reference_hfr,
                 bench=bench_state)
+        rep.checks.extend(fr_checks)
         plausibility.report(rep, log)
         plausibility.save(rep, cfg.out_dir)
         manifest["stages"]["plausibility"] = rep.rows()
@@ -585,6 +615,10 @@ def main(argv=None) -> int:
         over = {"channel_lag": a.channel_lag} if a.channel_lag else {}
         if a.card_gain:
             over["card_gain"] = a.card_gain
+        if a.freq_response:
+            over["freq_response"] = a.freq_response
+        if a.abgleich_bode_dir:
+            over["abgleich_bode_dir"] = a.abgleich_bode_dir
         if a.gain:
             over["gain_file"] = Path(a.gain)
         reevaluate(a.reevaluate, out_dir=a.out, **over)

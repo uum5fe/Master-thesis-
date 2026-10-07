@@ -298,6 +298,14 @@ class Config:
     # conditions). Set it here to subtract it from Re Z in silver and put the
     # maps on the Gamry's reference plane; 0 leaves Z as the UC taps see it.
     uc_series_mohm_cm2: float = 0.0
+    # FREQUENCY RESPONSE OF THE MEASURING CHAIN (frequency_response.py).
+    # After every run: the ex-situ amplifier response G_d per segment (from
+    # gain_file, or from the Abgleich bode/ folder when given) and the
+    # in-situ response of each segment against the plate median, before and
+    # after the timing correction. Writes RUN_DIR/frequency_response/ and two
+    # plausibility checks; never changes Z. "off" skips it.
+    freq_response: str = "report"          # off | report
+    abgleich_bode_dir: Path | None = None
     card_gain_min_snr_db: float = 20.0     # steps below: not used
     card_gain_min_steps: int = 5
     card_gain_tol_pct: float = 1.0         # within: "ok"

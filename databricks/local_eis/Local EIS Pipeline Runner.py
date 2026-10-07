@@ -101,11 +101,12 @@ import ecm_drt
 import plausibility
 import dc_closure
 import segment_scale
+import frequency_response
  
 # Force reload during development (plate_style before the maps that use it)
 for mod in [config, utils, eis_local, gamry_sync, channel_lag, card_gain,
             bronze, silver, gold, plausibility, dc_closure, segment_scale,
-            pipeline_main,
+            frequency_response, pipeline_main,
             geom, csv_source, csv_pipeline, gamry_dta, gamry_compare, abgleich,
             ladder_snap, tone_estimation, eis_measurement_model,
             figure_panels, plate_style, plate_maps, plate_figure, plate_plotly,
@@ -558,6 +559,23 @@ CARD_GAIN = 'report'
 # against the Gamry Vdc over all conditions: 13.4 on 2612030. 0 = Z as the UC
 # taps see it (the default); 13.4 = on the Gamry's reference plane.
 UC_SERIES_MOHM_CM2 = 0.0
+# Frequency response of the measuring chain (frequency_response.py), after
+# every run: the ex-situ amplifier response G_d of each segment (from the
+# Abgleich bode/ sweeps when ABGLEICH_DIR is set in the "Chain response" cell,
+# otherwise from GAIN_FILE) and the in-situ response of each segment against
+# the plate median, before and after the timing correction. Writes
+# RUN_DIR/frequency_response/ and two plausibility checks; it never changes Z.
+# 'off' skips it. See the "Frequency response" cell after the runs.
+FREQ_RESPONSE = 'report'
+
+
+def _bode_dir():
+    """The Abgleich bode/ folder, when the "Chain response" cell has one."""
+    _ab = globals().get('ABGLEICH_DIR') or ''
+    _b = Path(_ab) / 'bode' if _ab else None
+    return _b if _b is not None and _b.is_dir() else None
+
+
 # The current-closure check compares the segment currents with the bench's
 # measured I_S at the Gamry sweep; without a readable bench log it uses the
 # current in the condition name (45A -> 45 A). Nothing to set here.
@@ -1833,6 +1851,8 @@ for cond in _conditions_to_run:
         gamry_sync=GAMRY_SYNC,
         card_gain=CARD_GAIN,
         uc_series_mohm_cm2=float(UC_SERIES_MOHM_CM2),
+        freq_response=FREQ_RESPONSE,
+        abgleich_bode_dir=_bode_dir(),
         gamry_dir=Path(GAMRY_DIR) if GAMRY_DIR else None,
         gamry_version=GAMRY_VERSION,
         bench_log=Path(BENCH_LOG) if BENCH_LOG else None,
@@ -2046,6 +2066,77 @@ if _cg_runs:
               "gain_file=<that file>)")
     print(f"\n  written to {_dcc_dir}")
  
+
+# COMMAND ----------
+
+# DBTITLE 1,Frequency response of the measuring chain (ex-situ + in-situ, all conditions)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Z = K * U_cell / u_seg is a ratio of two measured signals, so whatever the
+# measuring chain does to either signal lands in Z -- hardest at the top of
+# the band, where a phase error rotates the points that set the HFR.
+#
+# 1. EX-SITU G_d(f) = j_sigma / j_r of each segment's current amplifier, from
+#    the Abgleich bode/ sweeps (ABGLEICH_DIR in the "Chain response" cell) or
+#    from GAIN_FILE. Absolute, but it sees only the amplifiers.
+# 2. IN-SITU Z_s / plate median of each segment during the measurement,
+#    before (chain file divided out, no timing correction) and after (mux
+#    de-skew + channel lag). Relative -- what all segments share cancels --
+#    but it sees the whole chain: cards, multiplexer slots, scale factors.
+#
+# Each run already wrote RUN_DIR/frequency_response/ (FREQ_RESPONSE =
+# 'report'); results from the cache that predate it are computed here.
+# Nothing in this cell changes Z.
+# ═══════════════════════════════════════════════════════════════════════════════
+importlib.reload(frequency_response)
+
+_fr_runs = [Path(pr['out_dir']) for pr in PIPELINE_RESULTS.values()
+            if pr and pr.get('out_dir')]
+_fr_rows = []
+for _rd in _fr_runs:
+    print(f"\n{'═'*75}\n  {_rd.name}\n{'═'*75}")
+    _frd = _rd / frequency_response.OUT
+    _sj = _frd / 'summary.json'
+    if _sj.is_file():
+        _frs = json.loads(_sj.read_text())
+        frequency_response.report(_frs, say=print)
+    else:
+        # a read-only cache folder gets its results beside the other tmp output
+        try:
+            _frd.mkdir(parents=True, exist_ok=True)
+            (_frd / '.w').touch()
+            (_frd / '.w').unlink()
+        except OSError:
+            _frd = _TMP_BASE / LEEPA / 'frequency_response' / _rd.name
+        _frs = frequency_response.run(
+            _rd, gain_file=GAIN_FILE or None, bode_dir=_bode_dir(),
+            out_dir=_frd, f_top=min(float(F_MAX), 4000.0),
+            title=f"In-situ response, {_rd.name}")
+    for _c in frequency_response.checks(_frs):
+        print(f"  {_c}")
+    for _png in ('freq_response_exsitu.png', 'freq_response_insitu.png'):
+        if (_frd / _png).is_file() and (_png != 'freq_response_exsitu.png'
+                                        or _rd == _fr_runs[0]):
+            display(IPImage(filename=str(_frd / _png)))
+    _ins = _frs.get('insitu', {})
+    if _ins.get('available'):
+        _k = f"{_ins['f_top_hz']:g}"
+        _row = {'run': _rd.name}
+        for _st in ('raw', 'clean'):
+            _r = _ins['stages'].get(_st, {}).get(_k)
+            if _r:
+                _row[f'phase_sd_{_st}_deg'] = round(_r['phase_deg_sd'], 1)
+        for _c in _ins.get('card_residual', []):
+            _row[f"{_c['card']}_step_pct"] = _c['mag_step_hf_pct']
+        _fr_rows.append(_row)
+
+if _fr_rows:
+    print(f"\n{'═'*75}\n  IN-SITU, ALL CONDITIONS: phase spread at the top of the "
+          f"band (sd over segments) and |H| step per card above "
+          f"{frequency_response.F_HF:g} Hz\n{'═'*75}")
+    print(pd.DataFrame(_fr_rows).to_string(index=False))
+    print("  A card step that is the same at every current is the hardware; "
+          "one that changes with load is the cell.")
+
 
 # COMMAND ----------
 

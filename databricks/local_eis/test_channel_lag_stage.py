@@ -264,3 +264,20 @@ def test_two_card_groups_far_apart_are_both_brought_onto_the_plate():
     assert three < 3.0
     rel = [1e6 * (lags[s].tau_s - true[s]) for s in items]
     assert np.ptp(rel) < 2.0          # one common offset left, nothing else
+
+
+def test_the_modelled_band_stops_where_the_cards_stop_agreeing():
+    """2612030 at fs = 25 kHz: cards coherent to 3.8 kHz, 10-25 deg apart at
+    4.7-5.9 kHz. With f_max_hz = 250000 the band ran to 9.5 kHz."""
+    from dataclasses import replace
+    f = np.array([100.0, 1194.0, 3796.9, 4733.5, 9515.6])
+    sp = replace(_bronze("5"), freq=f, Z_raw=np.full(f.size, 0.06 + 0j),
+                 snr_ref_db=np.full(f.size, 40.0), snr_seg_db=np.full(f.size, 40.0),
+                 snr_comb_db=np.full(f.size, 40.0), thd=np.zeros(f.size),
+                 drift=np.zeros(f.size), n_per_step=np.full(f.size, 20000),
+                 on_grid=np.ones(f.size, bool))
+    cfg = _cfg().replace(f_max_hz=250000.0)
+    g = silver.gate_points(sp, cfg)
+    assert list(g["freq"][g["keep"]]) == [100.0, 1194.0, 3796.9]
+    g = silver.gate_points(sp, cfg.replace(coherent_f_max_frac_fs=0.0))
+    assert g["keep"].sum() == 5

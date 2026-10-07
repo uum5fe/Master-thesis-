@@ -72,7 +72,7 @@ def _run(f_hi, seeds=8, extra=None):
     out = {"topband": [], "xint": [], "crossing": [], "at_fmax": []}
     for seed in range(seeds):
         res = silver.process_segment(_spectrum(f_hi, seed=seed, extra=extra),
-                                     _skew(), DEFAULT.replace(verbose=False),
+                                     _skew(), DEFAULT.replace(coherent_f_max_frac_fs=0.0, verbose=False),
                                      None)
         if res is None:
             continue
@@ -155,6 +155,6 @@ def test_disagreement_between_them_tracks_arc_closure() -> None:
 
 def test_the_cross_check_is_reported_per_segment() -> None:
     res = silver.process_segment(_spectrum(3000, seed=1), _skew(),
-                                 DEFAULT.replace(verbose=False), None)
+                                 DEFAULT.replace(coherent_f_max_frac_fs=0.0, verbose=False), None)
     assert np.isfinite(res.R_ohmic_xint)
     assert res.R_ohmic_xint != res.R_ohmic       # genuinely a second estimate

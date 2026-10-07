@@ -49,7 +49,7 @@ def _skew():
 
 
 def _run(sp, cfg=None):
-    cfg = cfg or DEFAULT.replace(f_min_hz=0.15, f_max_hz=4500.0)
+    cfg = cfg or DEFAULT.replace(coherent_f_max_frac_fs=0.0, f_min_hz=0.15, f_max_hz=4500.0)
     ledger: list[dict] = []
     res = silver.process_segment(sp, _skew(), cfg, None, ledger=ledger)
     return res, ledger

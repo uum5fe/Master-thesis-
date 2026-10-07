@@ -360,6 +360,15 @@ class Config:
     # constant only stops binding before it gets the chance.
     f_min_hz: float = 0.15
     f_max_hz: float = 30000.0
+    # THE TOP OF THE BAND SILVER MODELS, as a fraction of the card's fs.
+    # Detection may go higher (f_hi_frac_fs); the impedance may not. On
+    # 2612030 (fs = 25 kHz) the five cards agree as pure delays up to 3.8 kHz
+    # (1-2 deg apart) and part above it: 10 deg at 4.7 kHz, 24 at 5.9 kHz,
+    # with the plate spectrum turning inductive. With f_max_hz = 250000 the
+    # band ran to 9.5 kHz and R_ohmic, read at its top, came out 38-43
+    # mOhm*cm2 -- below even the Gamry. 0.16 * 25 kHz = 4 kHz. Raise it only
+    # for hardware whose cards stay phase-coherent higher; 0 disables it.
+    coherent_f_max_frac_fs: float = 0.16
     f_hi_frac_fs: float = 0.45       # detection ceiling as a fraction of fs
     ppd: int = 12                    # points per decade of the detection grid
 

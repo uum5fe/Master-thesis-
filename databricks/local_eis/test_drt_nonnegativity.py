@@ -68,7 +68,7 @@ def _spectrum(noise: float = 0.0, seed: int = 1, n: int = 40,
 
 
 def _run(noise=0.0, seed=1, nonneg=True, r_mt=R_MT_TRUE):
-    cfg = DEFAULT.replace(verbose=False, drt_nonneg=nonneg)
+    cfg = DEFAULT.replace(coherent_f_max_frac_fs=0.0, verbose=False, drt_nonneg=nonneg)
     res = silver.process_segment(_spectrum(noise, seed, r_mt=r_mt), _skew(),
                                  cfg, None)
     assert res is not None, "fixture was rejected by the gates"

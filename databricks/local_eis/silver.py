@@ -1234,7 +1234,8 @@ def extrapolate_hf(drt: dict, f_hi: float, n: int = 40) -> dict:
 #: the counts add up to the number dropped instead of double-counting.
 REJECT_REASONS = {
     "not_finite": "the phasor fit did not return a finite Z",
-    "outside_band": "outside cfg.f_min_hz .. cfg.f_max_hz",
+    "outside_band": "outside cfg.f_min_hz .. min(cfg.f_max_hz, "
+                    "cfg.coherent_f_max_frac_fs * fs)",
     "snr": "SNR below the gate for this point",
     "thd": "harmonic distortion above cfg.max_thd",
     "drift": "amplitude drifted during the dwell, above cfg.max_drift",
@@ -1269,8 +1270,11 @@ def gate_points(sp: BronzeSpectrum, cfg: Config) -> dict:
 
     keep = gate(np.isfinite(freq) & (freq > 0)
                 & np.isfinite(Z.real) & np.isfinite(Z.imag), "not_finite")
-    keep &= gate((freq >= cfg.f_min_hz) & (freq <= cfg.f_max_hz),
-                 "outside_band")
+    f_top = float(cfg.f_max_hz)
+    frac = float(getattr(cfg, "coherent_f_max_frac_fs", 0.0) or 0.0)
+    if frac > 0 and np.isfinite(getattr(sp, "fs", np.nan)) and sp.fs > 0:
+        f_top = min(f_top, frac * float(sp.fs))
+    keep &= gate((freq >= cfg.f_min_hz) & (freq <= f_top), "outside_band")
 
     # Point-level gates.  An ON-GRID step is a real step -- a geometric
     # progression is not something noise produces -- so for those the SNR

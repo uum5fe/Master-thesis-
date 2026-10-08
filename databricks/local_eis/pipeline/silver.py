@@ -1,0 +1,2169 @@
+#!/usr/bin/env python3
+"""
+silver.py  --  LAYER 2 of 3:  correction, modelling, validation
+===============================================================
+
+Silver turns raw phasors into spectra that can be believed, and attaches an
+uncertainty to every number so the gold layer can decide how much weight to
+give it.  Nothing here is cosmetic: every step either removes a known
+instrumental effect or reports how well the data survives a test it could
+have failed.
+
+THE FOUR STAGES
+---------------
+    1. structural de-skew      the high-frequency fix (section 2)
+    2. uncertainty             CRLB per point, propagated through the ratio
+    3. measurement model       Bayesian DRT -> R_inf with a credible interval
+    4. validation and tiering  lin-KK, Z-HIT, DC closure -> quality tier
+
+-------------------------------------------------------------------------
+SECTION 2 IN FULL: WHY THE HIGH-FREQUENCY ARC WAS WRONG
+-------------------------------------------------------------------------
+The impedance is a ratio of two phasors measured on two different channels:
+
+    Z_s(w) = K_s * A_ref(w) / A_s(w)
+
+If the two channels are not sampled at the same instant, the ratio picks up
+exp(-j w dt) where dt is the acquisition skew.  That factor is an ALL-PASS:
+it leaves |Z| untouched and rotates the phase by -w*dt, linearly in
+frequency.  It is therefore invisible in a Bode magnitude plot and fatal in a
+Nyquist plot, and it grows with frequency -- which is why the damage is
+concentrated exactly at the top of the band, where the HF intercept lives.
+
+The old pipeline fitted ONE FREE DELAY PER CARD by minimising a KK residual.
+That is better than the parity guess it replaced, but it is still wrong in
+structure, because the skew is not a per-card constant.  A multiplexed
+converter digitises its channels in sequence, so channel at slot p is sampled
+at
+
+    t = n/fs + p/(n_ch * fs)
+
+and the skew between the reference at slot p_ref and a segment at slot p_s is
+
+    dt_s = (p_s - p_ref) / (n_ch * fs)                              (nominal)
+
+which is DIFFERENT FOR EVERY SEGMENT ON THE CARD.  At 10 kHz with 16
+channels one slot is 6.25 us; segments ten slots apart differ by 62.5 us,
+which is 67 degrees of phase at 3 kHz.  Fitting a single per-card delay
+splits that difference and leaves half of it on every segment, with opposite
+signs on either side of the reference.  That is precisely the "fan-out" seen
+in the legacy phase plots -- some segments curling up, some curling down.
+
+WHAT SILVER DOES INSTEAD
+------------------------
+It fits a two-parameter STRUCTURAL model per card,
+
+    dt_s = dt0 + k * (p_s - p_ref)
+
+where p_s is read from the FAMOS header.  Here `k` is the per-slot conversion
+time -- nominally 1/(n_ch*fs), but left free because a sequencer that idles
+between bursts has a shorter effective slot -- and `dt0` absorbs whatever is
+common to the card: analogue filter group delay, cable, trigger offset.
+
+Two free parameters constrained by every segment on the card, instead of one
+free parameter per card (too rigid, wrong shape) or one per segment (too
+loose: with 4 % noise the per-segment cost surface is flatter than the noise
+and the estimate wanders by tens of microseconds).  The fitted `k` is then
+reported against its nominal value, which makes the whole model falsifiable:
+if the recovered slot time is not close to 1/(n_ch*fs), the multiplexer
+hypothesis is wrong and the pipeline says so instead of quietly applying a
+correction it cannot justify.
+
+-------------------------------------------------------------------------
+SECTION 3: R_inf WITH AN HONEST ERROR BAR
+-------------------------------------------------------------------------
+The high-frequency intercept is an EXTRAPOLATION.  Sampling at 10 kHz stops
+the usable band near 3.5-4.5 kHz, while a PEMFC's real-axis intercept sits at
+1-10 kHz, so R_inf is always partly inferred.  Reading `Re Z` at f_max makes
+that inference invisible and puts all the noise of the single worst point
+into the map.  Fitting a lin-KK model makes it better but still returns a
+bare number.
+
+Silver instead puts a Gaussian-process prior on the distribution of
+relaxation times and solves for the posterior:
+
+    Z(w) = R_inf + jwL + sum_m  gamma_m / (1 + jw tau_m),
+    gamma ~ N(0, K),   K_ij = sigma_f^2 exp(-(x_i-x_j)^2 / 2 l^2),  x = log tau
+
+Because the model is linear in (R_inf, L, gamma), the posterior is Gaussian
+in closed form.  Three consequences, all of which the plain fit cannot give:
+
+  * R_inf arrives as a mean AND a standard deviation.  A segment whose
+    intercept is uncertain to 40 % can now be drawn as uncertain instead of
+    being drawn as a hot spot.
+  * The posterior can be evaluated ABOVE f_max.  That is the only honest way
+    to reach the intercept, and the credible interval widens as it
+    extrapolates, which is the correct behaviour.
+  * The prior regularises the tau padding that made the unregularised lin-KK
+    fit diverge, so relaxations just outside the window no longer have to be
+    excluded by hand.
+
+Hyperparameters are chosen by maximising the marginal likelihood rather than
+being set by hand, which is the point Liu & Ciucci make about GP-DRT.
+
+REFERENCES
+----------
+B. A. Boukamp, J. Electrochem. Soc. 142 (1995) 1885        -- lin-KK
+M. Schoenleber, D. Klotz, E. Ivers-Tiffee, Electrochim. Acta 131 (2014) 20
+P. Agarwal, M. E. Orazem, L. H. Garcia-Rubio,
+    J. Electrochem. Soc. 139 (1992) 1917                   -- measurement model
+W. Ehm et al., ACH Models in Chemistry 137 (2000) 145      -- Z-HIT
+T. H. Wan, M. Saccoccio, C. Chen, F. Ciucci,
+    Electrochim. Acta 184 (2015) 483                       -- DRT discretisation
+J. Liu, F. Ciucci, Electrochim. Acta 331 (2020) 135316     -- GP-DRT
+D. C. Rife, R. R. Boorstyn, IEEE Trans. Inf. Theory 20 (1974) 591  -- CRLB
+P. M. Ramos, A. Cruz Serra, Measurement 41 (2008) 135      -- joint sine fit
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import numpy as np
+
+import r2d2_geometry as geom
+import eis_measurement_model as mm
+from eis_validation import lin_kk, z_hit
+
+import utils
+import channel_lag
+import card_gain
+from config import Config, DEFAULT, A_CELL_CM2
+from bronze import BronzeRun, BronzeSpectrum
+
+
+# ===========================================================================
+# 1. Containers
+# ===========================================================================
+
+
+@dataclass
+class SkewModel:
+    """Structural acquisition-skew model for one card."""
+
+    card: str
+    basis: str                 # "slot" | "parity" -- which hypothesis won
+    dt0: float                 # common offset, seconds
+    k_slot: float              # per-basis-unit conversion time, seconds
+    k_nominal: float           # 1 / (n_ch * fs)
+    cost_gain: float           # relative improvement over dt = 0
+    n_segments: int
+    applied: bool
+    note: str = ""
+
+    @property
+    def slot_ratio(self) -> float:
+        """Fitted slot time over nominal.  ~1 supports the mux hypothesis."""
+        return self.k_slot / self.k_nominal if self.k_nominal else np.nan
+
+    def dt_for(self, slot_seg: int, slot_ref: int) -> float:
+        return self.dt0 + self.k_slot * basis_value(self.basis, slot_seg, slot_ref)
+
+
+@dataclass
+class SilverSpectrum:
+    """One segment, corrected, modelled and graded."""
+
+    segment: str
+    card: str
+    freq: np.ndarray
+    Z_corr: np.ndarray          # de-skewed measured points
+    Z_model: np.ndarray         # posterior mean of the KK/DRT model
+    Z_model_sd: np.ndarray      # posterior sd of |Z|, same length
+    sigma_rel: np.ndarray       # per-point relative sd used as weights
+
+    # scalars
+    R_ohmic: float              # R_inf, ohm*cm^2 (top-band weighted mean)
+    R_ohmic_sd: float           # statistical + unresolved-arc bracket
+    R_ohmic_drt: float          # the DRT posterior value, as a cross-check
+    hf_arc_open: float          # resistance estimated to lie ABOVE f_max
+    hf_closure: float           # 1.0 = arc fully closed inside the band
+    R_pol: float                # sum gamma, ohm*cm^2
+    L: float
+    dt_applied: float
+    tau_peak: float
+    gamma: np.ndarray           # the DRT itself
+    tau_grid: np.ndarray
+
+    # validation
+    kk_res_max: float
+    kk_mu: float
+    zhit_dev: float
+    zhit_drift: float
+    hf_phase_slope: float       # residual all-pass content, rad/ln(f)
+
+    # bookkeeping
+    T_degC: float
+    K: float
+    K_imputed: bool
+    u_dc: float
+    area_cm2: float
+    n_used: int
+    n_dropped: int
+    snr_med_db: float
+    thd_med: float
+    tier: str                   # "A" | "B" | "C"
+    flags: list[str] = field(default_factory=list)
+    # carried through from bronze so the residual-skew check can correlate
+    # the leftover delay against converter channel order
+    channel_slot: int = -1
+    ref_slot: int = -1
+    #: R_inf by extrapolating the top of the arc to Im Z = 0. A SECOND
+    #: estimator of the same quantity, with a different failure mode: it is
+    #: the better one when the arc does not close inside the band. Quoted
+    #: beside R_ohmic so the two bracket the answer -- see r_ohmic_axis_fit.
+    R_ohmic_xint: float = float("nan")
+    #: Current-chain lag of this segment against the plate (channel_lag.py):
+    #: what was fitted, what was removed from Z before R_ohmic was read, and
+    #: the verdict. nan / 0 / "" when the stage is off.
+    chain_tau_est: float = float("nan")
+    chain_tau_applied: float = 0.0
+    chain_status: str = ""
+
+    @property
+    def j_dc(self) -> float:
+        return self.u_dc / self.K if self.K else np.nan
+
+    @property
+    def R_ohmic_cv(self) -> float:
+        return self.R_ohmic_sd / abs(self.R_ohmic) if self.R_ohmic else np.inf
+
+
+@dataclass
+class SilverRun:
+    spectra: dict[str, SilverSpectrum]
+    skew: dict[str, SkewModel]
+    dc_closure: dict
+    cell_freq: np.ndarray
+    Z_cell: np.ndarray
+    #: Segments contributing at each aggregate frequency. A point carried by a
+    #: handful of segments is not a cell measurement; filter on this before
+    #: comparing against a whole-cell instrument.
+    cell_n_seg: np.ndarray = field(default_factory=lambda: np.zeros(0, int))
+    #: One row per segment per point: whether it was kept, and if not, which
+    #: gate removed it. This is the evidence for "why does my spectrum stop
+    #: at 400 Hz" and "why is this segment missing".
+    point_ledger: list = field(default_factory=list)
+    #: Segments bronze never produced at all -- no ADC channel for them on any
+    #: card. A different fact from "measured and rejected", and the two used to
+    #: be indistinguishable from the outputs.
+    unwired: list = field(default_factory=list)
+    #: Segments rebuilt from their measured neighbours: {segment: spectrum}.
+    #: Kept SEPARATE from `spectra`, which is measurements only, so nothing
+    #: downstream can mistake a reconstruction for a measurement.
+    filled: dict = field(default_factory=dict)
+    #: Per rebuilt segment: the donors it came from and how far away they are.
+    fill_info: dict = field(default_factory=dict)
+    #: The full aggregate, both normalisations and the coverage.
+    aggregate: dict = field(default_factory=dict)
+    #: segment -> channel_lag.ChannelLag, every segment the stage looked at
+    channel_lag: dict = field(default_factory=dict)
+    #: card -> bronze's alignment verdict (lag, applied, corr, ...), carried
+    #: so the plausibility report can say when a card was never aligned
+    card_lags: dict = field(default_factory=dict)
+    #: bronze's UC check: {channel: {card: card_gain.CardReference}}
+    card_ref: dict = field(default_factory=dict)
+
+    def card_factors(self) -> dict:
+        """card -> card_gain.CardFactor: |Z| per band and j_dc vs the plate."""
+        return card_gain.impedance_factors(
+            self.spectra, voltage=uc_gain_pct(self.card_ref))
+
+    def reach(self) -> list[dict]:
+        """Per segment: how far up in frequency it got, and what stopped it.
+
+        The blocking reason is the gate that removed the most points ABOVE the
+        highest surviving frequency -- which is the honest answer to "what is
+        limiting my bandwidth", rather than the most common reason overall.
+        """
+        by_seg: dict[str, list[dict]] = {}
+        for row in self.point_ledger:
+            by_seg.setdefault(str(row["segment"]), []).append(row)
+        out = []
+        for seg in self.unwired:
+            out.append({
+                "segment": str(seg), "n_points": 0, "n_kept": 0,
+                "f_min_hz": float("nan"), "f_max_hz": float("nan"),
+                "n_above_f_max": 0, "blocked_by": "no_channel",
+                "explanation": "no ADC channel for this segment on any card "
+                               "file -- it was never recorded, so there is "
+                               "nothing to evaluate",
+                "verdict": "not wired",
+            })
+        for seg, rows in by_seg.items():
+            kept = [r for r in rows if r["kept"]]
+            f_max = max((r["freq_hz"] for r in kept), default=float("nan"))
+            above = [r for r in rows
+                     if not r["kept"]
+                     and (not kept or r["freq_hz"] > f_max)]
+            tally: dict[str, int] = {}
+            for r in above:
+                tally[r["reason"]] = tally.get(r["reason"], 0) + 1
+            blocking = max(tally.items(), key=lambda kv: kv[1])[0] if tally else ""
+            out.append({
+                "segment": seg,
+                "n_points": len(rows),
+                "n_kept": len(kept),
+                "f_min_hz": min((r["freq_hz"] for r in kept), default=float("nan")),
+                "f_max_hz": f_max,
+                "n_above_f_max": len(above),
+                "blocked_by": blocking,
+                "explanation": REJECT_REASONS.get(blocking, ""),
+                "verdict": rows[0]["segment_verdict"] if rows else "",
+            })
+        return sorted(out, key=lambda r: (len(r["segment"]), r["segment"]))
+
+    def tiers(self) -> dict[str, int]:
+        out: dict[str, int] = {}
+        for s in self.spectra.values():
+            out[s.tier] = out.get(s.tier, 0) + 1
+        return out
+
+
+# ===========================================================================
+# 2. Structural acquisition skew  --  the high-frequency fix
+# ===========================================================================
+
+
+def _kk_residual(freq: np.ndarray, Z: np.ndarray,
+                 sigma_rel: np.ndarray | None, M: int | None = None) -> float:
+    """Weighted KK-model residual: how far the spectrum is from realisable."""
+    r = mm.fit_kk_model(freq, Z, sigma_rel, M=M)
+    return float(r["res_rms"]) if r.get("ok") else np.inf
+
+
+def basis_value(basis: str, slot_seg: int, slot_ref: int) -> int:
+    """Channel-order term of the skew model, under either hardware hypothesis.
+
+    TWO HYPOTHESES, AND THE DATA DECIDES
+    ------------------------------------
+    "slot"    a single converter walks the channel list, so channel at
+              position p is sampled at p/(n_ch*fs) and the skew grows
+              linearly with the position difference.
+
+    "parity"  two converter cores work alternately, so all even channels are
+              sampled together and all odd channels half a sample period
+              later.  The skew then takes only three values, -1, 0 and +1
+              times 1/(2*fs), and depends on the PARITY of the position, not
+              on its magnitude.
+
+    These predict very different things -- under "slot" two adjacent channels
+    differ by one small step, under "parity" they differ by the maximum -- so
+    they are easy to tell apart from data, and silver fits both and keeps
+    whichever leaves the smaller Kramers-Kronig residual.  Guessing would be
+    unwise: at 10 kHz the parity model predicts 1/(2*fs) = 50 us, and the
+    per-card delays previously reported for this rig were 49.6 and 52.9 us on
+    two of the five cards, which is a strong hint but not a measurement.
+    """
+    if basis == "parity":
+        return (slot_seg % 2) - (slot_ref % 2)
+    return slot_seg - slot_ref
+
+
+def skew_cost(prep: list[tuple], dt0: float, k: float, M: int | None,
+              basis: str = "slot") -> float:
+    """Mean normalised KK residual of a card under dt = dt0 + k*basis."""
+    tot = 0.0
+    for f, Z, s_rel, p_seg, p_ref in prep:
+        b = basis_value(basis, p_seg, p_ref)
+        r = _kk_residual(f, utils.apply_delay(f, Z, dt0 + k * b), s_rel, M=M)
+        if not np.isfinite(r):
+            return np.inf
+        tot += r
+    return tot / len(prep)
+
+
+def fs_prep(prep: list[tuple], default: float = 10_000.0) -> float:
+    """Sampling rate implied by the prepared spectra (for delay bounds)."""
+    try:
+        return float(max(p[0].max() for p in prep)) / 0.35
+    except Exception:
+        return default
+
+
+def optimise_skew(prep: list[tuple], k_nom: float, cfg: Config,
+                  basis: str = "slot") -> tuple[float, float, float, float]:
+    """Coarse-to-fine 2-D search for (dt0, k).
+
+    A FULL 2-D grid, not coordinate descent.  The two parameters are strongly
+    correlated -- raising dt0 and lowering k moves the middle segments hardly
+    at all -- so scanning k at dt0 = 0 and then dt0 at the winning k lands in
+    the wrong basin and stays there.  That failure is not theoretical: on the
+    synthetic card in validate_hf.py it returned a slot time of the wrong
+    SIGN, at a cost visibly higher than the cost at the truth.
+
+    The scan runs at a FIXED number of Voigt elements.  Letting the
+    mu-criterion re-select M at every grid point makes the cost surface
+    piecewise in M, and those steps are comparable in size to the minimum
+    being searched for.  M is released again for the final fit.
+    """
+    slot = np.array([basis_value(basis, p[3], p[4]) for p in prep], float)
+    span = max(1.0, float(np.ptp(slot)))
+
+    n_dec = max(1.0, np.log10(max(p[0].max() for p in prep)
+                              / max(min(p[0].min() for p in prep), 1e-9)))
+    M_scan = int(np.clip(round(4 * n_dec), 6, 24))
+
+    # dt0 is a COMMON offset: analogue front-end delay, trigger offset,
+    # filter group-delay mismatch.  Physically it is sub-microsecond to a few
+    # microseconds.  It is bounded here to half a sample period because a
+    # larger common delay is indistinguishable from a smaller one plus a
+    # sampling shift, and because the Kramers-Kronig objective develops
+    # spurious minima far from zero: left unbounded it returned -154 us on a
+    # synthetic built with no common offset at all, which at 3.7 kHz is -206
+    # degrees of rotation and drove the real part of 56 of 70 segments
+    # negative.
+    dt0_lim = min(2.0 * k_nom * span, 0.5 / fs_prep(prep))
+    dt0_grid = np.linspace(-dt0_lim, dt0_lim, 25)
+    k_grid = np.linspace(-2.5 * k_nom, 2.5 * k_nom, 25)
+
+    base = skew_cost(prep, 0.0, 0.0, M_scan, basis)
+    best, best_c = (0.0, 0.0), base
+    for dt0 in dt0_grid:
+        for k in k_grid:
+            c = skew_cost(prep, dt0, k, M_scan, basis)
+            if c < best_c:
+                best_c, best = c, (dt0, k)
+
+    # local refinement around the coarse winner, two passes
+    d_step = float(dt0_grid[1] - dt0_grid[0])
+    k_step = float(k_grid[1] - k_grid[0])
+    for _ in range(2):
+        d0, k0 = best
+        for dt0 in np.linspace(d0 - d_step, d0 + d_step, 9):
+            for k in np.linspace(k0 - k_step, k0 + k_step, 9):
+                c = skew_cost(prep, dt0, k, M_scan, basis)
+                if c < best_c:
+                    best_c, best = c, (dt0, k)
+        d_step /= 4.0
+        k_step /= 4.0
+
+    return best[0], best[1], base, best_c
+
+
+def fit_structural_skew(card: str, items: list[BronzeSpectrum],
+                        cfg: Config, log=None,
+                        basis_override: str | None = None) -> SkewModel:
+    """Fit dt(slot) = dt0 + k * (slot_seg - slot_ref) for one card.
+
+    The cost is the sum over segments of the NORMALISED KK residual, so that
+    a low-impedance segment does not dominate a high-impedance one.  A delay
+    is an all-pass and the Voigt+L basis is minimum-phase, so the basis
+    cannot absorb a delay: the residual therefore has a genuine minimum at
+    the true skew.  Summing over segments turns each segment's shallow
+    minimum into one sharp one, improving as sqrt(n_segments).
+    """
+    log = log or utils.get_logger(cfg.verbose)
+    usable = [sp for sp in items
+              if np.isfinite(sp.Z_raw).sum() >= cfg.min_points_per_spectrum * 2]
+    if len(usable) < 3:
+        return SkewModel(card, "slot", 0.0, 0.0, 0.0, 0.0, len(usable), False,
+                         "too few segments to constrain a skew model")
+
+    fs = usable[0].fs
+    n_ch = usable[0].n_ch_on_card
+    k_nom = 1.0 / (n_ch * fs)
+
+    # Does the band resolve a delay at all?  A delay is only visible if it
+    # turns the phase appreciably at the top of the band.
+    f_max = max(np.nanmax(sp.freq) for sp in usable)
+    f_min = min(np.nanmin(sp.freq) for sp in usable)
+    if np.log10(f_max / max(f_min, 1e-9)) < cfg.skew_min_decades:
+        return SkewModel(card, "slot", 0.0, 0.0, k_nom, 0.0, len(usable),
+                         False, "band too narrow to resolve a delay")
+
+    # Pre-extract clean arrays once; the grid search touches them many times.
+    prep = []
+    for sp in usable:
+        ok = np.isfinite(sp.Z_raw) & np.isfinite(sp.freq) & (sp.freq > 0)
+        if ok.sum() < cfg.min_points_per_spectrum:
+            continue
+        s_rel = utils.sigma_rel_from_snr(
+            sp.snr_comb_db[ok], n=sp.n_per_step[ok],
+            model=cfg.uncertainty_model,
+            floor=cfg.sigma_rel_floor, ceiling=cfg.sigma_rel_ceiling)
+        prep.append((sp.freq[ok], sp.Z_raw[ok], s_rel,
+                     sp.channel_slot, sp.ref_slot))
+    if len(prep) < 3:
+        return SkewModel(card, "slot", 0.0, 0.0, k_nom, 0.0, len(prep),
+                         False, "too few usable spectra")
+
+    # ------------------------------------------------------------------
+    # FIT BOTH HARDWARE HYPOTHESES AND KEEP THE ONE THE DATA PREFERS
+    # ------------------------------------------------------------------
+    # "slot" assumes one converter walking the channel list; "parity" assumes
+    # two cores alternating, which puts every odd channel half a sample period
+    # behind every even one.  They make different predictions for adjacent
+    # channels, so the Kramers-Kronig residual can tell them apart.  Nothing
+    # is assumed: both are fitted and the loser is reported alongside, so the
+    # margin between them is visible rather than hidden inside a default.
+    want = basis_override or getattr(cfg, "skew_basis", "auto")
+    candidates = ("slot", "parity") if want == "auto" else (want,)
+    trials = {}
+    for b in candidates:
+        k_ref = k_nom if b == "slot" else 1.0 / (2.0 * fs)
+        d0, kf, base_b, best_b = optimise_skew(prep, k_ref, cfg, basis=b)
+        trials[b] = dict(dt0=d0, k=kf, base=base_b, best=best_b, k_ref=k_ref)
+
+    basis = min(trials, key=lambda b: trials[b]["best"])
+    other = ("parity" if basis == "slot" else "slot") if len(trials) > 1 else basis
+    t = trials[basis]
+    dt0_fit, k_fit, base, best_c = t["dt0"], t["k"], t["base"], t["best"]
+    k_nom_used = t["k_ref"]
+    margin = ((trials[other]["best"] - best_c) / max(best_c, 1e-12)
+              if other in trials else float("nan"))
+    gain = float((base - best_c) / base) if base > 0 else 0.0
+
+    slot_deltas = np.array([basis_value(basis, p[3], p[4]) for p in prep], float)
+
+    # The differential part is known a priori from the channel order and is
+    # the part that MATTERS: it differs between segments and therefore paints
+    # false structure onto the plate map.  The common part dt0 is benign --
+    # it rotates every segment equally -- and is also barely identifiable from
+    # a Kramers-Kronig residual, so it is fitted but only applied when the
+    # cost surface actually has a minimum worth the name.
+    ratio = k_fit / k_nom_used if k_nom_used else np.nan
+    trust_fit = bool(0.5 <= ratio <= 1.6)
+    k_used = k_fit if trust_fit else k_nom_used
+    k_source = "fitted" if trust_fit else "nominal (fitted value rejected)"
+
+    # Three conditions before a common offset is applied at all, because the
+    # default of zero is the safe one: a wrong dt0 rotates EVERY segment and
+    # is far more damaging than omitting a real one, which merely shifts the
+    # whole plate.
+    if not getattr(cfg, "fit_common_delay", False):
+        # See config.fit_common_delay: dt0 is degenerate with the series
+        # inductance, which the measurement model already removes.
+        sm = SkewModel(card=card, basis=basis, dt0=0.0, k_slot=k_used,
+                       k_nominal=k_nom_used, cost_gain=gain,
+                       n_segments=len(prep),
+                       applied=bool(cfg.skew_model != "none"))
+        sm.note = (f"basis={basis} (beats {other} by {100*margin:.0f} % of "
+                   f"cost); step {k_source}; common offset not fitted "
+                   f"(degenerate with series L, absorbed there)")
+        log.info(f"    {card}: basis={basis}, step = {k_used*1e6:.3f} us "
+                 f"(nominal {k_nom_used*1e6:.3f}, ratio {ratio:.2f}), "
+                 f"{len(prep)} segments")
+        log.info(f"      differential spread across the card: "
+                 f"{(k_used*np.ptp(slot_deltas))*1e6:+.1f} us = "
+                 f"{np.degrees(2*np.pi*f_max*abs(k_used)*np.ptp(slot_deltas)):.0f}"
+                 f" deg at {f_max:.0f} Hz -- this is what distorts the map")
+        log.info("      common offset held at 0 (degenerate with series L)")
+        return sm
+
+    fs_eff = fs_prep(prep)
+    dt0_lim = min(2.0 * k_nom_used * max(1.0, float(np.ptp(slot_deltas))),
+                  0.5 / fs_eff)
+    interior = abs(dt0_fit) < 0.95 * dt0_lim        # not stuck at the edge
+    plausible = abs(dt0_fit) <= 0.5 / fs_eff        # not larger than physics
+    ident = _dt0_identifiability(prep, k_used, k_nom_used, cfg, basis)
+    apply_dt0 = bool(ident["identifiable"] and interior and plausible)
+    dt0_used = dt0_fit if apply_dt0 else 0.0
+    if not apply_dt0:
+        ident["reason"] = ("not identifiable" if not ident["identifiable"]
+                           else "optimum at the search boundary" if not interior
+                           else "larger than a physical front-end delay")
+
+    applied = bool(cfg.skew_model != "none")
+    sm = SkewModel(card=card, basis=basis, dt0=dt0_used, k_slot=k_used,
+                   k_nominal=k_nom_used, cost_gain=gain,
+                   n_segments=len(prep), applied=applied)
+    sm.note = (f"basis={basis} (beats {other} by {100*margin:.0f} % of cost); "
+               f"step {k_source}; common offset "
+               + (f"fitted {dt0_used*1e6:+.2f} us" if apply_dt0
+                  else f"held at 0 ({ident.get('reason','not identifiable')}, "
+                       f"raw fit {dt0_fit*1e6:+.1f} us)"))
+
+    log.info(f"    {card}: basis={basis} (vs {other}: {100*margin:+.0f} % cost), "
+             f"step = {k_used*1e6:.3f} us "
+             f"(nominal {k_nom_used*1e6:.3f}, fitted {k_fit*1e6:+.3f}, "
+             f"ratio {ratio:.2f}), {len(prep)} segments, cost -{100*gain:.0f} %")
+    log.info(f"      differential spread across the card: "
+             f"{(k_used*np.ptp(slot_deltas))*1e6:+.1f} us = "
+             f"{np.degrees(2*np.pi*f_max*abs(k_used)*np.ptp(slot_deltas)):.0f} deg "
+             f"at {f_max:.0f} Hz -- this is what distorts the map")
+    log.info(f"      common offset dt0 = {dt0_used*1e6:+.2f} us")
+    return sm
+
+
+def _dt0_identifiability(prep: list[tuple], k: float, k_nom: float,
+                         cfg: Config, basis: str = "slot") -> dict:
+    """Is the common-mode delay visible above the noise in the cost?
+
+    Scans dt0 with the differential part held fixed and reports the relative
+    range of the cost.  If a whole sample period of common delay changes the
+    KK residual by less than a couple of percent, the minimum is meaningless
+    and the pipeline says so instead of applying a number it invented.
+    """
+    grid = np.linspace(-1.5 * k_nom * 16, 1.5 * k_nom * 16, 13)
+    costs = np.array([skew_cost(prep, d, k, 12, basis) for d in grid])
+    good = np.isfinite(costs)
+    if good.sum() < 5:
+        return {"identifiable": False, "range": 0.0}
+    c = costs[good]
+    rng_rel = float((c.max() - c.min()) / max(c.min(), 1e-12))
+    # A real minimum should move the residual by more than the fit's own
+    # scatter.  10 % is deliberately demanding.
+    return {"identifiable": bool(rng_rel > 0.10), "range": rng_rel}
+
+
+def residual_skew_check(spectra: dict, cfg: Config, log=None) -> dict:
+    """After correction, is there any channel-order structure LEFT?
+
+    This is a stronger test of the converter architecture than the fit cost,
+    which separates the two hypotheses by only ~1 % and is close to a coin
+    toss.  The idea: a correctly modelled skew leaves NO residual delay that
+    depends on the channel position.  A wrongly modelled one leaves a very
+    characteristic pattern --
+
+        true 'slot' corrected as 'parity'  -> residual RAMPS with slot index
+        true 'parity' corrected as 'slot'  -> residual SAWTOOTHS with parity
+
+    so correlating the residual delay against both predictors says which model
+    is wrong, and it says it from the corrected data rather than from a fit
+    statistic.  The residual delay per segment comes from the high-frequency
+    phase slope, which recovers delay DIFFERENCES exactly (it carries a common
+    offset from the series inductance, but a common offset cannot correlate
+    with channel order and so drops out of this test).
+    """
+    log = log or utils.get_logger(cfg.verbose)
+    d, slot, par = [], [], []
+    for sp in spectra.values():
+        s_idx = getattr(sp, "channel_slot", -1)
+        r_idx = getattr(sp, "ref_slot", -1)
+        if s_idx < 0 or r_idx < 0:
+            continue                     # slot unknown; nothing to correlate
+        dt, r2 = utils.signed_delay_from_phase(sp.freq, sp.Z_corr)
+        if not (np.isfinite(dt) and np.isfinite(r2) and r2 > 0.5):
+            continue
+        d.append(dt)
+        slot.append(s_idx - r_idx)
+        par.append((s_idx - r_idx) % 2)
+    if len(d) < 6:
+        return {"ok": False}
+    d = np.array(d); slot = np.array(slot, float); par = np.array(par, float)
+
+    def corr(a, b):
+        if np.std(a) == 0 or np.std(b) == 0:
+            return 0.0
+        return float(abs(np.corrcoef(a, b)[0, 1]))
+
+    out = {"ok": True, "n": len(d),
+           "corr_slot": corr(d, slot), "corr_parity": corr(d, par),
+           "spread_us": float(np.std(d) * 1e6)}
+    log.info(f"  residual skew check on {len(d)} corrected segments: "
+             f"|corr| with slot index {out['corr_slot']:.2f}, "
+             f"with parity {out['corr_parity']:.2f}, "
+             f"spread {out['spread_us']:.2f} us")
+    # 0.35, not 0.5.  On the end-to-end test, correcting slot-skew data with
+    # the parity model left |corr| = 0.49 against parity -- a clearly wrong
+    # architecture that a 0.5 threshold waves through.  Residual delay should
+    # correlate with channel order essentially not at all when the model is
+    # right, so the bar belongs low.
+    worst = max(out["corr_slot"], out["corr_parity"])
+    if worst > 0.35:
+        which = "slot" if out["corr_slot"] > out["corr_parity"] else "parity"
+        alt = "parity" if which == "slot" else "slot"
+        log.warning(f"  residual delay still tracks {which} "
+                    f"(|corr| = {worst:.2f}) - the channel-order model has "
+                    f"not fully removed the skew.")
+        log.warning(f"  try skew_basis=\"{alt}\" in config.py and compare "
+                    f"this number; the correct architecture should leave "
+                    f"|corr| below about 0.2 on both predictors.")
+    else:
+        log.info("  no channel-order structure left - architecture consistent "
+                 "with the data")
+    return out
+
+
+def sp_slot(sp) -> int:
+    return int(sp.channel_slot - sp.ref_slot)
+
+
+def choose_global_basis(by_card: dict, cfg: Config, log=None) -> tuple[str, dict]:
+    """Decide the converter architecture ONCE for the whole plate.
+
+    All acquisition cards in a rig are the same hardware, so they cannot have
+    different converter architectures.  Letting each card vote separately is
+    therefore not merely noisy, it is unphysical -- and it happened: on the
+    end-to-end test the selector returned `parity` for cards 1, 2 and 4 and
+    `slot` for cards 3 and 5.  The per-card margin is only 1-2 % of the fit
+    cost, which is well inside the noise, so a per-card vote is close to a
+    coin toss.
+
+    Summing the cost over every card turns five weak votes into one strong
+    one: the margin grows while the noise averages down.
+    """
+    log = log or utils.get_logger(cfg.verbose)
+    totals = {"slot": 0.0, "parity": 0.0}
+    per_card = {}
+    for card, items in sorted(by_card.items()):
+        prep, k_nom, fs = _prepare_card(items, cfg)
+        if prep is None:
+            continue
+        for b in ("slot", "parity"):
+            k_ref = k_nom if b == "slot" else 1.0 / (2.0 * fs)
+            _, _, base, best = optimise_skew(prep, k_ref, cfg, basis=b)
+            norm = best / base if base > 0 else 1.0
+            totals[b] += norm
+            per_card.setdefault(card, {})[b] = norm
+
+    if not per_card:
+        return "slot", {}
+    winner = min(totals, key=lambda b: totals[b])
+    loser = "parity" if winner == "slot" else "slot"
+    margin = (totals[loser] - totals[winner]) / max(totals[winner], 1e-12)
+    n_agree = sum(1 for c in per_card
+                  if min(per_card[c], key=lambda b: per_card[c][b]) == winner)
+    log.info(f"  converter architecture: '{winner}' chosen plate-wide "
+             f"({100*margin:.1f} % lower total cost than '{loser}'; "
+             f"{n_agree}/{len(per_card)} cards agree individually)")
+    if margin < 0.05:
+        log.warning(f"  margin is small - the two architectures are barely "
+                    f"distinguishable here.  Set skew_basis explicitly in "
+                    f"config.py from the card datasheet if you can.")
+    return winner, per_card
+
+
+def _prepare_card(items: list[BronzeSpectrum], cfg: Config):
+    """Shared preparation used by both the basis vote and the per-card fit."""
+    usable = [sp for sp in items
+              if np.isfinite(sp.Z_raw).sum() >= cfg.min_points_per_spectrum * 2]
+    if len(usable) < 3:
+        return None, None, None
+    fs = usable[0].fs
+    k_nom = 1.0 / (usable[0].n_ch_on_card * fs)
+    prep = []
+    for sp in usable:
+        ok = np.isfinite(sp.Z_raw) & np.isfinite(sp.freq) & (sp.freq > 0)
+        if ok.sum() < cfg.min_points_per_spectrum:
+            continue
+        s_rel = utils.sigma_rel_from_snr(
+            sp.snr_comb_db[ok], n=sp.n_per_step[ok],
+            model=cfg.uncertainty_model,
+            floor=cfg.sigma_rel_floor, ceiling=cfg.sigma_rel_ceiling)
+        prep.append((sp.freq[ok], sp.Z_raw[ok], s_rel,
+                     sp.channel_slot, sp.ref_slot))
+    if len(prep) < 3:
+        return None, None, None
+    return prep, k_nom, fs
+
+
+def fit_per_card_skew(card: str, items: list[BronzeSpectrum],
+                      cfg: Config, log=None) -> SkewModel:
+    """Legacy single-delay-per-card model, kept for A/B comparison."""
+    log = log or utils.get_logger(cfg.verbose)
+    spec = {}
+    for sp in items:
+        ok = np.isfinite(sp.Z_raw) & (sp.freq > 0)
+        if ok.sum() >= cfg.min_points_per_spectrum:
+            s_rel = utils.sigma_rel_from_snr(
+                sp.snr_comb_db[ok], n=sp.n_per_step[ok],
+                model=cfg.uncertainty_model)
+            spec[sp.segment] = (sp.freq[ok], sp.Z_raw[ok], s_rel)
+    if len(spec) < 3:
+        return SkewModel(card, "slot", 0.0, 0.0, 0.0, 0.0, len(spec), False,
+                         "too few")
+    info = mm.fit_shared_delay(spec, dt_range=cfg.skew_dt_range_s,
+                               n_grid=cfg.skew_n_grid, verbose=False)
+    fs = items[0].fs
+    k_nom = 1.0 / (items[0].n_ch_on_card * fs)
+    return SkewModel(card, "slot", float(info.get("dt", 0.0)), 0.0, k_nom,
+                     float(info.get("cost_gain", 0.0)), len(spec),
+                     bool(info.get("applied")), "per-card single delay")
+
+
+# ===========================================================================
+# 3. Bayesian DRT  --  R_inf with a credible interval
+# ===========================================================================
+
+
+def _drt_design(freq: np.ndarray, tau: np.ndarray, with_L: bool) -> np.ndarray:
+    """[1, (jw), 1/(1+jw tau_m) ...] -- linear in every parameter."""
+    w = 2 * np.pi * freq
+    cols = [np.ones_like(w, dtype=complex)]
+    if with_L:
+        cols.append(1j * w)
+    cols.extend(1.0 / (1.0 + 1j * w * t) for t in tau)
+    return np.column_stack(cols)
+
+
+def _se_kernel(x: np.ndarray, sigma_f: float, ell: float) -> np.ndarray:
+    d = x[:, None] - x[None, :]
+    return sigma_f ** 2 * np.exp(-0.5 * (d / ell) ** 2)
+
+
+def bayesian_drt(freq: np.ndarray, Z: np.ndarray, sigma_rel: np.ndarray,
+                 cfg: Config) -> dict:
+    """Gaussian-process DRT with a closed-form posterior.
+
+    Returns the posterior mean and standard deviation of every parameter,
+    most importantly R_inf, plus the model curve and its uncertainty.
+
+    The system is linear, so with a Gaussian prior and Gaussian noise the
+    posterior is exactly Gaussian:
+
+        Sigma = (Phi^H W Phi + P^-1)^-1 ,   mu = Sigma Phi^H W z
+
+    with W the inverse noise covariance and P the prior covariance
+    (block-diagonal: a very wide Gaussian on R_inf and L, the squared
+    exponential kernel on gamma).  Real and imaginary parts are stacked so
+    everything stays real-valued.
+    """
+    freq = np.asarray(freq, float)
+    Z = np.asarray(Z, complex)
+    ok = np.isfinite(freq) & (freq > 0) & np.isfinite(Z.real) & np.isfinite(Z.imag)
+    freq, Z = freq[ok], Z[ok]
+    s_rel = np.clip(np.asarray(sigma_rel, float)[ok], 1e-4, 1.0)
+    order = np.argsort(freq)
+    freq, Z, s_rel = freq[order], Z[order], s_rel[order]
+    n = len(freq)
+    if n < cfg.min_points_per_spectrum:
+        return {"ok": False, "note": "too few points"}
+
+    # --- tau grid -----------------------------------------------------------
+    # THE TWO ENDS ARE NOT SYMMETRIC, and the legacy notes had this backwards.
+    #
+    #   fast end, tau << 1/w_max :  1/(1 + jw tau) -> 1
+    #        identical to the constant column.  Measured correlation with it
+    #        is 1.0000, so R_inf and a fast element trade freely and the
+    #        extracted intercept runs away.  This is the end that must NOT be
+    #        padded generously.
+    #
+    #   slow end, tau >> 1/w_min :  1/(1 + jw tau) -> -j/(w tau)
+    #        a purely capacitive column, correlation with the constant only
+    #        ~0.47.  Padding here is safe and useful: it lets the model
+    #        describe a low-frequency process whose peak sits below the
+    #        measured window instead of distorting the in-band fit to reach
+    #        for it.
+    #
+    # A SMALL fast pad is still allowed on purpose.  R_inf physically means
+    # "everything faster than the band", so a spectrum containing a real
+    # relaxation just above f_max has an intercept that is genuinely
+    # ambiguous.  Letting the model carry a little fast content converts that
+    # ambiguity from a hidden bias into an honest widening of the posterior
+    # on R_inf -- which is the number the plate map is drawn from.
+    pad_fast = float(getattr(cfg, "drt_tau_pad_fast", 0.0))
+    pad_slow = float(getattr(cfg, "drt_tau_pad_slow",
+                             getattr(cfg, "drt_tau_pad_decades", 0.0)))
+    lo = np.log10(1.0 / (2 * np.pi * freq.max())) - pad_fast
+    hi = np.log10(1.0 / (2 * np.pi * freq.min())) + pad_slow
+    m = max(8, int(round(cfg.drt_n_tau_per_decade * (hi - lo))))
+    x = np.linspace(lo, hi, m)              # log10 tau
+    tau = 10.0 ** x
+
+    hi_band = Z[freq >= np.percentile(freq, 80)]
+    with_L = bool(np.mean(np.imag(hi_band)) > 0)
+    n_free = 2 if with_L else 1
+
+    Phi = _drt_design(freq, tau, with_L)
+    A = np.vstack([np.real(Phi), np.imag(Phi)])
+    b = np.concatenate([np.real(Z), np.imag(Z)])
+    # absolute per-point sd, from the relative sd and |Z|
+    sd = np.concatenate([s_rel * np.abs(Z), s_rel * np.abs(Z)])
+    sd = np.maximum(sd, 1e-12 * max(np.max(np.abs(Z)), 1e-12))
+
+    scale = float(np.median(np.abs(Z)))     # keeps the prior scale-free
+    wide = (1e3 * scale) ** 2               # near-flat prior on R_inf and L
+
+    # PRIOR MEAN.  gamma is a distribution of resistances and is therefore
+    # POSITIVE, but a Gaussian prior centred on zero shrinks it towards zero
+    # and the constant column takes up the slack -- which shows up as R_inf
+    # biased HIGH.  Measured on synthetic spectra that bias was +5 to +7
+    # mOhm*cm2 on a true 60, i.e. 10 %, and it is systematic, so it does not
+    # average away across the plate.
+    #
+    # Centring the prior on a data-driven guess removes it.  The guess is the
+    # crudest possible one -- the real-axis width of the spectrum spread over
+    # the tau grid -- and because the prior variance stays wide the data still
+    # dominates; all that changes is that the model is no longer told, before
+    # seeing anything, that every relaxation is probably absent.
+    hi_re = float(np.median(np.real(Z[freq >= np.percentile(freq, 80)])))
+    lo_re = float(np.median(np.real(Z[freq <= np.percentile(freq, 20)])))
+    R_pol_guess = max(lo_re - hi_re, 0.0)
+    m0 = np.zeros(A.shape[1])
+    m0[0] = hi_re                            # R_inf ~ Re Z at the top of band
+    m0[n_free:] = R_pol_guess / max(m, 1)    # gamma spread evenly over tau
+
+    def neg_log_eml(theta: np.ndarray) -> float:
+        """Negative log marginal likelihood, for hyperparameter selection."""
+        log_sf, log_l, log_sn = theta
+        sf, ell, sn = np.exp(log_sf), np.exp(log_l), np.exp(log_sn)
+        P = np.zeros((A.shape[1], A.shape[1]))
+        P[:n_free, :n_free] = np.eye(n_free) * wide
+        P[n_free:, n_free:] = _se_kernel(x, sf * scale, ell) + 1e-10 * scale ** 2 * np.eye(m)
+        S = sd * sn
+        try:
+            C = A @ P @ A.T + np.diag(S ** 2)
+            L_ = np.linalg.cholesky(C + 1e-12 * np.trace(C) / len(C) * np.eye(len(C)))
+        except np.linalg.LinAlgError:
+            return 1e12
+        r = b - A @ m0
+        alpha = np.linalg.solve(L_.T, np.linalg.solve(L_, r))
+        return float(0.5 * r @ alpha + np.sum(np.log(np.diag(L_))))
+
+    # Hyperparameters are BOUNDED, and the noise scale is nearly pinned.
+    #
+    # An unbounded Nelder-Mead on log-hyperparameters diverged in testing --
+    # literally overflowing exp() -- and the failure is not benign: the way it
+    # diverges is by inflating sigma_n, which tells the model the data are
+    # worthless, so gamma is shrunk to its prior and the constant column
+    # absorbs the whole spectrum.  R_inf then runs away.  That is exactly the
+    # 17x spread the first version produced.
+    #
+    # sigma_n is bounded tightly around 1 because it multiplies a noise
+    # estimate that is already physical: sigma_rel comes from the Cramer-Rao
+    # bound of the sine fit, not from a guess, so the model has no business
+    # rescaling it by more than a factor of ~2.
+    theta0 = np.log([1.0, float(np.clip(cfg_len(cfg), 0.2, 3.0)), 1.0])
+    bounds = [np.log([0.05, 20.0]),      # sigma_f, relative to |Z|
+              np.log([0.2, 3.0]),        # length scale, decades of log10(tau)
+              np.log([0.5, 2.0])]        # sigma_n, multiplier on the CRLB
+    if getattr(cfg, "drt_optimise_hypers", True):
+        try:
+            from scipy.optimize import minimize
+            res = minimize(neg_log_eml, theta0, method="L-BFGS-B",
+                           bounds=bounds, options={"maxiter": 60})
+            theta = res.x if np.isfinite(res.fun) else theta0
+        except Exception:
+            theta = theta0
+    else:
+        theta = theta0
+    theta = np.clip(theta, [b[0] for b in bounds], [b[1] for b in bounds])
+
+    sf, ell, sn = np.exp(theta)
+    P = np.zeros((A.shape[1], A.shape[1]))
+    P[:n_free, :n_free] = np.eye(n_free) * wide
+    P[n_free:, n_free:] = _se_kernel(x, sf * scale, ell) + 1e-10 * scale ** 2 * np.eye(m)
+    S = sd * sn
+    W = np.diag(1.0 / S ** 2)
+
+    try:
+        Pinv = np.linalg.inv(P + 1e-12 * np.trace(P) / len(P) * np.eye(len(P)))
+        Sigma = np.linalg.inv(A.T @ W @ A + Pinv)
+        mu = Sigma @ (A.T @ W @ b + Pinv @ m0)
+    except np.linalg.LinAlgError:
+        return {"ok": False, "note": "posterior is singular"}
+
+    # ------------------------------------------------------------------
+    # gamma >= 0.  A DISTRIBUTION OF RELAXATION TIMES CANNOT BE NEGATIVE.
+    # ------------------------------------------------------------------
+    # The posterior above is an unconstrained Gaussian, so nothing stops it
+    # returning negative gamma, and on noisy data it does -- not as a small
+    # wobble but as a large oscillation: the fit describes the low-frequency
+    # arc with excess weight in the mid-tau bucket and cancels it with
+    # negative weight in the slow bucket.
+    #
+    # gold.split_processes took max(sum, 0), so a negative sum became a hard
+    # ZERO: the plate then reports "no mass transport" on a cell that visibly
+    # has a transport arc, and the resistance that went missing reappears
+    # inside R_ct. Two wrong numbers, both looking like measurements.
+    #
+    # MEASURED on a synthetic carrying R_ct = 40 and R_mt = 30 mOhm*cm2 at
+    # tau = 2 ms and 0.2 s (test_drt_nonnegativity.py), with the declared SNR
+    # matched to the noise actually present:
+    #
+    #             R_ct           R_mt           R_pol        model vs truth
+    #   noise   off     on     off     on     off     on     off      on
+    #    0 %   .0456  .0382  .0151  .0306   .0458  .0689
+    #    1 %   .0465  .0391  .0345  .0319   .0666  .0710   0.38 %  0.43 %
+    #    3 %   .0414  .0393  .0352  .0356   .0725  .0749   0.92 %  0.99 %
+    #    8 %   .0448  .0398  .0451  .0466   .0845  .0865   2.12 %  1.96 %
+    #
+    # R_pol bias goes from -37 % to +3.5 % at 8 % noise while the fit to the
+    # data is unchanged (last two columns), so this buys accuracy in the
+    # split without costing anything in the curve that the cell aggregate is
+    # built from. R_ohmic is untouched either way: it is measured at the top
+    # of the band, not taken from the DRT.
+    #
+    # The constraint is not a regularisation choice, it is physics: gamma is
+    # a sum of RC elements of a passive network. Imposing it keeps the same
+    # objective -- weighted least squares plus the same GP prior, written in
+    # augmented (Tikhonov) form -- and simply forbids the cancellation.
+    # R_inf and L stay free, because a series inductance is genuinely signed.
+    if getattr(cfg, "drt_nonneg", True) and np.any(mu[n_free:] < 0):
+        try:
+            from scipy.optimize import lsq_linear
+            # SOLVED THROUGH THE POSTERIOR PRECISION, NOT THE PRIOR SQUARE ROOT.
+            # The objective is the same either way, but the obvious stacking
+            # -- [W^1/2 A ; P^-1/2] -- needs P^-1/2, and P carries a
+            # squared-exponential kernel over log tau, which is close to
+            # singular by construction. Its inverse spans enormous magnitudes
+            # and the bounded solver converges poorly on it: measured 16 %
+            # median error against the true curve at 1 % noise, where the
+            # unconstrained fit gives 0.4 %.
+            #
+            # H = A'WA + Pinv is the posterior precision, already well
+            # conditioned (it is the matrix inverted for Sigma above). With
+            # H = C C', minimising (t-mu)'H(t-mu) is the same as minimising
+            # ||C' t - C^-1 g||, which is an ordinary bounded least squares
+            # on a square, well-scaled system.
+            H = A.T @ W @ A + Pinv
+            H = 0.5 * (H + H.T)
+            g = A.T @ W @ b + Pinv @ m0
+            C = np.linalg.cholesky(
+                H + 1e-12 * np.trace(H) / len(H) * np.eye(len(H)))
+            lo = np.concatenate([np.full(n_free, -np.inf), np.zeros(m)])
+            hi = np.full(A.shape[1], np.inf)
+            sol = lsq_linear(C.T, np.linalg.solve(C, g), bounds=(lo, hi),
+                             max_iter=500, tol=1e-12)
+            if sol.success or np.all(np.isfinite(sol.x)):
+                mu = sol.x
+                nonneg_applied = True
+            else:
+                nonneg_applied = False
+        except Exception:                                   # noqa: BLE001
+            # scipy missing or the solve failed: clip rather than ship a
+            # negative distribution, and say so in the result.
+            mu = np.concatenate([mu[:n_free], np.maximum(mu[n_free:], 0.0)])
+            nonneg_applied = "clipped"
+    else:
+        nonneg_applied = bool(getattr(cfg, "drt_nonneg", True))
+
+    R_inf = float(mu[0])
+    R_inf_sd = float(np.sqrt(max(Sigma[0, 0], 0.0)))
+    L = float(mu[1]) if with_L else 0.0
+    gamma = mu[n_free:]
+    R_pol = float(np.sum(gamma))
+
+    Z_model = Phi @ mu
+    # propagate the posterior into the curve: var(Re) + var(Im)
+    var_re = np.einsum("ij,jk,ik->i", np.real(Phi), Sigma, np.real(Phi))
+    var_im = np.einsum("ij,jk,ik->i", np.imag(Phi), Sigma, np.imag(Phi))
+    Z_sd = np.sqrt(np.maximum(var_re + var_im, 0.0))
+
+    k_peak = int(np.argmax(np.abs(gamma))) if len(gamma) else 0
+    tau_peak = float(tau[k_peak]) if len(gamma) else np.nan
+
+    # ------------------------------------------------------------------
+    # HOW MUCH OF THE ARC IS STILL OPEN AT f_max
+    # ------------------------------------------------------------------
+    # R_inf means "everything faster than the band".  If the spectrum still
+    # has curvature at f_max, some of the high-frequency arc is outside the
+    # window and R_inf silently absorbs it.  Measured on synthetic spectra
+    # with a 4.5 kHz process and the band stopping at 3.5 kHz, EVERY
+    # estimator -- Re Z at f_max, Boukamp lin-KK R0, and this posterior --
+    # came out biased by the same +8 to +10 mOhm*cm2.  Padding the tau grid
+    # to reach past f_max did not recover it at any noise level down to
+    # 0.2 %: the information is not in the data, and a model that claims
+    # otherwise is fitting its own prior.
+    #
+    # So the bias is not corrected here.  It is MEASURED and reported, which
+    # is the only honest option, and it is added to the uncertainty on R_inf
+    # so that a segment whose arc is wide open is drawn as uncertain instead
+    # of as a confident hot spot.  The real fix is instrumental: raise the
+    # sampling rate until the arc closes inside the band.
+    # The model cannot see a relaxation outside its tau grid, so asking it how
+    # much arc is left over-reports closure -- it returned 0.996 on a spectrum
+    # that was demonstrably 12 mOhm*cm2 short.  The detectable signature is
+    # the residual IMAGINARY part at f_max once the series inductance is taken
+    # out: a closed arc has Im Z -> 0 there, and anything left is capacitive
+    # content the window did not reach.
+    #
+    # For an arc whose peak sits near f_max, Im Z = -R/2 at the peak, so
+    # 2*|Im Z(f_max)| is the natural order-of-magnitude bound on the resistance
+    # still hidden above the band.  On the synthetic with 12 mOhm*cm2 of
+    # unresolved arc it returns 11.6, which brackets the observed +8.7 bias.
+    i_top = int(np.argmax(freq))
+    w_top = 2 * np.pi * freq[i_top]
+    Im_top = float(np.imag(Z_model[i_top]) - w_top * L)   # inductance removed
+    arc_open = float(2.0 * abs(min(Im_top, 0.0)))
+    closure = float(R_pol / (R_pol + arc_open)) if (R_pol + arc_open) > 0 else np.nan
+    R_inf_sd_total = float(np.sqrt(R_inf_sd ** 2 + arc_open ** 2))
+
+    resid = (Z - Z_model) / np.abs(Z)
+    res_rms = float(np.sqrt(np.mean(np.abs(resid) ** 2)))
+
+    return {
+        "ok": True, "freq": freq, "Z": Z, "Z_model": Z_model, "Z_model_sd": Z_sd,
+        "nonneg": nonneg_applied,
+        "R_inf": R_inf, "R_inf_sd": R_inf_sd_total,
+        "R_inf_sd_posterior": R_inf_sd, "hf_arc_open": arc_open,
+        "hf_closure": closure, "L": L, "R_pol": R_pol,
+        "gamma": gamma, "tau": tau, "tau_peak": tau_peak,
+        "res_rms": res_rms, "with_L": with_L,
+        "hyper": {"sigma_f": float(sf), "ell_decades": float(ell),
+                  "sigma_n": float(sn)},
+        "sigma_rel": s_rel,
+    }
+
+
+def cfg_len(cfg: Config) -> float:
+    return float(getattr(cfg, "drt_length_scale_init", 0.7))
+
+
+def r_ohmic_topband(freq: np.ndarray, Z: np.ndarray, sigma_rel: np.ndarray,
+                    span_decades: float = 0.35, n_min: int = 3,
+                    n_max: int = 8) -> tuple[float, float, int]:
+    """R_inf as an inverse-variance weighted mean of Re Z at the top of band.
+
+    WHY THIS AND NOT THE MODEL POSTERIOR
+    ------------------------------------
+    This was chosen against the alternatives on synthetic spectra, not by
+    preference.  With the acquisition skew correctly removed:
+
+        estimator            arc closed          arc open past f_max
+        Re Z at f_max        bias +0.8  rms 2.3   bias  +8.6  rms  8.9
+        top-band mean        bias +0.6  rms 1.4   bias +10.0  rms 10.1
+        Boukamp lin-KK R0    bias +10.0 rms 11.3   bias +10.0  rms 11.3
+        GP-DRT posterior     bias +6.1  rms 6.7    bias  +8.7  rms  9.0
+
+    When the arc closes inside the band the simple weighted mean is five
+    times more accurate than either model, and it recovers the segment-to-
+    segment spread exactly (1.24x against a true 1.24x).  When the arc does
+    NOT close, every estimator carries the same bias, because the missing
+    resistance is outside the window and no inversion can conjure it back --
+    that was checked down to 0.2 % noise, where the model bias got worse, not
+    better, since it was then fitting its own prior.
+
+    So the elaborate estimator earns nothing here and the simple one is used.
+    The DRT is still computed, because R_pol, the peak relaxation time and
+    the process split are things only it provides, and its R_inf is kept
+    alongside as a cross-check: when the two disagree, the spectrum is not
+    behaving like a passive RC network and the segment deserves a look.
+
+    Averaging is deliberately confined to a THIRD of a decade.  Widening it
+    keeps reducing the noise but drags in arc curvature, which is bias, and
+    on the open-arc case the bias grew from +8.6 to +11.0 as the window went
+    from one point to eight.
+    """
+    freq = np.asarray(freq, float)
+    Z = np.asarray(Z, complex)
+    ok = np.isfinite(freq) & (freq > 0) & np.isfinite(Z.real)
+    if ok.sum() < 1:
+        return np.nan, np.nan, 0
+    f, z = freq[ok], Z[ok]
+    s = np.clip(np.asarray(sigma_rel, float)[ok], 1e-4, 1.0)
+
+    f_top = f.max()
+    sel = f >= f_top * 10.0 ** (-span_decades)
+    if sel.sum() < n_min:                       # take the highest n_min anyway
+        sel = np.zeros_like(f, bool)
+        sel[np.argsort(f)[-min(n_min, len(f)):]] = True
+    if sel.sum() > n_max:
+        idx = np.argsort(f)[-n_max:]
+        sel = np.zeros_like(f, bool)
+        sel[idx] = True
+
+    re = np.real(z[sel])
+    sd = np.maximum(s[sel] * np.abs(z[sel]), 1e-15)
+    wts = 1.0 / sd ** 2
+    mean = float(np.sum(wts * re) / np.sum(wts))
+    sd_mean = float(np.sqrt(1.0 / np.sum(wts)))
+    return mean, sd_mean, int(sel.sum())
+
+
+def r_ohmic_axis_fit(freq: np.ndarray, Z: np.ndarray,
+                     n_top: int = 6) -> float:
+    """R_inf by extrapolating the top of the arc to Im Z = 0.
+
+    The textbook definition of HFR is where the spectrum CROSSES THE REAL
+    AXIS. Taking that literally -- hunting for the zero crossing of Im Z --
+    is the worst thing you can do with a band-limited measurement, because
+    when the arc does not close inside the band there is no crossing to find,
+    and the search then latches onto the inductive tail or onto nothing.
+
+    MEASURED over 12 noise realisations at 2 % noise, against a known
+    R_ohm = 60 mOhm*cm2 (test_hfr_estimators.py). Bias and rms in mOhm*cm2:
+
+      estimator                 arc closed    near f_max    arc OPEN
+      Re Z at f_max             -0.16  0.72   -0.02  0.62   +0.69  0.98
+      top-band weighted mean    -0.06  0.42   +0.24  0.45   +1.36  1.41
+      Im Z zero crossing        +0.19  0.57   +0.43  0.95  +40.3  40.3
+      THIS (fit to Im Z = 0)    +0.11  0.40   +0.60  0.67   -0.61  1.35
+      DRT posterior R_inf       -0.37  0.59   +0.50  0.69   +0.75  0.95
+
+    The zero crossing is competitive right up until the arc stops closing,
+    and then it is wrong by 67 % of the answer -- silently, because it still
+    returns a number. That is the failure mode to avoid in a plate map, where
+    nobody inspects 72 Nyquists.
+
+    This estimator fits Re Z against Im Z over the top `n_top` points and
+    reads off the intercept at Im Z = 0. It is the same idea as the crossing
+    but it EXTRAPOLATES to the axis instead of requiring the data to reach
+    it, which is why it survives the open-arc case (-0.61) where the crossing
+    does not. It is reported beside the shipped top-band mean rather than
+    replacing it: the two bracket the truth, and when they disagree by more
+    than their uncertainties the arc is not closed and neither should be
+    quoted without saying so.
+    """
+    freq = np.asarray(freq, float)
+    Z = np.asarray(Z, complex)
+    ok = np.isfinite(freq) & (freq > 0) & np.isfinite(Z.real) & np.isfinite(Z.imag)
+    if ok.sum() < 3:
+        return float("nan")
+    f, z = freq[ok], Z[ok]
+    idx = np.argsort(f)[-min(n_top, ok.sum()):]
+    im, re = np.imag(z[idx]), np.real(z[idx])
+    if np.ptp(im) <= 0:
+        return float("nan")
+    return float(np.polyval(np.polyfit(im, re, 1), 0.0))
+
+
+def extrapolate_hf(drt: dict, f_hi: float, n: int = 40) -> dict:
+    """Evaluate the posterior above the measured band.
+
+    This is the only defensible route to the high-frequency intercept when
+    the sampling rate cuts the band off below it.  The credible interval
+    widens as the model extrapolates, which is exactly what an honest
+    estimate should do.
+    """
+    if not drt.get("ok"):
+        return {}
+    f = drt["freq"]
+    f_new = np.logspace(np.log10(f.max()), np.log10(f_hi), n)
+    Phi = _drt_design(f_new, drt["tau"], drt["with_L"])
+    n_free = 2 if drt["with_L"] else 1
+    mu = np.concatenate([[drt["R_inf"]],
+                         ([drt["L"]] if drt["with_L"] else []),
+                         drt["gamma"]])
+    return {"freq": f_new, "Z": Phi @ mu, "n_free": n_free}
+
+
+# ===========================================================================
+# 4. Per-segment processing
+# ===========================================================================
+
+
+#: Why a point did not survive. The FIRST gate to reject a point owns it, so
+#: the counts add up to the number dropped instead of double-counting.
+REJECT_REASONS = {
+    "not_finite": "the phasor fit did not return a finite Z",
+    "outside_band": "outside cfg.f_min_hz .. min(cfg.f_max_hz, "
+                    "cfg.coherent_f_max_frac_fs * fs)",
+    "snr": "SNR below the gate for this point",
+    "thd": "harmonic distortion above cfg.max_thd",
+    "drift": "amplitude drifted during the dwell, above cfg.max_drift",
+    "magnitude": "|Z| outside the plausible 0.5 .. 800 mOhm.cm2 window",
+    "uncertainty": "propagated sigma above cfg.sigma_rel_max",
+    "cycles": "fewer than cfg.min_cycles_per_dwell cycles in the dwell",
+    "zmag_outlier": "local |Z| outlier against its neighbours",
+    "passivity": "Re Z negative above the passivity gate, after de-skew",
+}
+
+
+def gate_points(sp: BronzeSpectrum, cfg: Config) -> dict:
+    """The point-level gates of process_segment, on their own.
+
+    Returns keep (bool per point), reason (first gate to reject each point),
+    and the arrays the gates computed. Factored out so that the channel-lag
+    stage estimates each chain's lag on exactly the points silver models --
+    on all recorded points, the rejected top-of-band noise dominates the
+    phase and the fit means nothing.
+    """
+    freq = np.asarray(sp.freq, float)
+    Z = np.asarray(sp.Z_raw, complex)
+
+    reason = np.array([""] * freq.size, dtype=object)
+
+    def gate(ok: np.ndarray, name: str) -> np.ndarray:
+        """Apply a gate, recording it for the points it is the first to kill."""
+        ok = np.asarray(ok, bool)
+        newly = (reason == "") & ~ok
+        reason[newly] = name
+        return ok
+
+    keep = gate(np.isfinite(freq) & (freq > 0)
+                & np.isfinite(Z.real) & np.isfinite(Z.imag), "not_finite")
+    f_top = float(cfg.f_max_hz)
+    frac = float(getattr(cfg, "coherent_f_max_frac_fs", 0.0) or 0.0)
+    if frac > 0 and np.isfinite(getattr(sp, "fs", np.nan)) and sp.fs > 0:
+        f_top = min(f_top, frac * float(sp.fs))
+    keep &= gate((freq >= cfg.f_min_hz) & (freq <= f_top), "outside_band")
+
+    # Point-level gates.  An ON-GRID step is a real step -- a geometric
+    # progression is not something noise produces -- so for those the SNR
+    # becomes a WEIGHT rather than a membership test.  Off-grid candidates
+    # still face the full gate.  This is what keeps the top-of-band points,
+    # which are always the weakest, without letting noise in elsewhere.
+    snr = np.asarray(sp.snr_comb_db, float)
+    # Backstop only -- the uncertainty gate below is what actually decides.
+    # See the note above silver_snr_gate_db in config.py.
+    snr_gate = np.where(sp.on_grid,
+                        snr >= getattr(cfg, "silver_snr_floor_db",
+                                       cfg.snr_floor_db),
+                        snr >= getattr(cfg, "silver_snr_gate_db",
+                                       cfg.min_snr_db))
+    keep &= gate(np.nan_to_num(snr_gate, nan=False).astype(bool), "snr")
+    keep &= gate(~(np.isfinite(sp.thd) & (sp.thd > cfg.max_thd)), "thd")
+    keep &= gate(~(np.isfinite(sp.drift) & (sp.drift > cfg.max_drift)), "drift")
+
+    # Plausibility on the magnitude always; on the SIGN of the real part only
+    # above passivity_gate_min_hz.  See the note in config.py: a negative real
+    # part at low frequency is a documented consequence of down-the-channel
+    # starvation and is a fault signature worth keeping, not noise.
+    # |Z| is an ALL-PASS invariant: a delay cannot change it, so the
+    # magnitude bound is safe to apply to the uncorrected spectrum.
+    mag = np.abs(Z) * 1000.0
+    lo, hi = 0.5, 800.0
+    keep &= gate(np.isfinite(mag) & (mag > lo) & (mag < hi), "magnitude")
+    hf_region = freq >= cfg.passivity_gate_min_hz
+    # THE SIGN OF Re Z IS *NOT* AN INVARIANT.  It is deferred to after the
+    # de-skew below.  Applied here, it deleted points that the very next
+    # step would have rotated back into the passive half-plane: on segment 1
+    # it cut 14 surviving points to 6, under the 8-point floor, and the
+    # segment was thrown away as unmodellable.  Order matters.
+
+    # ---- the two gates that remove the high- and low-frequency garbage ----
+    # 1. PROPAGATED UNCERTAINTY.  Computed on the points still standing, so
+    #    the dwell length is accounted for: a weak point measured over many
+    #    samples survives, a weak point measured over a handful does not.
+    #    This is what stops the on-grid rescue from admitting noise.
+    with np.errstate(invalid="ignore", divide="ignore"):
+        s_all = utils.sigma_rel_from_snr(snr, n=sp.n_per_step,
+                                         model=cfg.uncertainty_model,
+                                         floor=cfg.sigma_rel_floor,
+                                         ceiling=1e9)
+    keep &= gate(np.isfinite(s_all) & (s_all <= cfg.sigma_rel_max),
+                 "uncertainty")
+
+    # 2. CYCLES IN THE DWELL.  A phasor fitted to a fraction of a period is
+    #    not a measurement of that period; at the low-frequency end the fit
+    #    cannot separate the fundamental from the drift term, and the two
+    #    trade against each other.
+    with np.errstate(invalid="ignore", divide="ignore"):
+        cycles = sp.n_per_step / sp.fs * freq
+    keep &= gate(np.isfinite(cycles) & (cycles >= cfg.min_cycles_per_dwell),
+                 "cycles")
+
+    # 3. LOCAL |Z| OUTLIERS.  Targets the runaway points directly instead of
+    #    inferring them from SNR, so weak-but-consistent points at the top of
+    #    the band survive.  Evaluated on what is still standing.
+    Zg = np.where(keep, Z, np.nan)
+    bad_z = utils.zmag_outliers(freq, Zg, n_mad=cfg.zmag_outlier_mad,
+                                win=cfg.zmag_outlier_win)
+    keep &= gate(~bad_z, "zmag_outlier")
+
+    n_drop = int((~keep).sum())
+    n_drop_unc = int(np.sum(np.isfinite(s_all) & (s_all > cfg.sigma_rel_max)))
+    n_drop_cyc = int(np.sum(np.isfinite(cycles)
+                            & (cycles < cfg.min_cycles_per_dwell)))
+    n_drop_out = int(bad_z.sum())
+    return dict(freq=freq, Z=Z, keep=keep, reason=reason, snr=snr,
+                s_all=s_all, cycles=cycles, bad_z=bad_z, n_drop=n_drop,
+                n_drop_unc=n_drop_unc, n_drop_cyc=n_drop_cyc,
+                n_drop_out=n_drop_out)
+
+
+def process_segment(sp: BronzeSpectrum, skew: SkewModel, cfg: Config,
+                    log=None, ledger: list | None = None,
+                    chain: "channel_lag.ChannelLag | None" = None
+                    ) -> SilverSpectrum | None:
+    """De-skew, weight, model, validate and grade one segment.
+
+    `ledger`, when given, is appended with one row per POINT recording which
+    gate removed it. Nine gates run in sequence and until now only their
+    totals were kept, so "my impedance stops at 400 Hz" and "this segment has
+    no spectrum at all" were unanswerable from the outputs -- the evidence was
+    computed and thrown away. The first gate to reject a point owns it.
+    """
+    g = gate_points(sp, cfg)
+    freq, Z, keep, reason = g["freq"], g["Z"], g["keep"], g["reason"]
+    snr, s_all, cycles = g["snr"], g["s_all"], g["cycles"]
+    n_drop, n_drop_unc = g["n_drop"], g["n_drop_unc"]
+    n_drop_cyc, n_drop_out = g["n_drop_cyc"], g["n_drop_out"]
+    def _emit(final_keep: np.ndarray, verdict: str) -> None:
+        if ledger is None:
+            return
+        for i in range(freq.size):
+            ledger.append({
+                "segment": sp.segment, "card": sp.card,
+                "freq_hz": round(float(freq[i]), 6),
+                "kept": int(bool(final_keep[i])),
+                "reason": "" if final_keep[i] else (reason[i] or "unknown"),
+                "snr_db": (round(float(snr[i]), 2)
+                           if np.isfinite(snr[i]) else ""),
+                "cycles": (round(float(cycles[i]), 2)
+                           if np.isfinite(cycles[i]) else ""),
+                "sigma_rel": (round(float(s_all[i]), 4)
+                              if np.isfinite(s_all[i]) else ""),
+                "segment_verdict": verdict,
+            })
+
+    if keep.sum() < cfg.min_points_per_spectrum:
+        # The segment is abandoned here. It used to vanish with no record at
+        # all, which is why "why is segment 33 not evaluated?" had no answer
+        # anywhere in the outputs.
+        _emit(keep, f"dropped: only {int(keep.sum())} point(s) survived, "
+                    f"cfg.min_points_per_spectrum is "
+                    f"{cfg.min_points_per_spectrum}")
+        if log:
+            worst = {}
+            for r in reason[~keep]:
+                worst[r] = worst.get(r, 0) + 1
+            top = sorted(worst.items(), key=lambda kv: -kv[1])[:3]
+            log.warning(
+                f"    segment {sp.segment}: dropped -- {int(keep.sum())} of "
+                f"{freq.size} points survived; most removed by "
+                + ", ".join(f"{k} ({v})" for k, v in top))
+        return None
+
+    f = freq[keep]
+    z = Z[keep]
+    s_rel = utils.sigma_rel_from_snr(snr[keep], n=sp.n_per_step[keep],
+                                     model=cfg.uncertainty_model,
+                                     floor=cfg.sigma_rel_floor,
+                                     ceiling=cfg.sigma_rel_ceiling)
+
+    # ---- structural de-skew ------------------------------------------------
+    dt = skew.dt_for(sp.channel_slot, sp.ref_slot) if skew.applied else 0.0
+    z_corr = utils.apply_delay(f, z, dt)
+
+    # ---- current-chain lag (channel_lag.py), after the de-skew it was
+    # ---- measured on ------------------------------------------------------
+    if chain is not None and chain.applied_s:
+        z_corr = z_corr * channel_lag.correction(f, chain.applied_s,
+                                               getattr(chain, "model", "delay"))
+    # ---- the UC taps' own series resistance (cfg.uc_series_mohm_cm2) -----
+    r_tap = float(getattr(cfg, "uc_series_mohm_cm2", 0.0) or 0.0)
+    if r_tap:
+        z_corr = z_corr - r_tap / 1000.0
+
+    # ---- passivity, NOW that the phase is corrected ------------------------
+    # Above passivity_gate_min_hz a passive cell has Re Z > 0.  Below it, a
+    # negative real part is a documented consequence of down-the-channel
+    # starvation (Schneider et al., ECS Trans. 25(1) 937 (2009)) and is kept
+    # and flagged rather than deleted.
+    asr = np.real(z_corr) * 1000.0
+    hf_f = f >= cfg.passivity_gate_min_hz
+    passive = ~(hf_f & np.isfinite(asr) & (asr <= 0))
+    n_neg_lf = int(np.sum(~hf_f & np.isfinite(asr) & (asr < 0)))
+    n_drop_pass = int((~passive).sum())
+    # Map the passivity verdict back onto the ORIGINAL point index, so the
+    # ledger stays one row per recorded point rather than per survivor.
+    idx = np.flatnonzero(keep)
+    reason[idx[~passive]] = "passivity"
+    keep[idx[~passive]] = False
+
+    if passive.sum() < cfg.min_points_per_spectrum:
+        _emit(keep, f"dropped: {int(passive.sum())} point(s) left after the "
+                    f"passivity gate, cfg.min_points_per_spectrum is "
+                    f"{cfg.min_points_per_spectrum}")
+        return None
+
+    _emit(keep, f"kept: {int(keep.sum())} of {freq.size} points, "
+                f"{float(freq[keep].min()):.4g}-{float(freq[keep].max()):.4g} Hz")
+
+    f, z, z_corr = f[passive], z[passive], z_corr[passive]
+    s_rel = s_rel[passive]
+    n_drop += n_drop_pass
+
+    # ---- measurement model -------------------------------------------------
+    if cfg.drt_enable:
+        model = bayesian_drt(f, z_corr, s_rel, cfg)
+    else:
+        model = {"ok": False}
+    if not model.get("ok"):
+        r = mm.fit_kk_model(f, z_corr, s_rel, mu_crit=cfg.mu_crit,
+                            ridge=cfg.kk_ridge)
+        if not r.get("ok"):
+            return None
+        model = {
+            "ok": True, "freq": r["freq"], "Z": r["Z"], "Z_model": r["Z_model"],
+            "Z_model_sd": np.zeros_like(r["freq"]),
+            "R_inf": float(r["R0"]), "R_inf_sd": np.nan, "L": float(r["L"]),
+            "R_pol": float(r["Rp"]), "gamma": np.zeros(0), "tau": np.zeros(0),
+            "tau_peak": np.nan, "res_rms": float(r["res_rms"]),
+            "sigma_rel": s_rel,
+        }
+
+    f_m = model["freq"]
+    z_m = model["Z"]
+    Z_model = model["Z_model"]
+    L = model["L"]
+
+    # jwL is cable and plate, not electrochemistry.  Removing it from the
+    # OUTPUT curve is what makes the arc close onto the real axis instead of
+    # hooking upward; it is reported separately so nothing is hidden.
+    if cfg.remove_inductance and L:
+        w = 2 * np.pi * f_m
+        z_m = z_m - 1j * w * L
+        Z_model = Z_model - 1j * w * L
+
+    # ---- R_ohmic: measured at the top of band, not extrapolated -----------
+    R_top, R_top_sd, n_top = r_ohmic_topband(f_m, z_m, model.get("sigma_rel", s_rel))
+    arc_open = float(model.get("hf_arc_open", 0.0) or 0.0)
+    closure = float(model.get("hf_closure", np.nan))
+    R_drt = float(model["R_inf"])
+    if not np.isfinite(R_top):
+        R_top, R_top_sd = R_drt, float(model.get("R_inf_sd", np.nan))
+    # The unresolved arc is a BIAS, not noise, so it is added in quadrature to
+    # the statistical error rather than being subtracted from the estimate:
+    # its sign is known but its size is only bracketed.
+    R_sd_total = float(np.sqrt(np.nan_to_num(R_top_sd) ** 2 + arc_open ** 2))
+    # the axis-intercept cross-check: same quantity, different failure mode
+    R_xint = r_ohmic_axis_fit(f_m, z_m)
+
+    # ---- independent validation -------------------------------------------
+    kk = lin_kk(f_m, z_m, mu_crit=cfg.mu_crit, tol=cfg.kk_tol)
+    zh = z_hit(f_m, z_m)
+
+    # ---- tiering: soft, never deleting ------------------------------------
+    flags: list[str] = []
+    if sp.K_imputed:
+        flags.append("imputed_calibration")
+    if not skew.applied:
+        flags.append("no_skew_correction")
+    if n_drop > 0.4 * len(freq):
+        flags.append("many_points_dropped")
+    if n_drop_unc:
+        flags.append(f"dropped_{n_drop_unc}_uncertain")
+    if n_drop_cyc:
+        flags.append(f"dropped_{n_drop_cyc}_short_dwell")
+    if n_drop_out:
+        flags.append(f"dropped_{n_drop_out}_zmag_outlier")
+    if n_drop_pass:
+        flags.append(f"dropped_{n_drop_pass}_non_passive_after_deskew")
+    if n_neg_lf:
+        # kept deliberately - see Schneider et al. 2009
+        flags.append(f"negative_ReZ_lf_{n_neg_lf}pts")
+
+    if chain is not None:
+        if chain.status == channel_lag.CORRECTED:
+            flags.append(f"chain_lag_removed_{1e6 * chain.applied_s:+.0f}us")
+        elif chain.status == channel_lag.REPORT_ONLY:
+            flags.append(f"chain_lag_{1e6 * chain.tau_s:+.0f}us_not_removed")
+        elif chain.status in channel_lag.UNRELIABLE:
+            flags.append(f"chain_phase_{chain.status}")
+
+    cv = abs(R_sd_total / R_top) if (R_top and np.isfinite(R_sd_total)) else np.inf
+    if np.isfinite(closure) and closure < 0.95:
+        flags.append(f"hf_arc_open_{1000*arc_open:.0f}mohm")
+    kk_res = float(kk.get("res_max", np.nan))
+
+    # A negative or zero high-frequency intercept is not a measurement, it is
+    # a failure: a passive cell cannot have one.  It happens when the top of
+    # the band is nearly all noise, and left alone it poisons every plate
+    # statistic downstream -- on the end-to-end test a single such segment
+    # turned the R_ohmic spread into 8e10.  Flag it, force the lowest tier,
+    # and let the spatial field supply a usable number instead.
+    if not (np.isfinite(R_top) and R_top > 0):
+        flags.append("nonphysical_R_ohmic")
+
+    if (not np.isfinite(R_top)) or R_top <= 0:
+        tier = "C"
+    elif kk_res <= cfg.kk_tol and cv <= 0.10:
+        tier = "A"
+    elif kk_res <= 3 * cfg.kk_tol and cv <= 0.25:
+        tier = "B"
+    else:
+        tier = "C"
+    if sp.K_imputed and tier == "A":
+        tier = "B"          # the shape is fine; the absolute level is not
+    # A channel whose high-frequency phase disagrees with the plate in a way
+    # that is not a first-order lag (typically a card read at the wrong
+    # time) cannot give a top-of-band R_ohmic worth mapping.
+    if chain is not None and chain.status in channel_lag.UNRELIABLE:
+        tier = "C"
+
+    return SilverSpectrum(
+        segment=sp.segment, card=sp.card, freq=f_m, Z_corr=z_m,
+        Z_model=Z_model, Z_model_sd=model.get("Z_model_sd", np.zeros_like(f_m)),
+        sigma_rel=model.get("sigma_rel", s_rel),
+        R_ohmic=float(R_top), R_ohmic_sd=float(R_sd_total),
+        R_ohmic_drt=R_drt, R_ohmic_xint=float(R_xint),
+        hf_arc_open=arc_open, hf_closure=closure,
+        R_pol=float(model["R_pol"]), L=float(L), dt_applied=float(dt),
+        tau_peak=float(model.get("tau_peak", np.nan)),
+        gamma=np.asarray(model.get("gamma", np.zeros(0))),
+        tau_grid=np.asarray(model.get("tau", np.zeros(0))),
+        kk_res_max=kk_res, kk_mu=float(kk.get("mu", np.nan)),
+        zhit_dev=float(zh.get("dev_rms", np.nan)),
+        zhit_drift=float(zh.get("drift_lf", np.nan)),
+        hf_phase_slope=float(utils.hf_phase_slope(f_m, z_m)),
+        T_degC=sp.T_degC, K=sp.K, K_imputed=sp.K_imputed, u_dc=sp.u_dc,
+        area_cm2=utils.segment_areas(cfg).get(
+            sp.segment, geom.SEGMENTS[sp.segment].area_cm2),
+        channel_slot=int(sp.channel_slot), ref_slot=int(sp.ref_slot),
+        n_used=int(len(f_m)), n_dropped=n_drop,
+        snr_med_db=float(np.nanmedian(snr[keep])),
+        thd_med=float(np.nanmedian(sp.thd[keep])),
+        tier=tier, flags=flags,
+        chain_tau_est=(float(chain.tau_s) if chain is not None
+                       else float("nan")),
+        chain_tau_applied=float(chain.applied_s) if chain is not None else 0.0,
+        chain_status=chain.status if chain is not None else "",
+    )
+
+
+def channel_lag_items(spectra: dict, skew: dict, cfg: Config) -> dict:
+    """segment -> (freq, de-skewed Z, usable) for channel_lag.estimate.
+
+    The same gates and the same de-skew as process_segment, so the lag is
+    measured on the points that will be modelled, in the frame they will be
+    modelled in.
+    """
+    items = {}
+    for seg, sp in spectra.items():
+        g = gate_points(sp, cfg)
+        sk = skew.get(sp.card)
+        dt = (sk.dt_for(sp.channel_slot, sp.ref_slot)
+              if sk is not None and sk.applied else 0.0)
+        items[seg] = (g["freq"], utils.apply_delay(g["freq"], g["Z"], dt),
+                      g["keep"])
+    return items
+
+
+# ===========================================================================
+# 5. Plate-level products
+# ===========================================================================
+
+
+def dc_closure(spectra: dict[str, SilverSpectrum], cfg: Config) -> dict:
+    """Sum(j_s * A_s) against the load current.
+
+    Genuinely independent: nothing in the chain was fitted to the current, so
+    this is the only end-to-end check of calibration, areas and DC levels
+    together.  It costs nothing and it is the first thing to look at.
+    """
+    j = {s: sp.j_dc for s, sp in spectra.items() if np.isfinite(sp.j_dc)}
+    if not j:
+        return {"ok": False}
+    A_meas = sum(spectra[s].area_cm2 for s in j)
+    I_meas = sum(j[s] * spectra[s].area_cm2 for s in j)
+    I_extrap = I_meas * A_CELL_CM2 / A_meas if A_meas else np.nan
+    out = {"ok": True, "area_measured_cm2": A_meas,
+           "area_total_cm2": A_CELL_CM2, "I_measured_A": I_meas,
+           "I_extrapolated_A": I_extrap, "i_setpoint_A": cfg.i_setpoint_a}
+    if cfg.i_setpoint_a:
+        out["deviation_pct"] = 100.0 * (I_extrap / cfg.i_setpoint_a - 1.0)
+    return out
+
+
+def cell_aggregate(spectra: dict[str, SilverSpectrum]
+                   ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Area-weighted harmonic mean -- what a cell-level instrument would see.
+
+    Segments sit in parallel across one cell voltage, so admittances add.
+    Being harmonic, the result is dominated by the LOW-impedance segments,
+    which is the mathematical statement of why an integral measurement hides
+    local faults: a flooded segment has high Z, contributes little
+    admittance, and barely moves the cell curve.
+
+    THE GRID IS THE UNION OF EVERY SEGMENT'S FREQUENCIES, NOT ONE SEGMENT'S.
+    This used to take `f_ref` from whichever segment had the most surviving
+    points, which silently deleted any frequency that segment happened to
+    lose.  Measured on RO2612030 at 150 A: the reference was segment 49 on
+    card 5, and eight frequencies -- 0.19, 75.3, 94.8, 119.3, 150.2, 189.2,
+    299.8, 475.1 Hz -- were dropped from the aggregate although 29 of the 68
+    segments carried a valid point at each of them.  On the Nyquist that is
+    the straight chord between 59.8 and 238.1 Hz.
+
+    Returns (freq, Z_cell, n_seg).  `n_seg` counts the segments that actually
+    MEASURED a point at that frequency -- not the ones whose band merely spans
+    it -- so a caller can require a minimum coverage before believing a point.
+    The distinction matters: at 150 A, 75.3 Hz lies inside all 68 segments'
+    bands but only 29 of them kept a point there, and a coverage of 68 would
+    have claimed evidence that does not exist.  The aggregate VALUE still uses
+    every segment whose band covers the frequency, since the Kramers-Kronig
+    model is continuous and interpolating it across a segment's own gap is
+    legitimate; only the reported count is restricted.  Frequencies are
+    matched on a relative tolerance, because each segment carries its own
+    float copy of the same ladder rung.
+    """
+    if not spectra:
+        return np.zeros(0), np.zeros(0), np.zeros(0, int)
+
+    usable = {s: sp for s, sp in spectra.items() if len(sp.freq) >= 3}
+    if not usable:
+        return np.zeros(0), np.zeros(0), np.zeros(0, int)
+
+    # ---- union grid, with near-duplicate rungs collapsed -------------------
+    every = np.sort(np.concatenate([np.asarray(sp.freq, float)
+                                    for sp in usable.values()]))
+    every = every[np.isfinite(every) & (every > 0)]
+    grid: list[float] = []
+    for f in every:
+        if not grid or abs(f / grid[-1] - 1.0) > 1e-3:
+            grid.append(float(f))
+        else:                       # same rung seen again: keep the mean
+            grid[-1] = 0.5 * (grid[-1] + float(f))
+    f_ref = np.asarray(grid, float)
+
+    on, areas = {}, {}
+    n_seg = np.zeros(len(f_ref), int)
+    for s, sp in usable.items():
+        z = utils.interp_complex(f_ref, sp.freq, sp.Z_model)
+        # interp_complex CLAMPS outside this segment's own band, holding the
+        # endpoint flat.  |Z| falls with frequency, so a held value is too
+        # large and inflates the aggregate at the top of the band.  Mask it.
+        lo, hi = float(np.min(sp.freq)), float(np.max(sp.freq))
+        inside = (f_ref >= lo * (1 - 1e-3)) & (f_ref <= hi * (1 + 1e-3))
+        on[s] = np.where(inside, z, np.nan + 0j)
+        areas[s] = sp.area_cm2
+        # measured here, not merely spanned: nearest own frequency within tol
+        own = np.asarray(sp.freq, float)
+        j = np.clip(np.searchsorted(own, f_ref), 1, len(own) - 1)
+        near = np.minimum(np.abs(f_ref / own[j] - 1.0),
+                          np.abs(f_ref / own[j - 1] - 1.0))
+        n_seg += (inside & np.isfinite(z) & (near <= 1e-3)).astype(int)
+
+    return f_ref, mm.aggregate_asr(f_ref, on, areas, A_CELL_CM2), n_seg
+
+
+class FilledSpectrum:
+    """A segment reconstructed from its neighbours.
+
+    Deliberately NOT a SilverSpectrum. It carries only what the aggregate and
+    the maps need, so that nothing can hand it to code expecting a measured
+    spectrum and get back a plausible-looking answer: there is no tier, no
+    KK residual and no DRT here, because none of those were measured.
+    """
+
+    __slots__ = ("segment", "freq", "Z_model", "area_cm2", "donors", "hops",
+                 "R_ohmic", "card")
+
+    def __init__(self, segment, freq, Z_model, area_cm2, donors, hops,
+                 R_ohmic=float("nan")):
+        self.segment = str(segment)
+        self.freq = freq
+        self.Z_model = Z_model
+        self.area_cm2 = float(area_cm2)
+        self.donors = list(donors)
+        self.hops = int(hops)
+        self.R_ohmic = float(R_ohmic)
+        self.card = "reconstructed"
+
+
+def build_filled_spectra(spectra: dict, cfg: Config, log=None
+                         ) -> tuple[dict, dict]:
+    """Rebuild substituted and (optionally) missing segments from neighbours.
+
+    Returns ({segment: FilledSpectrum}, {segment: info}). Both are empty
+    unless `substitute_segments` or `fill_missing_from_neighbours` asks for
+    it -- the default run reconstructs nothing.
+    """
+    import r2d2_geometry as geom
+    try:
+        import neighbours
+    except ImportError:                                     # noqa: BLE001
+        return {}, {}
+
+    log = log or utils.get_logger(getattr(cfg, "verbose", False))
+    want = {str(x) for x in (getattr(cfg, "substitute_segments", ()) or ())}
+    if getattr(cfg, "fill_missing_from_neighbours", False):
+        want |= {s for s in geom.SEGMENTS if s not in spectra}
+    # never rebuild something that was excluded outright: exclusion means the
+    # segment plays no part, and inventing a value for it is the opposite
+    want -= {str(x) for x in (getattr(cfg, "exclude_segments", ()) or ())}
+    want -= set(spectra)
+    if not want:
+        return {}, {}
+
+    areas = utils.segment_areas(cfg)
+    hops_max = int(getattr(cfg, "fill_max_hops", 2))
+    out, info = {}, {}
+    for seg in sorted(want, key=lambda x: int(x) if str(x).isdigit() else 0):
+        f, z, meta = neighbours.fill_spectrum(seg, spectra, areas,
+                                              max_hops=hops_max)
+        info[seg] = meta
+        if not meta.get("ok"):
+            log.warning(f"  segment {seg}: cannot rebuild from neighbours "
+                        f"({meta.get('reason')})")
+            continue
+        # R_ohmic of the reconstruction, by the same top-band rule the
+        # measured segments use, so the map compares like with like
+        r_top, _sd, _n = r_ohmic_topband(f, z, np.full(f.size, 0.05))
+        out[seg] = FilledSpectrum(seg, f, z, areas.get(seg,
+                                  geom.SEGMENTS[seg].area_cm2),
+                                  meta["donors"], meta["hops"], r_top)
+        log.info(f"  segment {seg}: rebuilt from {', '.join(meta['donors'])}"
+                 f"{' (2 hops away)' if meta['hops'] > 1 else ''} -- "
+                 f"an ESTIMATE, not a measurement")
+    return out, info
+
+
+def cell_aggregate_full(spectra: dict, filled: dict | None = None,
+                        a_cell: float = A_CELL_CM2) -> dict:
+    """The cell curve, with the arithmetic written out and both normalisations.
+
+    THE PRIMITIVE IS AN ADMITTANCE SUM.  Segments sit in parallel across one
+    cell voltage, so their admittances add:
+
+        1 / Z_cell(f) = SUM_v 1 / Z_v(f)          Z_v in ohm, per segment
+
+    Each segment is measured as an AREA-SPECIFIC impedance z_v [ohm.cm2], and
+    an area-specific impedance over an area A_v is an absolute impedance
+    z_v / A_v, so
+
+        Y_cell(f) = SUM_v A_v / z_v(f)            siemens
+        Z_cell(f) = 1 / Y_cell(f)                 ohm        <- the cell
+        z_cell(f) = A / Y_cell(f)                 ohm.cm2    <- area-specific
+
+    and the only question left is WHICH A the last line divides by. Two are
+    defensible and they are not the same number:
+
+      A_used(f)  the area that actually returned a value at this frequency.
+                 Self-consistent: it is the ASR of the region that was
+                 measured, and it is what to quote for the local result.
+      A_cell     the whole plate. This is what a cell-level instrument
+                 measures, so it is the one to compare against a Gamry sweep
+                 -- but it is only honest when the coverage is near 1,
+                 because uncovered area is being treated as if it carried
+                 current with the same ASR as the rest.
+
+    Both are returned, with the coverage, rather than one being chosen
+    silently. `filled` carries neighbour-reconstructed segments (see
+    neighbours.fill_spectrum); they count towards A_used, which is what
+    closes the gap between the two normalisations.
+
+    Returns a dict: freq, Y, Z_ohm, z_asr_used, z_asr_full, area_used,
+    area_coverage, n_seg, n_filled.
+    """
+    merged = dict(spectra)
+    filled = filled or {}
+    for seg, sp in filled.items():
+        merged[seg] = sp
+
+    f_ref, z_used, n_seg = cell_aggregate(merged)
+    if not len(f_ref):
+        return {"ok": False, "reason": "no usable segments"}
+
+    # rebuild the admittance and the contributing area on the same grid
+    Y = np.zeros(len(f_ref), complex)
+    a_used = np.zeros(len(f_ref))
+    for seg, sp in merged.items():
+        if len(sp.freq) < 3:
+            continue
+        a = float(sp.area_cm2)
+        z = utils.interp_complex(f_ref, np.asarray(sp.freq, float),
+                                 np.asarray(sp.Z_model, complex))
+        lo, hi = float(np.min(sp.freq)), float(np.max(sp.freq))
+        inside = (f_ref >= lo * (1 - 1e-3)) & (f_ref <= hi * (1 + 1e-3))
+        ok = inside & np.isfinite(z) & (z != 0)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            Y += np.where(ok, a / z, 0.0)
+        a_used += np.where(ok, a, 0.0)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        Z_ohm = np.where(Y != 0, 1.0 / Y, np.nan + 1j * np.nan)
+        z_full = np.where(Y != 0, a_cell / Y, np.nan + 1j * np.nan)
+
+    return {
+        "ok": True, "freq": f_ref, "Y": Y, "Z_ohm": Z_ohm,
+        "z_asr_used": z_used, "z_asr_full": z_full,
+        "area_used": a_used, "area_cell": float(a_cell),
+        "area_coverage": a_used / float(a_cell),
+        "n_seg": n_seg, "n_filled": len(filled),
+        "filled_segments": sorted(filled, key=lambda x: int(x)
+                                  if str(x).isdigit() else 0),
+    }
+
+
+# ===========================================================================
+# 6. Entry point
+# ===========================================================================
+
+
+def run(bronze_run: BronzeRun, cfg: Config = DEFAULT, log=None) -> SilverRun:
+    log = log or utils.get_logger(cfg.verbose)
+    utils.banner("SILVER  --  correction, modelling, validation", log)
+
+    # ---- 1. skew, per card -------------------------------------------------
+    utils.section(f"acquisition skew  (model: {cfg.skew_model})", log)
+    by_card: dict[str, list[BronzeSpectrum]] = {}
+    for sp in bronze_run.spectra.values():
+        by_card.setdefault(sp.card, []).append(sp)
+
+    global_basis = None
+    if cfg.skew_model == "structural":
+        if getattr(cfg, "skew_basis", "auto") == "auto":
+            global_basis, _ = choose_global_basis(by_card, cfg, log)
+        else:
+            global_basis = cfg.skew_basis
+            log.info(f"  converter architecture: '{global_basis}' "
+                     f"(set explicitly in config)")
+
+    skew: dict[str, SkewModel] = {}
+    for card, items in sorted(by_card.items()):
+        if cfg.skew_model == "structural":
+            skew[card] = fit_structural_skew(card, items, cfg, log,
+                                             basis_override=global_basis)
+        elif cfg.skew_model == "per_card":
+            skew[card] = fit_per_card_skew(card, items, cfg, log)
+        else:
+            fs = items[0].fs
+            skew[card] = SkewModel(card, "slot", 0.0, 0.0,
+                                   1.0 / (items[0].n_ch_on_card * fs),
+                                   0.0, len(items), False, "disabled")
+
+    # ---- 1b. current-chain lag per segment (channel_lag.py) ----------------
+    lags: dict = {}
+    if channel_lag.mode(cfg) != "off":
+        utils.section(f"current-chain lag per segment  "
+                      f"(mode: {channel_lag.mode(cfg)})", log)
+        try:
+            measured = {s: bronze_run.spectra[s]
+                        for s in bronze_run.segments_measured()}
+            lags = channel_lag.estimate(
+                channel_lag_items(measured, skew, cfg), cfg, log)
+        except Exception as exc:            # a diagnostic must not end a run
+            log.warning(f"  channel lag skipped: {type(exc).__name__}: {exc}")
+            lags = {}
+
+    # ---- 2. per segment ----------------------------------------------------
+    utils.section("measurement model per segment", log)
+    spectra: dict[str, SilverSpectrum] = {}
+    failed: list[str] = []
+    #: One row per segment per recorded point, with the gate that removed it.
+    point_ledger: list[dict] = []
+    for seg in bronze_run.segments_measured():
+        sp = bronze_run.spectra[seg]
+        try:
+            res = process_segment(sp, skew[sp.card], cfg, log,
+                                  ledger=point_ledger, chain=lags.get(seg))
+        except Exception as exc:                      # never lose the plate
+            log.warning(f"    segment {seg}: {type(exc).__name__}: {exc}")
+            res = None
+        if res is None:
+            failed.append(seg)
+            continue
+        spectra[seg] = res
+
+    tiers: dict[str, int] = {}
+    for s in spectra.values():
+        tiers[s.tier] = tiers.get(s.tier, 0) + 1
+    log.info(f"  {len(spectra)} segments modelled  "
+             f"(A={tiers.get('A',0)}  B={tiers.get('B',0)}  C={tiers.get('C',0)})")
+    if failed:
+        log.info(f"  {len(failed)} could not be modelled at all: "
+                 f"{', '.join(failed)}")
+        log.info("  (they are handed to gold.py for spatial inference, "
+                 "not discarded)")
+
+    if spectra:
+        rs = np.array([s.R_ohmic * 1000 for s in spectra.values()])
+        sd = np.array([s.R_ohmic_sd * 1000 for s in spectra.values()])
+        good = np.isfinite(rs) & (rs > 0)
+        if good.any():
+            log.info(f"  R_ohmic = {rs[good].mean():.1f} +/- "
+                     f"{rs[good].std():.1f} mOhm*cm2 "
+                     f"(spread {rs[good].max()/max(rs[good].min(),1e-9):.2f}x, "
+                     f"CV {100*rs[good].std()/rs[good].mean():.1f} %)")
+            if np.isfinite(sd).any():
+                log.info(f"  median posterior sd on R_ohmic: "
+                         f"{np.nanmedian(sd[good]):.2f} mOhm*cm2 "
+                         f"({100*np.nanmedian(sd[good]/np.maximum(rs[good],1e-9)):.1f} %)")
+
+    # ---- 3. plate products -------------------------------------------------
+    utils.section("plate-level checks", log)
+    dcc = dc_closure(spectra, cfg)
+    if dcc.get("ok"):
+        log.info(f"  DC closure: {dcc['area_measured_cm2']:.1f} / "
+                 f"{dcc['area_total_cm2']:.1f} cm2 measured, "
+                 f"I = {dcc['I_measured_A']:.1f} A -> "
+                 f"{dcc['I_extrapolated_A']:.1f} A full plate")
+        if "deviation_pct" in dcc:
+            log.info(f"  setpoint {dcc['i_setpoint_A']:.1f} A -> "
+                     f"deviation {dcc['deviation_pct']:+.1f} %")
+
+    if cfg.skew_model == "structural":
+        try:
+            residual_skew_check(spectra, cfg, log)
+        except Exception as exc:          # a diagnostic must never end a run
+            log.warning(f"  residual skew check skipped: "
+                        f"{type(exc).__name__}: {exc}")
+
+    # ---- segments rebuilt from their neighbours ----------------------------
+    filled, fill_info = build_filled_spectra(spectra, cfg, log)
+
+    agg = cell_aggregate_full(spectra, filled)
+    if agg.get("ok"):
+        f_cell, Z_cell, n_cell = agg["freq"], agg["z_asr_used"], agg["n_seg"]
+        cov = agg["area_coverage"]
+        log.info(f"  cell aggregate: 1/Z_cell = sum_v A_v / z_v over "
+                 f"{len(spectra)} measured"
+                 + (f" + {len(filled)} reconstructed" if filled else "")
+                 + f" segments, {len(f_cell)} frequencies")
+        log.info(f"    plate area covered: {100*np.nanmin(cov):.0f}-"
+                 f"{100*np.nanmax(cov):.0f} % "
+                 f"(median {100*np.nanmedian(cov):.0f} %) of "
+                 f"{agg['area_cell']:.1f} cm2; segments per frequency "
+                 f"{int(n_cell.min())}-{int(n_cell.max())}")
+        if np.nanmedian(cov) < 0.95:
+            log.warning(f"    the area-specific aggregate is normalised by "
+                        f"the COVERED area. Comparing it against a whole-cell "
+                        f"instrument means comparing "
+                        f"{100*np.nanmedian(cov):.0f} % of the plate against "
+                        f"100 % of it, which holds only if the unmeasured "
+                        f"area behaves like the measured area. Do NOT switch "
+                        f"to z_asr_full for this: it divides the whole-plate "
+                        f"area by the admittance of the measured part only, "
+                        f"so it is inflated by 1/coverage. To close the gap, "
+                        f"measure more area or fill the missing segments "
+                        f"(fill_missing_from_neighbours).")
+    else:
+        f_cell, Z_cell, n_cell = cell_aggregate(spectra)
+
+    return SilverRun(point_ledger=point_ledger,
+                     unwired=list(bronze_run.segments_missing()),
+                     spectra=spectra, skew=skew, dc_closure=dcc,
+                     cell_freq=f_cell, Z_cell=Z_cell, cell_n_seg=n_cell,
+                     filled=filled, fill_info=fill_info, aggregate=agg,
+                     channel_lag=lags,
+                     card_lags=dict(getattr(bronze_run, "lags", {}) or {}),
+                     card_ref=dict(getattr(bronze_run, "card_ref", {}) or {}))
+
+
+def uc_gain_pct(card_ref: dict) -> dict[str, float]:
+    """card -> gain in % of the UC channel its Z divides by, AFTER whatever
+    correction bronze applied (so 0 after a correction)."""
+    out = {}
+    for d in (card_ref or {}).values():
+        for c, r in d.items():
+            if getattr(r, "used_for_Z", False) and np.isfinite(r.gain):
+                out[c] = 100.0 * (r.gain / (r.applied or 1.0) - 1.0)
+    return out
+
+
+def save(sr: SilverRun, cfg: Config, log=None) -> Path:
+    log = log or utils.get_logger(cfg.verbose)
+    out = Path(cfg.out_dir) / "silver"
+    out.mkdir(parents=True, exist_ok=True)
+
+    rows = []
+    for seg in sorted(sr.spectra, key=int):
+        s = sr.spectra[seg]
+        for i, f in enumerate(s.freq):
+            rows.append({
+                "segment": seg, "freq_hz": round(float(f), 6),
+                "z_re_mohm_cm2": round(1000 * float(np.real(s.Z_corr[i])), 5),
+                "z_im_mohm_cm2": round(1000 * float(np.imag(s.Z_corr[i])), 5),
+                "zmodel_re_mohm_cm2": round(1000 * float(np.real(s.Z_model[i])), 5),
+                "zmodel_im_mohm_cm2": round(1000 * float(np.imag(s.Z_model[i])), 5),
+                "zmodel_sd_mohm_cm2": round(1000 * float(s.Z_model_sd[i]), 5),
+                "sigma_rel": round(float(s.sigma_rel[i]), 5),
+            })
+    utils.write_table(out / "spectra_clean.csv", rows)
+
+    # One row per segment the channel-lag stage looked at -- including the
+    # ones whose spectrum was later dropped, so "why was this not corrected"
+    # has an answer on disk.
+    lag_rows = getattr(sr, "channel_lag", {}) or {}
+    if lag_rows:
+        card_of = {s: sp.card for s, sp in sr.spectra.items()}
+        utils.write_table(out / "channel_lag.csv", [
+            lag_rows[s].row(card_of.get(s, ""))
+            for s in sorted(lag_rows, key=int)])
+
+    try:
+        cf = sr.card_factors()
+        if cf:
+            utils.write_table(out / "card_factors.csv",
+                              [cf[c].row() for c in sorted(cf)])
+    except Exception as exc:                                # noqa: BLE001
+        log.warning(f"  card factors not written: {exc}")
+
+    utils.write_table(out / "segments_summary.csv", [{
+        "segment": seg, "card": s.card, "tier": s.tier,
+        "area_cm2": round(s.area_cm2, 5),
+        "cx_mm": round(geom.SEGMENTS[seg].cx_mm, 2),
+        "cy_mm": round(geom.SEGMENTS[seg].cy_mm, 2),
+        "R_ohmic_mohm_cm2": round(1000 * s.R_ohmic, 4),
+        "R_ohmic_sd_mohm_cm2": round(1000 * s.R_ohmic_sd, 4)
+        if np.isfinite(s.R_ohmic_sd) else "",
+        # The second HFR estimator, and how far apart the two are. When the
+        # gap exceeds R_ohmic_sd the arc did not close inside the band and
+        # neither number should be quoted without saying so.
+        "R_ohmic_xint_mohm_cm2": round(1000 * s.R_ohmic_xint, 4)
+        if np.isfinite(s.R_ohmic_xint) else "",
+        "R_ohmic_spread_mohm_cm2": round(1000 * abs(s.R_ohmic - s.R_ohmic_xint), 4)
+        if np.isfinite(s.R_ohmic_xint) else "",
+        "hf_closure": round(s.hf_closure, 4) if np.isfinite(s.hf_closure) else "",
+        "R_pol_mohm_cm2": round(1000 * s.R_pol, 4),
+        "L_nH": round(1e9 * s.L, 3),
+        "tau_peak_s": f"{s.tau_peak:.4g}" if np.isfinite(s.tau_peak) else "",
+        "dt_applied_us": round(1e6 * s.dt_applied, 3),
+        "chain_tau_est_us": (round(1e6 * s.chain_tau_est, 2)
+                             if np.isfinite(s.chain_tau_est) else ""),
+        "chain_tau_applied_us": round(1e6 * s.chain_tau_applied, 2),
+        "chain_status": s.chain_status,
+        "T_degC": round(s.T_degC, 2),
+        "j_dc_A_cm2": round(s.j_dc, 6),
+        "kk_res_pct": round(100 * s.kk_res_max, 4)
+        if np.isfinite(s.kk_res_max) else "",
+        "zhit_dev_pct": round(100 * s.zhit_dev, 4)
+        if np.isfinite(s.zhit_dev) else "",
+        "hf_phase_slope": round(s.hf_phase_slope, 5),
+        "snr_med_db": round(s.snr_med_db, 2),
+        "thd_med_pct": round(100 * s.thd_med, 3)
+        if np.isfinite(s.thd_med) else "",
+        "n_used": s.n_used, "n_dropped": s.n_dropped,
+        "K_imputed": int(s.K_imputed),
+        "flags": ";".join(s.flags),
+    } for seg, s in sorted(sr.spectra.items(), key=lambda kv: int(kv[0]))])
+
+    utils.write_table(out / "skew_model.csv", [{
+        "card": k, "basis": v.basis, "dt0_us": round(1e6 * v.dt0, 4),
+        "slot_us": round(1e6 * v.k_slot, 4),
+        "slot_nominal_us": round(1e6 * v.k_nominal, 4),
+        "slot_ratio": round(v.slot_ratio, 3) if np.isfinite(v.slot_ratio) else "",
+        "cost_gain_pct": round(100 * v.cost_gain, 1),
+        "n_segments": v.n_segments, "applied": int(v.applied), "note": v.note,
+    } for k, v in sorted(sr.skew.items())])
+
+    # The rejection ledger: one row per segment per point. This is the file to
+    # open when a spectrum stops lower than expected or a segment is missing
+    # altogether -- it names the gate rather than leaving it to be guessed.
+    if sr.point_ledger:
+        utils.write_table(out / "point_rejections.csv", sr.point_ledger)
+        utils.write_table(out / "segment_reach.csv", sr.reach())
+
+    if len(sr.cell_freq):
+        # The columns say which normalisation each number uses, because the
+        # two differ by exactly the uncovered area and a reader cannot tell
+        # them apart from the values. z_re/z_im stay first and keep their
+        # meaning (the covered-area ASR) so existing readers are unaffected.
+        agg = sr.aggregate if sr.aggregate.get("ok") else {}
+        n_arr = (sr.cell_n_seg if len(sr.cell_n_seg) == len(sr.cell_freq)
+                 else np.zeros(len(sr.cell_freq), int))
+        rows = []
+        for i, (f, z, n) in enumerate(zip(sr.cell_freq, sr.Z_cell, n_arr)):
+            row = {
+                "freq_hz": round(float(f), 6),
+                "z_re_mohm_cm2": round(1000 * float(np.real(z)), 5),
+                "z_im_mohm_cm2": round(1000 * float(np.imag(z)), 5),
+                "n_segments": int(n),
+            }
+            if agg:
+                row.update({
+                    "z_re_full_mohm_cm2": round(1000 * float(np.real(agg["z_asr_full"][i])), 5),
+                    "z_im_full_mohm_cm2": round(1000 * float(np.imag(agg["z_asr_full"][i])), 5),
+                    "Z_re_mohm": round(1000 * float(np.real(agg["Z_ohm"][i])), 6),
+                    "Z_im_mohm": round(1000 * float(np.imag(agg["Z_ohm"][i])), 6),
+                    "area_used_cm2": round(float(agg["area_used"][i]), 3),
+                    "area_coverage": round(float(agg["area_coverage"][i]), 4),
+                })
+            rows.append(row)
+        utils.write_table(out / "cell_aggregate.csv", rows)
+
+    # Reconstructions live in their OWN file. Putting them in
+    # spectra_clean.csv would make an estimate indistinguishable from a
+    # measurement the moment anyone reads the table without the flags.
+    if sr.filled:
+        frows = []
+        for seg, sp in sorted(sr.filled.items(),
+                              key=lambda kv: int(kv[0]) if kv[0].isdigit() else 0):
+            for f, z in zip(sp.freq, sp.Z_model):
+                frows.append({
+                    "segment": seg, "source": "neighbours",
+                    "donors": " ".join(sp.donors), "hops": sp.hops,
+                    "freq_hz": round(float(f), 6),
+                    "z_re_mohm_cm2": round(1000 * float(np.real(z)), 5),
+                    "z_im_mohm_cm2": round(1000 * float(np.imag(z)), 5),
+                    "area_cm2": round(sp.area_cm2, 4),
+                })
+        utils.write_table(out / "spectra_reconstructed.csv", frows)
+
+    utils.write_json(out / "silver_manifest.json", {
+        "n_segments": len(sr.spectra), "tiers": sr.tiers(),
+        "dc_closure": sr.dc_closure,
+        "skew": {k: {"dt0_us": v.dt0 * 1e6, "slot_us": v.k_slot * 1e6,
+                     "slot_nominal_us": v.k_nominal * 1e6,
+                     "slot_ratio": v.slot_ratio, "applied": v.applied,
+                     "cost_gain": v.cost_gain, "note": v.note}
+                 for k, v in sr.skew.items()},
+    })
+    log.info(f"  silver written to {out}")
+    return out

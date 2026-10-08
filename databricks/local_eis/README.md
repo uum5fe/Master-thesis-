@@ -4,23 +4,46 @@ The bronze/silver/gold pipeline that runs in the Databricks workspace, plus the
 CSV evaluation path and the two plate maps.
 
 Full write-up of the gen2 plate and the CSV path:
-[`../../docs/GEN2_PLATE_AND_CSV_PIPELINE.md`](../../docs/GEN2_PLATE_AND_CSV_PIPELINE.md).
+[`docs/GEN2_PLATE_AND_CSV_PIPELINE.md`](docs/GEN2_PLATE_AND_CSV_PIPELINE.md).
+
+## How to use it on Databricks
+
+Upload this whole folder (keep the sub-folders) and open
+**`Local EIS Pipeline Runner`**. Its first cell finds the folder and runs
+`eis_paths.py`, which puts every sub-folder on `sys.path`, so all modules keep
+importing each other by plain name. Set the widgets, run all cells.
+
+Every result is ONE plot with drop-downs:
+
+| cell | drop-downs |
+| --- | --- |
+| Plate heat maps | Condition · Parameter (HFR, Re Z 1 kHz, R_ct, R_mt, R_pol, j, \|Z\| and phase at 100 Hz, T, chain lag) · View (2D spatial interpolated / values per segment) |
+| Nyquist / Bode | Condition · Plot (Nyquist, \|Z\|, phase) |
+| Gamry vs pipeline aggregate | Condition · Plot |
+| ECM fit per segment / of the aggregate | Condition · Plot |
+| ECM parameter tables, ECM plate maps | Condition (· Parameter · View) |
+| Frequency response | ex-situ amplifiers / in-situ per condition |
+
+`Local EIS Extra Analyses` holds the optional diagnostics (plate numbering
+check, ASR decomposition, Lin-KK, DRT, DRT-informed ECM and its comparison);
+it runs the main notebook first with `%run`.
 
 ## Layout
 
-| file | what it is |
+| folder | what is in it |
 | --- | --- |
-| `Local EIS Pipeline Runner.py` | the notebook. Widgets → run → Nyquist, heat maps, ECM, Gamry validation |
-| `main.py` | `run_pipeline(cfg)`; routes to FAMOS or CSV by `cfg.source_format` |
-| `config.py` | every tunable number, one definition each |
-| `r2d2_geometry.py` | **both plate maps**, `use_plate("gen1"\|"gen2")` |
-| `bronze.py` `silver.py` `gold.py` | the FAMOS path |
-| `eis_local.py` `utils.py` `eis_measurement_model.py` `eis_validation.py` | shared estimators, KK, measurement model |
-| `csv_source.py` | CSV reader, seven layouts incl. the R2-D2 logger, dialect auto-detection |
-| `csv_pipeline.py` | the CSV evaluation path |
-| `gamry_dta.py` | Gamry `.DTA` reader; builds the chain-response gain file |
-| `abgleich.py` | reads the raw `Step*_<T>Grad.csv` bench files; refits and verifies `curr.csv`/`temp.csv` |
-| `test_csv_pipeline.py` | end-to-end synthetic checks for the CSV path |
+| `Local EIS Pipeline Runner.py` | the main notebook: widgets → run → checks → results |
+| `Local EIS Extra Analyses.py` | optional diagnostics, `%run`s the runner |
+| `eis_paths.py` | puts the folders below on `sys.path` |
+| `run.py` | command line: `python run.py <module> [args]` |
+| `core/` | `config.py` (every tunable number), `utils.py`, `r2d2_geometry.py` (**both plate maps**), `plate_conditions.py` |
+| `pipeline/` | `main.py` (`run_pipeline`, `reevaluate`), `bronze.py` `silver.py` `gold.py` (FAMOS path), `csv_pipeline.py`, and their signal processing: `eis_local.py`, `hf_schedule.py`, `ladder_snap.py`, `tone_estimation.py`, `gamry_sync.py`, `channel_lag.py`, `eis_measurement_model.py`, `eis_validation.py`, `neighbours.py` |
+| `checks/` | `plausibility.py` and the per-run checks: `card_gain.py`, `dc_closure.py`, `segment_scale.py`, `frequency_response.py`, `via_resistance.py`, `gamry_compare.py`, `validate_hf.py` |
+| `analysis/` | `ecm_drt.py` (ECM / DRT fits), `polcurve.py` |
+| `plotting/` | `viewers.py` (the drop-down selector), `plate_figure.py` (static maps), `plate_plotly.py` (interactive maps), `plate_style.py`, `plate_maps.py`, `figure_panels.py`, `bench_plots.py` |
+| `readers/` | `gamry_dta.py` (Gamry `.DTA`, chain-response gain file), `abgleich.py` (calibration `Step*_<T>Grad.csv`), `csv_source.py`, `_vendor/zstd.py` |
+| `tests/` | `pytest tests` (+ `fixtures/`, `make_synth_famos.py`) |
+| `docs/` | write-ups and the change log (`FIXES.md`) |
 
 ## The two things to get right before a run
 
@@ -73,9 +96,11 @@ cross-check.
 ## Quick checks
 
 ```bash
-python main.py --self-test          # geometry (both plates), estimators, CSV readers
-python r2d2_geometry.py             # print both maps, write segment_areas_<plate>.csv
-python test_csv_pipeline.py         # end-to-end on synthetic data with known truth
+python run.py main --self-test                       # geometry, estimators, CSV readers
+python run.py main --reevaluate RUN_DIR --out OUT    # silver/gold again, no .DAT needed
+python run.py frequency_response RUN_DIR --bode ABGLEICH/bode
+python run.py via_resistance ABGLEICH_DIR RUN_DIR ...
+python -m pytest tests                               # the test suite
 ```
 
 ## Running

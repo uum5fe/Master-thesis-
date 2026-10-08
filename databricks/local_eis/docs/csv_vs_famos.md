@@ -69,6 +69,21 @@ Mirrored, the two measurements describe the same plate. At 450 A, FAMOS has the 
 
 The data cannot decide between them; the bench setup can. The pipeline therefore evaluates the files **as delivered** by default. Set `CSV_MIRROR_X = True` in the runner's settings cell (or `csv_mirror_x=True` in Config) to evaluate them mirrored. A mirrored run is cached separately.
 
+### Are the cathode inlet and outlet drawn at the wrong end?
+
+**Not for the FAMOS evaluation.** The maps put AIR IN (and COOLANT IN) at x = 252 mm and AIR OUT at x = 0 (`config.COOLANT_INLET_END = "xW"`, counter-flow). Four independent things in the FAMOS data agree with that:
+
+| Check | What physics expects at the air **outlet** | FAMOS 2612030, x = 0 vs x = 252 |
+|---|---|---|
+| R_mt at 450 A (O₂ depletion, water build-up) | largest | 137 vs 15 mΩ·cm² |
+| j_dc at 450 A | lowest | 1.35 vs 1.49 A/cm² |
+| Plate temperature at 450 A (coolant warms as it crosses the plate; coolant co-flows with the air) | hottest | 64.7 vs 62.1 °C |
+| Bench log (MF4): a coolant-inlet temperature dip appears at the H₂-outlet port | coolant inlet = H₂-outlet end = x = 252 | ✓ |
+
+With the inlet at x = 0 instead, the FAMOS map would put the largest mass-transport arcs, the lowest current and the hottest coolant all at the air **inlet**. That cannot happen at 450 A. Co-flow (air entering beside the H₂ at x = 0) fails the same test.
+
+The CSV delivery, as delivered, is internally consistent too, but towards the **other** end: its largest R_mt and its highest temperature are both at x = 252. The conflict is therefore between the two data sources, not with the drawn ports. Either that test ran with the flows reversed, or the tool maps channels to segments in mirror order. Compare the Nyquist plots: in FAMOS the large arcs are red (outlet); in the CSV as delivered they are blue (inlet).
+
 ### 4. Other differences
 
 - **Temperature:** the CSV runs were 1–7 K warmer (65 °C setpoint). That lowers R_ct and changes humidification, so arc sizes are not directly comparable.

@@ -229,6 +229,12 @@ class Config:
     # removes the only guess on the CSV path.
     csv_tones: tuple[float, ...] = ()
 
+    # A spectra_dir whose x axis runs from the other end of the plate: every
+    # segment is re-assigned to its left-right mirror before evaluation
+    # (csv_source.mirror_x). Off by default -- see the comparison with the
+    # FAMOS evaluation in docs/csv_vs_famos.md before switching it on.
+    csv_mirror_x: bool = False
+
     # CHANNEL SCAN, not sampling.  If the logger walks the channel list
     # inside a row, channel k is sampled k/csv_scan_rate_hz after the row
     # starts, so the segment and the cell voltage in one row are NOT
@@ -310,7 +316,7 @@ class Config:
     # linear interpolation between the segment centres, a square on every
     # measured segment, no labels (parula, soft gloss) -- the layout of the
     # bench's MATLAB maps, written as plate_<param>_interp.png; "both".
-    heatmap_style: str = "segments"        # segments | interpolated | both
+    heatmap_style: str = "interpolated"    # segments | interpolated | both
     abgleich_bode_dir: Path | None = None
     card_gain_min_snr_db: float = 20.0     # steps below: not used
     card_gain_min_steps: int = 5

@@ -77,6 +77,15 @@ SUPPORTED LAYOUTS  (`detect_dialect`, or force with cfg.csv_dialect)
 "gamry"       a folder of Gamry .DTA files, one per segment -- delegated to
               gamry_dta.py.
 
+"spectra_dir" a folder of finished spectra from the bench evaluation tool,
+              one file per segment plus the cell and an HFR table:
+                  z1.csv .. z72.csv   x= 14.0 cm / y= 15.125 cm / T= 65.07 degC
+                                      f= 10078.13 Hz  z= 49.13+24.29i mOhmcm2
+                  z_cell.csv          the same lines, whole cell
+                  hfr.csv             s1: x= .. y= ..: hfr_int= .. hfr_1kHz= ..
+              The folder name carries the operating point, e.g.
+              Spectrum2_65degC_449A. No phasor estimation on this path.
+
 Every reader returns a `CsvMeasurement`, and `csv_pipeline` consumes only
 that.  Adding a sixth layout means adding a reader here and nothing else.
 """
@@ -115,7 +124,7 @@ _ZPHZ_COL = re.compile(r"^(z_?ph[zs]?|phase|phi|phase_deg)$", re.I)
 _SEGID_COL = re.compile(r"^(seg(ment)?(_?id|_?no|_?nr)?|channel|kanal)$", re.I)
 
 DIALECTS = ("r2d2", "r2d2_sweep", "records", "wide_time", "long_time",
-            "freq", "gamry")
+            "freq", "gamry", "spectra_dir")
 
 
 # --------------------------------------------------------------------------
@@ -227,7 +236,10 @@ class CsvMeasurement:
                      f_max_hz=round(max(float(v[0].max())
                                         for v in self.spectra.values()), 4)
                      if self.spectra else None)
-        d.update(self.meta)
+        # the large per-segment tables of a spectra_dir stay out of a summary
+        d.update({k: v for k, v in self.meta.items()
+                  if k not in ("cell_spectrum", "T_seg_C", "positions_mm",
+                               "tool_hfr")})
         return d
 
 
@@ -425,6 +437,8 @@ def detect_dialect(path) -> str:
     if p.is_dir():
         if any(p.glob("*.DTA")) or (p / "bode").is_dir():
             return "gamry"
+        if is_spectra_dir(p):
+            return "spectra_dir"
         cands = r2d2_point_files(p)
         if not cands:
             # A CAMPAIGN PARENT, not a sweep. `csv_files/` holds one folder
@@ -958,6 +972,303 @@ def read_gamry(path, area_cm2: float | None = None) -> CsvMeasurement:
                           z_unit="ohm", meta=meta)
 
 
+# --------------------------------------------------------------------------
+# Finished spectra from the bench evaluation tool  ("spectra_dir")
+# --------------------------------------------------------------------------
+# One folder per operating point, named like Spectrum2_65degC_449A:
+#
+#     z<n>.csv     segment n:  x= 14.000000 cm  /  y= 15.125000 cm  /
+#                              T= 65.076867 degC, then one line per frequency
+#                              f= 10078.130000 Hz   z= 49.138565+24.295839i mOhmcm2
+#     z_cell.csv   the whole cell, same lines without the header
+#     hfr.csv      s<n>: x= .. y= ..: hfr_int= .. hfr_1kHz= .. hfr_300Hz= ..
+#     spectra.png  the tool's own Nyquist plot
+#
+# The x / y header says "cm" but the numbers are MILLIMETRES: segment 1 is at
+# (14.0, 15.125), exactly r2d2_geometry's centroid in mm, and the plate is
+# 252 mm wide. They are checked against the geometry, which also confirms
+# that file z<n> is our segment n. Z is already area-specific (mOhm*cm2),
+# with the usual sign: a positive imaginary part is inductive.
+
+_SPEC_LINE = re.compile(
+    r"f\s*=\s*([-+\d.eE]+)\s*Hz\s*z\s*=\s*([-+\d.eE]+)([-+][\d.eE]+)i", re.I)
+_SPEC_HDR = re.compile(r"^\s*([xyT])\s*=\s*([-+\d.eE]+)", re.I)
+_SPEC_HFR = re.compile(r"(hfr_\w+)\s*=\s*([-+\d.eE]+)", re.I)
+
+
+def is_spectra_dir(folder) -> bool:
+    """A folder of z<n>.csv spectra files (the bench evaluation tool)."""
+    folder = Path(folder)
+    zs = [p for p in folder.glob("z*.csv") if re.fullmatch(r"z\d+", p.stem)]
+    if len(zs) < 2:
+        return False
+    head = zs[0].read_text(encoding="utf-8", errors="replace")[:600]
+    return bool(_SPEC_LINE.search(head))
+
+
+def operating_point(folder) -> dict:
+    """Temperature and current from a folder name like Spectrum2_65degC_449A."""
+    name = Path(folder).name
+    out = {"name": name}
+    m = re.search(r"(\d+(?:[.,]\d+)?)\s*deg\s*C", name, re.I)
+    if m:
+        out["T_C"] = float(m.group(1).replace(",", "."))
+    m = re.search(r"(?:^|_)(\d+(?:[.,]\d+)?)\s*A(?:$|_)", name)
+    if m:
+        out["current_A"] = float(m.group(1).replace(",", "."))
+    return out
+
+
+def _spectrum_lines(text: str) -> tuple[np.ndarray, np.ndarray]:
+    f, z = [], []
+    for m in _SPEC_LINE.finditer(text):
+        f.append(float(m.group(1)))
+        z.append(complex(float(m.group(2)), float(m.group(3))))
+    f, z = np.array(f), np.array(z, complex)
+    o = np.argsort(f)
+    return f[o], z[o]
+
+
+def read_spectra_dir(folder) -> CsvMeasurement:
+    """Every z<n>.csv of one operating point, in mOhm*cm2, with the segment
+    positions and temperatures from their headers, the cell spectrum and the
+    tool's HFR table in `meta`."""
+    folder = Path(folder)
+    spectra, pos, temps = {}, {}, {}
+    for p in sorted(folder.glob("z*.csv")):
+        m = re.fullmatch(r"z(\d+)", p.stem)
+        if not m:
+            continue
+        seg = str(int(m.group(1)))
+        text = p.read_text(encoding="utf-8", errors="replace")
+        hdr = {}
+        for ln in text.splitlines()[:6]:
+            h = _SPEC_HDR.match(ln)
+            if h:
+                hdr[h.group(1).lower()] = float(h.group(2))
+        f, z = _spectrum_lines(text)
+        if f.size == 0:
+            continue
+        spectra[seg] = (f, z)
+        if "x" in hdr and "y" in hdr:
+            pos[seg] = (hdr["x"], hdr["y"])
+        if "t" in hdr:
+            temps[seg] = hdr["t"]
+    if not spectra:
+        raise ValueError(f"{folder}: no z<n>.csv spectra")
+    meta = {"operating_point": operating_point(folder), "T_seg_C": temps,
+            "positions_mm": pos}
+    cell = folder / "z_cell.csv"
+    if cell.is_file():
+        f, z = _spectrum_lines(cell.read_text(encoding="utf-8", errors="replace"))
+        meta["cell_spectrum"] = (f, z)
+    hfr = folder / "hfr.csv"
+    if hfr.is_file():
+        tab = {}
+        for ln in hfr.read_text(encoding="utf-8", errors="replace").splitlines():
+            m = re.match(r"\s*s(\d+)\s*:", ln)
+            if m:
+                tab[str(int(m.group(1)))] = {k.lower(): float(v)
+                                            for k, v in _SPEC_HFR.findall(ln)}
+        meta["tool_hfr"] = tab
+    # The header positions against the plate geometry. The tool gives a
+    # representative point of each segment, not its area centroid, so they
+    # differ by up to ~5 mm on the staircase segments; what proves the
+    # numbering is that every file's point lies on its own segment's pads.
+    try:
+        import r2d2_geometry as geom
+        wrong = []
+        for sg, (x, y) in pos.items():
+            if sg not in geom.SEGMENTS:
+                wrong.append(sg)
+                continue
+            pad = (int(x // geom.PAD_W_MM) + 1, int(y // geom.PAD_H_MM) + 1)
+            if pad not in set(geom.SEGMENTS[sg].pads):
+                near = min(geom.SEGMENTS, key=lambda n: np.hypot(
+                    x - geom.SEGMENTS[n].cx_mm, y - geom.SEGMENTS[n].cy_mm))
+                if near != sg:
+                    wrong.append(sg)
+        meta["numbering_ok"] = not wrong
+        if wrong:
+            meta["numbering_mismatch"] = sorted(wrong, key=int)
+    except Exception:                                       # noqa: BLE001
+        pass
+    return CsvMeasurement("frequency", "spectra_dir", str(folder),
+                          spectra=spectra, z_unit="mohm_cm2", meta=meta)
+
+
+
+def mirror_map_x() -> dict[str, str]:
+    """Segment -> the segment at the mirrored x (x -> plate width - x, same
+    y), on the current plate."""
+    import r2d2_geometry as geom
+    W = float(geom.PLATE_W_MM)
+    out = {}
+    for s, g in geom.SEGMENTS.items():
+        out[s] = min(geom.SEGMENTS, key=lambda n: np.hypot(
+            geom.SEGMENTS[n].cx_mm - (W - g.cx_mm),
+            geom.SEGMENTS[n].cy_mm - g.cy_mm))
+    return out
+
+
+def mirror_x(m: CsvMeasurement) -> CsvMeasurement:
+    """Re-assign every segment of a spectra_dir to its left-right mirror.
+
+    For a delivery whose x axis runs from the other end of the plate than
+    r2d2_geometry's. Evidence it is needed (2612030 vs the Spectrum<n>
+    folders): the temperature gradient along x is reversed at 450 A, and
+    R_pol / R_mt correlate at r = -0.78 / -0.74 with the FAMOS map as
+    delivered and at +0.97 / +0.95 after mirroring. Opt-in (config
+    csv_mirror_x), never automatic: which side is right is a statement about
+    the bench, not something the data can prove.
+    """
+    mp = mirror_map_x()
+    m.spectra = {mp.get(s, s): v for s, v in m.spectra.items()}
+    for k in ("T_seg_C", "tool_hfr"):
+        if isinstance(m.meta.get(k), dict):
+            m.meta[k] = {mp.get(s, s): v for s, v in m.meta[k].items()}
+    if isinstance(m.meta.get("positions_mm"), dict):
+        import r2d2_geometry as geom
+        W = float(geom.PLATE_W_MM)
+        m.meta["positions_mm"] = {mp.get(s, s): (W - x, y) for s, (x, y)
+                                  in m.meta["positions_mm"].items()}
+    m.meta["mirrored_x"] = True
+    return m
+
+
+def spectra_dirs(root) -> list[Path]:
+    """Every spectra_dir folder at or below `root` (one level of nesting)."""
+    root = Path(root)
+    if is_spectra_dir(root):
+        return [root]
+    out = []
+    for d in sorted(p for p in root.iterdir() if p.is_dir()):
+        if is_spectra_dir(d):
+            out.append(d)
+        else:
+            out += [e for e in sorted(q for q in d.iterdir() if q.is_dir())
+                    if is_spectra_dir(e)]
+    return out
+
+
+def condition_current(condition: str) -> float | None:
+    m = re.search(r"(\d+(?:[.,]\d+)?)", str(condition))
+    return float(m.group(1).replace(",", ".")) if m else None
+
+
+def match_condition(folders, condition: str, tol: float = 0.05):
+    """The folder whose current is nearest to `condition` (e.g. "450A" ->
+    Spectrum2_65degC_449A), within `tol` relative; None if there is none."""
+    want = condition_current(condition)
+    if want is None:
+        return None
+    best, err = None, tol
+    for d in folders:
+        cur = operating_point(d).get("current_A")
+        if cur is None:
+            continue
+        e = abs(cur - want) / want
+        if e <= err:
+            best, err = Path(d), e
+    return best
+
+
+
+# ---------------------------------------------------------------------------
+# A csv_files/ tree as a menu: campaign folder -> {condition: sweep folder}
+# ---------------------------------------------------------------------------
+# The runner's condition drop-down speaks in setpoints ("450A"), the bench
+# names its folders after what it measured ("Spectrum2_65degC_449A"). These
+# helpers find the operating-point folders under csv_files/ -- finished
+# spectra (spectra_dir) or R2-D2 point-file sweeps -- group them by the folder
+# that holds them, and label each by its nominal setpoint.
+
+def is_condition_folder(folder) -> bool:
+    """One operating point: a spectra_dir, or a sweep folder whose name
+    carries the current (Spectrum10_65degC_450A)."""
+    d = Path(folder)
+    if not d.is_dir():
+        return False
+    if is_spectra_dir(d):
+        return True
+    if any((d / s).is_dir() for s in ("bronze", "silver", "gold")):
+        return False                         # a pipeline RESULT, not a sweep
+    return ("current_A" in operating_point(d)
+            and sum(p.suffix.lower() == ".csv" for p in d.iterdir()) >= 3)
+
+
+def condition_folders(root, depth: int = 3) -> list[Path]:
+    """Every operating-point folder at or below `root`, `depth` levels deep."""
+    root = Path(root)
+    if not root.is_dir():
+        return []
+    if is_condition_folder(root):
+        return [root]
+    out: list[Path] = []
+    if depth <= 0:
+        return out
+    try:
+        subs = sorted(p for p in root.iterdir() if p.is_dir())
+    except OSError:
+        return out
+    for d in subs:
+        out += condition_folders(d, depth - 1)
+    return out
+
+
+def campaigns(root, depth: int = 3) -> dict[str, list[Path]]:
+    """{campaign label: [operating-point folders]}. The campaign is the folder
+    that HOLDS the operating points, labelled relative to `root` ("." when the
+    points sit directly in it)."""
+    root = Path(root)
+    out: dict[str, list[Path]] = {}
+    for d in condition_folders(root, depth):
+        parent = d.parent if d != root else d
+        try:
+            lab = str(parent.relative_to(root)) or "."
+        except ValueError:
+            lab = parent.name
+        out.setdefault(lab, []).append(d)
+    return out
+
+
+def nominal_label(current_a: float) -> str:
+    """449 A -> "450A": the setpoint, when the measured current is within 2 %
+    of a multiple of 5 A; the rounded current otherwise."""
+    c = float(current_a)
+    n = 5.0 * round(c / 5.0)
+    if n > 0 and abs(c - n) / n <= 0.02:
+        c = n
+    return f"{c:g}A" if c != int(c) else f"{int(c)}A"
+
+
+def condition_map(folders) -> dict[str, Path]:
+    """{"450A": folder, ...} for the folders that carry a current. Two folders
+    with the same setpoint: the one closer to it, then the newer one, wins
+    (the loser is named in `condition_map.duplicates`)."""
+    best: dict[str, tuple[float, float, Path]] = {}
+    dup: dict[str, list[Path]] = {}
+    for d in folders:
+        cur = operating_point(d).get("current_A")
+        if cur is None:
+            continue
+        lab = nominal_label(cur)
+        want = condition_current(lab) or cur
+        try:
+            age = -Path(d).stat().st_mtime
+        except OSError:
+            age = 0.0
+        rank = (abs(cur - want), age, Path(d))
+        dup.setdefault(lab, []).append(Path(d))
+        if lab not in best or rank[:2] < best[lab][:2]:
+            best[lab] = rank
+    condition_map.duplicates = {k: v for k, v in dup.items() if len(v) > 1}
+    return {k: v[2] for k, v in best.items()}
+
+
+condition_map.duplicates = {}
+
+
 _READERS = {
     "r2d2": read_r2d2,
     "r2d2_sweep": read_r2d2_sweep,
@@ -966,6 +1277,7 @@ _READERS = {
     "long_time": read_long_time,
     "freq": read_freq,
     "gamry": read_gamry,
+    "spectra_dir": read_spectra_dir,
 }
 
 

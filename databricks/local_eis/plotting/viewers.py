@@ -548,6 +548,20 @@ def plate_maps(summaries: dict, title: str = "", fields=PLATE_FIELDS,
                   title=f"Plate maps — {title}" if title else "")
 
 
+def save_page(fragment: str, path, title: str = "") -> Path:
+    """A viewer (what displayHTML shows) as a standalone .html file: the same
+    drop-downs and plots, opened in any browser. Plotly comes from the CDN."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        f"<title>{_html.escape(title or path.stem)}</title></head>"
+        "<body style='margin:16px;background:#fff'>"
+        f"{fragment}</body></html>", encoding="utf-8")
+    return path
+
+
 def unpack_payload(html: str):
     """The selector's gzip+base64 payload, decoded (tests only)."""
     import base64

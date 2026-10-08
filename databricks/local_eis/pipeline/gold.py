@@ -494,49 +494,6 @@ def plate_heatmap_interactive(records: dict[str, SegmentRecord], param: str,
         subtitle="hatched / value* = rebuilt, not measured")
 
 
-def nyquist_figure(sr: SilverRun, cfg: Config):
-    """Every segment, measured points and model curve, plus the cell curve."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    fig, ax = plt.subplots(1, 3, figsize=(18, 5.4))
-    segs = sorted(sr.spectra, key=int)
-    cm = plt.get_cmap("viridis")
-    for i, s in enumerate(segs):
-        sp = sr.spectra[s]
-        c = cm(i / max(1, len(segs) - 1))
-        a = 0.9 if sp.tier == "A" else 0.5 if sp.tier == "B" else 0.25
-        zr, zc = sp.Z_corr * 1000, sp.Z_model * 1000
-        ax[0].plot(np.real(zr), -np.imag(zr), ".", ms=2, color=c, alpha=.25 * a)
-        ax[0].plot(np.real(zc), -np.imag(zc), "-", lw=1.1, color=c, alpha=a)
-        ax[1].plot(sp.freq, np.abs(zc), "-", lw=1.0, color=c, alpha=a)
-        ax[2].plot(sp.freq, np.degrees(np.angle(zc)), "-", lw=1.0, color=c,
-                   alpha=a)
-    if len(sr.cell_freq):
-        zc = sr.Z_cell * 1000
-        ax[0].plot(np.real(zc), -np.imag(zc), "k--d", ms=4, lw=2, zorder=9,
-                   label="cell: area-weighted harmonic mean")
-        ax[1].plot(sr.cell_freq, np.abs(zc), "k--", lw=2, zorder=9)
-        ax[2].plot(sr.cell_freq, np.degrees(np.angle(zc)), "k--", lw=2, zorder=9)
-        ax[0].legend(fontsize=8)
-    ax[0].set(xlabel="Z' [mOhm cm2]", ylabel="-Z'' [mOhm cm2]",
-              title="Nyquist - dots measured, lines model")
-    ax[0].axhline(0, color=".6", lw=.7, ls=":")
-    ax[0].set_aspect("equal", adjustable="datalim")
-    ax[1].set(xscale="log", yscale="log", xlabel="f [Hz]",
-              ylabel="|Z| [mOhm cm2]", title="Bode magnitude")
-    ax[2].set(xscale="log", xlabel="f [Hz]", ylabel="phase [deg]",
-              title="Bode phase", ylim=(-90, 30))
-    ax[2].axhline(0, color=".6", lw=.7, ls=":")
-    for a_ in ax:
-        a_.grid(alpha=.25, which="both")
-    fig.suptitle(f"Local EIS, {len(segs)} segments, opacity by quality tier",
-                 fontweight="bold")
-    fig.tight_layout()
-    return fig
-
-
 # ===========================================================================
 # 6. Entry point
 # ===========================================================================
@@ -794,10 +751,16 @@ def save(gr: GoldRun, sr: SilverRun, cfg: Config, log=None) -> Path:
                     plt.close(fig)
         except Exception as exc:                            # noqa: BLE001
             log.info(f"  plate figures skipped: {type(exc).__name__}: {exc}")
-        fig = nyquist_figure(sr, cfg)
-        import matplotlib.pyplot as plt
-        fig.savefig(out / "nyquist.png", dpi=150, bbox_inches="tight")
-        plt.close(fig)
+        # the Nyquist the runner shows, coloured cathode inlet -> outlet, as
+        # PNG and interactive HTML (plotting/nyquist.py); silver has written
+        # spectra_clean.csv by now
+        try:
+            import nyquist as _nyq
+            _nyq.save_run(cfg.out_dir, out_dir=out,
+                          title=f"{cfg.leepa or ''} / {cfg.condition or ''}"
+                                .strip(" /"))
+        except Exception as exc:                            # noqa: BLE001
+            log.info(f"  nyquist figure skipped: {type(exc).__name__}: {exc}")
 
     if cfg.write_html:
         for p in cfg.heatmap_params:

@@ -126,11 +126,13 @@ def _cell(marker: str) -> str:
     raise AssertionError(f"cell {marker!r} not found")
 
 
-def test_the_display_filter_is_off(tmp_path) -> None:
-    """Every finite silver-accepted point is drawn in its segment's colour;
-    nothing is set aside as a grey cross."""
+def test_the_nyquist_cell_filters_nothing_and_colours_by_air_path(
+        tmp_path) -> None:
+    """Every finite silver-accepted point is drawn (no display filter), and
+    the colour is the position along the air path, as nyquist.figure does."""
     src = _cell("INTERACTIVE NYQUIST + BODE PER CONDITION")
-    assert "DISPLAY_FILTER = False" in src
+    assert "DISPLAY_FILTER" not in src
+    assert "nyquist.figure(" in src and "NYQUIST_COLOUR = 'flow'" in src
 
 
 def test_both_nyquist_cells_read_the_reconstructions(tmp_path) -> None:

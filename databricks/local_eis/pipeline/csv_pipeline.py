@@ -947,6 +947,7 @@ def from_frequency_file(m: csv_source.CsvMeasurement, cfg, log
     just a picture.
     """
     areas = utils.segment_areas(cfg)
+    T_file = (m.meta or {}).get("T_seg_C", {}) or {}
     out: dict[str, SegmentSpectrum] = {}
     for seg, (f, Z) in m.spectra.items():
         flags = [f"unit_in={m.z_unit}"]
@@ -963,7 +964,8 @@ def from_frequency_file(m: csv_source.CsvMeasurement, cfg, log
         flags.append("sigma_assumed_2pc")
         out[seg] = SegmentSpectrum(seg, f, Z, sig,
                                    np.full(f.shape, np.nan),
-                                   np.full(f.shape, 0, dtype=int), flags)
+                                   np.full(f.shape, 0, dtype=int), flags,
+                                   T_C=float(T_file.get(seg, float("nan"))))
     return out
 
 
@@ -1121,6 +1123,33 @@ def fit_ecm(freq, Z, sigma_rel=None, n_arcs=2, weight="sigma"):
     }
 
 
+def capacitive_band(freq, Z) -> np.ndarray:
+    """Mask of the points between the HF and the LF zero crossing of Z''.
+
+    The bench tool's spectra (spectra_dir) bend back above ~2 kHz: Z'' turns
+    positive and Z' falls towards ZERO at 10 kHz.  No cell has a vanishing
+    membrane resistance, so that loop is the measuring chain, not the cell,
+    and neither an R-L-(RQ) circuit nor lin-KK can describe it -- fitted
+    anyway, the ECM drives Rs to 0.  The usable spectrum is the capacitive
+    part: from the first crossing below the top of the band (the HFR
+    intercept) down to the LF crossing where an inductive low-frequency loop
+    starts, if there is one.
+    """
+    f = np.asarray(freq, float)
+    zi = np.asarray(Z, complex).imag
+    o = np.argsort(f)[::-1]
+    cap = zi[o] < 0
+    keep = np.zeros(f.size, bool)
+    if not cap.any():
+        return ~keep
+    i0 = int(np.argmax(cap))                 # first capacitive point from the top
+    i1 = i0
+    while i1 + 1 < cap.size and cap[i1 + 1]:
+        i1 += 1
+    keep[o[i0:i1 + 1]] = True
+    return keep
+
+
 def choose_n_arcs(freq, Z, sigma_rel=None) -> dict:
     """Fit one arc and two, keep the one the data supports.
 
@@ -1218,7 +1247,8 @@ def validate(sp: SegmentSpectrum, cfg) -> dict:
 # ===========================================================================
 
 
-def write_outputs(spectra, ecm, agg, cfg, log, extra: dict) -> dict:
+def write_outputs(spectra, ecm, agg, cfg, log, extra: dict,
+                  reader_meta: dict | None = None) -> dict:
     import r2d2_geometry as geom
 
     out = Path(cfg.out_dir)
@@ -1275,33 +1305,60 @@ def write_outputs(spectra, ecm, agg, cfg, log, extra: dict) -> dict:
         erows.append(d)
     utils.write_table(out / "csv" / "ecm_parameters.csv", erows)
 
-    # gold/plate_summary.csv is the per-segment scalar table every map on the
-    # plate-map and coverage tabs reads. The FAMOS path builds it in gold.py;
-    # here the same quantities come straight off the ECM fit, so it is
-    # assembled rather than recomputed. Units match gold's: ohm.cm2, not
-    # mohm.cm2, because that is what the reader expects to divide by.
+    # gold/plate_summary.csv in EXACTLY the FAMOS gold format: display units
+    # (mOhm*cm2, A/cm2, degC), a `class` column, the segment centroid -- so
+    # the heat-map viewer, the Nyquist cell and the plausibility checks read
+    # a CSV run and a FAMOS run the same way. (This used to be ohm*cm2 with
+    # its own column names, which put every CSV map 1000x off scale.)
+    import gold as _gold
+    import silver as _silver
+    from gamry_compare import _hf_intercept
+    tool = (reader_meta or {}).get("tool_hfr", {}) or {}
     summary = []
     for seg in sorted(spectra, key=int):
         r = ecm.get(seg, {})
         ok = bool(r.get("ok"))
         sp = spectra[seg]
-        summary.append({
-            "segment": int(seg),
+        f, Z = np.asarray(sp.freq, float), np.asarray(sp.Z, complex)
+        # R_ohmic: the high-frequency intercept (-Z'' = 0) when the spectrum
+        # reaches it -- the tool's hfr_int is the same quantity -- else the
+        # FAMOS top-of-band estimate
+        r_int = _hf_intercept(f, Z) if f.size > 3 else float("nan")
+        if not np.isfinite(r_int) and f.size > 3:
+            r_int = _silver.r_ohmic_topband(f, Z, np.asarray(sp.sigma_rel))[0]
+        z100 = (np.interp(np.log(100.0), np.log(f), Z.real)
+                + 1j * np.interp(np.log(100.0), np.log(f), Z.imag)) \
+            if f.size > 1 and f.min() <= 100.0 <= f.max() else complex("nan")
+        g = geom.SEGMENTS.get(seg)
+        row = {
+            "segment": int(seg), "class": "measured",
+            "tier": r.get("verdict", "") if ok else "",
+            "cx_mm": round(g.cx_mm, 2) if g else "",
+            "cy_mm": round(g.cy_mm, 2) if g else "",
             "area_cm2": areas.get(seg, float("nan")),
-            "R_ohmic": r["R_ohmic"] if ok else float("nan"),
-            "R_ct": r["R_ct"] if ok else float("nan"),
-            "R_mt": r["R_mt"] if ok else float("nan"),
-            "R_pol": r["R_pol"] if ok else float("nan"),
+            "flags": ";".join(sp.flags),
+            "R_ohmic": 1000 * r_int,
+            "R_ohmic_ecm": 1000 * r["R_ohmic"] if ok else float("nan"),
+            "R_ct": 1000 * r["R_ct"] if ok else float("nan"),
+            "R_mt": 1000 * r["R_mt"] if ok else float("nan"),
+            "R_pol": 1000 * r["R_pol"] if ok else float("nan"),
+            "ReZ_1kHz": 1000 * _gold.re_at(f, Z, 1000.0),
+            "Z_mag_100Hz": 1000 * abs(z100),
+            "phase_100Hz": float(np.degrees(np.angle(z100))),
             "tau_peak": r["tau_peak"] if ok else float("nan"),
             "chi2_nu": r.get("chi2_nu", float("nan")),
             "j_dc": getattr(sp, "j_dc", float("nan")),
-            "T_C": sp.T_C,
+            "T_degC": sp.T_C,
             "n_points": len(sp.freq),
             "measured": 1,
-            "inferred": 0,
-            "tier": r.get("verdict", "") if ok else "",
-            "flags": ";".join(sp.flags),
-        })
+        }
+        t = tool.get(seg, {})
+        for k_in, k_out in (("hfr_int", "hfr_tool"),
+                            ("hfr_1khz", "hfr_1kHz_tool"),
+                            ("hfr_300hz", "hfr_300Hz_tool")):
+            if k_in in t:
+                row[k_out] = t[k_in]
+        summary.append(row)
     utils.write_table(out / "gold" / "plate_summary.csv", summary)
 
     if agg[0].size:
@@ -1316,73 +1373,47 @@ def write_outputs(spectra, ecm, agg, cfg, log, extra: dict) -> dict:
         # Also where the whole-cell check and the viewer look for it.
         utils.write_table(out / "silver" / "cell_aggregate.csv", cell_rows)
 
+    # the whole-cell spectrum of a spectra_dir (the tool's z_cell.csv): the
+    # reference this path has instead of a Gamry sweep
+    cell_ref = (reader_meta or {}).get("cell_spectrum")
+    if cell_ref is not None and len(cell_ref[0]):
+        utils.write_table(out / "silver" / "cell_reference.csv", [
+            {"freq_hz": float(f), "z_re_mohm_cm2": float(z.real),
+             "z_im_mohm_cm2": float(z.imag)}
+            for f, z in zip(cell_ref[0], cell_ref[1])])
+
     maps = {}
     if cfg.write_png:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        import config as _config        # fixed heat-map scales
+        import nyquist
+        import plate_figure
 
-        for param, key, unit in (("R_ohmic", "R_ohmic", "mΩ·cm²"),
-                                 ("R_ct", "R_ct", "mΩ·cm²"),
-                                 ("R_mt", "R_mt", "mΩ·cm²"),
-                                 ("R_pol", "R_pol", "mΩ·cm²")):
-            vals = {s: 1000 * r[key] for s, r in ecm.items()
-                    if r.get("ok") and np.isfinite(r[key])}
+        # the plate maps, as the FAMOS gold writes them (heatmap_style)
+        cls = {str(r["segment"]): "measured" for r in summary}
+        for prm in ("R_ohmic", "ReZ_1kHz", "R_ct", "R_mt", "R_pol", "T_degC"):
+            vals = {str(r["segment"]): r[prm] for r in summary
+                    if np.isfinite(r.get(prm, float("nan")))}
             if len(vals) < 3:
                 continue
-            p = geom.plot_map(out / f"map_{param}.png", vals,
-                              label=f"{param}  [{unit}]",
-                              limits=_config.heatmap_limits(param),
-                              title=f"{geom.ACTIVE_PLATE.title} — {param} "
-                                    f"({len(vals)} segments, CSV source)")
-            maps[param] = str(p)
+            for rd in plate_figure.renders(getattr(cfg, "heatmap_style",
+                                                   "interpolated")):
+                fig = plate_figure.draw_flow_plate(
+                    vals, prm, classes=cls, render=rd,
+                    title=f"{cfg.condition or Path(str(cfg.csv_path)).name}"
+                          " (CSV)")
+                pth = out / "gold" / f"plate_{prm}{plate_figure.suffix(rd)}.png"
+                fig.savefig(pth, dpi=200, bbox_inches="tight",
+                            facecolor=fig.get_facecolor())
+                plt.close(fig)
+                maps[prm + plate_figure.suffix(rd)] = str(pth)
 
-        # A sweep too short to fit anything still says something: |Z| and the
-        # phase at the one measured frequency are a plate map in their own
-        # right, and they are what a single point file is for.
-        n_f = int(np.median([sp.freq.size for sp in spectra.values()])) \
-            if spectra else 0
-        if n_f < 6 and spectra:
-            f_ref = float(np.median([sp.freq[0] for sp in spectra.values()]))
-            zmag = {s: 1000 * float(np.abs(sp.Z[0])) for s, sp in spectra.items()}
-            zphi = {s: float(np.degrees(np.angle(sp.Z[0])))
-                    for s, sp in spectra.items()}
-            for nm, val, unit in (("Z_mag", zmag, "mΩ·cm²"),
-                                  ("Z_phase", zphi, "°")):
-                p = geom.plot_map(out / f"map_{nm}_{f_ref:.0f}Hz.png", val,
-                                  label=f"|Z|  [{unit}]" if nm == "Z_mag"
-                                        else f"arg Z  [{unit}]",
-                                  title=f"{geom.ACTIVE_PLATE.title} — {nm} at "
-                                        f"{f_ref:.1f} Hz ({len(val)} segments)")
-                maps[f"{nm}_at_f"] = str(p)
-            jdc = {s: sp.j_dc for s, sp in spectra.items()
-                   if np.isfinite(sp.j_dc)}
-            if len(jdc) > 3:
-                maps["j_dc"] = str(geom.plot_map(
-                    out / "map_j_dc.png", jdc, label="j  [A/cm²]",
-                    title=f"{geom.ACTIVE_PLATE.title} — DC current density"))
-
-        # Nyquist, all segments plus the cell aggregate
-        fig, ax = plt.subplots(figsize=(7.5, 6.5))
-        for seg in sorted(spectra, key=int):
-            sp = spectra[seg]
-            ax.plot(1000 * sp.Z.real, -1000 * sp.Z.imag, lw=0.8, alpha=0.55)
-        if agg[0].size:
-            ax.plot(1000 * agg[1].real, -1000 * agg[1].imag, "k-", lw=2.4,
-                    label="cell aggregate")
-            ax.legend()
-        ax.set(xlabel="Z'  [mΩ·cm²]",
-               ylabel="-Z''  [mΩ·cm²]",
-               title=f"{geom.ACTIVE_PLATE.title} — local EIS from CSV "
-                     f"({len(spectra)} segments)")
-
-        ax.grid(alpha=0.3)
-        ax.set_aspect("equal", adjustable="datalim")
-        fig.tight_layout()
-        fig.savefig(out / "nyquist.png", dpi=150)
-        plt.close(fig)
-        maps["nyquist"] = str(out / "nyquist.png")
+        # the Nyquist, exactly the plot the runner shows (plotting/nyquist.py)
+        saved = nyquist.save_run(
+            out, title=f"{cfg.condition or Path(str(cfg.csv_path)).name} — "
+                       f"local EIS from CSV")
+        maps.update({f"nyquist_{k}": v for k, v in saved.items()})
 
     manifest = {"config": cfg.to_dict(), "plate": geom.ACTIVE_PLATE.key,
                 "source": "csv", "figures": maps,
@@ -1461,12 +1492,21 @@ def run_csv(cfg, stop_after: str = "gold") -> dict:
                            extra={"r2d2": r2d2_report, "metadata": md})
 
     m = csv_source.read(cfg.csv_path, dialect)
+    if m.dialect == "spectra_dir" and getattr(cfg, "csv_mirror_x", False):
+        csv_source.mirror_x(m)
+        log.info("  mirror: segments re-assigned to their left-right mirror "
+                 "(cfg.csv_mirror_x)")
     log.info(f"  read  : {m.dialect} / {m.kind}, "
              f"{len(m.segments)} segments")
     for k, v in m.summary().items():
         log.debug(f"          {k} = {v}")
 
-    cal = eis_local.PlateCalibration.load(cfg.curr_cal, cfg.temp_cal)
+    # Finished impedances (frequency kind) need no Abgleich; only a raw
+    # time-domain record is calibrated from it.
+    if m.kind == "frequency" and not (cfg.curr_cal and Path(cfg.curr_cal).is_file()):
+        cal = eis_local.PlateCalibration.load(None, None)
+    else:
+        cal = eis_local.PlateCalibration.load(cfg.curr_cal, cfg.temp_cal)
 
     # --- temperatures ------------------------------------------------------
     T_seg: dict[str, float] = {}
@@ -1578,11 +1618,36 @@ def _finish_csv(spectra, sched, m, cfg, log, t0, stop_after, extra=None):
     # --- current-chain lag per segment (channel_lag.py) --------------------
     # The same stage as the FAMOS path's silver: fit each segment's lag
     # against the plate median on its usable points, and remove it before
-    # R_ohmic is read.
-    _apply_channel_lag(spectra, cfg, log)
+    # R_ohmic is read.  NOT for a bench-tool spectra folder (spectra_dir): those
+    # impedances are the tool's finished result, its chain is already
+    # compensated, and the per-segment phase differences left at 10 kHz are the
+    # cell's own inductive tail -- rotating them onto the plate median would
+    # pull every intercept by up to 15 mΩ·cm².
+    if getattr(m, "dialect", "") == "spectra_dir":
+        log.info("  chain : spectra_dir is the bench tool's finished "
+                 "impedance -- no lag correction")
+    else:
+        _apply_channel_lag(spectra, cfg, log)
 
     # --- validation --------------------------------------------------------
-    kk = {seg: validate(sp, cfg) for seg, sp in spectra.items()}
+    # spectra_dir: KK and the ECM see only the capacitive band (see
+    # capacitive_band); the maps, Nyquist and HFR still use every point.
+    band_only = getattr(m, "dialect", "") == "spectra_dir"
+    fit_sp = spectra
+    if band_only:
+        fit_sp = {}
+        for seg, sp in spectra.items():
+            k = capacitive_band(sp.freq, sp.Z)
+            fit_sp[seg] = SegmentSpectrum(
+                sp.segment, sp.freq[k], sp.Z[k], sp.sigma_rel[k],
+                sp.snr_db[k], sp.n_used[k], list(sp.flags), sp.T_C, sp.K,
+                sp.j_dc)
+        nb = np.median([s.freq.size for s in fit_sp.values()]) if fit_sp else 0
+        fb = [s.freq.max() for s in fit_sp.values() if s.freq.size]
+        log.info(f"  band  : KK + ECM on the capacitive band only, median "
+                 f"{nb:.0f} points, up to {np.median(fb) if fb else 0:.0f} Hz "
+                 f"(HF loop above the intercept is the chain)")
+    kk = {seg: validate(sp, cfg) for seg, sp in fit_sp.items()}
     n_kk = sum(1 for v in kk.values() if v.get("ok"))
     log.info(f"  KK    : {n_kk}/{len(kk)} segments inside "
              f"{100*cfg.kk_tol:.0f} % residual")
@@ -1592,7 +1657,7 @@ def _finish_csv(spectra, sched, m, cfg, log, t0, stop_after, extra=None):
 
     # --- ECM + aggregate ---------------------------------------------------
     ecm = {}
-    for seg, sp in spectra.items():
+    for seg, sp in fit_sp.items():
         ecm[seg] = choose_n_arcs(sp.freq, sp.Z, sp.sigma_rel)
     n_ok = sum(1 for r in ecm.values() if r.get("ok"))
     if n_ok:
@@ -1612,7 +1677,8 @@ def _finish_csv(spectra, sched, m, cfg, log, t0, stop_after, extra=None):
                "kk_pass": n_kk, "kk_total": len(kk),
                "cell_aggregate": agg[2],
                "elapsed_s": round(time.time() - t0, 2),
-               **(extra or {})})
+               **(extra or {})},
+        reader_meta=getattr(m, "meta", None))
     utils.banner("DONE", log)
     log.info(f"  {time.time()-t0:.1f} s -> {cfg.out_dir}")
     return manifest

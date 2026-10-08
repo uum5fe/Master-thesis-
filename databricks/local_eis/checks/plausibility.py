@@ -1036,8 +1036,10 @@ def check_from_disk(run_dir, cfg=None, plate_key: str = "gen1",
     for r in summary:
         seg = str(int(float(r["segment"])))
         spectra[seg] = SimpleNamespace(
+            # plate_summary.csv is in display units (mOhm*cm2), FAMOS and
+            # CSV alike; the checks work in ohm*cm2
             j_dc=_f(r, "j_dc"), area_cm2=_f(r, "area_cm2"),
-            R_ohmic=_f(r, "R_ohmic"), R_ohmic_sd=float("nan"),
+            R_ohmic=_f(r, "R_ohmic") / 1e3, R_ohmic_sd=float("nan"),
             Z_corr=np.asarray(points.get(seg, []), complex),
             freq=np.asarray(freqs.get(seg, []), float),
             card=card_of.get(seg, ""))

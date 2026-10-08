@@ -163,8 +163,10 @@ def test_the_nyquist_cell_shows_one_plot_with_condition_and_view(
           "PIPELINE_RESULTS": {"150A": {"out_dir": tmp_path}},
           "LEEPA": "2612030", "pd": pd, "np": np, "Path": Path,
           "spectra_csv": lambda d: Path(d) / "silver" / "spectra_clean.csv",
-          "maps_dir": lambda d: Path(d)}
+          "maps_dir": lambda d: Path(d), "SOURCE_FORMAT": "famos",
+          "CSV_FOLDERS": {}, "nyquist": __import__("nyquist")}
     _setup_show_fig(ns)
+    ns["viewer_dirs"] = lambda: [tmp_path / "viewers"]
     exec(_cell("INTERACTIVE NYQUIST + BODE PER CONDITION"), ns)
     assert len(html) == 1                       # ONE plot, not a stack
     assert html[0].count("<select") == 2        # Condition + Plot
@@ -172,4 +174,8 @@ def test_the_nyquist_cell_shows_one_plot_with_condition_and_view(
     views = {k.split(viewers.SEP)[1] for k in data}
     assert views == {"Nyquist", "|Z|(f) Bode", "Phase(f)"}
     nyq = data[viewers.SEP.join(("150A", "Nyquist"))]["fig"]
-    assert len(nyq["data"]) == 3
+    # three segments + the air-path colour bar
+    assert len(nyq["data"]) == 4
+    # and the same viewer is saved as a standalone page
+    page = tmp_path / "viewers" / "nyquist.html"
+    assert page.is_file() and "<select" in page.read_text()

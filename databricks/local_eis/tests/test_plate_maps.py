@@ -129,12 +129,14 @@ def test_the_heatmap_cell_shows_one_selector_and_writes_static_maps(
     gold_dir.mkdir()
     pd.DataFrame(rows).to_csv(gold_dir / "plate_summary.csv", index=False)
 
-    shown, html = [], []
+    shown, html, saved = [], [], []
     monkeypatch.setattr(ipd, "display", lambda obj: shown.append(obj))
     ns = {"plate_maps": plate_maps, "plate_figure": plate_figure,
           "viewers": viewers, "MIN_SNR_DB": 5.0, "HEATMAP_STYLE": "both",
           "EVALUATION_MODE": "default", "displayHTML": html.append,
-          "_widget": lambda *a, default='': "2612030",
+          "_widget": lambda *a, default='': "2612030", "LEEPA": "2612030",
+          "condition_sort_key": lambda c: c,
+          "save_viewer": lambda h, name, title='': saved.append(name),
           "selected_conditions": lambda: ["150A"],
           "result_dir": lambda leepa, cond: (tmp_path, "this session's run"),
           "describe_source": lambda cond, d, prov: f"  {cond}: {prov}"}
@@ -153,3 +155,4 @@ def test_the_heatmap_cell_shows_one_selector_and_writes_static_maps(
                                     "R_pol (total polarisation)",
                                     "Current density"}
     assert viewers.VIEW_2D in html[0] and viewers.VIEW_SEG in html[0]
+    assert saved == ["plate_maps"]              # the selector is saved too

@@ -146,11 +146,10 @@ def test_the_heatmap_cell_shows_one_selector_and_writes_static_maps(
     assert shown == []
     # one selector: Condition / Parameter / View, every parameter, both views
     assert len(html) == 1 and html[0].count("<select") == 3
-    data = json.loads(re.search(r"var DATA = (\{.*?\});\n", html[0],
-                                re.S).group(1))
+    data = viewers.unpack_payload(html[0])["items"]
     keys = [k.split(viewers.SEP) for k in data]
     assert {k[1] for k in keys} == {"HFR (Rs)", "R_ct (charge transfer)",
                                     "R_mt (mass transport)",
                                     "R_pol (total polarisation)",
                                     "Current density"}
-    assert {k[2] for k in keys} == {viewers.VIEW_2D, viewers.VIEW_SEG}
+    assert viewers.VIEW_2D in html[0] and viewers.VIEW_SEG in html[0]

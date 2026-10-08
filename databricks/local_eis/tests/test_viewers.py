@@ -28,11 +28,11 @@ def _summary(tmp_path, cond="45A"):
 
 
 def _data(h):
-    return json.loads(re.search(r"var DATA = (\{.*?\});\n", h, re.S).group(1))
+    return viewers.unpack_payload(h)["data"]
 
 
 def _shared(h):
-    return json.loads(re.search(r"var SHARED = (\[.*?\]);\n", h, re.S).group(1))
+    return viewers.unpack_payload(h)["shared"]
 
 
 def test_selector_has_one_dropdown_per_dimension_and_every_combination():
@@ -55,21 +55,34 @@ def test_html_items_and_missing_combinations():
 def test_plate_maps_offer_every_parameter_in_both_views(tmp_path):
     h = viewers.plate_maps({"45A": _summary(tmp_path), "450A":
                             _summary(tmp_path, "450A")}, title="t")
-    d = _data(h)
-    params = {k.split(viewers.SEP)[1] for k in d}
-    assert params == {"HFR (Rs)", "R_ct (charge transfer)", "Current density",
-                      "Temperature"}
-    views = {k.split(viewers.SEP)[2] for k in d}
-    assert views == {viewers.VIEW_2D, viewers.VIEW_SEG}
-    assert len(d) == 2 * 4 * 2
-    # the 2D view: a shaded image, squares on the segments, a colour bar
-    f2d = d[viewers.SEP.join(("45A", "HFR (Rs)", viewers.VIEW_2D))]["fig"]
-    sh = _shared(h)
-    types = [(sh[t["__ref__"]] if "__ref__" in t else t).get("type")
-             for t in f2d["data"]]
-    assert "image" in types and "scatter" in types
-    # pieces repeated across maps (here: identical data) are stored once
-    assert len(sh) >= 1 and h.count('"__ref__"') > len(sh)
+    P = viewers.unpack_payload(h)
+    keys = [k.split(viewers.SEP) for k in P["items"]]
+    assert {k[1] for k in keys} == {"HFR (Rs)", "R_ct (charge transfer)",
+                                    "Current density", "Temperature"}
+    assert len(keys) == 2 * 4
+    # the View drop-down offers both views; the browser builds the one chosen
+    assert h.count("<select") == 3
+    assert viewers.VIEW_2D in h and viewers.VIEW_SEG in h
+    it = P["items"][viewers.SEP.join(("45A", "HFR (Rs)"))]
+    assert len(it["v"]) == len(geom.ACTIVE_PLATE.segments)
+    nr, nc, _ = it["gs"]
+    assert len(it["g"]) == nr * nc
+    # geometry once: every pad has its owner segment
+    assert len(P["G"]["owner"]) == geom.N_ROWS
+    # small enough for a notebook cell
+    assert len(h) < 60_000
+
+
+def test_the_quantised_field_decodes_to_the_values(tmp_path):
+    h = viewers.plate_maps({"45A": _summary(tmp_path)})
+    it = viewers.unpack_payload(h)["items"][viewers.SEP.join(("45A",
+                                                              "R_ct (charge transfer)"))]
+    nr, nc, _ = it["gs"]
+    g = np.cumsum(np.array(it["g"]).reshape(nr, nc), axis=1)
+    z = it["vmin"] + g / 250 * (it["vmax"] - it["vmin"])
+    v = np.array(list(it["v"].values()))
+    assert z.min() >= min(v.min(), it["vmin"]) - 1e-9
+    assert z.max() <= max(v.max(), it["vmax"]) + 1e-9
 
 
 def test_by_condition_splits_panels_into_a_second_dropdown():

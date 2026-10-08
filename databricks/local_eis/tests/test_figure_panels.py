@@ -168,8 +168,7 @@ def test_the_nyquist_cell_shows_one_plot_with_condition_and_view(
     exec(_cell("INTERACTIVE NYQUIST + BODE PER CONDITION"), ns)
     assert len(html) == 1                       # ONE plot, not a stack
     assert html[0].count("<select") == 2        # Condition + Plot
-    data = json.loads(re.search(r"var DATA = (\{.*?\});\n", html[0],
-                                re.S).group(1))
+    data = viewers.unpack_payload(html[0])["data"]
     views = {k.split(viewers.SEP)[1] for k in data}
     assert views == {"Nyquist", "|Z|(f) Bode", "Phase(f)"}
     nyq = data[viewers.SEP.join(("150A", "Nyquist"))]["fig"]

@@ -37,3 +37,27 @@ def test_write_condition_maps_reads_a_plate_summary(tmp_path):
     csv.write_text("\n".join(rows) + "\n")
     out = plate_figure.write_condition_maps(csv, tmp_path, "2612030 / 45A", dpi=40)
     assert set(out) == {"R_ohmic", "R_ct", "R_mt", "R_pol"}
+
+
+def test_interpolated_render_has_no_labels_and_marks_measured(tmp_path):
+    import matplotlib.pyplot as plt
+    vals = _values()
+    fig = plate_figure.draw_flow_plate(vals, "R_ohmic", render="interpolated")
+    ax = fig.axes[0]
+    texts = {t.get_text() for t in ax.texts}
+    assert not any(t in texts for t in vals)          # no segment numbers
+    assert len(ax.images) == 1                         # the interpolated field
+    squares = [p for p in ax.patches
+               if p.get_edgecolor()[:3] != (0, 0, 0) and p.get_width() == 5.0]
+    assert len(squares) == len(vals)
+    plt.close(fig)
+
+
+def test_write_condition_maps_both_styles(tmp_path):
+    csv = tmp_path / "plate_summary.csv"
+    rows = ["segment,class,R_ohmic"] + [f"{s},measured,{v}"
+                                        for s, v in _values().items()]
+    csv.write_text("\n".join(rows))
+    out = plate_figure.write_condition_maps(csv, tmp_path, params=("R_ohmic",),
+                                            dpi=30, render="both")
+    assert set(out) == {"R_ohmic", "R_ohmic_interp"}

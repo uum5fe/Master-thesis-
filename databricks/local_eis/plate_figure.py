@@ -112,7 +112,8 @@ def draw_flow_plate(values: dict, param: str, title: str = "",
                     label: str | None = None, unit: str | None = None,
                     cmap: str | None = None, decimals: int | None = None,
                     side: str | None = None, show_values: bool = True,
-                    plate_name: str | None = None, figsize=(16, 9.4)):
+                    plate_name: str | None = None, figsize=(16, 9.4),
+                    render: str = "segments", gloss: float | None = None):
     """One plate heat map in the viewer's layout. Returns the figure.
 
     values    segment -> value (display units); missing = grey
@@ -124,6 +125,15 @@ def draw_flow_plate(values: dict, param: str, title: str = "",
     side      None (default): every port drawn solid. "cathode" or "anode":
               that side's ports solid and the other gas's faded, as the
               interactive viewer does
+    render    "segments" (default): every segment filled with its own value,
+              number and value printed. "interpolated": the active area
+              filled by 2D linear interpolation between the segment centres
+              (nearest value beyond the outermost centres), a hollow square
+              on every measured segment, no numbers -- the layout of the
+              bench's MATLAB maps. Frame, ports, arrows and sensors are the
+              same in both.
+    gloss     interpolated only: strength of the soft sheen, 0 = flat
+              (default plate_style.INTERP_GLOSS)
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -134,7 +144,8 @@ def draw_flow_plate(values: dict, param: str, title: str = "",
     f_label, f_unit, f_ramp, f_dec = FIELDS.get(param, (param, "", _JET, 1))
     label = label or f_label
     unit = f_unit if unit is None else unit
-    cm = _cmap(cmap or f_ramp)
+    interp = render == "interpolated"
+    cm = _cmap(cmap or (style.INTERP_CMAP if interp else f_ramp))
     dec = f_dec if decimals is None else decimals
 
     p = geom.plate(plate_name) if plate_name else geom.ACTIVE_PLATE
@@ -173,7 +184,10 @@ def draw_flow_plate(values: dict, param: str, title: str = "",
     ax.add_patch(Rectangle((0, 0), W, H, fc="#b0b6bd", ec="none", zorder=1.5))
 
     # ---- segments ----------------------------------------------------------
-    for n in sorted(p.segments, key=int):
+    if interp:
+        _draw_interpolated(ax, p, vals, classes, cm, norm, W, H,
+                           style.INTERP_GLOSS if gloss is None else gloss)
+    for n in ([] if interp else sorted(p.segments, key=int)):
         s = p.segments[n]
         v = vals.get(n)
         face = (0.83, 0.83, 0.84, 1.0) if v is None else cm(norm(v))
@@ -185,7 +199,7 @@ def draw_flow_plate(values: dict, param: str, title: str = "",
                                    lw=0.0, hatch=("////" if est else None),
                                    alpha=0.95, zorder=2))
     owner = {pad: n for n, seg in p.segments.items() for pad in seg.pads}
-    for (c, r), n in owner.items():
+    for (c, r), n in ([] if interp else owner.items()):
         x0, y0 = (c - 1) * PAD_W_MM, (r - 1) * PAD_H_MM
         if owner.get((c + 1, r)) != n:
             ax.plot([x0 + PAD_W_MM] * 2, [y0, y0 + PAD_H_MM],
@@ -199,7 +213,7 @@ def draw_flow_plate(values: dict, param: str, title: str = "",
                            zorder=4))
 
     # labels: number (bold) and value underneath
-    for n in sorted(p.segments, key=int):
+    for n in ([] if interp else sorted(p.segments, key=int)):
         s = p.segments[n]
         v = vals.get(n)
         face = (0.83, 0.83, 0.84, 1.0) if v is None else cm(norm(v))
@@ -321,6 +335,10 @@ def draw_flow_plate(values: dict, param: str, title: str = "",
              fontsize=17, fontweight="bold", color="#1d1f20", va="top")
     if subtitle:
         fig.text(0.03, 0.925, subtitle, fontsize=10, color="#5d5d60", va="top")
+    if interp:
+        fig.text(0.03, 0.895, "\u25a1 = segment measured (dashed: rebuilt);  "
+                 "rest: 2D linear interpolation between segment centres",
+                 fontsize=9.5, color=style.MEASURED_MARK, va="top")
 
     # ---- colour bar (fixed scale) -------------------------------------------
     from matplotlib.cm import ScalarMappable
@@ -341,12 +359,85 @@ def draw_flow_plate(values: dict, param: str, title: str = "",
     return fig
 
 
+def _draw_interpolated(ax, p, vals, classes, cm, norm, W, H, gloss):
+    """Fill the active area by 2D linear interpolation between the segment
+    centres, give it a soft sheen, and mark every segment with a square."""
+    from matplotlib.colors import LightSource
+    from matplotlib.patches import Rectangle
+    from scipy.interpolate import griddata
+
+    pts, z = [], []
+    for n, v in vals.items():
+        if n in p.segments:
+            pts.append((p.segments[n].cx_mm, p.segments[n].cy_mm))
+            z.append(v)
+    if len(pts) < 3:
+        ax.add_patch(Rectangle((0, 0), W, H, fc=style.MISSING_FILL,
+                               ec="none", zorder=2))
+        return
+    pts, z = np.asarray(pts, float), np.asarray(z, float)
+    gx, gy = np.meshgrid(np.linspace(0, W, int(W * 2) + 1),
+                         np.linspace(0, H, int(H * 2) + 1))
+    zi = griddata(pts, z, (gx, gy), method="linear")
+    # beyond the outermost centres (the plate edge): an inverse-distance
+    # blend of the four nearest centres. A plain nearest-value fill leaves
+    # blocky Voronoi patches along the edge; this continues the field
+    # smoothly without inventing a trend the data does not have.
+    out = ~np.isfinite(zi)
+    if out.any():
+        from scipy.spatial import cKDTree
+        k = min(4, len(z))
+        d, i = cKDTree(pts).query(np.c_[gx[out], gy[out]], k=k)
+        d, i = np.atleast_2d(d), np.atleast_2d(i)
+        w = 1.0 / np.maximum(d, 1e-6) ** 2
+        zi[out] = np.sum(w * z[i], axis=1) / np.sum(w, axis=1)
+    # a 1.5 mm smoothing removes the seam where the two fills meet; far
+    # below a segment's size, so no segment's own value is blurred away
+    from scipy.ndimage import gaussian_filter
+    zi = gaussian_filter(zi, sigma=3.0, mode="nearest")
+
+    rgb = cm(norm(zi))[..., :3]
+    if gloss and gloss > 0:
+        # soft relief from the field itself (light from the top left) ...
+        ls = LightSource(azdeg=315, altdeg=50)
+        span = float(norm.vmax - norm.vmin) or 1.0
+        rgb = ls.shade_rgb(rgb, elevation=(zi - norm.vmin) / span * 40.0,
+                           blend_mode="soft", fraction=float(gloss))
+        # ... and a faint diagonal highlight across the plate: the sheen
+        u = (gx / W * 0.6 + (1 - gy / H) * 0.4)
+        sheen = np.clip(1.0 - np.abs(u - 0.62) / 0.38, 0, 1) ** 2
+        rgb = rgb + (1.0 - rgb) * (0.22 * float(gloss) * sheen)[..., None]
+    ax.imshow(np.clip(rgb, 0, 1), extent=(0, W, H, 0), origin="upper",
+              interpolation="bilinear", zorder=2, aspect="auto")
+
+    side = 5.0                                     # mm, the measured mark
+    for n, s in p.segments.items():
+        if n not in vals:
+            continue
+        est = classes.get(n, "measured") not in ("", "measured")
+        ax.add_patch(Rectangle((s.cx_mm - side / 2, s.cy_mm - side / 2),
+                               side, side, fc="none", ec=style.MEASURED_MARK,
+                               lw=1.3, ls=("--" if est else "-"),
+                               alpha=(0.7 if est else 0.95), zorder=3.5))
+
+
 def _fixed(param) -> bool:
     try:
         import config
         return config.heatmap_limits(param) is not None
     except Exception:                                       # noqa: BLE001
         return False
+
+
+def renders(style_: str) -> tuple[str, ...]:
+    """The map styles a heatmap_style setting asks for."""
+    return {"both": ("segments", "interpolated"),
+            "interpolated": ("interpolated",)}.get(style_, ("segments",))
+
+
+def suffix(render: str) -> str:
+    """File-name suffix: plate_R_ohmic.png / plate_R_ohmic_interp.png."""
+    return "_interp" if render == "interpolated" else ""
 
 
 def __getattr__(name):
@@ -359,8 +450,10 @@ def __getattr__(name):
 
 def write_condition_maps(summary_csv, out_dir, title: str = "",
                          params=("R_ohmic", "R_ct", "R_mt", "R_pol"),
-                         dpi: int = 200, side: str | None = None) -> dict:
-    """Draw plate_<param>.png for every param from a gold plate_summary.csv."""
+                         dpi: int = 200, side: str | None = None,
+                         render: str = "segments") -> dict:
+    """Draw plate_<param>.png for every param from a gold plate_summary.csv
+    (render "interpolated": plate_<param>_interp.png; "both": both)."""
     import csv
     from pathlib import Path
     import matplotlib.pyplot as plt
@@ -371,12 +464,14 @@ def write_condition_maps(summary_csv, out_dir, title: str = "",
         vals = {r["segment"]: r[prm] for r in rows if r.get(prm) not in (None, "")}
         if not vals:
             continue
-        fig = draw_flow_plate(vals, prm, title=title, classes=classes, side=side)
-        path = Path(out_dir) / f"plate_{prm}.png"
-        fig.savefig(path, dpi=dpi, bbox_inches="tight",
-                    facecolor=fig.get_facecolor())
-        plt.close(fig)
-        out[prm] = str(path)
+        for rd in renders(render):
+            fig = draw_flow_plate(vals, prm, title=title, classes=classes,
+                                  side=side, render=rd)
+            path = Path(out_dir) / f"plate_{prm}{suffix(rd)}.png"
+            fig.savefig(path, dpi=dpi, bbox_inches="tight",
+                        facecolor=fig.get_facecolor())
+            plt.close(fig)
+            out[prm + suffix(rd)] = str(path)
     return out
 
 

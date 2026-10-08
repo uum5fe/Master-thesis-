@@ -102,11 +102,12 @@ import plausibility
 import dc_closure
 import segment_scale
 import frequency_response
+import via_resistance
  
 # Force reload during development (plate_style before the maps that use it)
 for mod in [config, utils, eis_local, gamry_sync, channel_lag, card_gain,
             bronze, silver, gold, plausibility, dc_closure, segment_scale,
-            frequency_response, pipeline_main,
+            frequency_response, via_resistance, pipeline_main,
             geom, csv_source, csv_pipeline, gamry_dta, gamry_compare, abgleich,
             ladder_snap, tone_estimation, eis_measurement_model,
             figure_panels, plate_style, plate_maps, plate_figure, plate_plotly,
@@ -567,6 +568,11 @@ UC_SERIES_MOHM_CM2 = 0.0
 # RUN_DIR/frequency_response/ and two plausibility checks; it never changes Z.
 # 'off' skips it. See the "Frequency response" cell after the runs.
 FREQ_RESPONSE = 'report'
+# Static plate maps: 'segments' (each segment filled and labelled),
+# 'interpolated' (2D linear interpolation between segment centres, squares
+# on the measured segments, no numbers, parula with a soft gloss -- like the
+# bench's MATLAB maps; plate_<param>_interp.png), or 'both'.
+HEATMAP_STYLE = 'both'
 
 
 def _bode_dir():
@@ -1853,6 +1859,7 @@ for cond in _conditions_to_run:
         uc_series_mohm_cm2=float(UC_SERIES_MOHM_CM2),
         freq_response=FREQ_RESPONSE,
         abgleich_bode_dir=_bode_dir(),
+        heatmap_style=HEATMAP_STYLE,
         gamry_dir=Path(GAMRY_DIR) if GAMRY_DIR else None,
         gamry_version=GAMRY_VERSION,
         bench_log=Path(BENCH_LOG) if BENCH_LOG else None,
@@ -2136,6 +2143,40 @@ if _fr_rows:
     print(pd.DataFrame(_fr_rows).to_string(index=False))
     print("  A card step that is the same at every current is the hardware; "
           "one that changes with load is the cell.")
+
+
+# COMMAND ----------
+
+# DBTITLE 1,Via resistance vs temperature per card (Abgleich DC calibration)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Each segment's current is the voltage drop over its vias, amplified. The
+# Abgleich DC calibration (Step1_20Grad .. Step5_90Grad, Step6_20Grad back)
+# gives, per segment, the slope k = du/di at 20..90 degC: proportional to the
+# via resistance. Plotted per card, with the operating temperatures of the
+# runs below shaded.
+#
+# Why it matters for the current density: j = u / K(T), so a via whose real
+# temperature differs from the one the pipeline assumes for it (interpolated
+# from T1..T4) shifts j by -alpha per kelvin (alpha ~ 0.39 %/K, copper) and
+# every impedance of that segment by +alpha per kelvin.
+# Needs ABGLEICH_DIR (set in the "Chain response" cell).
+# ═══════════════════════════════════════════════════════════════════════════════
+importlib.reload(via_resistance)
+
+_ab = globals().get('ABGLEICH_DIR') or ''
+if not _ab or not Path(_ab).is_dir():
+    print("  ABGLEICH_DIR is not set -- run the 'Chain response' cell first "
+          "(it finds the Abgleich folder), or set ABGLEICH_DIR to the folder "
+          "that holds Step1_20Grad.csv and coefficients/.")
+else:
+    _via_runs = [Path(pr['out_dir']) for pr in PIPELINE_RESULTS.values()
+                 if pr and pr.get('out_dir')]
+    _via_out = _TMP_BASE / LEEPA / 'via_resistance'
+    _via = via_resistance.run(_ab, _via_runs, out_dir=_via_out)
+    for _png in ('via_vs_temperature.png', 'via_alpha.png'):
+        if (_via_out / _png).is_file():
+            display(IPImage(filename=str(_via_out / _png)))
+    print(f"  written to {_via_out}")
 
 
 # COMMAND ----------
@@ -2573,6 +2614,12 @@ for cond in _conds:
     # Match Gamry condition
     gamry_df = _gamry.get(cond, None)
     LIKE_FOR_LIKE = True          # set False to see the uncorrected overlay
+    # The comparison uses only the band BOTH instruments covered, so the
+    # Gamry curve used to stop where the local band stops (~4 kHz) although
+    # the sweep goes to 30 kHz. GAMRY_FULL_RANGE draws the rest of the sweep
+    # as a separate dashed trace -- shown, not compared.
+    GAMRY_FULL_RANGE = globals().get('GAMRY_FULL_RANGE', True)
+    gamry_full = None
     _I_err, _L, _lo, _hi = 0.0, 0.0, float('nan'), float('nan')
     if LIKE_FOR_LIKE:
         # (1) shunt-calibration scale, from DC closure — NOT fitted to the Gamry
@@ -2598,6 +2645,7 @@ for cond in _conds:
                 gamry_df['z_im'] = gamry_df['z_im'] - 2 * np.pi * _fg * _L
 
         # (3) restrict both curves to the overlapping band
+        gamry_full = gamry_df
         if gamry_df is not None and agg_df is not None and len(agg_df) > 3:
             _lo = max(agg_df['freq_hz'].min(), gamry_df['freq_hz'].min())
             _hi = min(agg_df['freq_hz'].max(), gamry_df['freq_hz'].max())
@@ -2692,6 +2740,36 @@ for cond in _conds:
             marker=dict(size=4, color='#c0392b'),
             legendgroup='agg', showlegend=False), row=1, col=3)
  
+    # Gamry outside the local band (dashed grey): the rest of the sweep, to
+    # its own top frequency (30 kHz), with the same corrections applied
+    if GAMRY_FULL_RANGE and gamry_full is None:
+        gamry_full = gamry_df
+    if GAMRY_FULL_RANGE and gamry_full is not None and gamry_df is not None \
+            and len(gamry_full) > len(gamry_df):
+        _in = gamry_full['freq_hz'].between(gamry_df['freq_hz'].min(),
+                                            gamry_df['freq_hz'].max())
+        _ext = gamry_full.copy()
+        _ext.loc[_in & ~_ext['freq_hz'].isin([gamry_df['freq_hz'].min(),
+                                              gamry_df['freq_hz'].max()]),
+                 ['z_re', 'z_im']] = np.nan
+        Z_e = _ext['z_re'].values + 1j * _ext['z_im'].values
+        _fmax = gamry_full['freq_hz'].max()
+        fig.add_trace(go.Scatter(
+            x=_ext['z_re'], y=-_ext['z_im'], mode='lines+markers',
+            line=dict(width=2, color='grey', dash='dash'),
+            marker=dict(size=4, color='grey', symbol='diamond-open'),
+            name=f'Gamry {cond} outside local band (to {_fmax/1e3:.0f} kHz)',
+            legendgroup='gamry_full', connectgaps=False,
+            customdata=_ext['freq_hz'].values,
+            hovertemplate=f"Gamry {cond} (not compared)<br>f=%{{customdata:.0f}} Hz"
+                "<br>Z'=%{x:.1f}<br>-Z''=%{y:.1f}<extra></extra>",
+        ), row=1, col=1)
+        for _col, _y in ((2, np.abs(Z_e)), (3, np.degrees(np.angle(Z_e)))):
+            fig.add_trace(go.Scatter(x=_ext['freq_hz'], y=_y, mode='lines+markers',
+                line=dict(width=2, color='grey', dash='dash'),
+                marker=dict(size=3, color='grey'), connectgaps=False,
+                legendgroup='gamry_full', showlegend=False), row=1, col=_col)
+
     # Gamry reference (thick black)
     if gamry_df is not None:
         Z_g = gamry_df['z_re'].values + 1j * gamry_df['z_im'].values
@@ -3116,15 +3194,17 @@ for cond, (gold_csv, prov) in sorted(_COND_GOLD.items()):
         # T1..T4, and the fixed colour scale from config.HEATMAP_LIMITS.
         # Which side each port is on follows config.PLATE_VIEW_MIRRORED and
         # config.COOLANT_INLET_END. plate_figure.py.
-        fig = plate_figure.draw_flow_plate(
-            vals, col, classes=_classes, label=label, unit=unit, decimals=dec,
-            title=f'{_LEEPA} / {cond} / SNR {_SNR or "default"}')
-        _png_out = _out_dir / f'plate_{col}.png'
-        fig.savefig(str(_png_out), dpi=200, bbox_inches='tight',
-                    facecolor=fig.get_facecolor())
-        display(fig)
-        plt.close(fig)
-        print(f'  {col}: {_png_out}')
+        for _rd in plate_figure.renders(globals().get('HEATMAP_STYLE', 'segments')):
+            fig = plate_figure.draw_flow_plate(
+                vals, col, classes=_classes, label=label, unit=unit,
+                decimals=dec, render=_rd,
+                title=f'{_LEEPA} / {cond} / SNR {_SNR or "default"}')
+            _png_out = _out_dir / f'plate_{col}{plate_figure.suffix(_rd)}.png'
+            fig.savefig(str(_png_out), dpi=200, bbox_inches='tight',
+                        facecolor=fig.get_facecolor())
+            display(fig)
+            plt.close(fig)
+            print(f'  {col}: {_png_out}')
 
 
 # COMMAND ----------

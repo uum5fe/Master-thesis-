@@ -562,6 +562,12 @@ class Comparison:
     hfr_ref_fit: float = float("nan")     # ohm.cm2, extrapolated
     bench: dict[str, float] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
+    #: the whole sweep as recorded (ohm.cm2), for display only. The metrics
+    #: above use the overlap band alone; a Nyquist drawn from `Z_ref` stops
+    #: where the LOCAL band stops (~4 kHz), although the Gamry went to 30 kHz.
+    freq_ref_full: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    Z_ref_full: np.ndarray = field(
+        default_factory=lambda: np.zeros(0, complex))
 
     # -- scalar metrics -----------------------------------------------------
 
@@ -704,6 +710,8 @@ def compare(freq_local: np.ndarray, Z_local: np.ndarray, sweep: CellSweep,
         hfr_local_fit=local_fit,
         hfr_ref_fit=ref_fit,
         bench=dict(bench or {}), notes=notes,
+        freq_ref_full=np.asarray(ref_f, float),
+        Z_ref_full=np.asarray(ref_Z, complex),
     )
 
 
@@ -753,6 +761,17 @@ def write_outputs(comparisons: list[Comparison], out_dir, log=None) -> None:
             })
     if rows:
         utils.write_table(out / "gamry_comparison_curves.csv", rows)
+    # the whole sweep as recorded (to 30 kHz), for plotting beyond the band
+    full = [{"condition": c.condition,
+             "freq_hz": round(float(f), 6),
+             "z_re_ref_mohm_cm2": round(1e3 * float(z.real), 5),
+             "z_im_ref_mohm_cm2": round(1e3 * float(z.imag), 5),
+             "in_local_band": int(c.n_points > 0 and c.freq.min() <= f
+                                  <= c.freq.max())}
+            for c in comparisons
+            for f, z in zip(c.freq_ref_full, c.Z_ref_full)]
+    if full:
+        utils.write_table(out / "gamry_reference_full.csv", full)
 
     if log:
         for c in comparisons:
@@ -785,6 +804,15 @@ def plot(comparisons: list[Comparison], path="gamry_comparison.png"):
     fig, axes = plt.subplots(2, n, figsize=(4.2 * n, 7.4), squeeze=False)
     for j, c in enumerate(comparisons):
         ax = axes[0][j]
+        if c.Z_ref_full.size:
+            # the part of the sweep above (and below) the local band: drawn,
+            # but not compared -- there is no local point to compare it with
+            out = ((c.freq_ref_full > c.freq.max())
+                   | (c.freq_ref_full < c.freq.min()))
+            zf = np.where(out, c.Z_ref_full, np.nan)
+            ax.plot(1e3 * zf.real, -1e3 * zf.imag, "o--", ms=2, lw=.8,
+                    color="0.6", label=f"Gamry outside the local band "
+                    f"(to {c.freq_ref_full.max() / 1e3:.0f} kHz)")
         ax.plot(1e3 * c.Z_ref.real, -1e3 * c.Z_ref.imag, "o-", ms=3, lw=1,
                 color="0.35", label="whole cell (Gamry)")
         ax.plot(1e3 * c.Z_local.real, -1e3 * c.Z_local.imag, "s-", ms=3, lw=1,

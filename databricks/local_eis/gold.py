@@ -786,12 +786,16 @@ def save(gr: GoldRun, sr: SilverRun, cfg: Config, log=None) -> Path:
                 sc = PARAM_META.get(p, {}).get("scale", 1.0)
                 vals = {s: r.values.get(p, np.nan) * sc
                         for s, r in gr.records.items()}
-                fig = plate_figure.draw_flow_plate(
-                    vals, p, classes=cls,
-                    title=f"{cfg.leepa or ''} / {cfg.condition or ''}".strip(" /"))
-                fig.savefig(out / f"plate_{p}.png", dpi=200,
-                            bbox_inches="tight", facecolor=fig.get_facecolor())
-                plt.close(fig)
+                for rd in plate_figure.renders(
+                        getattr(cfg, "heatmap_style", "segments")):
+                    fig = plate_figure.draw_flow_plate(
+                        vals, p, classes=cls, render=rd,
+                        title=f"{cfg.leepa or ''} / {cfg.condition or ''}"
+                        .strip(" /"))
+                    fig.savefig(out / f"plate_{p}{plate_figure.suffix(rd)}.png",
+                                dpi=200, bbox_inches="tight",
+                                facecolor=fig.get_facecolor())
+                    plt.close(fig)
         except Exception as exc:                            # noqa: BLE001
             log.info(f"  plate figures skipped: {type(exc).__name__}: {exc}")
         fig = nyquist_figure(sr, cfg)

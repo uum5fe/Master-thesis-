@@ -119,6 +119,17 @@ def test_only_the_overlapping_band_is_compared(sweep):
     assert c.n_points < 60
 
 
+def test_the_whole_sweep_is_kept_for_display(sweep, tmp_path):
+    """The comparison uses the overlap only, but the sweep above the local
+    band (to 30 kHz) is kept and drawn rather than cut off."""
+    f = np.logspace(np.log10(0.5), np.log10(3000), 40)
+    c = GC.compare(f, cell_asr(f), sweep, A_CELL)
+    assert c.freq.max() <= 3000 + 1e-9
+    assert c.freq_ref_full.max() == sweep.freq.max()
+    assert c.Z_ref_full.size == sweep.freq.size
+    assert GC.plot([c], tmp_path / "g.png").is_file()
+
+
 def test_hfr_is_refused_when_it_lies_above_the_evaluated_band(sweep):
     """The intercept is not always inside the pipeline's band.
 

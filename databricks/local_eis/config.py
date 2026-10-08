@@ -305,6 +305,12 @@ class Config:
     # after the timing correction. Writes RUN_DIR/frequency_response/ and two
     # plausibility checks; never changes Z. "off" skips it.
     freq_response: str = "report"          # off | report
+    # STYLE OF THE STATIC PLATE MAPS (plate_figure.py). "segments": every
+    # segment filled with its own value and labelled; "interpolated": 2D
+    # linear interpolation between the segment centres, a square on every
+    # measured segment, no labels (parula, soft gloss) -- the layout of the
+    # bench's MATLAB maps, written as plate_<param>_interp.png; "both".
+    heatmap_style: str = "segments"        # segments | interpolated | both
     abgleich_bode_dir: Path | None = None
     card_gain_min_snr_db: float = 20.0     # steps below: not used
     card_gain_min_steps: int = 5

@@ -66,6 +66,19 @@ JET_STOPS: tuple[tuple[float, str], ...] = (
 #: name every drawing uses for the heat-map ramp
 HEATMAP_CMAP = "plotly_jet"
 
+#: MATLAB's "parula" (the ramp of the bench's interpolated MATLAB maps:
+#: dark blue -> blue -> teal -> green -> yellow), as nine stops. Used by the
+#: interpolated maps (plate_figure.draw_flow_plate(render="interpolated")).
+PARULA_STOPS: tuple[str, ...] = (
+    "#352a87", "#0f5cdd", "#1481d6", "#06a4ca", "#2eb7a4",
+    "#87bf77", "#d1bb59", "#fec832", "#f9fb0e")
+
+#: interpolated maps: ramp, and the strength of the soft gloss (0 = flat)
+INTERP_CMAP = "parula"
+INTERP_GLOSS = 0.35
+#: outline of the "segment measured" squares on interpolated maps
+MEASURED_MARK = "#c2185b"
+
 #: fill of a segment with no value
 MISSING_FILL = (0.83, 0.83, 0.84, 1.0)
 
@@ -85,6 +98,9 @@ def mpl_cmap(name: str | None = None):
     if name in (None, "", "jet", "Jet", HEATMAP_CMAP):
         return LinearSegmentedColormap.from_list(
             HEATMAP_CMAP, [(p, _rgb01(c)) for p, c in JET_STOPS], N=256)
+    if name in ("parula", "Parula"):
+        return LinearSegmentedColormap.from_list("parula", PARULA_STOPS,
+                                                 N=256)
     import matplotlib.pyplot as plt
     return plt.get_cmap(name)
 

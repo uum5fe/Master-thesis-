@@ -24,10 +24,11 @@ Units are mΩ·cm² unless stated otherwise. Figures are in `docs/figures/famos_
    |---|---|---|---|---|
    | FAMOS aggregate \|Z\| vs Gamry | +8.5 % | +7.1 % | +12.6 % | +16.5 % |
 
-   This is a measurement bias, made of:
-   - a series offset of about +11 mΩ·cm² at high frequency (UC taps vs the Gamry sense leads);
-   - a current-measurement deficit of 2.5–4.7 % (current closure);
-   - a residual gain that grows with current.
+   This is a measurement bias. Fitting FAMOS = a · Gamry + b over 0.3 Hz–2.5 kHz, the Nyquist is mainly **stretched**:
+   - gain a = 1.05 / 1.06 / 1.10 / 1.16 at 45 / 60 / 150 / 450 A (the −Im Z part alone, which no offset can touch, gives 1.06 / 1.06 / 1.09 / 1.12);
+   - only a small series offset b = 2–5 mΩ·cm².
+
+   The segment currents add up to only 95.3–97.5 % of I_S, which accounts for 2.5–4.7 % of the gain (almost all of it at 45/60 A). The rest grows with current.
 
    The CSV plate aggregate (another day) lies within +1…+7 % of the same Gamry spectra.
 3. **The FAMOS HFR is the weakest FAMOS number.** The band stops at 3.0–3.8 kHz, where the spectrum is still capacitive, so HFR is a top-band mean and not an intercept.
@@ -105,7 +106,7 @@ FAMOS values are means over the 150 s sweep windows (Figure 1). CSV values are t
 
 - **R_pol agrees within 4–8 %** at every current. It is the robust number.
 - **The R_ct / R_mt split does not agree** (45 A: 140 / 219 vs 33 / 340). The CSV fit can only use data up to about 2.5 kHz (the band ends where the HF artifact starts), so the high-frequency arc is not pinned down. CSV R_ct varies 25–96 % between segments; FAMOS varies 7–13 %.
-- **ReZ at 1 kHz is about 64.5 for FAMOS at every current; CSV gives 53.6–62.3.** The FAMOS value is lifted by the series offset (Section 4.1). In the CSV data, 1 kHz is already bending into the HF artifact.
+- **ReZ at 1 kHz is about 64.5 for FAMOS at every current; CSV gives 53.6–62.3.** The FAMOS value is lifted by the gain and offset of Section 4.1. In the CSV data, 1 kHz is already bending into the HF artifact.
 - **Plate temperature is 4–6 K lower in FAMOS** at every current. This comes from the warm-up (Section 2) and possibly a sensor offset. It is worth checking against the coolant once the cell is steady.
 
 ### 3.2 Whole cell: both plates against the Gamry
@@ -119,7 +120,7 @@ FAMOS values are means over the 150 s sweep windows (Figure 1). CSV values are t
 
 ![Whole cell Nyquist](figures/famos_vs_csv/fig2_whole_cell_nyquist.png)
 
-*Figure 2. The CSV aggregate (another test day) follows the FAMOS-day Gamry more closely than the FAMOS aggregate recorded at the same time. FAMOS has the right shape but sits too far right: an offset plus a gain.*
+*Figure 2. The CSV aggregate (another test day) follows the FAMOS-day Gamry more closely than the FAMOS aggregate recorded at the same time. FAMOS has the right shape but is stretched by 5–16 %, plus a 2–5 mΩ·cm² offset.*
 
 ### 3.3 Spatial quality
 
@@ -153,14 +154,23 @@ Neighbour contrast: 1.0 means the map looks like randomly placed values; lower m
 
 ### 4.1 Absolute level: +7…+17 % against the Gamry at the same moment
 
-| Contribution | Evidence | Size |
-|---|---|---|
-| Series resistance between the UC taps and the Gamry sense leads (reference plane) | "R_s matched-band closure": local 59.5–60.9 vs whole cell 46.6–50.9 over the same top frequencies | **+10…+12 mΩ·cm²**, nearly constant |
-| Segment currents read low | "current closure": Σ segment current = 95.3 / 95.8 / 96.9 / 97.5 % of I_S | **+2.5…+4.7 %** on \|Z\| |
-| 5 unmeasured segments (33, 65–68, all at the air-inlet end, x = 224–248 mm) | recomputed from the 72-segment CSV data | up to +2 % at 450 A |
-| Remaining gain that grows with current | after the three items above, 0.25 Hz is still 0 / 0 / +3 / +8 % high (45 / 60 / 150 / 450 A) | grows from 45 A to 450 A |
+Fit of the FAMOS aggregate against the simultaneous Gamry, FAMOS = a · Gamry + b over 0.3 Hz–2.5 kHz. The median residual after the fit is 1.4 / 1.6 / 3.2 / 4.4 %, so the two numbers describe the mismatch well.
 
-The first two are calibration items. The pipeline already has the hooks for them (`UC_SERIES_MOHM_CM2`, the current closure, the Gamry comparison). The third needs a bench check: AC gain of the shunt amplifiers at high DC current, and temperature compensation of the copper shunts (0.39 %/K).
+| | 45 A | 60 A | 150 A | 450 A |
+|---|---|---|---|---|
+| gain a (stretch of the whole Nyquist) | 1.049 | 1.056 | 1.102 | 1.160 |
+| gain from −Im Z alone (immune to any offset) | 1.055 | 1.060 | 1.088 | 1.121 |
+| series offset b [mΩ·cm²] | 5.2 | 3.1 | 3.2 | 1.9 |
+
+| Contribution to the gain | Evidence | Size |
+|---|---|---|
+| Segment currents read low | "current closure": Σ segment current = 95.3 / 95.8 / 96.9 / 97.5 % of I_S | **+2.5…+4.7 %**: nearly all of the gain at 45/60 A |
+| 5 unmeasured segments (33, 65–68, all at the air-inlet end, x = 224–248 mm) | recomputed from the 72-segment CSV data | up to +2 % at 450 A |
+| Remaining gain that grows with current | a minus the two items above | about 0 / 0 / +4 / +9 % |
+
+- **The current deficit** is a calibration item. The pipeline already measures it as the current closure.
+- **The remaining current-dependent gain** needs a bench check: the AC gain of the shunt amplifiers at high DC current, the temperature compensation of the copper shunts (0.39 %/K), and the per-segment scale factors (±5.5 %). The last matter because at 450 A the parallel sum is dominated by the low-impedance inlet segments.
+- **The "R_s matched-band closure"** (local 59.5–60.9 vs whole cell 46.6–50.9 over the top frequencies) is not a separate 11 mΩ·cm² series resistance. It is the small offset plus the gain applied to the HFR, plus the noisier top of the band.
 
 ### 4.2 HFR depends on how far the band reaches
 
@@ -232,7 +242,7 @@ So the CSV test is the one with the swapped orientation. Evaluate it with `CSV_M
 1. **The same operating point everywhere:**
    - local spectra, the whole-cell Gamry, the DC current per segment and the bench log are recorded at the same time;
    - only this makes closures possible (aggregate vs Gamry, Σ currents vs I_S, series resistance);
-   - those closures are what revealed the +11 mΩ·cm² offset and the 3–5 % current deficit. The CSV tool cannot reveal its own errors.
+   - those closures are what revealed the 5–16 % gain error and the 3–5 % current deficit. The CSV tool cannot reveal its own errors.
 2. **Current-density map (j_dc).** It is the most direct local performance quantity, it confirms the transport picture (lowest j at the air outlet at 450 A), and it is absent in CSV.
 3. **Raw data, re-evaluable, with per-point uncertainty.**
    - Quality gates (SNR, distortion, drift, KK) work on real σ; on CSV σ is assumed.
@@ -248,7 +258,7 @@ So the CSV test is the one with the swapped orientation. Evaluate it with `CSV_M
 
 | Priority | Action | Fixes |
 |---|---|---|
-| 1 | **Absolute calibration per run against the simultaneous Gamry:**<br>• set `UC_SERIES_MOHM_CM2` ≈ 11–12 (from the matched-band closure);<br>• correct the current gain by the measured closure;<br>• keep the Gamry comparison as an acceptance check (aim: \|Z\| within ±5 %) | Section 4.1, about two-thirds of the bias |
+| 1 | **Absolute calibration per run against the simultaneous Gamry:**<br>• fit gain and series offset per condition (as in Section 4.1) and report the corrected aggregate;<br>• correct the current gain by the measured closure;<br>• keep the Gamry comparison as an acceptance check (aim: \|Z\| within ±5 %) | Section 4.1: all of the bias at 45/60 A, about half at 450 A |
 | 2 | **Reach the HF intercept** (3.8–4.7 kHz on this cell):<br>• raise the FAMOS sampling rate and/or the excitation amplitude so that 4–6 kHz is measured with usable SNR (today the 4732 Hz step is at −37…−52 dB);<br>• until then, report HFR at a **fixed** frequency, identical for every current (e.g. Re Z at 2.4 kHz) | Section 4.2 zig-zag; random-looking HFR map |
 | 3 | **Steady-state protocol:**<br>• condition first (the CSV profile does 10 min at 300 A, then a full pol curve);<br>• start EIS only when coolant inlet is at set ±0.5 K, dT/dt < 0.05 K/min and flows are at set ±2 %;<br>• ≥ 5 min per current;<br>• measure descending as well as ascending | Sections 2 and 4.3: drift/distortion rejections, warm-up bias, hysteresis |
 | 4 | **Fix the 450 A air-flow drift** (13.2 → 11.5 Nl/min under a 13.5 set point) and **match humidification** to the profile (dew point 46 °C at 450 A, not 54–55 °C) | 450 A operating point |

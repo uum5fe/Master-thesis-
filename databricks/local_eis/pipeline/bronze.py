@@ -1351,7 +1351,7 @@ def _gamry_guided(kept, tl, files, cards, cfg, lags, fs_seen, gs_mode, log):
     utils.section(f"Gamry clock  (gamry_sync = {gs_mode}, {tl.path.name})",
                   log)
     fs_ref = float(np.median(list(fs_seen.values()))) if fs_seen else 25000.0
-    f_top = min((cfg.f_hi(v) for v in fs_seen.values()), default=np.inf)
+    f_top = min((cfg.f_known_hi(v) for v in fs_seen.values()), default=np.inf)
     res = gamry_sync.align(kept, tl, fs_ref, cfg.f_min_hz, f_top)
     info = {"mode": gs_mode, "sweep": tl.path.name,
             "started": str(tl.started) if tl.started else None,
@@ -1408,7 +1408,8 @@ def _gamry_guided(kept, tl, files, cards, cfg, lags, fs_seen, gs_mode, log):
 
     kept, moved = gamry_sync.relocate(
         kept, res, tl, hf_schedule.LazyChannels(fam), float(fam.fs), lag,
-        rebuild, make_step, log=log)
+        rebuild, make_step, log=log,
+        min_window_snr_db=getattr(cfg, "window_min_snr_db", -3.0))
     info["relocated"] = moved
     if getattr(cfg, "window_confine", True):
         kept, conf = gamry_sync.confine_windows(

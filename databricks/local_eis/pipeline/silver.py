@@ -1154,6 +1154,42 @@ def r_ohmic_topband(freq: np.ndarray, Z: np.ndarray, sigma_rel: np.ndarray,
     return mean, sd_mean, int(sel.sum())
 
 
+def r_ohmic_method(cfg) -> str:
+    """'intercept' or 'topband' -- config.r_ohmic_method, 'auto' resolved
+    by config.full_band."""
+    m = str(getattr(cfg, "r_ohmic_method", "auto") or "auto").lower()
+    if m == "auto":
+        return "intercept" if getattr(cfg, "full_band", False) else "topband"
+    return m
+
+
+def r_ohmic_intercept(freq: np.ndarray, Z: np.ndarray, sigma_rel=None,
+                      f_min_hz: float = 100.0) -> tuple[float, float]:
+    """The high-frequency intercept: Re Z where Im Z changes from negative
+    (capacitive, below) to positive (inductive, above), linear between the
+    two points around it. The LOWEST such crossing above `f_min_hz` is the
+    one that closes the electrochemical arc; a crossing further up is noise
+    on the inductive branch, and one below ~100 Hz is the low-frequency loop.
+    Returns (R, sd) in the units of Z, (nan, nan) when the band never
+    reaches the real axis."""
+    f = np.asarray(freq, float)
+    Z = np.asarray(Z, complex)
+    s = (np.full(f.size, np.nan) if sigma_rel is None
+         else np.asarray(sigma_rel, float))
+    o = np.argsort(f)
+    f, Z, s = f[o], Z[o], s[o]
+    ok = np.isfinite(f) & np.isfinite(Z) & (f >= f_min_hz)
+    f, Z, s = f[ok], Z[ok], s[ok]
+    for i in range(f.size - 1):
+        a, b = Z.imag[i], Z.imag[i + 1]
+        if a < 0.0 <= b:
+            w = a / (a - b)
+            R = float(Z.real[i] + w * (Z.real[i + 1] - Z.real[i]))
+            sd = float(np.nanmean([s[i] * abs(Z[i]), s[i + 1] * abs(Z[i + 1])]))
+            return R, sd
+    return float("nan"), float("nan")
+
+
 def r_ohmic_axis_fit(freq: np.ndarray, Z: np.ndarray,
                      n_top: int = 6) -> float:
     """R_inf by extrapolating the top of the arc to Im Z = 0.
@@ -1231,7 +1267,8 @@ def extrapolate_hf(drt: dict, f_hi: float, n: int = 40) -> dict:
 REJECT_REASONS = {
     "not_finite": "the phasor fit did not return a finite Z",
     "outside_band": "outside cfg.f_min_hz .. min(cfg.f_max_hz, "
-                    "cfg.coherent_f_max_frac_fs * fs)",
+                    "cfg.coherent_f_max_frac_fs * fs) -- or "
+                    "cfg.full_band_frac_fs * fs with cfg.full_band",
     "snr": "SNR below the gate for this point",
     "thd": "harmonic distortion above cfg.max_thd",
     "drift": "amplitude drifted during the dwell, above cfg.max_drift",
@@ -1267,7 +1304,9 @@ def gate_points(sp: BronzeSpectrum, cfg: Config) -> dict:
     keep = gate(np.isfinite(freq) & (freq > 0)
                 & np.isfinite(Z.real) & np.isfinite(Z.imag), "not_finite")
     f_top = float(cfg.f_max_hz)
-    frac = float(getattr(cfg, "coherent_f_max_frac_fs", 0.0) or 0.0)
+    full = bool(getattr(cfg, "full_band", False))
+    frac = float((getattr(cfg, "full_band_frac_fs", 0.49) if full else
+                  getattr(cfg, "coherent_f_max_frac_fs", 0.0)) or 0.0)
     if frac > 0 and np.isfinite(getattr(sp, "fs", np.nan)) and sp.fs > 0:
         f_top = min(f_top, frac * float(sp.fs))
     keep &= gate((freq >= cfg.f_min_hz) & (freq <= f_top), "outside_band")
@@ -1485,6 +1524,14 @@ def process_segment(sp: BronzeSpectrum, skew: SkewModel, cfg: Config,
     R_top, R_top_sd, n_top = r_ohmic_topband(f_m, z_m, model.get("sigma_rel", s_rel))
     arc_open = float(model.get("hf_arc_open", 0.0) or 0.0)
     closure = float(model.get("hf_closure", np.nan))
+    # With the full band the spectrum crosses the real axis inside it: R_ohmic
+    # is then that crossing, as the Gamry and the bench tool define it, and
+    # the arc is closed by construction.
+    if r_ohmic_method(cfg) == "intercept":
+        R_int, R_int_sd = r_ohmic_intercept(f_m, z_m,
+                                            model.get("sigma_rel", s_rel))
+        if np.isfinite(R_int) and R_int > 0:
+            R_top, R_top_sd, arc_open, closure = R_int, R_int_sd, 0.0, 1.0
     R_drt = float(model["R_inf"])
     if not np.isfinite(R_top):
         R_top, R_top_sd = R_drt, float(model.get("R_inf_sd", np.nan))
@@ -1600,8 +1647,16 @@ def channel_lag_items(spectra: dict, skew: dict, cfg: Config) -> dict:
         sk = skew.get(sp.card)
         dt = (sk.dt_for(sp.channel_slot, sp.ref_slot)
               if sk is not None and sk.applied else 0.0)
+        keep = np.asarray(g["keep"], bool)
+        if getattr(cfg, "full_band", False):
+            # the lag is a DELAY only below the phase-coherent limit; the
+            # full band's top is kept for the spectrum, not for this fit
+            frac = float(getattr(cfg, "coherent_f_max_frac_fs", 0.16) or 0.16)
+            fs = float(getattr(sp, "fs", np.nan))
+            if np.isfinite(fs) and fs > 0:
+                keep = keep & (np.asarray(g["freq"], float) <= frac * fs)
         items[seg] = (g["freq"], utils.apply_delay(g["freq"], g["Z"], dt),
-                      g["keep"])
+                      keep)
     return items
 
 

@@ -553,6 +553,14 @@ try:
                              ['recommended', 'custom'], 'Parameter profile')
     dbutils.widgets.text('f_min_hz', '0.15', 'F min (Hz)')
     dbutils.widgets.text('f_max_hz', '4500.0', 'F max (Hz)')
+    # BAND -- full: every step of the sweep the FAMOS card can resolve, up to
+    # just below its Nyquist frequency (12.25 kHz at fs = 25 kHz); R_ohmic is
+    # then the measured real-axis intercept. coherent: stop at the limit
+    # where the five cards still agree as pure delays (0.16 fs = 4 kHz at
+    # 25 kHz) and at F max; R_ohmic is the top-band mean. This widget is not
+    # pinned by the parameter profile.
+    dbutils.widgets.dropdown('f_band', 'full', ['full', 'coherent'],
+                             'Band (full = up to fs/2)')
     dbutils.widgets.dropdown('min_snr_db', '0',
                              ['-30', '-20', '-10', '-3', '0', '3', '5', '8',
                               '10'],
@@ -712,6 +720,7 @@ COND_FILTER = ('ALL' if SELECTED_CONDITIONS == list(CONDITIONS)
                else ', '.join(SELECTED_CONDITIONS))
 F_MIN = float(_w('f_min_hz', '0.15'))
 F_MAX = float(_w('f_max_hz', '4500.0'))
+FULL_BAND = _w('f_band', 'full') == 'full'
 MIN_SNR_DB = float(_w('min_snr_db', '0'))
 STOP_AFTER = _w('stop_after', 'gold')
 EVALUATION_MODE = _w('evaluation_mode', 'default')
@@ -757,6 +766,8 @@ if PARAM_PROFILE == 'recommended':
     MIN_SNR_DB = float(RECOMMENDED_PARAMS['min_snr_db'])
     F_MIN = float(RECOMMENDED_PARAMS['f_min_hz'])
     F_MAX = float(RECOMMENDED_PARAMS['f_max_hz'])
+    if _ignored and FULL_BAND:
+        _ignored = [x for x in _ignored if not x.startswith('f_max_hz')]
     if _ignored:
         print(f"  Parameter profile 'recommended': widget value(s) "
               f"{', '.join(_ignored)} ignored. Set the profile to 'custom' "
@@ -778,7 +789,13 @@ print(f"  Leepa:     {LEEPA}"
          else ''))
 print(f"  Condition: {COND_FILTER}   -> {', '.join(SELECTED_CONDITIONS)}")
 print(f"  Profile:   {PARAM_PROFILE}   (mode {EVALUATION_MODE})")
-print(f"  Band:      {F_MIN} – {F_MAX} Hz")
+if FULL_BAND:
+    # the whole sweep; the card's Nyquist frequency is the real ceiling
+    # (config.full_band_frac_fs), F max only stops a 30 kHz sweep record
+    F_MAX = 30000.0
+BAND_TEXT = (f"{F_MIN} Hz – fs/2 (full band; 12.25 kHz at 25 kHz)"
+             if FULL_BAND else f"{F_MIN} – {F_MAX} Hz (coherent band)")
+print(f"  Band:      {BAND_TEXT}")
 print(f"  Min SNR:   {MIN_SNR_DB} dB")
 print(f"  Stop:      {STOP_AFTER}")
 print(f"  Format:    {SOURCE_FORMAT}")
@@ -1237,7 +1254,10 @@ _CACHE_IDENTITY_KEYS = (
     'csv_mirror_x',
     # where each step's window sits decides every low-frequency point
     'window_confine', 'window_min_interval_s', 'window_guard_s',
-    'window_settle_periods',
+    'window_settle_periods', 'window_min_snr_db',
+    # the band: full (to fs/2, R_ohmic = intercept) or coherent
+    'full_band', 'full_band_frac_fs', 'coherent_f_max_frac_fs',
+    'f_hi_frac_fs', 'r_ohmic_method',
     # The build decides WHICH whole-cell sweep the aggregate is compared
     # against, and that comparison is written into the manifest. Two builds
     # are two different references, so they are two different results.
@@ -1273,6 +1293,7 @@ def _run_identity(mode=None, f_min=None, f_max=None, snr=None):
     base = DEFAULT.replace(
         f_min_hz=F_MIN if f_min is None else f_min,
         f_max_hz=F_MAX if f_max is None else f_max,
+        full_band=bool(globals().get('FULL_BAND', False)),
         min_snr_db=MIN_SNR_DB if snr is None else float(snr),
         gamry_version=globals().get('GAMRY_VERSION', ''),
         exclude_segments=globals().get('EXCLUDE_SEGMENTS', frozenset()),
@@ -1647,7 +1668,7 @@ _h = [f'''
     <span style="font-size:19px;font-weight:700">Run plan</span>
     <span style="font-size:13px;color:#57606a">
       Leepa <b>{_esc(LEEPA)}</b> &middot; {_esc(COND_FILTER)} &middot;
-      {_esc(SOURCE_FORMAT)} &middot; {F_MIN:g}&ndash;{F_MAX:g} Hz &middot;
+      {_esc(SOURCE_FORMAT)} &middot; {_esc(BAND_TEXT)} &middot;
       SNR &ge; {MIN_SNR_DB:g} dB &middot; stop after {_esc(STOP_AFTER)}
     </span>
   </div>
@@ -1829,7 +1850,7 @@ print(f"  Gamry build:{' ' + GAMRY_VERSION if GAMRY_VERSION else ''}"
                                  'one campaign, the sweeps may be another '
                                  "cell's)"))
 print(f"  Conditions: {_conditions_to_run}")
-print(f"  Band:       {F_MIN} – {F_MAX} Hz")
+print(f"  Band:       {BAND_TEXT}")
 print(f"  Stop after: {STOP_AFTER}")
 # The mode decides the gates AND the cache entry, so it is printed with the
 # rest of the run identity rather than left to be inferred from the results.
@@ -1933,6 +1954,7 @@ for cond in _conditions_to_run:
         condition=cond,
         f_min_hz=F_MIN,
         f_max_hz=F_MAX,
+        full_band=FULL_BAND,
         write_png=True,
         write_html=True,
         infer_missing_segments=False,  # Don't infer unmeasured segments (36,66,70,71)

@@ -390,6 +390,26 @@ class Config:
     # for hardware whose cards stay phase-coherent higher; 0 disables it.
     coherent_f_max_frac_fs: float = 0.16
     f_hi_frac_fs: float = 0.45       # detection ceiling as a fraction of fs
+    # FULL BAND: evaluate every step of the sweep the card can resolve, up to
+    # just below its Nyquist frequency (full_band_frac_fs * fs = 12.25 kHz at
+    # 25 kHz), instead of stopping at the phase-coherent limit above. On
+    # 2612030 the Gamry swept 30 kHz .. 0.3 Hz: 4733, 5928, 7547, 9516 and
+    # 11953 Hz are added; 15.0, 19.0, 23.9 and 30.0 kHz lie above fs/2, alias
+    # onto other frequencies and cannot be measured at 25 kHz. What changes
+    # with it (silver):
+    #   * R_ohmic is the measured high-frequency intercept (Im Z = 0, the
+    #     Gamry and bench-tool definition), not the top-band mean -- the top
+    #     of a full band is the inductive branch, where that mean read
+    #     38-43 mOhm*cm2 on 2612030;
+    #   * the in-situ channel-lag fit stays below the coherent limit, where
+    #     the chain IS a delay; above it the cards part (10 deg at 4.7 kHz,
+    #     24 deg at 5.9 kHz) and those points are kept, flagged by the
+    #     Kramers-Kronig residual, not used to estimate a delay.
+    full_band: bool = False
+    full_band_frac_fs: float = 0.49
+    # "auto": intercept with full_band, top-band mean otherwise;
+    # "intercept" / "topband" force one.
+    r_ohmic_method: str = "auto"
     ppd: int = 12                    # points per decade of the detection grid
 
     # ---- schedule detection (bronze) --------------------------------------
@@ -637,6 +657,11 @@ class Config:
     # and window_settle_periods periods of settling at the start; then no two
     # windows may overlap. On RO2612030 the blind detector let low-frequency
     # windows run 4-10 s into the neighbouring step.
+    # gamry_sync = "guide": an "ok" window whose segment channels show less
+    # than this median SNR at its frequency holds no tone and is searched for
+    # in its Gamry slot like a misplaced one (None: never). Normal windows
+    # read 6..25 dB, an empty one about -30 dB.
+    window_min_snr_db: float | None = -3.0
     window_confine: bool = True
     window_min_interval_s: float = 3.0
     window_guard_s: float = 0.5
@@ -1038,8 +1063,16 @@ class Config:
         raise ValueError(f"unknown preset {name!r}")
 
     def f_hi(self, fs: float) -> float:
-        """Detection ceiling for a given sampling rate."""
+        """Ceiling of the BLIND step search for a given sampling rate."""
         return min(self.f_max_hz, self.f_hi_frac_fs * fs)
+
+    def f_known_hi(self, fs: float) -> float:
+        """Ceiling for steps whose frequency is KNOWN (the Gamry's): a sine
+        fit at a known frequency stays well conditioned up to just below
+        Nyquist, so with full_band it goes to full_band_frac_fs * fs."""
+        if self.full_band:
+            return min(self.f_max_hz, self.full_band_frac_fs * fs)
+        return self.f_hi(fs)
 
     def to_dict(self) -> dict:
         d = asdict(self)

@@ -194,7 +194,8 @@ def test_recommended_profile_pins_the_settings_of_the_clean_script(volume,
     overridden with the clean script's values -- and the cell says which ones
     it ignored. 5 dB is the value that cut 45 A off at ~90 Hz."""
     ns = _run_cell(volume, {"evaluation_mode": "permissive",
-                            "min_snr_db": "5", "f_max_hz": "2000.0"})
+                            "min_snr_db": "5", "f_max_hz": "2000.0",
+                            "f_band": "coherent"})
     assert ns["PARAM_PROFILE"] == "recommended"
     assert ns["EVALUATION_MODE"] == "default"
     assert ns["MIN_SNR_DB"] == 0.0
@@ -208,10 +209,24 @@ def test_recommended_profile_pins_the_settings_of_the_clean_script(volume,
 def test_custom_profile_uses_the_widgets(volume) -> None:
     ns = _run_cell(volume, {"param_profile": "custom",
                             "evaluation_mode": "permissive",
-                            "min_snr_db": "5", "f_max_hz": "2000.0"})
+                            "min_snr_db": "5", "f_max_hz": "2000.0",
+                            "f_band": "coherent"})
     assert ns["EVALUATION_MODE"] == "permissive"
     assert ns["MIN_SNR_DB"] == 5.0
     assert ns["F_MAX"] == 2000.0
+
+
+def test_the_full_band_is_the_default_and_not_pinned_by_the_profile(volume,
+                                                                     capsys
+                                                                     ) -> None:
+    """Band 'full' evaluates the whole sweep up to fs/2: F max steps aside
+    (30 kHz, the sweep's top) and the recommended profile does not pull it
+    back to 4500 Hz."""
+    ns = _run_cell(volume, {"f_max_hz": "4500.0"})
+    assert ns["FULL_BAND"] is True
+    assert ns["F_MAX"] == 30000.0
+    assert "full band" in ns["BAND_TEXT"]
+    assert "f_max_hz" not in capsys.readouterr().out
 
 
 def test_the_clean_script_config_is_the_default() -> None:
@@ -227,5 +242,6 @@ def test_those_config_values_are_in_the_cache_key() -> None:
     src = RUNNER.read_text()
     block = src[src.index("_CACHE_IDENTITY_KEYS = ("):]
     block = block[:block.index("\n)")]
-    for k in ("fit_common_delay", "silver_snr_gate_db", "silver_snr_floor_db"):
+    for k in ("fit_common_delay", "silver_snr_gate_db", "silver_snr_floor_db",
+              "full_band", "r_ohmic_method", "window_min_snr_db"):
         assert f"'{k}'" in block, k

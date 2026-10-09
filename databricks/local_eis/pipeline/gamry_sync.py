@@ -437,7 +437,8 @@ def locate(chans, fs: float, f: float, lo: int, hi: int,
 
 def relocate(steps, sync: SyncResult, tl: Timeline, chans, fs: float,
              lag: int, rebuild, make_step, log=None,
-             slot_before_s: float = 2.0, slot_after_s: float = 1.0
+             slot_before_s: float = 2.0, slot_after_s: float = 1.0,
+             min_window_snr_db: float | None = None
              ) -> tuple[list, list]:
     """Re-locate misplaced and missing steps in their Gamry slot -- and every
     window that was only interpolated.
@@ -455,14 +456,37 @@ def relocate(steps, sync: SyncResult, tl: Timeline, chans, fs: float,
     windows of its sweep neighbours and verified by hf_schedule's CFAR test;
     a step that fails keeps what it had (a misplaced one is dropped, since
     its window is known to be wrong). Returns (steps, per-step log rows).
+
+    `min_window_snr_db`: also search an "ok" window whose segment channels
+    hold no tone at its frequency (median channel SNR below this). The time
+    check alone cannot see it at the top of the sweep, where the Gamry runs
+    several steps per second and the stamps have one-second resolution: on
+    2612030 the 3797 Hz window passed as "ok" with every segment at -30 dB.
     """
     import hf_schedule
     steps = list(steps)
     by_index = {r["gamry_index"]: r for r in sync.rows}
     order = sorted(by_index)                  # Gamry measurement order
     # common-base windows of the points already trusted, for the bounds
+    empty = set()
+    if min_window_snr_db is not None:
+        for g, r in by_index.items():
+            if r["verdict"] != "ok" or r.get("window_source") == "interpolated":
+                continue
+            s = steps[r["step_index"]]
+            try:
+                snr = hf_schedule._median_channel_snr_db(
+                    chans, fs, r["f_gamry_hz"], int(s.start + lag),
+                    int(s.stop + lag))
+            except Exception:                               # noqa: BLE001
+                continue
+            if np.isfinite(snr) and snr < min_window_snr_db:
+                empty.add(g)
+
     def guessed(r):
-        return r["verdict"] == "ok" and r.get("window_source") == "interpolated"
+        return r["verdict"] == "ok" and (
+            r.get("window_source") == "interpolated"
+            or r["gamry_index"] in empty)
 
     trusted = {g: (steps[r["step_index"]].start, steps[r["step_index"]].stop)
                for g, r in by_index.items()
@@ -483,7 +507,8 @@ def relocate(steps, sync: SyncResult, tl: Timeline, chans, fs: float,
         if nxt:
             hi = min(hi, min(nxt))
         lo, hi = int(lo + lag), int(hi + lag)            # card's own index
-        was = "interpolated" if guessed(r) else r["verdict"]
+        was = ("empty" if g in empty else
+               "interpolated" if guessed(r) else r["verdict"])
         row = {"gamry_index": g, "f_gamry_hz": f, "was": was,
                "search_s": (round((lo - lag) / fs, 3), round((hi - lag) / fs, 3))}
         win = locate(chans, fs, f, lo, hi) if hi > lo else None
@@ -520,7 +545,7 @@ def relocate(steps, sync: SyncResult, tl: Timeline, chans, fs: float,
             drop.add(r["step_index"])
             row["result"] = row["result"] + "; wrong window dropped"
         elif win is None and guessed(r):
-            row["result"] = row["result"] + "; interpolated window kept"
+            row["result"] = row["result"] + f"; {was} window kept"
         out_rows.append(row)
         if log is not None:
             log.info(f"    {f:9.2f} Hz ({was}): {row['result']}")

@@ -7,7 +7,7 @@ Same measuring plate (R2-D2 gen1, 72 segments). Compared:
 | What the files are | **Finished impedances**: one `z<n>.csv` per segment (mΩ·cm²), plus `z_cell.csv`, `hfr.csv` and `spectra.png`. The bench tool has already done the evaluation. | **Raw waveforms** (.DAT per card). Our bronze → silver → gold pipeline extracts the phasors, removes the chain and timing errors, and fits. |
 | Order ID / Gamry / MF4 / Abgleich | none | all available |
 | Conditions | 45, 60, 150, 449 A at 65 °C | 45, 60, 150, 450 A |
-| Band | 0.2 Hz – 10.08 kHz, 48 points | 0.19 Hz – 3.8 kHz, about 41 points |
+| Band | 0.2 Hz – 10.08 kHz, 48 points | 0.19 Hz – 3 kHz in the delivered run (Gamry swept 0.3 Hz – 30 kHz; `full` band: up to 11.95 kHz) |
 | Segments | all 72 | 67 measured (the rest are unmeasured or rebuilt) |
 | Segment temperature (median) | 64.7 / 65.3 / 66.6 °C (45 / 150 / 450 A) | 58.2 / 61.0 / 63.9 °C |
 
@@ -20,15 +20,23 @@ Same measuring plate (R2-D2 gen1, 72 segments). Compared:
 
 ## The differences that matter
 
-### 1. The HF part above about 2 kHz is not the cell
+### 1. The inductive part at high frequency: all three measurements have it
 
-Between 2 and 10 kHz every segment, at every current, turns inductive. Z' falls towards **0** at 10 kHz (minimum −0.1 mΩ·cm², median about 35). The whole-cell `z_cell.csv` reaches Re = 9 mΩ·cm² at 10 kHz.
+Above about 2–4 kHz every spectrum turns inductive (Im Z > 0, below the axis in the Nyquist plot). This part is real: the cell, the plate and the cables have inductance. The question is only how far each measurement reaches into it and how much of its own chain it adds. RO2612030, medians:
 
-A membrane cannot have zero resistance, so this loop belongs to the measuring chain. It is why:
-- the plausibility checks flag *passivity* (Re Z ≤ 0 on 3 segments) and *segment frequency response* (phase spread 25° at 10 kHz);
-- an ECM fitted to the full band put Rs at 0 (18 ± 21 mΩ·cm²). On the capacitive band Rs is 44–49 mΩ·cm², close to the intercept.
+| | Crosses the real axis | Re Z at about 10 kHz [mΩ·cm²] | Im Z at about 10 kHz [mΩ·cm²] | Top of the evaluated band |
+|---|---|---|---|---|
+| Gamry, whole cell (4-wire) | 3.4–3.9 kHz | 43.5–45.6 | +12.5 to +13.6 | 30 kHz |
+| CSV bench tool, segments | 2.6–2.9 kHz | 35.7–36.7, falling towards 0 | +21 to +22 | 10 kHz |
+| FAMOS, segments | about 1.9 kHz | not measured | +6.7 / +9.6 at 3 kHz (45 / 450 A) | 3 kHz |
 
-FAMOS stops at 3.8 kHz, so it never shows this loop. **Above about 2 kHz, only the FAMOS data describes the cell.**
+Why FAMOS seemed not to have it:
+- **Its band stopped at 3 kHz.** The Gamry swept from 30 kHz, but the pipeline cut at F max = 4500 Hz and at 0.16 f_s = 4 kHz (phase-coherent limit). The 3797 Hz window also passed the time check but held no tone (all segments at −30 dB). Only the 2390 and 2987 Hz points are inductive, a hook of 4–10 mΩ·cm² below the axis, against 20+ for the CSV at 10 kHz.
+- **The `full` band (runner widget `f_band`, now the default)** adds 3797, 4733, 5928, 7547, 9516 and 11953 Hz. It also searches empty windows on the segment channels (`window_min_snr_db`) and reads R_ohmic at the real-axis crossing. 15, 19, 24 and 30 kHz lie above f_s/2 = 12.5 kHz and cannot be measured at 25 kHz.
+
+What differs between the three:
+- **The CSV's Re Z falls towards 0 at 10 kHz; the Gamry's does not** (it stays at 44–49 up to 30 kHz). A cell resistance cannot fall like that. The tool's current chain adds about +13° at 10 kHz over the Gamry (about 4 µs of uncorrected delay), which rotates the spectrum and pulls Re down. That is also why 3 segments go non-passive (Re Z ≤ 0) and an ECM on the full CSV band put Rs at 0. On the capacitive band only, Rs is 44–49 mΩ·cm², close to the intercept.
+- **FAMOS crosses earlier than the Gamry (1.9 vs 3.4 kHz).** Against the Gamry, the FAMOS segments carry about 10 µs of phase lead common to all channels: 5° at 1.5 kHz, 12° at 3 kHz. The in-situ lag correction measures each channel against the plate median, so a delay shared by every channel cannot be seen by it. A bench sweep of each FAMOS card with the same Gamry sweep would measure it.
 
 ### 2. The HFR is defined differently, but the numbers agree
 

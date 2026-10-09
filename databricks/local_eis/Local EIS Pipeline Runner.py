@@ -3482,9 +3482,17 @@ for cond, pr in PIPELINE_RESULTS.items():
             print(f"    Measured:  {gs.get('n_measured', '?')}/"
                   f"{gs.get('n_total', '?')} segments")
             print(f"    Inferred:  {gs.get('n_inferred', '?')}")
-            if 'R_ohmic' in gs:
-                r = gs['R_ohmic']
-                print(f"    R_ohmic:   {1000*r['mean']:.1f} ± {1000*r['sd']:.1f} mΩ·cm² (spread {r['spread']:.2f}x)")
+            # mean / median over the 36 tile segments (1–36, one per 5×5-pad
+            # tile; the edge segments 37–72 inside the tiles are not counted)
+            for _p in ('R_ohmic', 'ReZ_1kHz', 'R_ct', 'R_mt', 'R_pol'):
+                r = gs.get(_p)
+                if r and 'median' in r:
+                    print(f"    {_p + ':':10s} mean {1000*r['mean']:.1f} ± "
+                          f"{1000*r['sd']:.1f}, median {1000*r['median']:.1f} "
+                          f"mΩ·cm² over {r['n_used']} of 36 tiles")
+                elif r:
+                    print(f"    {_p + ':':10s} mean {1000*r['mean']:.1f} ± "
+                          f"{1000*r['sd']:.1f} mΩ·cm² (cached run, all segments)")
         else:
             print(f"    Segments:  {_m.get('n_segments', '?')} with a spectrum")
             print(f"    ECM:       {_m.get('n_ecm_ok', '?')} converged")
@@ -3500,6 +3508,13 @@ for cond, pr in PIPELINE_RESULTS.items():
     if _summary_path.exists():
         df_s = pd.read_csv(_summary_path)
         print(f"    Segments:  {len(df_s)} in summary table")
+    _stats_path = maps_dir(out_dir) / 'plate_statistics.csv'
+    if _stats_path.exists():
+        df_t = pd.read_csv(_stats_path)
+        print("    Plate statistics over the 36 tiles (gold/plate_statistics.csv):")
+        _tab = df_t[['parameter', 'unit', 'n_tiles', 'mean', 'median', 'sd',
+                     'cv_pct']].round(3).to_string(index=False)
+        print('      ' + _tab.replace('\n', '\n      '))
     print()
 
 # COMMAND ----------

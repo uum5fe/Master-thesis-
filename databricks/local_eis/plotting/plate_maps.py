@@ -65,18 +65,12 @@ def _finite(values: dict) -> dict[str, float]:
     return out
 
 
-def uniformity_stats(values: dict) -> dict:
-    """n, mean, median, sd, CV [%], min, max, span relative to the mean [%]."""
-    v = np.array(list(_finite(values).values()), float)
-    if v.size == 0:
-        return dict(n=0, mean=np.nan, median=np.nan, sd=np.nan, cv_pct=np.nan,
-                    min=np.nan, max=np.nan, span_pct=np.nan)
-    mean = float(v.mean())
-    sd = float(v.std(ddof=1)) if v.size > 1 else 0.0
-    return dict(n=int(v.size), mean=mean, median=float(np.median(v)), sd=sd,
-                cv_pct=100.0 * sd / abs(mean) if mean else np.nan,
-                min=float(v.min()), max=float(v.max()),
-                span_pct=100.0 * float(np.ptp(v)) / abs(mean) if mean else np.nan)
+def uniformity_stats(values: dict, classes: dict | None = None) -> dict:
+    """n, mean, median, sd, CV [%], min, max, span relative to the mean [%],
+    over the 36 representative segments (1..36, one per 5x5-pad tile; the
+    edge segments 37..72 inside those tiles are not counted) -- plate_stats."""
+    import plate_stats
+    return plate_stats.tile_stats(values, classes)
 
 
 def robust_limits(values: dict, pct=(5.0, 95.0)) -> tuple[float, float]:
@@ -205,15 +199,16 @@ def draw_value_map(values: dict, label: str, unit: str = "",
 
     head = title or label
     if show_stats:
-        st = uniformity_stats(vals)
+        st = uniformity_stats(vals, classes)
         u = f" {unit}" if unit else ""
         scale = ("min..max" if (limits is None and pct is None) else
                  "fixed" if limits is not None else
                  f"{pct[0]:g}th..{pct[1]:g}th percentile")
         n_est = sum(1 for k in vals if classes.get(k, "measured")
                     not in ("", "measured"))
-        head += (f"\nn = {st['n']}"
-                 + (f" ({n_est} rebuilt, hatched, value marked *)" if n_est
+        head += (f"\n{st['n']} of {st['n_tiles']} tiles (segments 1–36, "
+                 f"5×5 pads each)"
+                 + (f"; {n_est} rebuilt, hatched, value marked *" if n_est
                     else "")
                  + f"   mean {st['mean']:.{decimals}f}{u}"
                  f"   median {st['median']:.{decimals}f}{u}"

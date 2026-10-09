@@ -184,21 +184,19 @@ def _field_traces(fd: Field, p, show_colorbar: bool = True) -> list:
 
 
 def _subtitle(fd: Field) -> str:
+    """Counts, then mean / median / sd over the 36 tile segments
+    (plate_stats: segments 1..36, one per 5x5-pad tile)."""
+    import plate_stats
     vals = _clean(fd.values)
     classes = {str(k): str(v) for k, v in (fd.classes or {}).items()}
-    meas = np.array([v for k, v in vals.items()
-                     if classes.get(k, "measured") in ("", "measured")], float)
-    if meas.size < 2:
+    n_meas = sum(1 for k in vals
+                 if classes.get(k, "measured") in ("", "measured"))
+    line = plate_stats.summary_line(vals, classes, fd.decimals, fd.unit)
+    if n_meas < 2 or not line:
         return ""
-    d = fd.decimals
-    u = f" {fd.unit}" if fd.unit else ""
-    n_est = len(vals) - meas.size
-    return (f"{meas.size} measured" + (f", {n_est} rebuilt (value*)" if n_est
-                                       else "")
-            + f" · mean {meas.mean():.{d}f} · median {np.median(meas):.{d}f}"
-            f" · sd {meas.std(ddof=1):.{d}f} · CV "
-            f"{100 * meas.std(ddof=1) / abs(meas.mean()):.1f} %"
-            f" · min..max {meas.min():.{d}f}..{meas.max():.{d}f}{u}")
+    n_est = len(vals) - n_meas
+    return (f"{n_meas} measured" + (f", {n_est} rebuilt (value*)" if n_est
+                                    else "") + " · " + line)
 
 
 def _end_annotations(W: float, H: float) -> list[dict]:

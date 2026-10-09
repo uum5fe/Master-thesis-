@@ -62,6 +62,7 @@ import numpy as np
 import r2d2_geometry as geom
 
 import utils
+import plate_stats
 from config import (Config, DEFAULT, PARAM_META, FAULT_RULES, PLATE_W_MM,
                     KNOWN_BAD_SEGMENTS)
 from silver import SilverRun, SilverSpectrum
@@ -678,19 +679,24 @@ def run(sr: SilverRun, cfg: Config = DEFAULT, log=None) -> GoldRun:
         "tiers": sr.tiers(),
         "dc_closure": sr.dc_closure,
     }
-    for p in ("R_ohmic", "R_ct", "R_mt", "j_dc"):
-        v = [r.values.get(p, np.nan) for r in records.values()
-             if r.cls == "measured"]
-        # Resistances and current densities are positive by construction, so a
-        # non-positive value is a failed fit, not a small measurement.  Letting
-        # one through makes max/min meaningless -- it produced a reported
-        # "spread" of 8e10 before this guard existed.
-        v = np.array([x for x in v if np.isfinite(x) and x > 0])
-        if v.size:
-            stats[p] = {"mean": float(v.mean()), "sd": float(v.std()),
-                        "min": float(v.min()), "max": float(v.max()),
-                        "spread": float(v.max() / v.min()),
-                        "n_used": int(v.size)}
+    # Plate statistics over the 36 tile segments (plate_stats): segment
+    # 1..36 stands for its whole 5x5-pad tile and the edge segments 37..72
+    # inside the tiles are not counted, so every tile weighs the same area.
+    # Resistances and current densities are positive by construction, so a
+    # non-positive value is a failed fit, not a small measurement.  Letting
+    # one through makes max/min meaningless -- it produced a reported
+    # "spread" of 8e10 before this guard existed.
+    cls = {s: r.cls for s, r in records.items()}
+    for p in ("R_ohmic", "ReZ_1kHz", "R_ct", "R_mt", "R_pol", "j_dc"):
+        st = plate_stats.tile_stats(
+            {s: r.values.get(p, np.nan) for s, r in records.items()}, cls,
+            positive=True)
+        if st["n"]:
+            stats[p] = {"mean": st["mean"], "median": st["median"],
+                        "sd": st["sd"], "min": st["min"], "max": st["max"],
+                        "spread": st["max"] / st["min"],
+                        "n_used": st["n"], "missing_tiles": st["missing"],
+                        "basis": st["basis"]}
     return GoldRun(records=records, fields=fields, stats=stats,
                    cell_freq=sr.cell_freq, Z_cell=sr.Z_cell)
 
@@ -716,6 +722,8 @@ def save(gr: GoldRun, sr: SilverRun, cfg: Config, log=None) -> Path:
             row[p + "_sd"] = round(sd * sc, 5) if np.isfinite(sd) else ""
         rows.append(row)
     utils.write_table(out / "plate_summary.csv", rows)
+    # plate mean / median per parameter over the 36 tile segments
+    plate_stats.write_statistics(out / "plate_summary.csv")
 
     if cfg.write_png:
         for p in cfg.heatmap_params:

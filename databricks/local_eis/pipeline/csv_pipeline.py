@@ -1360,6 +1360,9 @@ def write_outputs(spectra, ecm, agg, cfg, log, extra: dict,
                 row[k_out] = t[k_in]
         summary.append(row)
     utils.write_table(out / "gold" / "plate_summary.csv", summary)
+    # plate mean / median over the 36 tile segments, as for FAMOS
+    import plate_stats
+    plate_stats.write_statistics(out / "gold" / "plate_summary.csv")
 
     if agg[0].size:
         a_used = agg[2].get("area_used_per_freq", np.full(agg[0].size, np.nan))

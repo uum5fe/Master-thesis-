@@ -322,6 +322,7 @@ def _plate_geometry(p, gloss: float) -> dict:
     import base64
     import io
 
+    import plate_figure
     import plate_plotly
     import plate_style as style
     import r2d2_geometry as geom
@@ -338,7 +339,10 @@ def _plate_geometry(p, gloss: float) -> dict:
     for n, seg in p.segments.items():
         lx, ly, narrow = plate_plotly._label_xy(p, n, seg)
         lab[n] = [round(lx, 2), round(ly, 2), int(narrow)]
-        cen[n] = [round(seg.cx_mm, 2), round(seg.cy_mm, 2)]
+        # where the map draws the segment: its label pad, the red number
+        # box of the plate drawing
+        cx, cy = plate_figure.node_xy(p, n)
+        cen[n] = [round(cx, 3), round(cy, 3)]
     # the gloss: a faint diagonal sheen, white with an alpha ramp
     gx, gy = np.meshgrid(np.linspace(0, W, 127), np.linspace(0, H, 61))
     u = gx / W * 0.6 + (1 - gy / H) * 0.4
@@ -384,8 +388,8 @@ def _plate_item(p, fd, head: str, step: float = 4.0) -> dict:
                   not in ("", "measured")],
           "t2d": f"<b>{head} — {fd.label}</b><br><sup>" + " | ".join(
               x for x in (plate_plotly._subtitle(fd), note,
-                          "□ = segment measured; rest: 2D linear "
-                          "interpolation", style.flow_note()) if x) + "</sup>",
+                          "□ = segment at its drawing position (label pad); "
+                          "rest: 2D linear interpolation", style.flow_note()) if x) + "</sup>",
           "tseg": f"<b>{head} — {fd.label}</b><br><sup>" + " | ".join(
               x for x in (plate_plotly._subtitle(fd), note,
                           style.flow_note()) if x) + "</sup>"}
@@ -489,17 +493,23 @@ _PLATE_RENDER = r"""
         colorscale: G.parula, zmin: it.vmin, zmax: it.vmax, colorbar: cbar(it),
         hovertemplate: it.label + " ≈ %{z:." + it.dec + "f}" + u + "<extra>interpolated</extra>"});
     }
-    var sx = [], sy = [], stx = [], sco = [];
+    // every measured segment = its label pad (pw x ph mm), outlined at the
+    // place of the drawing's red number box, its number inside
+    var sx = [], sy = [], stx = [], sno = [], sco = [];
+    var shapes = [{type: "rect", x0: 0, y0: 0, x1: G.W, y1: G.H, line: {color: "#5d5d60", width: 1.5}}];
     Object.keys(it.v).forEach(function(n) {
       var C = G.cen[n]; if (!C) return;
-      var est = it.est.indexOf(n) >= 0;
-      sx.push(C[0]); sy.push(C[1]); sco.push(est ? "rgba(194,24,91,0.55)" : G.mark);
+      var est = it.est.indexOf(n) >= 0, col = est ? "rgba(194,24,91,0.55)" : G.mark;
+      sx.push(C[0]); sy.push(C[1]); sno.push(n); sco.push(col);
       stx.push("<b>segment " + n + "</b><br>" + it.label + " = " + fmt(it.v[n], it.dec) + u + "<br>" + (est ? "rebuilt" : "measured"));
+      shapes.push({type: "rect", x0: C[0] - G.pw / 2, x1: C[0] + G.pw / 2,
+        y0: C[1] - G.ph / 2, y1: C[1] + G.ph / 2, layer: "above",
+        line: {color: col, width: 1.6, dash: est ? "dash" : "solid"}});
     });
-    data.push({type: "scatter", mode: "markers", x: sx, y: sy, text: stx, hoverinfo: "text",
-      marker: {symbol: "square-open", size: 11, color: sco, line: {width: 1.8}}, showlegend: false});
+    data.push({type: "scatter", mode: "text", x: sx, y: sy, text: sno, hovertext: stx, hoverinfo: "text",
+      textfont: {size: 9, color: sco}, showlegend: false});
     var extra = {
-      shapes: [{type: "rect", x0: 0, y0: 0, x1: G.W, y1: G.H, line: {color: "#5d5d60", width: 1.5}}],
+      shapes: shapes,
       images: [{source: G.sheen, xref: "x", yref: "y", x: 0, y: 0, sizex: G.W, sizey: G.H,
                 xanchor: "left", yanchor: "top", sizing: "stretch", layer: "above", opacity: 1}]};
     return [data, layout(G, it.t2d, extra)];

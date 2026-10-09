@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import numpy as np
 
+import plate_stats
 import plate_style as style
 import r2d2_geometry as geom
 from r2d2_geometry import PAD_W_MM, PAD_H_MM
@@ -127,10 +128,10 @@ def draw_flow_plate(values: dict, param: str, title: str = "",
               interactive viewer does
     render    "segments" (default): every segment filled with its own value,
               number and value printed. "interpolated": the active area
-              filled by 2D linear interpolation between the segment centres
-              (nearest value beyond the outermost centres), a hollow square
-              on every measured segment, no numbers -- the layout of the
-              bench's MATLAB maps. Frame, ports, arrows and sensors are the
+              filled by 2D linear interpolation between the segments'
+              label pads (the red number boxes of the plate drawing), each
+              measured segment outlined as that pad with its number in it
+              -- the layout of the bench's MATLAB maps. Frame, ports, arrows and sensors are the
               same in both.
     gloss     interpolated only: strength of the soft sheen, 0 = flat
               (default plate_style.INTERP_GLOSS)
@@ -321,23 +322,23 @@ def draw_flow_plate(values: dict, param: str, title: str = "",
 
     # ---- title + statistics ------------------------------------------------
     v = np.array(list(vals.values()), float)
-    meas = np.array([x for k, x in vals.items()
-                     if classes.get(k, "measured") in ("", "measured")], float)
-    if subtitle is None and meas.size:
-        subtitle = (f"{meas.size} measured"
-                    + (f", {v.size - meas.size} rebuilt (hatched, value*)"
-                       if v.size > meas.size else "")
-                    + f"   ·   mean {meas.mean():.{dec}f}   median "
-                      f"{np.median(meas):.{dec}f}   sd {meas.std(ddof=1):.{dec}f}"
-                      f"   CV {100 * meas.std(ddof=1) / abs(meas.mean()):.1f} %"
-                      f"   min..max {meas.min():.{dec}f}..{meas.max():.{dec}f} {unit}")
+    n_meas = sum(1 for k in vals
+                 if classes.get(k, "measured") in ("", "measured"))
+    if subtitle is None and n_meas:
+        # mean / median over the 36 tile segments only (plate_stats)
+        subtitle = (f"{n_meas} measured"
+                    + (f", {v.size - n_meas} rebuilt (hatched, value*)"
+                       if v.size > n_meas else "")
+                    + "   ·   " + plate_stats.summary_line(
+                        vals, classes, dec, unit, sep="   "))
     fig.text(0.03, 0.965, (title + " — " if title else "") + label,
              fontsize=17, fontweight="bold", color="#1d1f20", va="top")
     if subtitle:
         fig.text(0.03, 0.925, subtitle, fontsize=10, color="#5d5d60", va="top")
     if interp:
-        fig.text(0.03, 0.895, "\u25a1 = segment measured (dashed: rebuilt);  "
-                 "rest: 2D linear interpolation between segment centres",
+        fig.text(0.03, 0.895, "\u25a1 = segment at its drawing position (label "
+                 "pad, dashed: rebuilt);  rest: 2D linear interpolation "
+                 "between them",
                  fontsize=9.5, color=style.MEASURED_MARK, va="top")
 
     # ---- colour bar (fixed scale) -------------------------------------------
@@ -359,11 +360,23 @@ def draw_flow_plate(values: dict, param: str, title: str = "",
     return fig
 
 
+def node_xy(p, n: str) -> tuple[float, float]:
+    """Where segment n sits on the maps: the centre of its label pad, the red
+    number box of the plate drawing (r2d2_geometry.label_xy)."""
+    if n in p.label_col and n in p.label_row:
+        return ((p.label_col[n] - 0.5) * PAD_W_MM,
+                (p.label_row[n] - 0.5) * PAD_H_MM)
+    s = p.segments[n]
+    return s.cx_mm, s.cy_mm
+
+
 def interpolate_field(p, vals: dict, W: float, H: float, step: float = 0.5):
     """The value field over the active area: 2D linear interpolation between
-    the segment centres, an inverse-distance blend of the four nearest centres
-    beyond the outermost ones (a nearest-value fill leaves blocky patches at
-    the edge), and a 1.5 mm smoothing that removes the seam between the two.
+    the segments' label pads (the red number boxes of the drawing, so every
+    value sits exactly where the drawing places its segment), an
+    inverse-distance blend of the four nearest nodes beyond the outermost
+    ones (a nearest-value fill leaves blocky patches at the edge), and a
+    1.5 mm smoothing that removes the seam between the two.
     Returns (gx, gy, zi) on a `step`-mm grid, or None with < 3 values."""
     from scipy.interpolate import griddata
     from scipy.ndimage import gaussian_filter
@@ -372,7 +385,7 @@ def interpolate_field(p, vals: dict, W: float, H: float, step: float = 0.5):
     pts, z = [], []
     for n, v in vals.items():
         if n in p.segments:
-            pts.append((p.segments[n].cx_mm, p.segments[n].cy_mm))
+            pts.append(node_xy(p, n))
             z.append(v)
     if len(pts) < 3:
         return None
@@ -412,6 +425,7 @@ def shaded_rgb(gx, gy, zi, cm, norm, W: float, H: float, gloss: float):
 def _draw_interpolated(ax, p, vals, classes, cm, norm, W, H, gloss):
     """Fill the active area with the interpolated field and mark every
     segment with a square."""
+    import matplotlib.patheffects as pe
     from matplotlib.patches import Rectangle
 
     got = interpolate_field(p, vals, W, H)
@@ -424,15 +438,23 @@ def _draw_interpolated(ax, p, vals, classes, cm, norm, W, H, gloss):
               extent=(0, W, H, 0), origin="upper", interpolation="bilinear",
               zorder=2, aspect="auto")
 
-    side = 5.0                                     # mm, the measured mark
-    for n, s in p.segments.items():
+    # every measured segment: its label pad (5.60 x 6.05 mm) outlined at the
+    # exact place of the drawing's red number box, with its number inside
+    for n in p.segments:
         if n not in vals:
             continue
+        x, y = node_xy(p, n)
         est = classes.get(n, "measured") not in ("", "measured")
-        ax.add_patch(Rectangle((s.cx_mm - side / 2, s.cy_mm - side / 2),
-                               side, side, fc="none", ec=style.MEASURED_MARK,
-                               lw=1.3, ls=("--" if est else "-"),
+        ax.add_patch(Rectangle((x - PAD_W_MM / 2, y - PAD_H_MM / 2),
+                               PAD_W_MM, PAD_H_MM, fc="none",
+                               ec=style.MEASURED_MARK, lw=1.3,
+                               ls=("--" if est else "-"),
                                alpha=(0.7 if est else 0.95), zorder=3.5))
+        ax.text(x, y, n, ha="center", va="center", fontsize=6.5,
+                fontweight="bold", color=style.MEASURED_MARK,
+                alpha=(0.75 if est else 1.0), zorder=3.6,
+                path_effects=[pe.withStroke(linewidth=1.8,
+                                            foreground="white")])
 
 
 def _fixed(param) -> bool:

@@ -39,17 +39,35 @@ def test_write_condition_maps_reads_a_plate_summary(tmp_path):
     assert set(out) == {"R_ohmic", "R_ct", "R_mt", "R_pol"}
 
 
-def test_interpolated_render_has_no_labels_and_marks_measured(tmp_path):
+def test_interpolated_render_marks_each_segment_at_its_drawing_position(tmp_path):
+    """Every measured segment is outlined as its label pad -- the red number
+    box of the plate drawing, 5.60 x 6.05 mm -- with its number inside."""
     import matplotlib.pyplot as plt
+    geom.use_plate("gen1")
     vals = _values()
     fig = plate_figure.draw_flow_plate(vals, "R_ohmic", render="interpolated")
     ax = fig.axes[0]
-    texts = {t.get_text() for t in ax.texts}
-    assert not any(t in texts for t in vals)          # no segment numbers
     assert len(ax.images) == 1                         # the interpolated field
-    squares = [p for p in ax.patches
-               if p.get_edgecolor()[:3] != (0, 0, 0) and p.get_width() == 5.0]
-    assert len(squares) == len(vals)
+    boxes = {}
+    from matplotlib.patches import Rectangle
+    for p in ax.patches:
+        if (isinstance(p, Rectangle)
+                and np.isclose(p.get_width(), geom.PAD_W_MM)
+                and np.isclose(p.get_height(), geom.PAD_H_MM)
+                and p.get_facecolor()[3] == 0):
+            x, y = p.get_xy()
+            boxes[(round(x + geom.PAD_W_MM / 2, 3),
+                   round(y + geom.PAD_H_MM / 2, 3))] = p
+    assert len(boxes) == len(vals)
+    # the drawing: segment 37 at (2.8, 3.025), 1 at (14, 15.125),
+    # 72 at (249.2, 117.975), 60 at (198.8, 117.975)
+    for xy in ((2.8, 3.025), (14.0, 15.125), (249.2, 117.975),
+               (198.8, 117.975)):
+        assert xy in boxes
+    numbers = {t.get_text(): t.get_position() for t in ax.texts
+               if t.get_text() in vals}
+    assert set(numbers) == set(vals)
+    assert np.allclose(numbers["37"], (2.8, 3.025))
     plt.close(fig)
 
 

@@ -360,9 +360,31 @@ def _label_pads(segs: dict[str, Segment]) -> tuple[dict[str, int], dict[str, int
     return lcol, lrow
 
 
+# Label pads as printed on R2D2_Coordinates_and_Segment_Numbering.pdf -- the
+# red number boxes, one pad (5.60 x 6.05 mm) each.  segment -> (pad column,
+# pad row), 1-based, read off the drawing's mm ticks: x = (col-0.5)*5.60,
+# y = (row-0.5)*6.05.  1..36 sit on the centre pad of their 5x5 tile
+# (columns 3, 8, .., 43; rows 3, 8, 13, 18); 37..72 on columns 1, 5, 10, 36,
+# 41, 45 x rows 1, 5, 9, 12, 16, 20 (x = 2.8, 25.2, 53.2, 198.8, 226.8,
+# 249.2 mm; y = 3.025, 27.225, 51.425, 69.575, 93.775, 117.975 mm).  Every
+# one of these pads belongs to its segment in the plant's pad map.  (The
+# pad nearest the centroid, used before, is a different pad for 20 of the
+# 72 segments -- 37 by 5.5 mm -- so the maps did not match the drawing.)
+_GEN1_LABELS: dict[int, tuple[int, int]] = {
+    **{k: (5 * ((k - 1) // 4) + 3, 5 * ((k - 1) % 4) + 3)
+       for k in range(1, 37)},
+    **{37 + 6 * i + j: (c, r)
+       for i, c in enumerate([1, 5, 10, 36, 41, 45])
+       for j, r in enumerate([1, 5, 9, 12, 16, 20])},
+}
+
+
 def _build_gen1() -> tuple[dict[str, Segment], dict[str, int], dict[str, int]]:
     segs = _segments_from_matrix(_parse_matrix(_GEN1_MATRIX_TEXT))
     lcol, lrow = _label_pads(segs)
+    for n, (c, r) in _GEN1_LABELS.items():
+        if (c, r) in segs[str(n)].pads:
+            lcol[str(n)], lrow[str(n)] = c, r
     return segs, lcol, lrow
 
 
@@ -557,6 +579,14 @@ def equal_areas(plate_name: str | None = None) -> dict[str, float]:
     segs = plate(plate_name).segments if plate_name else SEGMENTS
     a = A_CELL_CM2 / N_SEGMENTS
     return {k: a for k in segs}
+
+
+def label_xy(plate_name: str | None = None) -> dict[str, tuple[float, float]]:
+    """Segment name -> (x, y) in mm of the centre of its label pad -- the
+    red number box on the drawing, where the segment is drawn on the maps."""
+    p = plate(plate_name) if plate_name else ACTIVE_PLATE
+    return {k: ((p.label_col[k] - 0.5) * PAD_W_MM,
+                (p.label_row[k] - 0.5) * PAD_H_MM) for k in p.segments}
 
 
 def centroids(plate_name: str | None = None) -> dict[str, tuple[float, float]]:

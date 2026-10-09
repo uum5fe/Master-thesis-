@@ -370,8 +370,9 @@ def run_pipeline(cfg: Config, stop_after: str = "gold") -> dict:
              f"{gr.stats['n_bad']} hardware-bad")
     if "R_ohmic" in gr.stats:
         r = gr.stats["R_ohmic"]
-        log.info(f"  R_ohmic {1000*r['mean']:.1f} +/- {1000*r['sd']:.1f} "
-                 f"mOhm cm2, spread {r['spread']:.2f}x")
+        log.info(f"  R_ohmic mean {1000*r['mean']:.1f} +/- {1000*r['sd']:.1f}, "
+                 f"median {1000*r['median']:.1f} mOhm cm2 over "
+                 f"{r['n_used']} of 36 tiles, spread {r['spread']:.2f}x")
     log.info(f"  {dt:.1f} s -> {cfg.out_dir}")
 
     manifest["elapsed_s"] = dt

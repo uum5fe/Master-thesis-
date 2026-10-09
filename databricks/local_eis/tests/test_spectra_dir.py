@@ -105,6 +105,8 @@ def test_a_csv_run_writes_the_famos_summary(campaign, tmp_path):
     assert (out / "gold" / "nyquist.html").is_file()
     assert (out / "gold" / "nyquist.png").is_file()
     assert (out / "gold" / "plate_R_ohmic_interp.png").is_file()
+    st = pd.read_csv(out / "gold" / "plate_statistics.csv")
+    assert st.set_index("parameter").loc["R_ohmic", "n_tiles"] == 36
 
 
 def test_nyquist_colours_run_from_air_inlet_to_outlet():

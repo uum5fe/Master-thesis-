@@ -50,9 +50,9 @@ That pattern is what a cell that is **not stationary** at the outlet produces du
 
 The CSV spectra look smooth because the bench tool smooths its results and the run was steady. The underlying cell behaviour is the same.
 
-## 4. A plotting artefact made it look worse
+## 4. How the Nyquist plot draws it
 
-The Nyquist line joined points across steps that the gates had rejected, so it drew long zig-zags. `plotting/nyquist.py` now leaves a gap where a step is missing (`_with_gaps`). The figures are `figures/spectra_recheck/nyquist_<cond>_gaps.png`.
+The Nyquist line joins the kept points continuously. Where the gates rejected a step, the line runs straight from the point before to the point after it, so on a noisy low-frequency arc the chords exaggerate the zig-zag. The plot stays continuous by choice. Where the points are, not the line, is what shows the data quality.
 
 ## 5. Verdict per segment
 

@@ -268,6 +268,111 @@ def apply_frequencies(steps, sync: SyncResult, rebuild) -> tuple[list, int]:
 
 
 # ---------------------------------------------------------------------------
+# confining low-frequency windows to their Gamry step
+# ---------------------------------------------------------------------------
+
+def confine_windows(steps, sync: SyncResult, fs: float, rebuild,
+                    min_interval_s: float = 3.0, guard_s: float = 0.5,
+                    settle_periods: float = 0.5, min_cycles: float = 2.5,
+                    tol: float = 0.03, log=None) -> tuple[list, list]:
+    """Put every long (low-frequency) step's window inside its Gamry step.
+
+    WHY. The blind detector finds a step by demodulating the cell voltage at
+    its frequency over at most 6 s. Below ~1 Hz that cannot tell the tone from
+    its neighbour on the sweep (0.19 and 0.24 Hz are 0.05 Hz apart, a 6 s
+    window resolves ~0.17 Hz), so the window grows into the neighbouring step
+    and is then extended by another demodulation length. align() only checks
+    where a window ENDS, with a tolerance of 3 periods (16 s at 0.19 Hz), so
+    the overlap passed as "ok". Measured on RO2612030 at 450 A: the 0.19 Hz
+    window started 9.6 s before its Gamry step, the 0.24 Hz one ended 6.9 s
+    early; in a simulation of that sweep the misplaced windows put up to 4-5 %
+    error on single points (3-6 Hz) of an outlet spectrum, alternating in sign
+    from step to step -- a zig-zag along the arc.
+
+    WHAT. The Gamry stamps the end of every point; the step of frequency f_k
+    is the interval between the previous point's stamp and its own, mapped to
+    the FAMOS base with the fitted offset. For every step whose interval is at
+    least `min_interval_s` long (shorter steps share a one-second stamp and
+    cannot be bounded this way) the window becomes
+
+        [t_prev + guard + settle, t_own - guard]
+
+    with guard >= the offset spread (stamps have 1 s resolution) and settle =
+    `settle_periods` periods of the new tone (the transient after a frequency
+    change), capped at a quarter of the step. If fewer than `min_cycles` cycles
+    remain, the settle is dropped; if still fewer, the step is left as it was.
+
+    Returns (steps, rows); each row names the step, the old and the new window.
+    """
+    steps = list(steps)
+    if not sync.ok or not steps:
+        return steps, []
+    g = max(float(guard_s), float(sync.spread_s) if np.isfinite(sync.spread_s)
+            else 0.0)
+    freqs = np.array([s.freq for s in steps], float)
+    rows = sorted(sync.rows, key=lambda r: r["gamry_index"])
+    out = []
+    for prev, r in zip(rows[:-1], rows[1:]):
+        if r["gamry_index"] != prev["gamry_index"] + 1:
+            continue                       # predecessor outside the band
+        f = float(r["f_gamry_hz"])
+        t0, t1 = float(prev["pred_end_s"]), float(r["pred_end_s"])
+        if t1 - t0 < min_interval_s:
+            continue
+        i = _match(f, freqs, tol)
+        if i < 0:
+            continue
+        settle = min(settle_periods / f, 0.25 * (t1 - t0))
+        a, b = t0 + g + settle, t1 - g
+        if (b - a) * f < min_cycles:
+            a = t0 + g
+        if (b - a) * f < min_cycles:
+            continue
+        old = (steps[i].start / fs, steps[i].stop / fs)
+        steps[i] = rebuild(steps[i], start=int(round(a * fs)),
+                           stop=int(round(b * fs)), window_source="gamry_step")
+        out.append({"f_hz": f, "old_start_s": round(old[0], 3),
+                    "old_end_s": round(old[1], 3), "new_start_s": round(a, 3),
+                    "new_end_s": round(b, 3),
+                    "shift_start_s": round(a - old[0], 3),
+                    "shift_end_s": round(b - old[1], 3)})
+    if log is not None and out:
+        big = [o for o in out if max(abs(o["shift_start_s"]),
+                                     abs(o["shift_end_s"])) > 1.0]
+        log.info(f"  {len(out)} low-frequency window(s) confined to their "
+                 f"Gamry step ({len(big)} moved by more than 1 s)")
+    return steps, out
+
+
+def separate_windows(steps, fs: float, rebuild, min_cycles: float = 2.0,
+                     log=None) -> tuple[list, int]:
+    """No two windows may overlap: one stretch of record holds one tone.
+
+    Steps are taken in time order; where a window runs into the next one the
+    two are cut at the middle of the overlap. A cut that would leave fewer
+    than `min_cycles` cycles in either window is not made (that step is left
+    for the quality gates). Returns (steps, number of cuts).
+    """
+    steps = list(steps)
+    order = sorted(range(len(steps)), key=lambda k: steps[k].start)
+    n = 0
+    for a_i, b_i in zip(order[:-1], order[1:]):
+        A, B = steps[a_i], steps[b_i]
+        if A.stop <= B.start:
+            continue
+        cut = (A.stop + B.start) // 2
+        if ((cut - A.start) / fs * A.freq < min_cycles
+                or (B.stop - cut) / fs * B.freq < min_cycles):
+            continue
+        steps[a_i] = rebuild(A, stop=int(cut))
+        steps[b_i] = rebuild(B, start=int(cut))
+        n += 1
+    if log is not None and n:
+        log.info(f"  {n} overlapping window pair(s) cut apart")
+    return steps, n
+
+
+# ---------------------------------------------------------------------------
 # re-locating a step in the slot the Gamry predicts
 # ---------------------------------------------------------------------------
 

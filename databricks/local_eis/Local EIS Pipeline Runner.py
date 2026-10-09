@@ -1235,6 +1235,9 @@ _CACHE_IDENTITY_KEYS = (
     'min_points_per_spectrum',
     # a mirrored CSV evaluation is a different map of the same files
     'csv_mirror_x',
+    # where each step's window sits decides every low-frequency point
+    'window_confine', 'window_min_interval_s', 'window_guard_s',
+    'window_settle_periods',
     # The build decides WHICH whole-cell sweep the aggregate is compared
     # against, and that comparison is written into the manifest. Two builds
     # are two different references, so they are two different results.

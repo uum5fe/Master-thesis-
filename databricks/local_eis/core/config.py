@@ -629,6 +629,18 @@ class Config:
     # should have refused it -- and repairing those windows would hide the
     # fault. Above this fraction the repair refuses and says so.
     window_max_repair_frac: float = 0.25
+
+    # ONE STRETCH OF RECORD HOLDS ONE TONE (gamry_sync.confine_windows,
+    # gamry_sync.separate_windows). With the Gamry .dta available, every step
+    # longer than window_min_interval_s gets its window from the Gamry step
+    # interval, minus window_guard_s at both ends (stamps have 1 s resolution)
+    # and window_settle_periods periods of settling at the start; then no two
+    # windows may overlap. On RO2612030 the blind detector let low-frequency
+    # windows run 4-10 s into the neighbouring step.
+    window_confine: bool = True
+    window_min_interval_s: float = 3.0
+    window_guard_s: float = 0.5
+    window_settle_periods: float = 0.5
     # OFF BY DEFAULT.  Pruning is the only part of the ensemble path that can
     # REMOVE a step the old pipeline would have kept, so it is the only part
     # that can make a run worse -- and it did, on real 45 A data: a band that

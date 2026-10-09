@@ -71,6 +71,26 @@ def colours(segments, colour: str = "flow") -> dict[str, str]:
     return {s: f"hsl({int(i * 360 / n)}, 70%, 50%)" for i, s in enumerate(segs)}
 
 
+def _with_gaps(f, *cols, max_ratio: float = 1.4):
+    """Insert NaN where a frequency step is missing between two kept points.
+
+    The sweep runs at 10 points per decade (ratio 1.26). A larger jump means
+    silver rejected the step(s) in between, and a straight line across the
+    gap draws a spectrum that was never measured -- on the low-frequency arc
+    of a noisy segment those chords are what makes it look like a zig-zag.
+    """
+    f = np.asarray(f, float)
+    o = np.argsort(f)
+    f = f[o]
+    cols = [np.asarray(c, float)[o] for c in cols]
+    if f.size < 2:
+        return (f, *cols)
+    brk = np.flatnonzero(f[1:] / np.maximum(f[:-1], 1e-30) > max_ratio) + 1
+    f = np.insert(f, brk, np.nan)
+    cols = [np.insert(c, brk, np.nan) for c in cols]
+    return (f, *cols)
+
+
 def _seg_key(s):
     try:
         return int(s)
@@ -102,7 +122,7 @@ def figure(df, title: str = "", colour: str = "flow", rebuilt=None,
         ok = np.isfinite(f) & np.isfinite(zr) & np.isfinite(zi)
         if ok.sum() < 3:
             continue
-        f, zr, zi = f[ok], zr[ok], zi[ok]
+        f, zr, zi = _with_gaps(f[ok], zr[ok], zi[ok])
         c, name = col[s], f"Seg {s}"
         fig.add_trace(go.Scatter(
             x=zr, y=-zi, mode="markers+lines", name=name, legendgroup=name,
@@ -193,7 +213,9 @@ def save_png(df, path, title: str = "", colour: str = "flow", rebuilt=None,
             continue
         c = (_jet(pos.get(s, 0.5)) if colour == "flow"
              else plt.get_cmap("hsv")(i / n))
-        ax.plot(zr[ok], -zi[ok], "-", lw=0.9, color=c, alpha=0.9)
+        _f, gr, gi = _with_gaps(d["freq_hz"].to_numpy(float)[ok], zr[ok], zi[ok])
+        ax.plot(gr, -gi, "-", lw=0.9, color=c, alpha=0.9)
+        ax.plot(gr, -gi, ".", ms=2.0, color=c, alpha=0.9)
     if rebuilt is not None and len(rebuilt):
         for s in rebuilt["segment"].astype(str).unique():
             d = rebuilt[rebuilt["segment"].astype(str) == s].sort_values("freq_hz")

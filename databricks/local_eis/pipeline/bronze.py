@@ -1222,6 +1222,14 @@ def consensus_schedule(files: list[Path], cards: dict[str, CardInfo],
         if gs_info.get("ok") and gs_mode in ("frequency", "guide"):
             grid["gamry_freqs"] = [float(f) for f in timeline.freq]
 
+    # ---- one stretch of record holds one tone ---------------------------
+    if getattr(cfg, "window_confine", True) and kept:
+        fs_ref = float(np.median(list(fs_seen.values()))) if fs_seen else 25000.0
+        kept, n_cut = gamry_sync.separate_windows(
+            kept, fs_ref, lambda st, **kw: ladder_snap._rebuild(Step, st, **kw),
+            log=log)
+        grid["windows_separated"] = n_cut
+
     log.info(f"  consensus: {len(kept)} steps "
              f"({kept[0].freq:.3f}..{kept[-1].freq:.1f} Hz), "
              f"{n_votes_kept} by card agreement, "
@@ -1402,6 +1410,14 @@ def _gamry_guided(kept, tl, files, cards, cfg, lags, fs_seen, gs_mode, log):
         kept, res, tl, hf_schedule.LazyChannels(fam), float(fam.fs), lag,
         rebuild, make_step, log=log)
     info["relocated"] = moved
+    if getattr(cfg, "window_confine", True):
+        kept, conf = gamry_sync.confine_windows(
+            kept, res, fs_ref, rebuild,
+            min_interval_s=getattr(cfg, "window_min_interval_s", 3.0),
+            guard_s=getattr(cfg, "window_guard_s", 0.5),
+            settle_periods=getattr(cfg, "window_settle_periods", 0.5),
+            log=log)
+        info["confined"] = conf
     return kept, info
 
 

@@ -164,6 +164,12 @@ def test_a_refused_lag_is_ignored_by_both_halves_or_neither() -> None:
     consensus = src[src.index("def consensus_schedule"):]
     consensus = consensus[:consensus.index("\ndef ", 1)]
 
-    assert 'info.get("applied")' in consensus, (
+    # both halves read the lag through bronze.card_shift / to_own /
+    # to_common, which honour `applied` in one place
+    assert B.to_own(1000, {"lag": 57_000, "applied": False}) == 1000
+    assert B.to_common(B.to_own(1000, {"lag": 57_000, "applied": True}),
+                       {"lag": 57_000, "applied": True}) == 1000
+    assert ('info.get("applied")' in consensus
+            or "to_common(" in consensus), (
         "consensus_schedule must gate its shift on `applied`, exactly as the "
         "phasor pass does")

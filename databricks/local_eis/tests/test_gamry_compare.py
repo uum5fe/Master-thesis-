@@ -404,3 +404,18 @@ def test_the_not_installed_advice_never_says_plain_pip_install_asammdf():
                   for ln in fix_lines), ("must not tell the reader to re-run "
                   "the exact command that failed")
     assert any("zstandard" in ln for ln in fix_lines)
+
+
+@pytest.mark.parametrize("name,current", [
+    ("V26_092_HFR_101_CurrVal_45.dta", 45.0), ("450A.DTA", 450.0),
+    ("300A_10kHz.DTA", 300.0), ("60A.DTA", 60.0),
+    ("Kashyyyk_100kHz_1Hz_500mA_#6.DTA", None)])
+def test_the_current_is_read_from_either_naming(name, current):
+    """RO2612025's whole-cell sweeps are named by current alone; read as '?'
+    they all collapsed to one condition and 450 A found no sweep at all."""
+    from pathlib import Path
+    stem = Path(name).stem
+    m = GC._CURRENT_RE.search(name) or \
+        GC._CURRENT_A_RE.search(stem)
+    got = float(m.group(1)) if m else None
+    assert got == current

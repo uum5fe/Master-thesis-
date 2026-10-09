@@ -559,8 +559,8 @@ def relocate(steps, sync: SyncResult, tl: Timeline, chans, fs: float,
 # ---------------------------------------------------------------------------
 
 def corroborate_card_lags(per_card: dict, lags: dict, fs: dict, tl: Timeline,
-                          f_lo: float, f_hi: float, tol_s: float = 0.5
-                          ) -> list[dict]:
+                          f_lo: float, f_hi: float, tol_s: float = 0.5,
+                          fs_steps: float | None = None) -> list[dict]:
     """Check every card's own clock against the Gamry's.
 
     `per_card`: card -> its detected steps, ON THE COMMON BASE where its lag
@@ -571,10 +571,13 @@ def corroborate_card_lags(per_card: dict, lags: dict, fs: dict, tl: Timeline,
     by an independent instrument. The lag applied is still bronze's
     cross-correlation value, sample-precise; the Gamry only vouches for it.
     Returns one row per card; the caller decides whether to apply.
+
+    `fs`: each card's own rate, for its lag in samples; `fs_steps`: the rate
+    of the indices in `per_card` (the common base's), when cards differ.
     """
     rows, offs = [], {}
     for c, steps in per_card.items():
-        r = align(steps, tl, fs.get(c, 25000.0), f_lo, f_hi)
+        r = align(steps, tl, fs_steps or fs.get(c, 25000.0), f_lo, f_hi)
         offs[c] = r
         rows.append({"card": c, "sync_ok": r.ok,
                      "offset_s": round(r.offset_s, 3)

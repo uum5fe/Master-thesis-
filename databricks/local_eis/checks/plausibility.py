@@ -288,7 +288,16 @@ def current_closure(j_dc: dict[str, float], areas: dict[str, float],
     i_meas = sum(j * a for j, a in pairs)
     if a_meas <= 0:
         return Check("current closure", NA, "measured area is zero")
-    i_full = i_meas * total_area / a_meas
+    i_seg = i_meas * total_area / a_meas
+    # THE PLATE MEAN OVER THE 36 TILES (plate_stats): segment 1..36 stands for
+    # its 5x5-pad tile, the edge segments inside the tiles are not counted,
+    # every tile weighs the same area -- the full-plate current is that mean
+    # times the plate area. The per-segment area sum is kept beside it.
+    import plate_stats
+    st = plate_stats.tile_stats({s: float(j_dc[s]) for s in j_dc
+                                 if np.isfinite(j_dc[s])})
+    tiles = st["n"] >= 2
+    i_full = st["mean"] * total_area if tiles else i_seg
 
     if not setpoint_a:
         return Check("current closure", NA,
@@ -298,9 +307,16 @@ def current_closure(j_dc: dict[str, float], areas: dict[str, float],
                      f"the condition name", i_full)
 
     dev = i_full / setpoint_a - 1.0
-    detail = (f"{i_meas:.1f} A measured over {a_meas:.1f} cm2 -> "
-              f"{i_full:.1f} A full plate vs {setpoint_a:.1f} A "
-              f"[{source}] ({100 * dev:+.1f} %)")
+    if tiles:
+        detail = (f"mean j over {st['n']} of 36 tiles {st['mean']:.4f} A/cm2 "
+                  f"x {total_area:.1f} cm2 = {i_full:.1f} A vs "
+                  f"{setpoint_a:.1f} A [{source}] ({100 * dev:+.1f} %); "
+                  f"segment-area sum: {i_meas:.1f} A over {a_meas:.1f} cm2 "
+                  f"-> {i_seg:.1f} A")
+    else:
+        detail = (f"{i_meas:.1f} A measured over {a_meas:.1f} cm2 -> "
+                  f"{i_full:.1f} A full plate vs {setpoint_a:.1f} A "
+                  f"[{source}] ({100 * dev:+.1f} %)")
     if abs(dev) <= 0.10:
         verdict = PASS
     elif abs(dev) <= 0.30:
@@ -310,13 +326,49 @@ def current_closure(j_dc: dict[str, float], areas: dict[str, float],
         verdict = FAIL
         detail += " -- too far out to be non-uniformity alone"
     return Check("current closure", verdict, detail, dev,
-                 rests_on="the unmeasured area carrying the same mean current "
-                          "density as the measured area")
+                 rests_on=("each of segments 1-36 standing for its own "
+                           "5x5-pad tile" if tiles else
+                           "the unmeasured area carrying the same mean "
+                           "current density as the measured area"))
 
 
 # ===========================================================================
 # 4. Shape checks: things a wrong channel map cannot fake
 # ===========================================================================
+
+def _positions(plate) -> dict[int, tuple[float, float]]:
+    """Segment -> (x, y) mm of its label pad: where the drawing places it."""
+    out = {}
+    for k, s in plate.segments.items():
+        if k in plate.label_col and k in plate.label_row:
+            out[int(k)] = ((plate.label_col[k] - 0.5) * r2d2_geometry.PAD_W_MM,
+                           (plate.label_row[k] - 0.5) * r2d2_geometry.PAD_H_MM)
+        else:
+            out[int(k)] = (s.cx_mm, s.cy_mm)
+    return out
+
+
+def _tile_or_all(values: dict, pos: dict) -> dict[int, float]:
+    """The 36 tile segments (plate_stats: 1..36, one per 5x5-pad tile, the
+    edge segments inside the tiles not counted) when at least 8 of them have
+    a value; every segment otherwise."""
+    good = {}
+    for s, v in values.items():
+        try:
+            k, f = int(s), float(v)
+        except (TypeError, ValueError):
+            continue
+        if k in pos and np.isfinite(f):
+            good[k] = f
+    tiles = {k: v for k, v in good.items() if 1 <= k <= 36}
+    return tiles if len(tiles) >= 8 else good
+
+
+def _basis(good: dict) -> str:
+    n = len(good)
+    return (f"{n} of 36 tiles" if good and max(good) <= 36
+            else f"{n} segments")
+
 
 def neighbour_smoothness(values: dict[str, float], plate_key: str = "gen1",
                          param: str = "R_ohmic") -> Check:
@@ -334,9 +386,8 @@ def neighbour_smoothness(values: dict[str, float], plate_key: str = "gen1",
     of R_ohmic itself.
     """
     plate = r2d2_geometry.plate(plate_key)
-    pos = {int(k): (s.cx_mm, s.cy_mm) for k, s in plate.segments.items()}
-    good = {int(s): float(v) for s, v in values.items()
-            if int(s) in pos and np.isfinite(v)}
+    pos = _positions(plate)
+    good = _tile_or_all(values, pos)
     if len(good) < 8:
         return Check(f"{param} smoothness", NA,
                      f"only {len(good)} finite values; needs 8")
@@ -364,7 +415,7 @@ def neighbour_smoothness(values: dict[str, float], plate_key: str = "gen1",
     ratio = measured / null
 
     detail = (f"neighbour contrast {ratio:.2f} of what the same values give "
-              f"when shuffled over the same positions")
+              f"when shuffled over the same positions ({_basis(good)})")
     if ratio <= 0.6:
         verdict, extra = PASS, " -- the map is spatially organised"
     elif ratio <= 0.85:
@@ -428,10 +479,9 @@ def flow_trend(values: dict[str, float], plate_key: str = "gen1",
     # does -- so it is named here rather than guessed silently. x is the long
     # axis of this plate (250 mm against 116 mm) and the one the channels run
     # along; pass axis="y" if a future plate is plumbed the other way.
-    coord = {int(k): (s.cx_mm if axis == "x" else s.cy_mm)
-             for k, s in plate.segments.items()}
-    good = {int(s): float(v) for s, v in values.items()
-            if int(s) in coord and np.isfinite(v)}
+    pos = _positions(plate)
+    coord = {k: (xy[0] if axis == "x" else xy[1]) for k, xy in pos.items()}
+    good = _tile_or_all(values, coord)
     if len(good) < 8:
         return Check(f"{param} along flow", NA,
                      f"only {len(good)} finite values; needs 8")
@@ -445,7 +495,8 @@ def flow_trend(values: dict[str, float], plate_key: str = "gen1",
 
     where = "inlet to outlet" if axis == "x" else "across the flow"
     direction = "falls" if r < 0 else "rises"
-    detail = f"{param} {direction} {where} (r = {r:+.2f} against {axis})"
+    detail = (f"{param} {direction} {where} (r = {r:+.2f} against {axis}, "
+              f"{_basis(good)})")
     if abs(r) < 0.15:
         return Check(f"{param} along flow", WARN,
                      detail + " -- essentially flat; a plate with a real "
@@ -565,14 +616,26 @@ def series_resistance_closure(r_ohmic: dict[str, float],
     calibration, or to the plate genuinely not being uniform over the
     unmeasured part -- rather than being absorbed into a curve.
     """
-    par = parallel_series_resistance(r_ohmic, areas, r_sd)
+    # 36 equal tiles (plate_stats) when enough of segments 1..36 have a value:
+    # each stands for 25 pads = 8.47 cm2, the edge segments are not counted
+    tile_r = {s: r for s, r in r_ohmic.items()
+              if str(s).isdigit() and 1 <= int(s) <= 36 and np.isfinite(r)
+              and r > 0}
+    if len(tile_r) >= 8:
+        a_tile = 25 * r2d2_geometry.PAD_AREA_CM2
+        par = parallel_series_resistance(tile_r, {s: a_tile for s in tile_r},
+                                         r_sd)
+        basis = f"{par.get('n_used', 0)} of 36 tiles"
+    else:
+        par = parallel_series_resistance(r_ohmic, areas, r_sd)
+        basis = f"{par.get('n_used', 0)} segments"
     if not par["ok"]:
         return Check("R_s parallel closure", NA,
                      "no segment has a finite positive R_ohmic")
     if not np.isfinite(reference_hfr_ohm_cm2) or reference_hfr_ohm_cm2 <= 0:
         return Check("R_s parallel closure", NA,
                      f"{1e3 * par['r_par_ohm_cm2']:.2f} mohm.cm2 from "
-                     f"{par['n_used']} segments in parallel, but the "
+                     f"{basis} in parallel, but the "
                      f"{reference_label} is not available to compare against",
                      par["r_par_ohm_cm2"])
 
@@ -580,7 +643,7 @@ def series_resistance_closure(r_ohmic: dict[str, float],
     dev = local / reference_hfr_ohm_cm2 - 1.0
     sd_txt = (f" +/- {1e3 * par['sd_ohm_cm2']:.2f}"
               if np.isfinite(par["sd_ohm_cm2"]) else "")
-    detail = (f"{par['n_used']} segments in parallel give "
+    detail = (f"{basis} in parallel give "
               f"{1e3 * local:.2f}{sd_txt} mohm.cm2 vs {reference_label} "
               f"{1e3 * reference_hfr_ohm_cm2:.2f} ({100 * dev:+.1f} %)")
 
@@ -1018,8 +1081,12 @@ def check_from_disk(run_dir, cfg=None, plate_key: str = "gen1",
         except (TypeError, ValueError):
             return float("nan")
 
+    # measured segments only: a rebuilt (substituted / inferred) value is the
+    # neighbours' value again and must not vote in a plate statistic
     summary = [r for r in _rows(run_dir / "gold" / "plate_summary.csv")
-               if r.get("measured", "1") not in ("0", "False", "false")]
+               if r.get("measured", "1") not in ("0", "False", "false")
+               and str(r.get("class", "measured") or "measured")
+               in ("measured",)]
     points: dict[str, list[complex]] = {}
     for r in _rows(run_dir / "silver" / "spectra_clean.csv"):
         seg = str(int(float(r["segment"])))

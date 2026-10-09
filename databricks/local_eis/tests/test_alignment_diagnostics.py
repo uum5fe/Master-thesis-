@@ -300,29 +300,58 @@ def test_refused_cards_are_left_out_of_the_closure() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_cards_at_a_different_rate_are_refused_not_correlated(tmp_path) -> None:
-    """A lag in samples is meaningless between two sample rates.
-
-    `_best_lag` walks two arrays index by index. If one card sampled at
-    50 kHz and the other at 100 kHz, index n is a different instant on each,
-    and the offset it returns is neither seconds nor samples of anything. The
-    campaign mixes rates, so this has to end in a stated refusal rather than
-    a number.
-    """
+def test_a_card_whose_samples_do_not_match_its_rate_is_refused(tmp_path) -> None:
+    """A lag in samples is meaningless between two sample rates, so the odd
+    card's trace is resampled onto the anchor's rate before it is correlated.
+    A card whose data do not match its stated rate then finds no credible
+    peak and is refused -- with its windows still converted by the rate
+    ratio, never read as anchor samples."""
     n = int(20 * FS)
     clean = sweep(n)
     a = _write_card(tmp_path / "Karte_1.DAT", clean)
     b = _write_card(tmp_path / "Karte_2.DAT", clean)
     c = _write_card(tmp_path / "Karte_3.DAT", clean)
     cards = _cards_for([a, b, c])
-    cards["Karte_3"].fs = 2 * FS                 # the odd card out
+    cards["Karte_3"].fs = 2 * FS                 # claims a rate it was not
 
     lags = B.estimate_card_lags([a, b, c], cards, DEFAULT)
 
     assert lags["Karte_3"]["applied"] is False
-    assert "sample rate" in lags["Karte_3"]["refused_reason"]
+    assert lags["Karte_3"]["ratio"] == pytest.approx(2.0)
+    assert lags["Karte_3"]["refused_reason"]
     # and the majority is still aligned to each other
     assert lags["Karte_1"]["applied"] and lags["Karte_2"]["applied"]
+
+
+def test_a_card_at_twice_the_rate_is_aligned_through_resampling(tmp_path) -> None:
+    """RO2612025: three 100 kHz cards and two 50 kHz cards. The slow card's
+    reference is resampled onto the anchor's rate, the offset measured there
+    and stored in the card's OWN samples, and the schedule reaches its record
+    through to_own(): common index x ratio + lag."""
+    from scipy.signal import resample_poly
+    n = int(20 * FS)
+    clean = sweep(n)
+    a = _write_card(tmp_path / "Karte_1.DAT", clean)
+    b = _write_card(tmp_path / "Karte_2.DAT", clean)
+    late = int(1.5 * FS)                         # armed 1.5 s later
+    x3 = np.concatenate([clean[late:], np.zeros(late)])
+    c = _write_card(tmp_path / "Karte_3.DAT", resample_poly(x3, 2, 1),
+                    fs=2 * FS)
+    cards = _cards_for([a, b, c])
+    assert cards["Karte_3"].fs == pytest.approx(2 * FS)
+
+    lags = B.estimate_card_lags([a, b, c], cards, DEFAULT)
+    info = lags["Karte_3"]
+    assert info["applied"] is True
+    assert info["ratio"] == pytest.approx(2.0)
+    assert info["fs_common"] == pytest.approx(FS)
+    assert info["lag"] == pytest.approx(-1.5 * 2 * FS, abs=4)
+    # a window at anchor sample 100000 (10 s) is at 8.5 s on the fast card
+    own = B.to_own(100_000, info)
+    assert own / (2 * FS) == pytest.approx(8.5, abs=1e-3)
+    assert B.to_common(own, info) == 100_000
+    # a refused lag still converts the units
+    assert B.to_own(100_000, dict(info, applied=False)) == 200_000
 
 
 def test_the_anchor_is_taken_from_the_largest_rate_group(tmp_path) -> None:

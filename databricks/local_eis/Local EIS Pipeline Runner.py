@@ -112,6 +112,52 @@ for mod in [config, utils, eis_local, gamry_sync, channel_lag, card_gain,
             bench_plots, polcurve, ecm_drt, nyquist]:
     importlib.reload(mod)
 
+# ─── ARE ALL MODULES FROM THIS BUILD? ───
+# A folder updated file by file can mix builds: on 2612030 450 A the new
+# config/silver ran (full band, R_ohmic at the intercept) next to an OLD gold
+# and plotting -- maps with the old statistics and the old segment marks, and
+# no plate_statistics.csv. Each module must come from this notebook's folder
+# and carry what this build added; anything else stops the run here, naming
+# the file.
+import plate_stats
+importlib.reload(plate_stats)
+_BUILD_MARKERS = {
+    config: ['full_band'], plate_stats: ['tile_stats', 'write_statistics'],
+    geom: ['label_xy'], bronze: ['to_own', 'to_common'],
+    silver: ['r_ohmic_intercept'], gold: ['plate_stats'],
+    plate_figure: ['node_xy'], plate_maps: ['uniformity_stats'],
+    plausibility: ['_tile_or_all'], gamry_sync: ['confine_windows'],
+}
+_stale = []
+for _m, _need in _BUILD_MARKERS.items():
+    _f = str(getattr(_m, '__file__', ''))
+    _missing = [a for a in _need
+                if not (hasattr(_m, a) or hasattr(getattr(_m, 'Config', None), a)
+                        or a in getattr(getattr(_m, 'Config', None),
+                                        '__dataclass_fields__', {}))]
+    if _missing or not _f.startswith(str(_PIPELINE_DIR)):
+        _stale.append(f"  {_m.__name__:14s} {_f}"
+                      + (f"   missing: {', '.join(_missing)}" if _missing else
+                         "   (outside this notebook's folder)"))
+# modules whose new code has no new name: look for it in the source
+import inspect as _inspect
+for _m, _txt in {plate_plotly: 'plate_stats', viewers: 'node_xy',
+                 nyquist: 'def save_run'}.items():
+    try:
+        _ok = _txt in _inspect.getsource(_m)
+    except (OSError, TypeError):
+        _ok = False
+    if not _ok:
+        _stale.append(f"  {_m.__name__:14s} {getattr(_m, '__file__', '')}"
+                      f"   missing: {_txt}")
+if _stale:
+    raise RuntimeError(
+        "These modules are not from this build:\n" + "\n".join(_stale)
+        + f"\nDelete the whole folder {_PIPELINE_DIR} in the workspace and "
+          "import the new zip into an EMPTY folder -- importing on top of an "
+          "existing folder can leave old files in place.")
+print(f"  modules: all {len(_BUILD_MARKERS)} checked modules from {_PIPELINE_DIR}")
+
 # ─── ONE PLOT PER FIGURE ───
 # Every spectrum cell below still builds its multi-panel figure (Nyquist, |Z|,
 # phase side by side, or a grid of segments) and hands it to show_fig(), which

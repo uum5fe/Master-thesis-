@@ -502,14 +502,43 @@ def estimate_card_lags(files: list[Path], cards: dict[str, CardInfo],
     mismatched = [s for s in stems
                   if s != base and not np.isclose(cards[s].fs, fs_base,
                                                   rtol=0, atol=1e-6)]
+    # ... so its trace is RESAMPLED onto the anchor's rate first, the lag is
+    # measured there in anchor samples, and converted to the card's own
+    # samples. The windows reach the card through to_own(), which applies the
+    # rate ratio whether or not the lag is accepted.
     for stem in mismatched:
-        out[stem] = {"lag": 0, "corr": float("nan"), "prominence": float("nan"),
-                     "applied": False, "corroborated_by": [], "rescued": False,
-                     "refused_reason": "sample rate differs from the anchor"}
-        log.warning(f"  {stem[-8:]}: fs = {cards[stem].fs:.0f} Hz against the "
-                    f"anchor's {fs_base:.0f} Hz - NOT aligned. A lag in "
-                    f"samples means nothing between two rates; this card "
-                    f"stays on its own clock.")
+        r = float(cards[stem].fs) / float(fs_base)
+        rec = {"lag": 0, "corr": float("nan"), "prominence": float("nan"),
+               "applied": False, "corroborated_by": [], "rescued": False,
+               "ratio": r, "resampled": True}
+        try:
+            x_rs = _to_rate(traces[stem], cards[stem].fs, fs_base)
+            lag_b, corr, prom = _best_lag(x_rs, ref, max_lag, guard)
+        except Exception as exc:                            # noqa: BLE001
+            rec["refused_reason"] = f"resampling failed: {exc}"
+            out[stem] = rec
+            log.warning(f"  {stem[-8:]}: fs = {cards[stem].fs:.0f} Hz, could "
+                        f"not be resampled for alignment ({exc}); windows "
+                        f"are rate-converted but not shifted")
+            continue
+        applied = bool(cfg.align_cards and abs(corr) >= cfg.align_min_corr
+                       and prom >= cfg.align_min_prominence)
+        rec.update(lag=int(round(lag_b * r)), corr=float(corr),
+                   prominence=float(prom), applied=applied)
+        if not applied:
+            rec["refused_reason"] = ("resampled peak below the floor or not "
+                                     "prominent")
+        out[stem] = rec
+        log.info(f"  {stem[-8:]}: fs = {cards[stem].fs:.0f} Hz, resampled to "
+                 f"{fs_base:.0f} Hz: lag {lag_b / fs_base:+8.4f} s   peak corr "
+                 f"{corr:+.3f}   prominence {prom:5.1f}"
+                 + ("" if applied else "   REFUSED"))
+        if applied:
+            drift = _blockwise_lag_diagnostic(x_rs, ref, lag_b, fs_base, cfg)
+            rec["drift"] = drift
+            if drift.get("ok"):
+                log.info(f"    clock: {drift['clock_mismatch_ppm']:+7.2f} ppm "
+                         f"over {len(drift['blocks'])} blocks")
 
     # ALL CANDIDATES FIRST, THEN THE DECISION.
     # The acceptance rule below asks whether ANOTHER card independently
@@ -601,6 +630,10 @@ def estimate_card_lags(files: list[Path], cards: dict[str, CardInfo],
         log.warning("  align_cards is off: schedule windows will be applied "
                     "to every card unshifted, which is only correct if the "
                     "cards were hardware-triggered together")
+    for st in stems:
+        if st in out:
+            out[st].setdefault("ratio", float(cards[st].fs) / float(fs_base))
+            out[st]["fs_common"] = float(fs_base)
     return out
 
 
@@ -608,6 +641,66 @@ def estimate_card_lags(files: list[Path], cards: dict[str, CardInfo],
 #: Kept only so a direct `_best_lag` call without a config still behaves as
 #: it always did; production passes `_guard_samples(cfg, fs)`.
 GUARD_SAMPLES_LEGACY = 5000
+
+
+# ---------------------------------------------------------------------------
+# the common time base and each card's own sample index
+# ---------------------------------------------------------------------------
+# Schedule windows are sample indices on the COMMON base: the anchor card's
+# clock and sample rate. A card maps them onto its own record with
+#
+#     own = round(common * ratio) + lag          ratio = fs_card / fs_common
+#
+# where `lag` counts only when it was applied. The ratio applies ALWAYS: it
+# is a unit conversion, not a timing claim. Before it existed a 50 kHz card
+# read the 100 kHz anchor's sample numbers as its own -- every window at
+# twice its true time, past the end of the record for most of the sweep --
+# and on RO2612025 450 A all 26 segments of the two 50 kHz cards lost 35 of
+# 45 points as "not finite".
+
+def card_ratio(info: dict | None) -> float:
+    r = (info or {}).get("ratio", 1.0)
+    try:
+        r = float(r)
+    except (TypeError, ValueError):
+        return 1.0
+    return r if np.isfinite(r) and r > 0 else 1.0
+
+
+def card_shift(info: dict | None) -> int:
+    info = info or {}
+    return int(info.get("lag", 0)) if info.get("applied") else 0
+
+
+def to_own(idx: int, info: dict | None) -> int:
+    """Common-base sample index -> this card's own sample index."""
+    return int(round(idx * card_ratio(info))) + card_shift(info)
+
+
+def to_common(idx: int, info: dict | None) -> int:
+    """This card's own sample index -> common-base sample index."""
+    return int(round((idx - card_shift(info)) / card_ratio(info)))
+
+
+def fs_common(lags: dict | None, fs_seen: dict | None = None) -> float:
+    """Sample rate of the common base: the anchor's."""
+    for v in (lags or {}).values():
+        f = v.get("fs_common") if isinstance(v, dict) else None
+        if f:
+            return float(f)
+    if fs_seen:
+        return float(np.median(list(fs_seen.values())))
+    return 25000.0
+
+
+def _to_rate(x: np.ndarray, fs_from: float, fs_to: float) -> np.ndarray:
+    """Polyphase resampling of an alignment trace onto another rate."""
+    from fractions import Fraction
+    from scipy.signal import resample_poly
+    fr = Fraction(float(fs_to) / float(fs_from)).limit_denominator(1000)
+    if fr.numerator == fr.denominator:
+        return np.asarray(x, float)
+    return resample_poly(np.asarray(x, float), fr.numerator, fr.denominator)
 
 
 def _guard_samples(cfg: Config, fs: float) -> int:
@@ -1005,10 +1098,11 @@ def consensus_schedule(files: list[Path], cards: dict[str, CardInfo],
         # sitting on the wrong tone.  Refusing a lag has to mean NO shift
         # anywhere, not half a shift.
         info = lags.get(stem, {}) if lags else {}
-        d = int(info.get("lag", 0)) if info.get("applied") else 0
-        if d:
-            steps = [ladder_snap._rebuild(Step, s, start=s.start - d,
-                                          stop=s.stop - d) for s in steps]
+        if card_shift(info) or card_ratio(info) != 1.0:
+            steps = [ladder_snap._rebuild(Step, s,
+                                          start=to_common(s.start, info),
+                                          stop=to_common(s.stop, info))
+                     for s in steps]
         per_card[stem] = steps
         fs_seen[stem] = float(fam.fs)
         log.info(f"  {stem}: {len(steps)} candidate steps "
@@ -1022,7 +1116,8 @@ def consensus_schedule(files: list[Path], cards: dict[str, CardInfo],
     if timeline is not None and lags is not None:
         f_top = min((cfg.f_hi(v) for v in fs_seen.values()), default=np.inf)
         card_sync = gamry_sync.corroborate_card_lags(
-            per_card, lags, fs_seen, timeline, cfg.f_min_hz, f_top)
+            per_card, lags, fs_seen, timeline, cfg.f_min_hz, f_top,
+            fs_steps=fs_common(lags, fs_seen))
         for row in card_sync:
             c = row["card"]
             if not row.get("corroborated"):
@@ -1031,14 +1126,17 @@ def consensus_schedule(files: list[Path], cards: dict[str, CardInfo],
                    f"corroborated by the Gamry clock "
                    f"({row['gamry_implied_lag_s']:+.3f} s)")
             if gs_mode in ("frequency", "guide"):
-                d = int(lags[c].get("lag", 0))
+                before = dict(lags[c])
                 lags[c]["applied"] = True
                 lags[c]["corroborated_by"] = list(
                     lags[c].get("corroborated_by", []) or []) + ["gamry"]
-                per_card[c] = [ladder_snap._rebuild(Step, st,
-                                                    start=st.start - d,
-                                                    stop=st.stop - d)
-                               for st in per_card[c]]
+                # back onto the card's own index as it was converted, then
+                # onto the common base with the lag now applied
+                per_card[c] = [ladder_snap._rebuild(
+                    Step, st,
+                    start=to_common(to_own(st.start, before), lags[c]),
+                    stop=to_common(to_own(st.stop, before), lags[c]))
+                    for st in per_card[c]]
                 log.info(msg + " -- APPLIED")
             else:
                 log.info(msg + " -- not applied (gamry_sync = report)")
@@ -1171,7 +1269,7 @@ def consensus_schedule(files: list[Path], cards: dict[str, CardInfo],
     # 77 -> 45 at 450 A on RO2612030), which is what `grid_tol` was failing to
     # do.  Nothing is deleted here; the quality gates still decide.
     if getattr(cfg, "ladder_snap", True) and kept:
-        fs_ref = float(np.median(list(fs_seen.values()))) if fs_seen else 25000.0
+        fs_ref = fs_common(lags, fs_seen)
         snapped, snap_info = ladder_snap.snap_steps(
             kept, fs_ref,
             ppd=getattr(cfg, "ladder_snap_ppd", None), log=log)
@@ -1203,7 +1301,7 @@ def consensus_schedule(files: list[Path], cards: dict[str, CardInfo],
     # without any extra data and can be replaced by the one the sweep would
     # have placed there.
     if getattr(cfg, "window_sanity", True) and len(kept) >= 4:
-        fs_ref = float(np.median(list(fs_seen.values()))) if fs_seen else 25000.0
+        fs_ref = fs_common(lags, fs_seen)
         fixed, win_info = ladder_snap.repair_windows(
             kept, fs_ref,
             min_dwell_frac=getattr(cfg, "window_min_dwell_frac", 0.40),
@@ -1224,7 +1322,7 @@ def consensus_schedule(files: list[Path], cards: dict[str, CardInfo],
 
     # ---- one stretch of record holds one tone ---------------------------
     if getattr(cfg, "window_confine", True) and kept:
-        fs_ref = float(np.median(list(fs_seen.values()))) if fs_seen else 25000.0
+        fs_ref = fs_common(lags, fs_seen)
         kept, n_cut = gamry_sync.separate_windows(
             kept, fs_ref, lambda st, **kw: ladder_snap._rebuild(Step, st, **kw),
             log=log)
@@ -1350,7 +1448,7 @@ def _gamry_guided(kept, tl, files, cards, cfg, lags, fs_seen, gs_mode, log):
     (guide) misplaced / missing windows re-located in their Gamry slot."""
     utils.section(f"Gamry clock  (gamry_sync = {gs_mode}, {tl.path.name})",
                   log)
-    fs_ref = float(np.median(list(fs_seen.values()))) if fs_seen else 25000.0
+    fs_ref = fs_common(lags, fs_seen)
     f_top = min((cfg.f_known_hi(v) for v in fs_seen.values()), default=np.inf)
     res = gamry_sync.align(kept, tl, fs_ref, cfg.f_min_hz, f_top)
     info = {"mode": gs_mode, "sweep": tl.path.name,
@@ -1388,6 +1486,8 @@ def _gamry_guided(kept, tl, files, cards, cfg, lags, fs_seen, gs_mode, log):
         c = cards.get(fp.stem)
         lg = (lags or {}).get(fp.stem, {})
         if c is None or not (lg.get("applied") or int(lg.get("lag", 0)) == 0):
+            continue
+        if card_ratio(lg) != 1.0:          # windows there are in other units
             continue
         fam = FamosFile(fp)
         n = len(fam.segment_names)
@@ -1499,7 +1599,6 @@ def pooled_reference_phasors(files: list[Path], cards: dict[str, CardInfo],
         info = lags.get(stem, {}) if lags else {}
         if info and not info.get("applied", True):
             continue
-        shift = int(info.get("lag", 0)) if info.get("applied") else 0
         fam = FamosFile(fp)
         name = cards[stem].ref_name
         if name not in fam.names:
@@ -1509,7 +1608,7 @@ def pooled_reference_phasors(files: list[Path], cards: dict[str, CardInfo],
         n_cards += 1
         used.append(stem)
         for i, st in enumerate(schedule):
-            a, b = st.start + shift, st.stop + shift
+            a, b = to_own(st.start, info), to_own(st.stop, info)
             if b <= a or a < 0 or b > len(ref):
                 continue
             A, r_rms, snr = utils.fit3(ref[a:b], fam.fs, st.freq)
@@ -1640,12 +1739,14 @@ def process_card(fp: Path, cal: PlateCalibration, schedule: list[Step],
                  ref_pool: tuple[np.ndarray, np.ndarray, dict] | None = None,
                  gain: dict | None = None,
                  v_gain: float = 1.0,
+                 ratio: float = 1.0,
                  ) -> dict[str, BronzeSpectrum]:
     """Raw phasors for every segment on one card.
 
     `schedule` windows are indices on the COMMON time base; `lag` is this
-    card's offset relative to it, so the window actually read is
-    (start + lag, stop + lag).
+    card's offset relative to it and `ratio` its sample rate over the common
+    base's, so the window actually read is
+    (round(start * ratio) + lag, round(stop * ratio) + lag).
 
     `ref_pool` is the plate-wide cell-voltage phasor from
     `pooled_reference_phasors`, already rotated to mux slot 0.  When it is
@@ -1729,7 +1830,8 @@ def process_card(fp: Path, cal: PlateCalibration, schedule: list[Step],
         for _nm in _names:
             _c = ref if _nm == ref_name else fam.channel(_nm)
             for i, st in enumerate(schedule):
-                a, b = st.start + lag, st.stop + lag
+                a, b = (int(round(st.start * ratio)) + lag,
+                        int(round(st.stop * ratio)) + lag)
                 if b <= a or a < 0 or b > len(_c):
                     _win[i] = None
                 elif _win[i] is not None:
@@ -1774,7 +1876,8 @@ def process_card(fp: Path, cal: PlateCalibration, schedule: list[Step],
 
         n_skip = 0
         for i, st in enumerate(schedule):
-            a, b = st.start + lag, st.stop + lag
+            a, b = (int(round(st.start * ratio)) + lag,
+                        int(round(st.stop * ratio)) + lag)
             if b <= a or a < 0 or b > len(x) or b > len(ref):
                 n_skip += 1
                 continue
@@ -1948,10 +2051,14 @@ def run(cfg: Config = DEFAULT, log=None) -> BronzeRun:
             continue
         log.info(f"  {fp.name}")
         info = lags.get(fp.stem, {})
-        shift = int(info.get("lag", 0)) if info.get("applied") else 0
+        shift = card_shift(info)
+        if card_ratio(info) != 1.0:
+            log.info(f"    windows converted to this card's rate "
+                     f"(x{card_ratio(info):g})")
         got = process_card(fp, cal, schedule, grid, cfg, log,
                            T_seg=T_seg, lag=shift, ref_pool=ref_pool,
-                           gain=gain, v_gain=v_gains.get(fp.stem, 1.0))
+                           gain=gain, v_gain=v_gains.get(fp.stem, 1.0),
+                           ratio=card_ratio(info))
         for seg, sp in got.items():
             if seg in spectra:
                 # two cards claim the same segment: keep the better SNR
@@ -2068,6 +2175,8 @@ def load(run_dir) -> BronzeRun:
                         "corr": num(r.get("corr")),
                         "prominence": num(r.get("prominence")),
                         "applied": str(r.get("applied", "1")) == "1",
+                        "ratio": num(r.get("ratio"), 1.0),
+                        "fs_common": num(r.get("fs_common"), 0.0) or None,
                         "rescued": str(r.get("rescued", "0")) == "1",
                         "refused_reason": r.get("refused_reason", "")}
             for r in rows("card_alignment.csv") if r.get("card")}
@@ -2176,6 +2285,8 @@ def save(run_obj: BronzeRun, cfg: Config, log=None) -> Path:
          "prominence": (round(v["prominence"], 2)
                         if np.isfinite(v.get("prominence", np.nan)) else ""),
          "applied": int(bool(v.get("applied"))),
+         "ratio": round(card_ratio(v), 9),
+         "fs_common": v.get("fs_common", ""),
          "rescued": int(bool(v.get("rescued"))),
          "corroborated_by": " ".join(v.get("corroborated_by", []) or []),
          "refused_reason": v.get("refused_reason", ""),

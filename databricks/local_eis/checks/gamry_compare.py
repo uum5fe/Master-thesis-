@@ -79,6 +79,10 @@ import utils
 
 #: Current setpoint in the file name, e.g. "..._HFR_102_CurrVal_60.dta".
 _CURRENT_RE = re.compile(r"CurrVal[_-]?(\d+(?:[.,]\d+)?)", re.I)
+#: ... or the current alone, as on RO2612025: "450A.DTA", "300A_10kHz.DTA".
+#: The A must not be followed by a letter (so "10kHz", "Abgleich" do not
+#: count) and the number must not be glued to a letter or digit before it.
+_CURRENT_A_RE = re.compile(r"(?<![A-Za-z0-9.,])(\d+(?:[.,]\d+)?)\s*A(?![A-Za-z])")
 #: Absolute start time in the Gamry header.
 _START_RE = re.compile(r"STARTTIME\s+LABEL\s+([\d.]+\s+[\d:]+)")
 #: The order number as it appears in a bench file name, e.g. "RO2611976-01".
@@ -203,7 +207,7 @@ def read_cell_sweep(path) -> CellSweep:
     sweep = gamry_dta.read_dta(path).sorted()
     text = path.read_text(encoding="latin-1", errors="ignore")
 
-    m = _CURRENT_RE.search(path.name)
+    m = _CURRENT_RE.search(path.name) or _CURRENT_A_RE.search(path.stem)
     current = float(m.group(1).replace(",", ".")) if m else None
 
     started = None

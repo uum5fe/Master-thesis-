@@ -194,8 +194,7 @@ def test_recommended_profile_pins_the_settings_of_the_clean_script(volume,
     overridden with the clean script's values -- and the cell says which ones
     it ignored. 5 dB is the value that cut 45 A off at ~90 Hz."""
     ns = _run_cell(volume, {"evaluation_mode": "permissive",
-                            "min_snr_db": "5", "f_max_hz": "2000.0",
-                            "f_band": "coherent"})
+                            "min_snr_db": "5", "f_max_hz": "2000.0"})
     assert ns["PARAM_PROFILE"] == "recommended"
     assert ns["EVALUATION_MODE"] == "default"
     assert ns["MIN_SNR_DB"] == 0.0
@@ -216,13 +215,14 @@ def test_custom_profile_uses_the_widgets(volume) -> None:
     assert ns["F_MAX"] == 2000.0
 
 
-def test_the_full_band_is_the_default_and_not_pinned_by_the_profile(volume,
-                                                                     capsys
-                                                                     ) -> None:
-    """Band 'full' evaluates the whole sweep up to fs/2: F max steps aside
-    (30 kHz, the sweep's top) and the recommended profile does not pull it
-    back to 4500 Hz."""
-    ns = _run_cell(volume, {"f_max_hz": "4500.0"})
+def test_the_coherent_band_is_the_default_and_full_is_a_choice(volume,
+                                                                capsys) -> None:
+    """The established evaluation stops at the coherent limit and F max
+    (4500 Hz); 'full' evaluates the whole sweep up to fs/2 and is not pulled
+    back to 4500 Hz by the recommended profile."""
+    ns = _run_cell(volume, {})
+    assert ns["FULL_BAND"] is False and ns["F_MAX"] == 4500.0
+    ns = _run_cell(volume, {"f_band": "full", "f_max_hz": "4500.0"})
     assert ns["FULL_BAND"] is True
     assert ns["F_MAX"] == 30000.0
     assert "full band" in ns["BAND_TEXT"]

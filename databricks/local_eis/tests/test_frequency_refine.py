@@ -51,8 +51,9 @@ def test_ladder_steps_move_onto_the_gamrys_frequencies(tmp_path):
     files, cards, steps = _card(tmp_path)
     err0 = [abs(s.freq / g - 1) for s, g in zip(steps, GAMRY)]
     assert max(err0) > 0.005                      # the snapped ladder is off
-    out, info = B.refine_frequencies(files, cards, steps, {}, DEFAULT,
-                                     lags={})
+    assert DEFAULT.freq_refine is False              # optional, off by default
+    out, info = B.refine_frequencies(files, cards, steps, {},
+                                     DEFAULT.replace(freq_refine=True), lags={})
     assert info["n_refined"] == len(GAMRY)
     for s, g in zip(out, GAMRY):
         assert abs(s.freq / g - 1) < 2e-4, (s.freq, g)
@@ -63,6 +64,7 @@ def test_gamry_frequencies_are_not_touched(tmp_path):
     steps = [B.ladder_snap._rebuild(Step, s, freq=g)
              for s, g in zip(steps, GAMRY)]
     out, info = B.refine_frequencies(files, cards, steps,
-                                     {"gamry_freqs": GAMRY}, DEFAULT, lags={})
+                                     {"gamry_freqs": GAMRY},
+                                     DEFAULT.replace(freq_refine=True), lags={})
     assert info["n_refined"] == 0 and info["n_exact"] == len(GAMRY)
     assert [s.freq for s in out] == GAMRY

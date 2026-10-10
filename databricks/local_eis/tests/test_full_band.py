@@ -114,7 +114,9 @@ def test_a_window_on_the_wrong_stretch_of_record_is_rejected():
     bad = int(np.argmin(np.abs(f - 3.0)))
     s[bad] = 1.0                                  # 2612030 450 A, 3.0 Hz
     sp.snr_seg_db = s
-    g = silver.gate_points(sp, DEFAULT)
+    on = DEFAULT.replace(off_tone_drop_db=12.0)
+    assert DEFAULT.off_tone_drop_db is None          # optional, off by default
+    g = silver.gate_points(sp, on)
     assert not g["keep"][bad] and g["reason"][bad] == "off_tone"
     assert g["reason"][bad - 1] != "off_tone"
     assert g["reason"][bad + 1] != "off_tone"

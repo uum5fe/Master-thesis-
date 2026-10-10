@@ -657,11 +657,21 @@ class Config:
     # and window_settle_periods periods of settling at the start; then no two
     # windows may overlap. On RO2612030 the blind detector let low-frequency
     # windows run 4-10 s into the neighbouring step.
+    # ---- OPTIONAL refinements, all OFF by default -------------------------
+    # The default evaluation is the established one (the 2612030 results of
+    # 07.10): detected windows as they are, the card estimate of each step's
+    # frequency, every on-grid point kept. Each switch below changes which
+    # points survive and was tried on 2612030; at 45 A, window_confine +
+    # off_tone_drop_db left a gap in the arc from 2.4 to 19 Hz (windows that
+    # read 2-10 dB against 25 dB around them are removed rather than shown),
+    # and the confined 0.96 / 1.5 Hz windows fell below 3 cycles. Turn them on
+    # deliberately, one at a time, and compare.
+    #
     # gamry_sync = "guide": an "ok" window whose segment channels show less
     # than this median SNR at its frequency holds no tone and is searched for
     # in its Gamry slot like a misplaced one (None: never). Normal windows
     # read 6..25 dB, an empty one about -30 dB.
-    window_min_snr_db: float | None = -3.0
+    window_min_snr_db: float | None = None
     # Blind frequencies (no Gamry): each step's frequency is re-estimated
     # once on the segment channels within +-freq_refine_pct of the ladder
     # value (the Gamry rounds its frequencies up to ~1.1 % off the ideal
@@ -670,14 +680,14 @@ class Config:
     # silver: reject a point whose segment SNR is this far below the 75th
     # percentile of the 5 steps on either side (None: off). Correct windows on 2612030
     # read 17-24 dB; windows on the neighbouring step 0-4 dB.
-    off_tone_drop_db: float | None = 12.0
+    off_tone_drop_db: float | None = None
     # full band: remove each card's phase offset against the plate above the
     # coherent limit (silver.card_hf_phase); |Z| is untouched
     card_hf_phase: bool = True
-    freq_refine: bool = True
+    freq_refine: bool = False
     freq_refine_pct: float = 1.5
-    fit_at_exact_frequency: bool = True
-    window_confine: bool = True
+    fit_at_exact_frequency: bool = False
+    window_confine: bool = False
     window_min_interval_s: float = 3.0
     window_guard_s: float = 0.5
     window_settle_periods: float = 0.5

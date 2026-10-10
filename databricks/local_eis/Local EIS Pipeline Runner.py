@@ -605,7 +605,7 @@ try:
     # where the five cards still agree as pure delays (0.16 fs = 4 kHz at
     # 25 kHz) and at F max; R_ohmic is the top-band mean. This widget is not
     # pinned by the parameter profile.
-    dbutils.widgets.dropdown('f_band', 'full', ['full', 'coherent'],
+    dbutils.widgets.dropdown('f_band', 'coherent', ['coherent', 'full'],
                              'Band (full = up to fs/2)')
     dbutils.widgets.dropdown('min_snr_db', '0',
                              ['-30', '-20', '-10', '-3', '0', '3', '5', '8',
@@ -766,7 +766,7 @@ COND_FILTER = ('ALL' if SELECTED_CONDITIONS == list(CONDITIONS)
                else ', '.join(SELECTED_CONDITIONS))
 F_MIN = float(_w('f_min_hz', '0.15'))
 F_MAX = float(_w('f_max_hz', '4500.0'))
-FULL_BAND = _w('f_band', 'full') == 'full'
+FULL_BAND = _w('f_band', 'coherent') == 'full'
 MIN_SNR_DB = float(_w('min_snr_db', '0'))
 STOP_AFTER = _w('stop_after', 'gold')
 EVALUATION_MODE = _w('evaluation_mode', 'default')

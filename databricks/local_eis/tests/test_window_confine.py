@@ -106,3 +106,19 @@ def test_separate_windows_keeps_a_window_that_would_get_too_short():
     steps = [_Step(1.0, 0, int(2.2 * FS)), _Step(0.8, int(0.2 * FS), int(20 * FS))]
     out, n = gamry_sync.separate_windows(steps, FS, _rebuild, min_cycles=2.0)
     assert n == 0
+
+
+def test_a_confined_window_keeps_the_cycles_silver_needs():
+    """2612030 45 A: the 0.96 Hz step lasts 4 s; guard + settle left 2.9
+    cycles and silver's 3-cycle gate threw the point away in every segment.
+    The margins shrink before the window does."""
+    fs = 1000.0
+    tl_rows = [{"gamry_index": 0, "f_gamry_hz": 1.2, "pred_end_s": 146.8},
+               {"gamry_index": 1, "f_gamry_hz": 0.9566, "pred_end_s": 150.8}]
+    sync = gamry_sync.SyncResult(True, 0.0, 0.5, 10, tl_rows)
+    st = _Step(freq=0.9566, start=int(145.0 * fs), stop=int(150.8 * fs))
+    out, rows = gamry_sync.confine_windows([st], sync, fs, _rebuild,
+                                           min_cycles=3.0)
+    s = out[0]
+    assert rows and (s.stop - s.start) / fs * s.freq >= 3.0
+    assert 146.8 < s.start / fs and s.stop / fs < 150.8

@@ -300,7 +300,9 @@ def confine_windows(steps, sync: SyncResult, fs: float, rebuild,
     with guard >= the offset spread (stamps have 1 s resolution) and settle =
     `settle_periods` periods of the new tone (the transient after a frequency
     change), capped at a quarter of the step. If fewer than `min_cycles` cycles
-    remain, the settle is dropped; if still fewer, the step is left as it was.
+    remain, the settle is dropped, then the guard halved; if still fewer, the
+    step is left as it was. `min_cycles` must be silver's cycles gate
+    (cfg.min_cycles_per_dwell), or a confined window is rejected later.
 
     Returns (steps, rows); each row names the step, the old and the new window.
     """
@@ -322,11 +324,17 @@ def confine_windows(steps, sync: SyncResult, fs: float, rebuild,
         i = _match(f, freqs, tol)
         if i < 0:
             continue
+        # narrowest acceptable margins last: full guard + settle, then no
+        # settle, then half the guard on each side. A window shorter than
+        # `min_cycles` would be thrown away by silver's cycles gate (3 at the
+        # default) -- on 2612030 45 A that cost the 0.96 and 1.5 Hz points of
+        # every segment -- so in that case the detected window is kept.
         settle = min(settle_periods / f, 0.25 * (t1 - t0))
-        a, b = t0 + g + settle, t1 - g
-        if (b - a) * f < min_cycles:
-            a = t0 + g
-        if (b - a) * f < min_cycles:
+        for a, b in ((t0 + g + settle, t1 - g), (t0 + g, t1 - g),
+                     (t0 + 0.5 * g, t1 - 0.5 * g)):
+            if (b - a) * f >= min_cycles:
+                break
+        else:
             continue
         old = (steps[i].start / fs, steps[i].stop / fs)
         steps[i] = rebuild(steps[i], start=int(round(a * fs)),

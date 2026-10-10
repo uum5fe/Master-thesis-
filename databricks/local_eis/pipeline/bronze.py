@@ -1517,6 +1517,7 @@ def _gamry_guided(kept, tl, files, cards, cfg, lags, fs_seen, gs_mode, log):
             min_interval_s=getattr(cfg, "window_min_interval_s", 3.0),
             guard_s=getattr(cfg, "window_guard_s", 0.5),
             settle_periods=getattr(cfg, "window_settle_periods", 0.5),
+            min_cycles=float(getattr(cfg, "min_cycles_per_dwell", 3.0)),
             log=log)
         info["confined"] = conf
     return kept, info

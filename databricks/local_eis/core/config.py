@@ -657,10 +657,13 @@ class Config:
     # and window_settle_periods periods of settling at the start; then no two
     # windows may overlap. On RO2612030 the blind detector let low-frequency
     # windows run 4-10 s into the neighbouring step.
-    # ---- OPTIONAL refinements, all OFF by default -------------------------
+    # ---- OPTIONAL refinements ----------------------------------------------
     # The default evaluation is the established one (the 2612030 results of
-    # 07.10): detected windows as they are, the card estimate of each step's
-    # frequency, every on-grid point kept. Each switch below changes which
+    # 07.10) plus window_confine (the 09.10 approach): low-frequency windows
+    # placed between the Gamry's step ends, never below 3 cycles -- on 45 A
+    # that raised the 0.6-1.9 Hz windows from 8-15 dB to 25 dB. Everything
+    # else below is OFF: the card estimate of each step's frequency, every
+    # on-grid point kept. Each switch below changes which
     # points survive and was tried on 2612030; at 45 A, window_confine +
     # off_tone_drop_db left a gap in the arc from 2.4 to 19 Hz (windows that
     # read 2-10 dB against 25 dB around them are removed rather than shown),
@@ -687,7 +690,7 @@ class Config:
     freq_refine: bool = False
     freq_refine_pct: float = 1.5
     fit_at_exact_frequency: bool = False
-    window_confine: bool = False
+    window_confine: bool = True
     window_min_interval_s: float = 3.0
     window_guard_s: float = 0.5
     window_settle_periods: float = 0.5

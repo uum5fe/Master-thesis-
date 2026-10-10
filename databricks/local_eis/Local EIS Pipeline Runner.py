@@ -1301,6 +1301,9 @@ _CACHE_IDENTITY_KEYS = (
     # where each step's window sits decides every low-frequency point
     'window_confine', 'window_min_interval_s', 'window_guard_s',
     'window_settle_periods', 'window_min_snr_db',
+    # which frequency every fit uses, and the two scatter fixes
+    'freq_refine', 'freq_refine_pct', 'fit_at_exact_frequency',
+    'off_tone_drop_db', 'card_hf_phase',
     # the band: full (to fs/2, R_ohmic = intercept) or coherent
     'full_band', 'full_band_frac_fs', 'coherent_f_max_frac_fs',
     'f_hi_frac_fs', 'r_ohmic_method',

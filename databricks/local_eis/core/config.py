@@ -662,6 +662,21 @@ class Config:
     # in its Gamry slot like a misplaced one (None: never). Normal windows
     # read 6..25 dB, an empty one about -30 dB.
     window_min_snr_db: float | None = -3.0
+    # Blind frequencies (no Gamry): each step's frequency is re-estimated
+    # once on the segment channels within +-freq_refine_pct of the ladder
+    # value (the Gamry rounds its frequencies up to ~1.1 % off the ideal
+    # 10/decade grid), and every fit -- pooled reference and segments --
+    # then uses that one frequency (fit_at_exact_frequency).
+    # silver: reject a point whose segment SNR is this far below the 75th
+    # percentile of the 5 steps on either side (None: off). Correct windows on 2612030
+    # read 17-24 dB; windows on the neighbouring step 0-4 dB.
+    off_tone_drop_db: float | None = 12.0
+    # full band: remove each card's phase offset against the plate above the
+    # coherent limit (silver.card_hf_phase); |Z| is untouched
+    card_hf_phase: bool = True
+    freq_refine: bool = True
+    freq_refine_pct: float = 1.5
+    fit_at_exact_frequency: bool = True
     window_confine: bool = True
     window_min_interval_s: float = 3.0
     window_guard_s: float = 0.5

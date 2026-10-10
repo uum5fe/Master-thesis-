@@ -1546,6 +1546,87 @@ def _on_grid(f: float, grid: dict, tol: float) -> bool:
 # ===========================================================================
 
 
+def refine_frequencies(files: list[Path], cards: dict[str, CardInfo],
+                       schedule: list[Step], grid: dict, cfg: Config,
+                       lags: dict[str, dict] | None = None, log=None
+                       ) -> tuple[list[Step], dict]:
+    """One exact frequency per step, used by EVERY fit that follows.
+
+    With a Gamry sweep the frequencies are the Gamry's own and nothing is
+    estimated. Without one, the ladder snap leaves each step on a perfect
+    10-points-per-decade grid -- but the Gamry rounds every frequency to what
+    its generator can make, up to -1.1 / +0.7 % off that grid (2612030 450 A:
+    step ratios 1.242 .. 1.273 against 1.2589). The per-card estimate then
+    searched only +-3 bins around the snapped value, which at 1516 Hz over a
+    0.31 s window is +-9.7 Hz while the tone was 20 Hz away.
+
+    Here each such step is estimated ONCE, on the stacked segment channels of
+    one aligned card (current channels: flat in frequency, 15-25 dB), with
+    the periodogram search widened to +-`freq_refine_pct` of the snapped
+    value. The result replaces the step frequency; the pooled reference and
+    every segment are then fitted at that same frequency.
+    """
+    log = log or utils.get_logger(cfg.verbose)
+    exact = set(float(f) for f in (grid.get("gamry_freqs") or []))
+
+    def is_exact(f):
+        return any(abs(f - g) <= 1e-6 * g for g in exact)
+
+    todo = [i for i, st in enumerate(schedule) if not is_exact(st.freq)]
+    info = {"n_exact": len(schedule) - len(todo), "n_refined": 0, "rows": []}
+    if not todo or not getattr(cfg, "freq_refine", True):
+        return schedule, info
+    pct = float(getattr(cfg, "freq_refine_pct", 1.5)) / 100.0
+    # the card that carries the estimate: same rate as the common base,
+    # aligned, most segment channels
+    best = None
+    for fp in files:
+        c = cards.get(fp.stem)
+        lg = (lags or {}).get(fp.stem, {})
+        if c is None or card_ratio(lg) != 1.0:
+            continue
+        if lags and not (lg.get("applied") or int(lg.get("lag", 0)) == 0):
+            continue
+        fam = FamosFile(fp)
+        if best is None or len(fam.segment_names) > best[2]:
+            best = (fp, fam, len(fam.segment_names), lg)
+    if best is None or best[2] < 1:
+        return schedule, info
+    fp, fam, _n, lg = best
+    names = list(fam.segment_names)[:16]
+    chans = {nm: fam.channel(nm) for nm in names}
+    out = list(schedule)
+    for i in todo:
+        st = schedule[i]
+        a, b = to_own(st.start, lg), to_own(st.stop, lg)
+        Y = [np.asarray(x[a:b], float) for x in chans.values()
+             if 0 <= a < b <= len(x)]
+        if not Y:
+            continue
+        T = (b - a) / fam.fs
+        try:
+            est = tone_estimation.card_frequency(
+                np.vstack(Y), fam.fs, f_prior=st.freq,
+                prior_band_bins=max(3.0, pct * st.freq * T))
+        except (ValueError, np.linalg.LinAlgError):
+            continue
+        if (est is None or not np.isfinite(est.freq) or est.at_bound
+                or abs(est.freq / st.freq - 1.0) > pct):
+            continue
+        out[i] = ladder_snap._rebuild(Step, st, freq=float(est.freq))
+        info["n_refined"] += 1
+        info["rows"].append({"freq_ladder_hz": float(st.freq),
+                             "freq_hz": float(est.freq),
+                             "shift_pct": 100.0 * (est.freq / st.freq - 1.0)})
+    if info["rows"]:
+        sh = np.array([r["shift_pct"] for r in info["rows"]])
+        log.info(f"  frequency refinement on {fp.stem[-8:]} ({len(names)} "
+                 f"segment channels): {info['n_refined']}/{len(todo)} steps "
+                 f"moved off the ideal ladder, median |shift| "
+                 f"{np.median(np.abs(sh)):.2f} %, max {np.max(np.abs(sh)):.2f} %")
+    return out, info
+
+
 def pooled_reference_phasors(files: list[Path], cards: dict[str, CardInfo],
                              schedule: list[Step], cfg: Config,
                              lags: dict[str, dict] | None = None, log=None
@@ -1838,8 +1919,16 @@ def process_card(fp: Path, cal: PlateCalibration, schedule: list[Step],
                     _win[i].append(np.asarray(_c[a:b], np.float32))
             del _c
         n_card_fb = 0
+        exact = grid.get("exact_freqs") if isinstance(grid, dict) else None
         for i, st in enumerate(schedule):
             if not _win[i]:
+                continue
+            if exact and getattr(cfg, "fit_at_exact_frequency", True):
+                # the pooled reference was fitted at st.freq: the segment must
+                # be fitted at the same frequency, or A_ref / A_seg carries
+                # the phase slip between two frequencies
+                f_card[i] = float(st.freq)
+                _win[i] = None
                 continue
             try:
                 est = tone_estimation.card_frequency(
@@ -2008,6 +2097,10 @@ def run(cfg: Config = DEFAULT, log=None) -> BronzeRun:
     T_seg, sensor_T = plate_temperatures(files, cards, cal, cfg, log)
 
     schedule, grid = consensus_schedule(files, cards, cfg, log, lags=lags)
+    schedule, grid["freq_refine"] = refine_frequencies(
+        files, cards, schedule, grid, cfg, lags=lags, log=log)
+    # every step now carries the frequency every fit below uses
+    grid["exact_freqs"] = [float(s.freq) for s in schedule]
 
     utils.section("per-segment raw phasors", log)
     # One cell-voltage phasor per step, pooled over every aligned card.  This

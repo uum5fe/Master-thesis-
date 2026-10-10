@@ -1270,6 +1270,9 @@ REJECT_REASONS = {
                     "cfg.coherent_f_max_frac_fs * fs) -- or "
                     "cfg.full_band_frac_fs * fs with cfg.full_band",
     "snr": "SNR below the gate for this point",
+    "off_tone": "segment SNR far below the neighbouring steps' "
+                "(cfg.off_tone_drop_db): the window holds the wrong stretch "
+                "of record",
     "thd": "harmonic distortion above cfg.max_thd",
     "drift": "amplitude drifted during the dwell, above cfg.max_drift",
     "magnitude": "|Z| outside the plausible 0.5 .. 800 mOhm.cm2 window",
@@ -1325,6 +1328,31 @@ def gate_points(sp: BronzeSpectrum, cfg: Config) -> dict:
                         snr >= getattr(cfg, "silver_snr_gate_db",
                                        cfg.min_snr_db))
     keep &= gate(np.nan_to_num(snr_gate, nan=False).astype(bool), "snr")
+
+    # A window that holds the wrong stretch of record -- the tail of the
+    # neighbouring step, or a gap -- shows as a segment SNR far below the
+    # steps around it, while the CRLB still calls it precise because N is
+    # large: on 2612030 450 A the 3.0, 6.0, 9.5, 12 and 15 Hz windows read
+    # 0-4 dB against 17-24 dB for their neighbours, and were the saw-tooth in
+    # the outlet segments' low-frequency arc.
+    drop_db = getattr(cfg, "off_tone_drop_db", 12.0)
+    if drop_db is not None and len(freq) >= 5:
+        s_seg = np.asarray(getattr(sp, "snr_seg_db", np.full(len(freq), np.nan)),
+                           float)
+        o = np.argsort(freq)
+        ok_tone = np.ones(len(freq), bool)
+        # the reference is the 75th percentile of the 5 steps on either
+        # side: wrong windows come in runs (6, 9.5, 12 and 15 Hz together on
+        # 2612030), and a median of a run of bad neighbours is itself bad
+        for pos, i in enumerate(o):
+            nb = [o[j] for j in range(max(0, pos - 5), min(len(o), pos + 6))
+                  if j != pos]
+            ref = s_seg[nb]
+            ref = ref[np.isfinite(ref)]
+            if ref.size >= 3 and np.isfinite(s_seg[i]):
+                ok_tone[i] = (s_seg[i] >= float(np.percentile(ref, 75))
+                              - float(drop_db))
+        keep &= gate(ok_tone, "off_tone")
     keep &= gate(~(np.isfinite(sp.thd) & (sp.thd > cfg.max_thd)), "thd")
     keep &= gate(~(np.isfinite(sp.drift) & (sp.drift > cfg.max_drift)), "drift")
 
@@ -1387,7 +1415,8 @@ def gate_points(sp: BronzeSpectrum, cfg: Config) -> dict:
 
 def process_segment(sp: BronzeSpectrum, skew: SkewModel, cfg: Config,
                     log=None, ledger: list | None = None,
-                    chain: "channel_lag.ChannelLag | None" = None
+                    chain: "channel_lag.ChannelLag | None" = None,
+                    card_phase: dict | None = None
                     ) -> SilverSpectrum | None:
     """De-skew, weight, model, validate and grade one segment.
 
@@ -1454,6 +1483,14 @@ def process_segment(sp: BronzeSpectrum, skew: SkewModel, cfg: Config,
     if chain is not None and chain.applied_s:
         z_corr = z_corr * channel_lag.correction(f, chain.applied_s,
                                                getattr(chain, "model", "delay"))
+    # ---- this card's phase above the coherent limit (card_hf_phase) -------
+    n_card_ph = 0
+    if card_phase:
+        for k, fi in enumerate(f):
+            d = card_phase.get(round(float(fi), 6))
+            if d is not None:
+                z_corr[k] = z_corr[k] * np.exp(-1j * d)
+                n_card_ph += 1
     # ---- the UC taps' own series resistance (cfg.uc_series_mohm_cm2) -----
     r_tap = float(getattr(cfg, "uc_series_mohm_cm2", 0.0) or 0.0)
     if r_tap:
@@ -1562,6 +1599,8 @@ def process_segment(sp: BronzeSpectrum, skew: SkewModel, cfg: Config,
         flags.append(f"dropped_{n_drop_out}_zmag_outlier")
     if n_drop_pass:
         flags.append(f"dropped_{n_drop_pass}_non_passive_after_deskew")
+    if n_card_ph:
+        flags.append(f"card_hf_phase_{n_card_ph}pts")
     if n_neg_lf:
         # kept deliberately - see Schneider et al. 2009
         flags.append(f"negative_ReZ_lf_{n_neg_lf}pts")
@@ -1658,6 +1697,66 @@ def channel_lag_items(spectra: dict, skew: dict, cfg: Config) -> dict:
         items[seg] = (g["freq"], utils.apply_delay(g["freq"], g["Z"], dt),
                       keep)
     return items
+
+
+def card_hf_phase(spectra: dict, skew: dict, lags: dict, cfg: Config,
+                  log=None) -> dict[str, dict[float, float]]:
+    """Per-card phase offset above the phase-coherent limit (full band only).
+
+    Below 0.16 fs every channel's chain is a pure delay and channel_lag
+    removes it. Above it the five cards part in a way a delay cannot
+    describe: on 2612030 450 A at 4733 Hz cards 1-2 read +23 deg, card 3
+    +35, cards 4-5 +43 -- the fan of the high-frequency Nyquist. At those
+    frequencies the cell is ohmic plus inductive and nearly uniform, so the
+    median phase of a card's segments minus the plate median, frequency by
+    frequency, is the card's own response. That difference is removed; |Z|
+    is left alone, so a real regional difference in magnitude stays.
+
+    Returns {card: {freq: delta_rad}}; empty below the limit or without
+    full_band.
+    """
+    if not (getattr(cfg, "full_band", False)
+            and getattr(cfg, "card_hf_phase", True)):
+        return {}
+    frac = float(getattr(cfg, "coherent_f_max_frac_fs", 0.16) or 0.16)
+    by_f: dict[float, list[tuple[str, float]]] = {}
+    for seg, sp in spectra.items():
+        fs = float(getattr(sp, "fs", np.nan))
+        if not (np.isfinite(fs) and fs > 0):
+            continue
+        g = gate_points(sp, cfg)
+        sk = skew.get(sp.card)
+        dt = (sk.dt_for(sp.channel_slot, sp.ref_slot)
+              if sk is not None and sk.applied else 0.0)
+        f = np.asarray(g["freq"], float)
+        z = utils.apply_delay(f, np.asarray(g["Z"], complex), dt)
+        ch = (lags or {}).get(seg)
+        if ch is not None and ch.applied_s:
+            z = z * channel_lag.correction(f, ch.applied_s,
+                                           getattr(ch, "model", "delay"))
+        use = np.asarray(g["keep"], bool) & (f > frac * fs) & np.isfinite(z)
+        for fi, zi in zip(f[use], z[use]):
+            by_f.setdefault(round(float(fi), 6), []).append(
+                (sp.card, float(np.angle(zi))))
+    out: dict[str, dict[float, float]] = {}
+    for fk, rows in by_f.items():
+        if len(rows) < 6:
+            continue
+        plate = float(np.median([a for _c, a in rows]))
+        cards = {}
+        for c, a in rows:
+            cards.setdefault(c, []).append(a)
+        for c, a in cards.items():
+            if len(a) >= 3:
+                out.setdefault(c, {})[fk] = float(np.median(a)) - plate
+    if out and log is not None:
+        utils.section("card phase above the coherent limit (full band)", log)
+        for c in sorted(out):
+            top = sorted(out[c].items())
+            txt = ", ".join(f"{f:.0f} Hz {np.degrees(d):+.1f} deg"
+                            for f, d in top[:4])
+            log.info(f"  {c[-8:]}: {txt}" + (" ..." if len(top) > 4 else ""))
+    return out
 
 
 # ===========================================================================
@@ -1957,6 +2056,15 @@ def run(bronze_run: BronzeRun, cfg: Config = DEFAULT, log=None) -> SilverRun:
             log.warning(f"  channel lag skipped: {type(exc).__name__}: {exc}")
             lags = {}
 
+    # ---- 1c. each card's phase above the coherent limit (full band) -------
+    card_ph: dict = {}
+    try:
+        card_ph = card_hf_phase(
+            {s: bronze_run.spectra[s] for s in bronze_run.segments_measured()},
+            skew, lags, cfg, log)
+    except Exception as exc:                      # a correction, not a gate
+        log.warning(f"  card phase skipped: {type(exc).__name__}: {exc}")
+
     # ---- 2. per segment ----------------------------------------------------
     utils.section("measurement model per segment", log)
     spectra: dict[str, SilverSpectrum] = {}
@@ -1967,7 +2075,8 @@ def run(bronze_run: BronzeRun, cfg: Config = DEFAULT, log=None) -> SilverRun:
         sp = bronze_run.spectra[seg]
         try:
             res = process_segment(sp, skew[sp.card], cfg, log,
-                                  ledger=point_ledger, chain=lags.get(seg))
+                                  ledger=point_ledger, chain=lags.get(seg),
+                                  card_phase=card_ph.get(sp.card))
         except Exception as exc:                      # never lose the plate
             log.warning(f"    segment {seg}: {type(exc).__name__}: {exc}")
             res = None

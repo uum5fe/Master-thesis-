@@ -103,3 +103,53 @@ def test_the_channel_lag_fit_stays_below_the_coherent_limit():
     items = silver.channel_lag_items({"1": sp}, {}, full)
     fq, _Z, use = items["1"]
     assert fq[use].max() <= 0.16 * FS
+
+
+def test_a_window_on_the_wrong_stretch_of_record_is_rejected():
+    """Its segment SNR sits far below its neighbours' while the CRLB, with
+    tens of thousands of samples, still calls it precise."""
+    f = _sweep()
+    sp = _spectrum(f, _z(f))
+    s = np.full(f.size, 20.0)
+    bad = int(np.argmin(np.abs(f - 3.0)))
+    s[bad] = 1.0                                  # 2612030 450 A, 3.0 Hz
+    sp.snr_seg_db = s
+    g = silver.gate_points(sp, DEFAULT)
+    assert not g["keep"][bad] and g["reason"][bad] == "off_tone"
+    assert g["reason"][bad - 1] != "off_tone"
+    assert g["reason"][bad + 1] != "off_tone"
+    off = silver.gate_points(sp, DEFAULT.replace(off_tone_drop_db=None))
+    assert off["reason"][bad] != "off_tone"
+
+
+def test_each_cards_high_frequency_phase_is_taken_out():
+    """Above the coherent limit cards 4-5 read 20 deg more than cards 1-2 on
+    2612030; the per-card offset against the plate median is removed, the
+    magnitude is not."""
+    f = _sweep()
+    full = DEFAULT.replace(full_band=True)
+    offs = {"Karte_1": 0.0, "Karte_2": 0.0, "Karte_4": np.radians(20.0)}
+    spectra = {}
+    n = 0
+    for card, d in offs.items():
+        for k in range(4):
+            n += 1
+            Z = _z(f) * (1 + 0.02 * k)
+            Z = np.where(f > 0.16 * FS, Z * np.exp(1j * d), Z)
+            sp = _spectrum(f, Z)
+            sp.segment, sp.card = str(n), card
+            spectra[str(n)] = sp
+    ph = silver.card_hf_phase(spectra, {}, {}, full)
+    assert set(ph) == set(offs)
+    f_hi = [k for k in ph["Karte_4"] if k > 0.16 * FS]
+    assert f_hi and all(abs(np.degrees(ph["Karte_4"][k]) - 20.0) < 1.0
+                        for k in f_hi)
+    assert all(abs(ph["Karte_1"][k]) < 1e-6 for k in f_hi)
+    res = silver.process_segment(spectra["9"], _skew(), full,
+                                 card_phase=ph["Karte_4"])
+    i = int(np.argmin(np.abs(res.freq - 7546.88)))
+    ref = _z(res.freq[i:i + 1])[0] * 1.0
+    assert abs(np.degrees(np.angle(res.Z_corr[i] / ref))) < 1.0
+    assert abs(abs(res.Z_corr[i]) / abs(ref) - 1.0) < 1e-6
+    assert any(fl.startswith("card_hf_phase") for fl in res.flags)
+    assert silver.card_hf_phase(spectra, {}, {}, DEFAULT) == {}

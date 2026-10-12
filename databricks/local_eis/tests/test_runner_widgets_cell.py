@@ -198,7 +198,7 @@ def test_recommended_profile_pins_the_settings_of_the_clean_script(volume,
     assert ns["PARAM_PROFILE"] == "recommended"
     assert ns["EVALUATION_MODE"] == "default"
     assert ns["MIN_SNR_DB"] == 0.0
-    assert ns["F_MAX"] == 4500.0
+    assert ns["F_MAX"] == 30000.0          # full band: the whole sweep
     assert ns["F_MIN"] == 0.15
     out = capsys.readouterr().out
     assert "evaluation_mode=permissive" in out and "ignored" in out
@@ -215,18 +215,18 @@ def test_custom_profile_uses_the_widgets(volume) -> None:
     assert ns["F_MAX"] == 2000.0
 
 
-def test_the_coherent_band_is_the_default_and_full_is_a_choice(volume,
-                                                                capsys) -> None:
-    """The established evaluation stops at the coherent limit and F max
-    (4500 Hz); 'full' evaluates the whole sweep up to fs/2 and is not pulled
-    back to 4500 Hz by the recommended profile."""
+def test_the_full_band_is_the_default_and_coherent_is_a_choice(volume,
+                                                               capsys) -> None:
+    """The kept (09.10 v3) evaluation runs the whole sweep up to fs/2 and is
+    not pulled back to 4500 Hz by the recommended profile; 'coherent' stops
+    at the coherent limit and F max (4500 Hz)."""
     ns = _run_cell(volume, {})
-    assert ns["FULL_BAND"] is False and ns["F_MAX"] == 4500.0
-    ns = _run_cell(volume, {"f_band": "full", "f_max_hz": "4500.0"})
     assert ns["FULL_BAND"] is True
     assert ns["F_MAX"] == 30000.0
     assert "full band" in ns["BAND_TEXT"]
     assert "f_max_hz" not in capsys.readouterr().out
+    ns = _run_cell(volume, {"f_band": "coherent", "f_max_hz": "4500.0"})
+    assert ns["FULL_BAND"] is False and ns["F_MAX"] == 4500.0
 
 
 def test_the_clean_script_config_is_the_default() -> None:

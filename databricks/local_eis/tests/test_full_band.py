@@ -155,3 +155,81 @@ def test_each_cards_high_frequency_phase_is_taken_out():
     assert abs(abs(res.Z_corr[i]) / abs(ref) - 1.0) < 1e-6
     assert any(fl.startswith("card_hf_phase") for fl in res.flags)
     assert silver.card_hf_phase(spectra, {}, {}, DEFAULT) == {}
+
+
+def _gamry(monkeypatch, tmp_path, f, Z):
+    import gamry_compare
+    from pathlib import Path
+    sweep = gamry_compare.CellSweep(path=Path(tmp_path / "450A.DTA"),
+                                    freq=f[::-1].copy(), Z_ohm=Z[::-1] / 300.0,
+                                    current_a=450.0, started=None)
+    monkeypatch.setattr(gamry_compare, "find_cell_sweeps",
+                        lambda *a, **k: [sweep])
+    return DEFAULT.replace(full_band=True, gamry_dir=tmp_path,
+                           condition="450A")
+
+
+def test_each_cards_phase_is_calibrated_against_the_gamry(monkeypatch,
+                                                          tmp_path):
+    """2612030: channel_lag aligns every channel to the plate median, so the
+    ~11 us lead all of them share survives it, and cards 3-5 add their own
+    filter lead above ~3.8 kHz -- the tails that bend down and to the left.
+    Per card, the delay is fitted against the Gamry and removed everywhere,
+    and from 1 kHz up the card's remaining offset is removed too; phase
+    only."""
+    f = _sweep()
+    lead = {"Karte_1": 11e-6, "Karte_2": 11e-6, "Karte_3": 8e-6}
+    spectra = {}
+    n = 0
+    for card, tau in lead.items():
+        for k in range(4):
+            n += 1
+            Z = _z(f) * (1 + 0.02 * k) * np.exp(2j * np.pi * f * tau)
+            if card == "Karte_3":                  # its filter above 3.8 kHz
+                Z = np.where(f > 3800, Z * np.exp(1j * np.radians(15.0)), Z)
+            sp = _spectrum(f, Z)
+            sp.segment, sp.card = str(n), card
+            spectra[str(n)] = sp
+    cfg = _gamry(monkeypatch, tmp_path, f, _z(f))
+    got = silver.gamry_card_phase(spectra, {}, {}, cfg)
+    assert got["applied"] and set(got["phase"]) == set(lead)
+    for card, tau in lead.items():
+        assert abs(got["cards"][card]["tau_us"] - 1e6 * tau) < 0.3
+        assert got["cards"][card]["resid_deg"] < 0.5
+
+    for seg in ("1", "9"):
+        sp = spectra[seg]
+        res = silver.process_segment(sp, _skew(), cfg,
+                                     card_phase=got["phase"][sp.card],
+                                     card_phase_ref="gamry")
+        scale = 1 + 0.02 * ((int(seg) - 1) % 4)
+        for f0 in (98.0, 1194.0, 7546.88):
+            i = int(np.argmin(np.abs(res.freq - f0)))
+            ref = _z(res.freq[i:i + 1])[0] * scale
+            assert abs(np.degrees(np.angle(res.Z_corr[i] / ref))) < 1.0, f0
+            assert abs(abs(res.Z_corr[i]) / abs(ref) - 1.0) < 1e-6
+        assert any(fl.startswith("card_phase_vs_gamry") for fl in res.flags)
+
+    # no sweep for the condition, the coherent band, or switched off: nothing
+    for c in (cfg.replace(condition="60A"), cfg.replace(full_band=False),
+              cfg.replace(gamry_card_phase=False)):
+        r = silver.gamry_card_phase(spectra, {}, {}, c)
+        assert not r["applied"] and r["phase"] == {}
+
+
+def test_a_card_with_an_implausible_delay_is_left_alone(monkeypatch,
+                                                         tmp_path):
+    """A fit far beyond any chain delay (here 200 us) means the comparison
+    went wrong (wrong sweep, wrong condition): that card is not touched."""
+    f = _sweep()
+    spectra = {}
+    for k in range(8):
+        card = "Karte_1" if k < 4 else "Karte_2"
+        tau = 200e-6 if card == "Karte_2" else 11e-6
+        sp = _spectrum(f, _z(f) * np.exp(2j * np.pi * f * tau))
+        sp.segment, sp.card = str(k + 1), card
+        spectra[sp.segment] = sp
+    cfg = _gamry(monkeypatch, tmp_path, f, _z(f))
+    got = silver.gamry_card_phase(spectra, {}, {}, cfg)
+    assert got["applied"] and set(got["phase"]) == {"Karte_1"}
+    assert "not credible" in got["cards"]["Karte_2"]["reason"]

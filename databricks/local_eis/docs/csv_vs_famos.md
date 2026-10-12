@@ -38,6 +38,24 @@ What differs between the three:
 - **The CSV's Re Z falls towards 0 at 10 kHz; the Gamry's does not** (it stays at 44–49 up to 30 kHz). A cell resistance cannot fall like that. The tool's current chain adds about +13° at 10 kHz over the Gamry (about 4 µs of uncorrected delay), which rotates the spectrum and pulls Re down. That is also why 3 segments go non-passive (Re Z ≤ 0) and an ECM on the full CSV band put Rs at 0. On the capacitive band only, Rs is 44–49 mΩ·cm², close to the intercept.
 - **FAMOS crosses earlier than the Gamry (1.9 vs 3.4 kHz).** Against the Gamry, the FAMOS segments carry about 10 µs of phase lead common to all channels: 5° at 1.5 kHz, 12° at 3 kHz. The in-situ lag correction measures each channel against the plate median, so a delay shared by every channel cannot be seen by it. A bench sweep of each FAMOS card with the same Gamry sweep would measure it.
 
+**Now corrected in the full band (`gamry_card_phase`, on by default).** With the full band, the tails bent down and to the left: at 12 kHz the plate read +60 to +73° where the Gamry reads +21°. Two chain effects add up:
+- every channel shares a lead of 10–13 µs;
+- cards 3–5 add their own filter lead above about 3.8 kHz (+15 to +23 µs apparent at 4.7–5.9 kHz).
+
+Silver now calibrates each card against the condition's Gamry whole-cell sweep:
+- **Delay.** It fits the card's delay to the median phase difference over 1 kHz – 0.12·f_s (3 kHz), where every card still behaves as a delay, and removes it at all frequencies.
+- **Filter.** From 1 kHz up, it also removes the card's remaining median offset to the Gamry, step by step.
+
+Only the phase changes. |Z| is untouched, so regional magnitude differences stay, and the segments of a card keep their spread around the card median.
+
+On the delivered v3 results this would give:
+- phase at 12 kHz of 21–22°, the same as the Gamry, instead of 60–73°;
+- an R_ohmic intercept median of 48–50 mΩ·cm², instead of 55–56 (Gamry 45–47).
+
+A card is left alone when its delay is above 50 µs or the fit residual is above 5°. When no Gamry sweep exists for the condition, the older plate-median card correction above 4 kHz is used. The log section "card phase calibrated against the Gamry" and `silver_manifest.json` (`gamry_card_phase`, `card_phase_deg`) show what was removed.
+
+The correction cannot remove one thing: single segments whose |Z| itself falls or rises above 4 kHz. Card 2 falls to about 0.8 of its 3 kHz level at 12 kHz and card 3 rises to about 1.2, while the Gamry stays at about 1.0. This is a per-channel amplitude response. Those tails still lean left or right. Read R_ohmic for those segments at the crossing (about 3 kHz), not from the 12 kHz end.
+
 ### 2. The HFR is defined differently, but the numbers agree
 
 | median, mΩ·cm² | 45 A | 150 A | 450 A |

@@ -674,7 +674,7 @@ class Config:
     # than this median SNR at its frequency holds no tone and is searched for
     # in its Gamry slot like a misplaced one (None: never). Normal windows
     # read 6..25 dB, an empty one about -30 dB.
-    window_min_snr_db: float | None = None
+    window_min_snr_db: float | None = -3.0
     # Blind frequencies (no Gamry): each step's frequency is re-estimated
     # once on the segment channels within +-freq_refine_pct of the ladder
     # value (the Gamry rounds its frequencies up to ~1.1 % off the ideal
@@ -685,8 +685,23 @@ class Config:
     # read 17-24 dB; windows on the neighbouring step 0-4 dB.
     off_tone_drop_db: float | None = None
     # full band: remove each card's phase offset against the plate above the
-    # coherent limit (silver.card_hf_phase); |Z| is untouched
+    # coherent limit (silver.card_hf_phase); |Z| is untouched. Used when no
+    # Gamry sweep of the condition is found (or gamry_card_phase is off).
     card_hf_phase: bool = True
+    # full band: calibrate each card's phase against the condition's
+    # whole-cell Gamry sweep (silver.gamry_card_phase). Per card, a delay is
+    # fitted between gamry_phase_f_lo_hz and gamry_phase_fit_hi_frac_fs * fs
+    # (~10-13 us on 2612030; channel_lag cannot see a delay all channels
+    # share) and removed at every frequency; at and above gamry_phase_f_lo_hz
+    # the card's remaining median phase offset to the Gamry is removed step
+    # by step (the card filters above ~3.8 kHz). Phase only, |Z| untouched.
+    # A card is corrected only when |tau| <= gamry_delay_max_us and the
+    # delay fit residual <= gamry_delay_max_resid_deg.
+    gamry_card_phase: bool = True
+    gamry_phase_f_lo_hz: float = 1000.0
+    gamry_phase_fit_hi_frac_fs: float = 0.12
+    gamry_delay_max_us: float = 50.0
+    gamry_delay_max_resid_deg: float = 5.0
     freq_refine: bool = False
     freq_refine_pct: float = 1.5
     fit_at_exact_frequency: bool = False

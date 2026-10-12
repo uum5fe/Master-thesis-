@@ -124,7 +124,7 @@ importlib.reload(plate_stats)
 _BUILD_MARKERS = {
     config: ['full_band'], plate_stats: ['tile_stats', 'write_statistics'],
     geom: ['label_xy'], bronze: ['to_own', 'to_common'],
-    silver: ['r_ohmic_intercept'], gold: ['plate_stats'],
+    silver: ['r_ohmic_intercept', 'gamry_card_phase'], gold: ['plate_stats'],
     plate_figure: ['node_xy'], plate_maps: ['uniformity_stats'],
     plausibility: ['_tile_or_all'], gamry_sync: ['confine_windows'],
 }
@@ -604,8 +604,10 @@ try:
     # then the measured real-axis intercept. coherent: stop at the limit
     # where the five cards still agree as pure delays (0.16 fs = 4 kHz at
     # 25 kHz) and at F max; R_ohmic is the top-band mean. This widget is not
-    # pinned by the parameter profile.
-    dbutils.widgets.dropdown('f_band', 'coherent', ['coherent', 'full'],
+    # pinned by the parameter profile. With 'full', each card's phase is
+    # calibrated against the condition's Gamry whole-cell sweep (its delay,
+    # and its filter above ~3.8 kHz; phase only, |Z| untouched).
+    dbutils.widgets.dropdown('f_band', 'full', ['full', 'coherent'],
                              'Band (full = up to fs/2)')
     dbutils.widgets.dropdown('min_snr_db', '0',
                              ['-30', '-20', '-10', '-3', '0', '3', '5', '8',
@@ -766,7 +768,7 @@ COND_FILTER = ('ALL' if SELECTED_CONDITIONS == list(CONDITIONS)
                else ', '.join(SELECTED_CONDITIONS))
 F_MIN = float(_w('f_min_hz', '0.15'))
 F_MAX = float(_w('f_max_hz', '4500.0'))
-FULL_BAND = _w('f_band', 'coherent') == 'full'
+FULL_BAND = _w('f_band', 'full') == 'full'
 MIN_SNR_DB = float(_w('min_snr_db', '0'))
 STOP_AFTER = _w('stop_after', 'gold')
 EVALUATION_MODE = _w('evaluation_mode', 'default')
@@ -1304,6 +1306,9 @@ _CACHE_IDENTITY_KEYS = (
     # which frequency every fit uses, and the two scatter fixes
     'freq_refine', 'freq_refine_pct', 'fit_at_exact_frequency',
     'off_tone_drop_db', 'card_hf_phase',
+    # each card's phase calibrated against the Gamry sweep
+    'gamry_card_phase', 'gamry_phase_f_lo_hz', 'gamry_phase_fit_hi_frac_fs',
+    'gamry_delay_max_us', 'gamry_delay_max_resid_deg',
     # the band: full (to fs/2, R_ohmic = intercept) or coherent
     'full_band', 'full_band_frac_fs', 'coherent_f_max_frac_fs',
     'f_hi_frac_fs', 'r_ohmic_method',

@@ -264,6 +264,12 @@ class SilverRun:
     card_lags: dict = field(default_factory=dict)
     #: bronze's UC check: {channel: {card: card_gain.CardReference}}
     card_ref: dict = field(default_factory=dict)
+    #: full band: the phase removed per card and frequency [deg], and how it
+    #: was measured: against the Gamry (silver.gamry_card_phase) or, without
+    #: a sweep, against the plate above the coherent limit (card_hf_phase)
+    card_hf_phase: dict = field(default_factory=dict)
+    gamry_card_phase: dict = field(default_factory=dict)
+    card_phase_ref: str = "plate"
 
     def card_factors(self) -> dict:
         """card -> card_gain.CardFactor: |Z| per band and j_dc vs the plate."""
@@ -1416,7 +1422,8 @@ def gate_points(sp: BronzeSpectrum, cfg: Config) -> dict:
 def process_segment(sp: BronzeSpectrum, skew: SkewModel, cfg: Config,
                     log=None, ledger: list | None = None,
                     chain: "channel_lag.ChannelLag | None" = None,
-                    card_phase: dict | None = None
+                    card_phase: dict | None = None,
+                    card_phase_ref: str = "plate"
                     ) -> SilverSpectrum | None:
     """De-skew, weight, model, validate and grade one segment.
 
@@ -1483,7 +1490,8 @@ def process_segment(sp: BronzeSpectrum, skew: SkewModel, cfg: Config,
     if chain is not None and chain.applied_s:
         z_corr = z_corr * channel_lag.correction(f, chain.applied_s,
                                                getattr(chain, "model", "delay"))
-    # ---- this card's phase above the coherent limit (card_hf_phase) -------
+    # ---- this card's phase: against the Gamry (gamry_card_phase) or, without
+    # ---- one, against the plate above the coherent limit (card_hf_phase) --
     n_card_ph = 0
     if card_phase:
         for k, fi in enumerate(f):
@@ -1600,7 +1608,9 @@ def process_segment(sp: BronzeSpectrum, skew: SkewModel, cfg: Config,
     if n_drop_pass:
         flags.append(f"dropped_{n_drop_pass}_non_passive_after_deskew")
     if n_card_ph:
-        flags.append(f"card_hf_phase_{n_card_ph}pts")
+        flags.append(f"card_phase_vs_gamry_{n_card_ph}pts"
+                     if card_phase_ref == "gamry"
+                     else f"card_hf_phase_{n_card_ph}pts")
     if n_neg_lf:
         # kept deliberately - see Schneider et al. 2009
         flags.append(f"negative_ReZ_lf_{n_neg_lf}pts")
@@ -1756,6 +1766,161 @@ def card_hf_phase(spectra: dict, skew: dict, lags: dict, cfg: Config,
             txt = ", ".join(f"{f:.0f} Hz {np.degrees(d):+.1f} deg"
                             for f, d in top[:4])
             log.info(f"  {c[-8:]}: {txt}" + (" ..." if len(top) > 4 else ""))
+    return out
+
+
+def _segment_phase_items(spectra: dict, skew: dict, lags: dict,
+                         card_ph: dict, cfg: Config):
+    """(freq, corrected Z, keep, fs) per segment: the de-skew, the channel lag
+    and the card phase, exactly as process_segment applies them."""
+    out = {}
+    for seg, sp in spectra.items():
+        g = gate_points(sp, cfg)
+        sk = skew.get(sp.card)
+        dt = (sk.dt_for(sp.channel_slot, sp.ref_slot)
+              if sk is not None and sk.applied else 0.0)
+        f = np.asarray(g["freq"], float)
+        z = utils.apply_delay(f, np.asarray(g["Z"], complex), dt)
+        ch = (lags or {}).get(seg)
+        if ch is not None and ch.applied_s:
+            z = z * channel_lag.correction(f, ch.applied_s,
+                                           getattr(ch, "model", "delay"))
+        cp = (card_ph or {}).get(sp.card) or {}
+        if cp:
+            z = np.array([zi * np.exp(-1j * cp.get(round(float(fi), 6), 0.0))
+                          for fi, zi in zip(f, z)], complex)
+        out[seg] = (f, z, np.asarray(g["keep"], bool),
+                    float(getattr(sp, "fs", np.nan)))
+    return out
+
+
+def gamry_card_phase(spectra: dict, skew: dict, lags: dict, cfg: Config,
+                     log=None) -> dict:
+    """Each card's phase calibrated against the condition's Gamry sweep.
+
+    channel_lag measures each channel against the plate median, so a delay
+    every channel shares cannot be seen by it, and card_hf_phase measures
+    each card against the plate median, which above ~3.8 kHz is itself
+    pulled by the three cards whose filters turn on there. On 2612030 the
+    result was the high-frequency fan: at 12 kHz the plate read +60..73 deg
+    where the Gamry reads +21 deg -- the tails that bend down and to the left.
+
+    The whole-cell Gamry sees the same cell at the same moment, and above
+    ~1 kHz the cell is ohmic plus inductive and nearly uniform. So per card:
+
+      d(f)  = median over the card's segments of phase(Z_seg) - phase(Z_Gamry)
+      tau_c = least squares through the origin of d(f) = 2 pi f tau_c between
+              gamry_phase_f_lo_hz and gamry_phase_fit_hi_frac_fs * fs, where
+              every card still behaves as a delay (10-13 us on 2612030)
+
+    tau_c is removed at every frequency (a delay is a delay at all
+    frequencies); at and above gamry_phase_f_lo_hz the measured d(f) itself
+    is removed, which also takes out the card filter above the coherent
+    limit. Phase only: |Z| is untouched, so regional differences in
+    magnitude stay; the segments of one card keep their spread around the
+    card median.
+
+    Returns {"applied", "sweep", "reason", "cards": {card: {...}},
+    "phase": {card: {freq: delta_rad}}}; "phase" is empty when nothing was
+    applied (no full band, no sweep, or no credible card).
+    """
+    out: dict = {"applied": False, "phase": {}, "cards": {}}
+    if not (getattr(cfg, "full_band", False)
+            and getattr(cfg, "gamry_card_phase", True)):
+        out["reason"] = "off"
+        return out
+    root = getattr(cfg, "gamry_dir", None)
+    if not root:
+        out["reason"] = "no gamry_dir"
+        return out
+    try:
+        import gamry_compare
+        found = gamry_compare.find_cell_sweeps(
+            root, order_id=getattr(cfg, "leepa", None),
+            version=getattr(cfg, "gamry_version", "") or None)
+    except Exception as exc:                                # noqa: BLE001
+        out["reason"] = f"sweep not read: {exc}"
+        return out
+    want = str(getattr(cfg, "condition", "") or "").upper()
+    hits = [s for s in found if s.condition.upper() == want]
+    if not hits:
+        out["reason"] = f"no whole-cell sweep for {want or '?'}"
+        return out
+    sw = hits[-1]
+    out["sweep"] = sw.path.name
+    gf = np.asarray(sw.freq, float)
+    o = np.argsort(gf)
+    gf = gf[o]
+    gph = np.unwrap(np.angle(np.asarray(sw.Z_ohm, complex)[o]))
+
+    f_lo = float(getattr(cfg, "gamry_phase_f_lo_hz", 1000.0))
+    hi_frac = float(getattr(cfg, "gamry_phase_fit_hi_frac_fs", 0.12))
+    t_max = 1e-6 * float(getattr(cfg, "gamry_delay_max_us", 50.0))
+    r_max = float(getattr(cfg, "gamry_delay_max_resid_deg", 5.0))
+
+    items = _segment_phase_items(spectra, skew, lags, {}, cfg)
+    by_card: dict[str, dict[float, list[float]]] = {}
+    freqs: dict[str, set] = {}
+    fs_card: dict[str, float] = {}
+    for seg, (f, z, keep, fs) in items.items():
+        card = spectra[seg].card
+        freqs.setdefault(card, set()).update(round(float(x), 6) for x in f)
+        if np.isfinite(fs) and fs > 0:
+            fs_card[card] = fs
+        use = keep & np.isfinite(z) & (f >= gf.min()) & (f <= gf.max())
+        for fi, zi in zip(f[use], z[use]):
+            g = float(np.interp(np.log(fi), np.log(gf), gph))
+            d = float(np.angle(zi * np.exp(-1j * g)))      # wrapped difference
+            by_card.setdefault(card, {}).setdefault(
+                round(float(fi), 6), []).append(d)
+
+    for card in sorted(by_card):
+        med = {fk: float(np.median(v)) for fk, v in by_card[card].items()
+               if len(v) >= 3}
+        fs = fs_card.get(card, np.nan)
+        f_hi = hi_frac * fs if np.isfinite(fs) else 3000.0
+        fit = sorted((fk, d) for fk, d in med.items() if f_lo <= fk <= f_hi)
+        info: dict = {"n_fit": len(fit)}
+        if len(fit) < 3:
+            info["reason"] = "fewer than 3 frequencies to fit the delay"
+            out["cards"][card] = info
+            continue
+        w = 2 * np.pi * np.array([r[0] for r in fit])
+        d = np.array([r[1] for r in fit])
+        tau = float(np.sum(w * d) / np.sum(w * w))
+        resid = float(np.degrees(np.sqrt(np.mean((d - w * tau) ** 2))))
+        info.update(tau_us=round(1e6 * tau, 2), resid_deg=round(resid, 2))
+        if abs(tau) > t_max or resid > r_max:
+            info["reason"] = (f"not credible: tau {1e6 * tau:+.1f} us, "
+                              f"residual {resid:.1f} deg")
+            out["cards"][card] = info
+            continue
+        ph = {fk: (med[fk] if fk >= f_lo and fk in med
+                   else 2 * np.pi * fk * tau)
+              for fk in sorted(freqs.get(card, ()))}
+        top = max((fk for fk in med if fk >= f_lo), default=None)
+        info.update(applied=True,
+                    dphi_top_deg=(round(float(np.degrees(med[top])), 1)
+                                  if top else None),
+                    f_top_hz=round(top, 1) if top else None)
+        out["cards"][card] = info
+        out["phase"][card] = ph
+    out["applied"] = bool(out["phase"])
+    if not out["applied"]:
+        out["reason"] = "no card with a credible delay fit"
+    if log is not None:
+        utils.section("card phase calibrated against the Gamry (full band)",
+                      log)
+        log.info(f"  {sw.path.name}: per card, median phase - Gamry phase; "
+                 f"delay fitted {f_lo:.0f} Hz .. {hi_frac:.2f} fs, the "
+                 f"measured offset removed from {f_lo:.0f} Hz up")
+        for c, i in sorted(out["cards"].items()):
+            if i.get("applied"):
+                log.info(f"  {c[-8:]}: tau {i['tau_us']:+.1f} us (residual "
+                         f"{i['resid_deg']:.1f} deg); at {i['f_top_hz']:.0f} "
+                         f"Hz {i['dphi_top_deg']:+.1f} deg removed")
+            else:
+                log.info(f"  {c[-8:]}: NOT corrected ({i.get('reason')})")
     return out
 
 
@@ -2056,14 +2221,23 @@ def run(bronze_run: BronzeRun, cfg: Config = DEFAULT, log=None) -> SilverRun:
             log.warning(f"  channel lag skipped: {type(exc).__name__}: {exc}")
             lags = {}
 
-    # ---- 1c. each card's phase above the coherent limit (full band) -------
+    # ---- 1c. each card's phase (full band): against the Gamry sweep of this
+    # ---- condition when there is one, else against the plate -------------
+    measured = {s: bronze_run.spectra[s] for s in bronze_run.segments_measured()}
     card_ph: dict = {}
+    gph: dict = {"applied": False}
     try:
-        card_ph = card_hf_phase(
-            {s: bronze_run.spectra[s] for s in bronze_run.segments_measured()},
-            skew, lags, cfg, log)
+        gph = gamry_card_phase(measured, skew, lags, cfg, log)
     except Exception as exc:                      # a correction, not a gate
-        log.warning(f"  card phase skipped: {type(exc).__name__}: {exc}")
+        log.warning(f"  Gamry card phase skipped: {type(exc).__name__}: {exc}")
+    ph_ref = "gamry" if gph.get("applied") else "plate"
+    if gph.get("applied"):
+        card_ph = gph["phase"]
+    else:
+        try:
+            card_ph = card_hf_phase(measured, skew, lags, cfg, log)
+        except Exception as exc:                  # a correction, not a gate
+            log.warning(f"  card phase skipped: {type(exc).__name__}: {exc}")
 
     # ---- 2. per segment ----------------------------------------------------
     utils.section("measurement model per segment", log)
@@ -2076,7 +2250,8 @@ def run(bronze_run: BronzeRun, cfg: Config = DEFAULT, log=None) -> SilverRun:
         try:
             res = process_segment(sp, skew[sp.card], cfg, log,
                                   ledger=point_ledger, chain=lags.get(seg),
-                                  card_phase=card_ph.get(sp.card))
+                                  card_phase=card_ph.get(sp.card),
+                                  card_phase_ref=ph_ref)
         except Exception as exc:                      # never lose the plate
             log.warning(f"    segment {seg}: {type(exc).__name__}: {exc}")
             res = None
@@ -2167,7 +2342,13 @@ def run(bronze_run: BronzeRun, cfg: Config = DEFAULT, log=None) -> SilverRun:
                      filled=filled, fill_info=fill_info, aggregate=agg,
                      channel_lag=lags,
                      card_lags=dict(getattr(bronze_run, "lags", {}) or {}),
-                     card_ref=dict(getattr(bronze_run, "card_ref", {}) or {}))
+                     card_ref=dict(getattr(bronze_run, "card_ref", {}) or {}),
+                     card_hf_phase={c: {f"{f:.0f}": round(float(np.degrees(d)), 2)
+                                        for f, d in sorted(v.items())}
+                                    for c, v in card_ph.items()},
+                     gamry_card_phase={k: v for k, v in gph.items()
+                                       if k != "phase"},
+                     card_phase_ref=ph_ref)
 
 
 def uc_gain_pct(card_ref: dict) -> dict[str, float]:
@@ -2328,6 +2509,9 @@ def save(sr: SilverRun, cfg: Config, log=None) -> Path:
                      "slot_ratio": v.slot_ratio, "applied": v.applied,
                      "cost_gain": v.cost_gain, "note": v.note}
                  for k, v in sr.skew.items()},
+        "card_phase_reference": sr.card_phase_ref,
+        "card_phase_deg": sr.card_hf_phase,
+        "gamry_card_phase": sr.gamry_card_phase,
     })
     log.info(f"  silver written to {out}")
     return out

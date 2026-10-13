@@ -34,6 +34,16 @@ There are no band, SNR or profile dropdowns any more. Results are cached on
 the Volume under a key made from every setting; after a code change run once
 with `rerun`.
 
+**A separate STANDARD pipeline**, notebook `Local EIS Standard Pipeline`
+(`pipeline/std_pipeline.py`), evaluates the same raw signals the textbook
+way end to end:
+- lock-in step location from the Gamry frequency list;
+- sine-fit phasors and Z = K·U/u_seg;
+- only known calibrations;
+- the standard circuit fit and the measured aggregate.
+
+Results go to `EIS_Results_standard/`. See the guide, §21.
+
 Full write-up of the gen2 plate and the CSV path:
 [`docs/GEN2_PLATE_AND_CSV_PIPELINE.md`](docs/GEN2_PLATE_AND_CSV_PIPELINE.md).
 

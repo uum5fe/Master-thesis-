@@ -583,3 +583,16 @@ beside the PNGs.
   - it is in the raw phasors (silver changes nothing below 20 Hz) and in the old v3 results too;
   - the outlet segments are 4× noisier than the inlet and scatter together (r = 0.87), so the cell itself is changing (water at the outlet), not the computation.
 
+## Separate standard pipeline (October 2026)
+
+- **New notebook `Local EIS Standard Pipeline` and `pipeline/std_pipeline.py`:** the raw FAMOS signals are evaluated end to end with textbook steps only:
+  - lock-in location of every Gamry frequency on each card, with residual-based exact edges;
+  - sine fit over whole periods;
+  - Z = K·U/u_seg with only the chain calibration and the ADC slot delay;
+  - SNR / cycles gate;
+  - the standard circuit fit;
+  - the measured aggregate vs the Gamry;
+  - interpolated maps.
+- **`readers/datago_source.py`:** the runner's datago reader as a module (Spark passed in), so both notebooks read datago first.
+- **Tested end to end** on synthetic raw data with cards armed at different times (`tests/test_std_pipeline.py`).
+

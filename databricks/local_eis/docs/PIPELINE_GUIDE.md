@@ -29,6 +29,7 @@ The slide deck that goes with this guide is linked from the README.
 18. [Known limitations and open items](#18-known-limitations-and-open-items)
 19. [Troubleshooting](#19-troubleshooting)
 20. [Glossary](#20-glossary)
+21. [The separate STANDARD pipeline](#21-the-separate-standard-pipeline-local-eis-standard-pipeline-notebook)
 
 ---
 
@@ -779,3 +780,44 @@ python run.py dc_closure RUN_45A RUN_60A ... -o OUT
 | Tier A/B/C/D | quality grade of a segment (D = inferred, no own data) |
 | Tile | one of the 36 equal 5 × 5-pad blocks used for plate statistics |
 | Bronze / silver / gold | the three processing layers: raw, corrected/modelled, plate field |
+
+---
+
+## 21. The separate STANDARD pipeline (`Local EIS Standard Pipeline` notebook)
+
+**A second, independent evaluation** of the same raw FAMOS signals. Every step is the textbook one, written out in one file: `pipeline/std_pipeline.py`. It shares only the file readers, calibration, geometry and plotting with the main pipeline, and none of its corrections or methods:
+- no consensus schedule;
+- no card cross-correlation;
+- no Gamry relocation or window confinement;
+- no channel-lag fit;
+- no DRT.
+
+| Step | What it does | Function |
+|---|---|---|
+| 1. Read | the cards (datago first, `readers/datago_source.py`; Volumes `.DAT` otherwise) and the Gamry `.DTA` of the condition, whose ZCURVE table is the list of excitation frequencies in sweep order | `discover_files`, `find_gamry`, `gamry_steps` |
+| 2. Locate | a **lock-in** for every Gamry frequency on each card: demodulate the cell voltage and the 4 strongest segment channels at f and average over ~10 periods. Every instant belongs to the frequency with the strongest normalised tone. Then the **edges** are refined: fit the sine at f in the middle of the step and grow the window while the signal still follows it. Every card is located on its own, so no card alignment is needed. | `locate_steps`, `refine_window` |
+| 3. Phasors | least-squares sine fit (cos, sin, offset, linear trend) at the known f over whole periods, first period dropped (settling); SNR from the residual | `step_window`, `sine_fit` |
+| 4. Impedance | **Z = K(T)·U/u_seg**, then only known corrections: the Abgleich chain calibration (gain file) and the ADC slot delay (slot_seg − slot_ref)/(n_ch·fs); a reversed channel (Re Z < 0 at low f) is flipped | `evaluate_card` |
+| 5. Quality | a point is kept with ≥ 3 periods and SNR ≥ 3 dB on both channels; Lin-KK residual per segment (reported, not used to drop) | `run` |
+| 6. Parameters | the standard circuit fit (§8.3, `standard_eis.py`): R_ohmic, R_ct, R_mt, R_pol, the graphical R_pol, arc frequencies, fit residual; also j = u_dc/K, T, Re Z(1 kHz), \|Z\| and phase at 100 Hz | `run` |
+| 7. Aggregate | the **measured** segment impedances in parallel, Z_cell = A_used / Σ A_s/Z_s, against the Gamry × 304.92 cm² | `run` |
+| 8. Output | `EIS_Results_standard/<order>/<condition>/`: `spectra.csv` (kept), `spectra_all.csv`, `schedule.csv` (where each step was found on each card), `parameters.csv`, `plate_statistics.csv` (36 tiles), `aggregate.csv`, `gamry_comparison.csv`, `manifest.json`, `nyquist.png/.html`, `gamry_vs_aggregate.png`, `plate_<param>_interp.png` | `write_figures` |
+
+**The notebook** (`Local EIS Standard Pipeline`):
+- widgets: order, conditions, write results;
+- cells: data source → run → Nyquist / Bode / phase of the measured spectra → interpolated plate maps → parameters and 36-tile statistics → aggregate vs Gamry → schedule summary.
+
+**What to expect on real data.** The per-channel delays between the cards' channels (−57…+76 µs on 2612030) are measured from the data in the main pipeline. They are deliberately not corrected here. Above a few hundred hertz the standard result therefore shows them as a phase spread between segments, and R_ohmic, read at the top of the band, carries it.
+
+**Tested** on synthetic raw data (`tests/make_synth_sweep.py`, `tests/test_std_pipeline.py`):
+- cards armed at different moments;
+- a descending stepped sweep with 4-period low-frequency steps;
+- a Gamry `.DTA`;
+- a multiplexer delay per channel;
+- a known circuit per segment.
+
+Results:
+- every step is located on every card, with edges to 0.05 period;
+- impedances are within 0.5 %;
+- R_ohmic, R_ct, R_mt, R_pol, j and T are recovered for all segments.
+

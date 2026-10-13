@@ -566,3 +566,20 @@ beside the PNGs.
   - the ledger tests use an explicit 0 dB gate.
 - **Handover guide:** `PIPELINE_GUIDE.md`.
 
+## Standard evaluation and interpolated maps only (October 2026)
+
+- **R_ohmic, R_ct, R_mt and R_pol are now computed the standard way** (`pipeline/standard_eis.py`, `config.param_method = "ecm"`). No DRT is used.
+  1. R_ohmic is the high-frequency intercept (the real-axis crossing, or Re Z extrapolated to Im Z = 0 from the top 6 points), held fixed.
+  2. R_ohmic + jωL + (R_ct‖CPE) + (R_mt‖CPE) is fitted by complex non-linear least squares with modulus weighting, both arcs peaking inside the band, the low-frequency inductive loop excluded.
+  3. R_pol = R_ct + R_mt.
+
+  The graphical R_pol (Re Z(f_min) − R_ohmic) and the fit residual are reported too. The notebook's ECM cells use the same fit. `param_method = "drt"` keeps the earlier DRT approach for comparison.
+- **450 A, 2612030, against the DRT evaluation:**
+  - R_ohmic 57.4 vs 58.6 and R_pol 109.7 vs 109.5 (plate medians, mΩ·cm²);
+  - R_mt 68 vs 29: the circuit's mass-transport arc sits at 3–10 Hz, whereas the fixed DRT cut at 16 Hz assigned part of it to R_ct;
+  - R_mt rises towards the air outlet.
+- **Maps:** only 2D interpolated plate maps (`gold/plate_<p>_interp.png`) for every parameter. The per-segment value maps (`map_*.png/.html`) and the viewer's "Values per segment" view are gone.
+- **450 A outlet scatter checked:**
+  - it is in the raw phasors (silver changes nothing below 20 Hz) and in the old v3 results too;
+  - the outlet segments are 4× noisier than the inlet and scatter together (r = 0.87), so the cell itself is changing (water at the outlet), not the computation.
+

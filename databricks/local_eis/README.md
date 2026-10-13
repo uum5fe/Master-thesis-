@@ -19,6 +19,11 @@ The FAMOS waveforms are read from **datago first**; when datago does not have
 the order (or cannot be queried) they are read from the **Volumes** `.DAT`
 files.
 
+R_ohmic, R_ct, R_mt and R_pol are computed the standard way: the
+high-frequency intercept, then an equivalent-circuit fit
+R_ohmic + L + (R_ct‖CPE) + (R_mt‖CPE) (`pipeline/standard_eis.py`; no DRT).
+Every parameter is drawn as one 2D interpolated plate map.
+
 The evaluation is fixed:
 - band **0.15 Hz – 2.4 kHz**: above ~2.5 kHz the FAMOS cards do not measure
   the cell — see the guide, §4, and `docs/figures/band_limit/`;

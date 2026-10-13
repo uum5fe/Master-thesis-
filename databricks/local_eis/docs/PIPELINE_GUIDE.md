@@ -721,7 +721,7 @@ python run.py dc_closure RUN_45A RUN_60A ... -o OUT
 ## 18. Known limitations and open items
 
 1. **The top of the band.** The band ends near or below the real-axis crossing (§4), so R_ohmic is usually the extrapolated intercept, not a crossing. That is why it is held fixed in the circuit fit.
-1b. **Low-frequency scatter at the 450 A air outlet is in the measurement.**
+2. **Low-frequency scatter at the 450 A air outlet is in the measurement.**
    - **Not caused by the processing:** silver changes the < 20 Hz values by 0.0 %, and the same scatter is in the old v3 results.
    - **Larger at the outlet:** the outlet segments (x < 60 mm) scatter 6.5 % rms against 1.7 % at the inlet, with lower SNR (10.7 vs 18 dB) and higher THD.
    - **Correlated between segments:** the outlet segments scatter together (r = 0.87), so the cell itself changes during the long low-frequency steps (water at the outlet).

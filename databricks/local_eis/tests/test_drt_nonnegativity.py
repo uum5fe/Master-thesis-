@@ -104,8 +104,15 @@ def test_a_real_transport_arc_is_recovered_not_zeroed() -> None:
     assert split["R_ct"] == pytest.approx(R_CT_TRUE, rel=0.20)
 
 
-def test_the_old_behaviour_loses_half_the_transport_arc() -> None:
-    """Documents what the numbers in the thesis would have been."""
+def test_the_old_behaviour_loses_half_the_transport_arc(monkeypatch) -> None:
+    """Documents what the numbers in the thesis would have been: no
+    non-negativity, and the inductance term decided by the mean Im Z of the
+    top 20 % of the band, as both were then (the fixture's 3 kHz top is
+    inductive, which the current rule models and the old one did not)."""
+    import eis_measurement_model as mm
+    monkeypatch.setattr(mm, "has_inductive_tail", lambda f, Z, n_top=3: bool(
+        np.mean(np.imag(np.asarray(Z)[np.asarray(f) >= np.percentile(f, 80)]))
+        > 0))
     _res, split = _run(noise=0.0, nonneg=False)
     assert split["R_mt"] < 0.6 * R_MT_TRUE
 

@@ -114,8 +114,12 @@ def lin_kk(freq: np.ndarray, Z: np.ndarray, mu_crit: float = 0.85,
     max_M = max_M or max(6, min(2 * n, 60))
 
     if add_inductance is None:
-        hi = Z[freq >= np.percentile(freq, 80)]
-        add_inductance = bool(np.mean(np.imag(hi)) > 0)
+        # inductive at the TOP of the band (the 3 highest frequencies), not
+        # on average over its top 20 %: over a full band that runs from a
+        # still-capacitive 1 kHz to 12 kHz the average hid a real tail
+        # (eis_measurement_model.has_inductive_tail)
+        top = np.argsort(freq)[-3:]
+        add_inductance = bool(np.mean(np.imag(Z[top])) > 0)
 
     n_dec = max(1.0, np.log10(freq.max() / freq.min()))
     M_min = int(np.clip(round(4 * n_dec), 4, max(4, n - 2)))

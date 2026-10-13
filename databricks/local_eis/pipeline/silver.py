@@ -859,8 +859,7 @@ def bayesian_drt(freq: np.ndarray, Z: np.ndarray, sigma_rel: np.ndarray,
     x = np.linspace(lo, hi, m)              # log10 tau
     tau = 10.0 ** x
 
-    hi_band = Z[freq >= np.percentile(freq, 80)]
-    with_L = bool(np.mean(np.imag(hi_band)) > 0)
+    with_L = mm.has_inductive_tail(freq, Z)
     n_free = 2 if with_L else 1
 
     Phi = _drt_design(freq, tau, with_L)

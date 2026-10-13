@@ -70,6 +70,27 @@ __all__ = ["fit_kk_model", "fit_delay_and_model", "fit_shared_delay",
 # ---------------------------------------------------------------------------
 
 
+def has_inductive_tail(freq, Z, n_top: int = 3) -> bool:
+    """True when the spectrum is inductive at the TOP of its band: the mean
+    Im Z of its n_top highest frequencies is > 0.
+
+    The earlier rule averaged the top 20 % of the frequencies. Over a full
+    band that runs from ~1 kHz (still capacitive) to 12 kHz (inductive), so
+    once the high-frequency phase was corrected to the Gamry's (+21 deg at
+    12 kHz, 2612030 45 A) the capacitive part outweighed it, the inductance
+    was dropped and the model could no longer follow the tail: the KK
+    residual doubled (7.7 -> 15.2 %) on a spectrum that had become cleaner.
+    """
+    f = np.asarray(freq, float)
+    z = np.asarray(Z, complex)
+    ok = np.isfinite(f) & np.isfinite(z)
+    if not ok.any():
+        return False
+    f, z = f[ok], z[ok]
+    top = np.argsort(f)[-max(1, int(n_top)):]
+    return bool(np.mean(np.imag(z[top])) > 0)
+
+
 def _design(freq: np.ndarray, taus: np.ndarray, with_L: bool) -> np.ndarray:
     """Complex design matrix [1, (jw), 1/(1+jw tau_k) ...]."""
     w = 2 * np.pi * freq
@@ -170,8 +191,7 @@ def fit_kk_model(freq, Z, sigma_rel=None, M=None, mu_crit=0.85,
         w = w / s
 
     if with_L is None:
-        hi = Z[freq >= np.percentile(freq, 80)]
-        with_L = bool(np.mean(np.imag(hi)) > 0)
+        with_L = has_inductive_tail(freq, Z)
 
     lo_tau = np.log10(1.0 / (2 * np.pi * freq.max())) - tau_pad
     hi_tau = np.log10(1.0 / (2 * np.pi * freq.min())) + tau_pad

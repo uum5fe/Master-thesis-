@@ -233,3 +233,25 @@ def test_a_card_with_an_implausible_delay_is_left_alone(monkeypatch,
     got = silver.gamry_card_phase(spectra, {}, {}, cfg)
     assert got["applied"] and set(got["phase"]) == {"Karte_1"}
     assert "not credible" in got["cards"]["Karte_2"]["reason"]
+
+
+def test_the_inductance_term_follows_the_top_of_the_band():
+    """Once the HF phase is corrected to the Gamry's, 1-3 kHz is still
+    capacitive and only above ~3.8 kHz is inductive (cards 4-5 keep
+    nothing above 5.9 kHz). Averaged over the top 20 %
+    of the band the tail disappeared and the KK/DRT models dropped L; the
+    top of the band decides now."""
+    import eis_measurement_model as mm
+    from eis_validation import lin_kk
+    f = _sweep()
+    f = f[f <= 6000]               # cards 4-5: nothing kept above 5.9 kHz
+    Z = _z(f)
+    hi = f >= np.percentile(f, 80)
+    assert np.mean(Z.imag[hi]) < 0          # the old rule saw no inductance
+    assert mm.has_inductive_tail(f, Z)
+    assert not mm.has_inductive_tail(f[f < 2000], Z[f < 2000])
+    kk = lin_kk(f, Z)
+    assert kk["res_max"] < 0.02
+    drt = silver.bayesian_drt(f, Z, np.full(f.size, 0.01), DEFAULT)
+    assert drt["L"] > 0
+    assert abs(drt["R_inf"] - R_TRUE) / R_TRUE < 0.05

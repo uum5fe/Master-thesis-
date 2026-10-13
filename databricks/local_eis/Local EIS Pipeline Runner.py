@@ -242,7 +242,7 @@ print("═" * 75)
 
 # COMMAND ----------
 
-# DBTITLE 1,Widgets: Order ID, Condition, Band, SNR, Stop-After
+# DBTITLE 1,Widgets: Order ID, Conditions, Segments + the fixed settings
 # ═══════════════════════════════════════════════════════════════════════════════
 # WIDGETS  —  Order ID, Condition, Band, SNR gate, Pipeline stage
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -932,7 +932,8 @@ if not skip_for_csv('chain response (Abgleich bode sweeps)'):
 # PERFORMANCE NOTE:
 #   Each card = 16 channels × 2.5M samples = 40M rows from Delta.
 #   ~30-60s per card vs ~5s from Volumes binary. Use Volumes when available.
-#   Toggle via DATA_SOURCE widget below.
+#   DATA_SOURCE is chosen automatically below: datago when it has the
+#   order's FAMOS cards, else the Volumes .DAT files.
 # ═══════════════════════════════════════════════════════════════════════════════
 import numpy as np
 import time
@@ -1545,13 +1546,22 @@ def _cache_conditions(leepa) -> list:
     if not root.exists():
         return out
     for cdir in sorted(root.iterdir()):
-        if not cdir.is_dir():
+        if not cdir.is_dir() or cdir.name == 'viewers':
             continue
+        # current layout <cond>/mode_<mode>/snr_<v>_<id>; older ones had the
+        # snr_ folders directly under <cond>, or nothing below it
         snr_subs = [d for d in sorted(cdir.iterdir())
                     if d.is_dir() and d.name.startswith('snr_')]
+        for m in sorted(cdir.iterdir()):
+            if m.is_dir() and m.name.startswith('mode_'):
+                snr_subs += [d for d in sorted(m.iterdir())
+                             if d.is_dir() and d.name.startswith('snr_')]
         if snr_subs:
             for d in snr_subs:
-                out.append((cdir.name, d.name[4:], d))
+                tag = d.name[4:]
+                if d.parent.name.startswith('mode_'):
+                    tag = f"{d.parent.name[5:]}/{tag}"
+                out.append((cdir.name, tag, d))
         else:
             out.append((cdir.name, None, cdir))
     return out
@@ -1789,21 +1799,21 @@ for cond in _conditions_to_run:
  
 _h.append('</table>')
  
-# ─── Everything else cached under this Leepa (other SNR gates, other bands) ───
+# ─── Everything else cached under this Leepa (earlier settings / versions) ───
 _others = [(c, s, d) for c, s, d in _cache_conditions(LEEPA)
            if not (c in _conditions_to_run
-                   and s == (str(MIN_SNR_DB) if MIN_SNR_DB is not None else None))]
+                   and d == _cache_dir(LEEPA, c, MIN_SNR_DB))]
 if _others:
     _h.append(f'''
   <div style="margin-top:22px;font-size:14px;font-weight:700">
     Also cached under Leepa {_esc(LEEPA)}
     <span style="font-weight:400;color:#57606a;font-size:12px">
-      &mdash; other SNR gates and conditions this run does not touch.
-      The SNR gate is part of the cache key: change it and you get a
-      different entry, not a stale one.</span>
+      &mdash; results of earlier pipeline versions or settings, and
+      conditions this run does not touch. Every setting is part of the
+      cache key, so they are never served as the current result.</span>
   </div>
   <table style="border-collapse:collapse;width:100%;font-size:13px;margin-top:6px">
-    <tr><th style="{_TH}">Condition</th><th style="{_TH}">SNR gate</th>
+    <tr><th style="{_TH}">Condition</th><th style="{_TH}">Entry (mode/snr_id)</th>
         <th style="{_TH}">Age</th><th style="{_TH}">Seg</th>
         <th style="{_TH}">Stages</th><th style="{_TH}">MB</th></tr>''')
     for c, s, d in _others:
@@ -2635,8 +2645,9 @@ if not skip_for_csv('Gamry vs aggregate'):
                 _fg = gamry_df['freq_hz'].values
                 _k  = _fg >= _fg.max() / 10.0          # top decade
                 if _k.sum() >= 4:
-                    _w = 2 * np.pi * _fg[_k]
-                    _L = float(np.sum(_w * gamry_df['z_im'].values[_k]) / np.sum(_w * _w))
+                    # not `_w`: that name is the widget reader of cell 3
+                    _om = 2 * np.pi * _fg[_k]
+                    _L = float(np.sum(_om * gamry_df['z_im'].values[_k]) / np.sum(_om * _om))
                     gamry_df = gamry_df.copy()
                     gamry_df['z_im'] = gamry_df['z_im'] - 2 * np.pi * _fg * _L
 

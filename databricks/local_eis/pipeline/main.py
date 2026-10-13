@@ -65,6 +65,12 @@ import sys
 import time
 from pathlib import Path
 
+# run directly (python pipeline/main.py ...): put core/, checks/, ... on the
+# path the way run.py and the notebook do
+if __package__ in (None, "") and "eis_paths" not in sys.modules:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    import eis_paths  # noqa: F401,E402
+
 import utils
 from config import Config, DEFAULT
 

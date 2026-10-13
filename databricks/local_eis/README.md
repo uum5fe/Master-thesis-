@@ -1,7 +1,31 @@
 # Local EIS pipeline — Databricks
 
-The bronze/silver/gold pipeline that runs in the Databricks workspace, plus the
-CSV evaluation path and the two plate maps.
+Turns the FAMOS recordings of the R2-D2 segmented plate into a local impedance
+spectrum per segment, plate heat maps (R_ohmic, Re Z 1 kHz, R_ct, R_mt, R_pol,
+j, T), a comparison with the Gamry whole-cell sweep and plausibility checks.
+
+**Start here:** [`docs/PIPELINE_GUIDE.md`](docs/PIPELINE_GUIDE.md) — the
+complete guide: how to run it, where the data comes from, every module and
+output file, the formulas, the cache, and the known limitations.
+
+## The final version in one paragraph
+
+Import the zip into an **empty** workspace folder, open
+`Local EIS Pipeline Runner`, choose order, conditions and run mode, run all.
+
+The FAMOS waveforms are read from **datago first**; when datago does not have
+the order (or cannot be queried) they are read from the **Volumes** `.DAT`
+files.
+
+The evaluation is fixed:
+- band **0.15 Hz – 2.4 kHz**: above ~2.5 kHz the FAMOS cards do not measure
+  the cell — see the guide, §4, and `docs/figures/band_limit/`;
+- 0 dB bronze SNR gate;
+- default gates.
+
+There are no band, SNR or profile dropdowns any more. Results are cached on
+the Volume under a key made from every setting; after a code change run once
+with `rerun`.
 
 Full write-up of the gen2 plate and the CSV path:
 [`docs/GEN2_PLATE_AND_CSV_PIPELINE.md`](docs/GEN2_PLATE_AND_CSV_PIPELINE.md).
@@ -43,7 +67,7 @@ it runs the main notebook first with `%run`.
 | `plotting/` | `viewers.py` (the drop-down selector), `plate_figure.py` (static maps), `plate_plotly.py` (interactive maps), `plate_style.py`, `plate_maps.py`, `figure_panels.py`, `bench_plots.py` |
 | `readers/` | `gamry_dta.py` (Gamry `.DTA`, chain-response gain file), `abgleich.py` (calibration `Step*_<T>Grad.csv`), `csv_source.py`, `_vendor/zstd.py` |
 | `tests/` | `pytest tests` (+ `fixtures/`, `make_synth_famos.py`) |
-| `docs/` | write-ups and the change log (`FIXES.md`) |
+| `docs/` | the guide (`PIPELINE_GUIDE.md`), write-ups, figures and the change log (`FIXES.md`); index in `docs/README.md` |
 
 ## The two things to get right before a run
 
@@ -119,8 +143,8 @@ python main.py --plate gen2 --source csv --csv /path/run.csv \
 ## The chain response is not optional
 
 The Abgleich delivery ships 72 Gamry sweeps of the current-measurement chain in
-`bode/`. Measured on both plates it is −11° of phase at 4.5 kHz — the top of
-the default analysis band — and −24° at 10 kHz. That is the same order as the
+`bode/`. Measured on both plates it is −2.5° of phase at 1 kHz, −11° at 4.5 kHz
+and −24° at 10 kHz (the evaluated band now ends at 2.4 kHz). That is the same order as the
 acquisition skew the pipeline works hard to remove, and unlike a skew it moves
 |Z| too. Build the file once:
 
@@ -164,7 +188,7 @@ hover values at the cursor, and the FAMOS plate sensors as °C reference lines.
 ## Per-segment checks that run on every measurement
 
 **Current-chain lag (`channel_lag.py`, silver and the CSV path).**
-`R_ohmic` is Re Z at the top of the kept band (~1.2 kHz on 2612030). Each
+`R_ohmic` is Re Z at the top of the kept band (up to 2.4 kHz). Each
 segment's shunt/trace/amplifier chain can add a first-order time constant
 (shunt L/R); on 2612030 up to ~110 µs, i.e. 37° at 1.2 kHz and an R_ohmic
 ~20 mΩ·cm² low — the 44 vs 66 mΩ·cm² between segments 19 and 14. Silver now

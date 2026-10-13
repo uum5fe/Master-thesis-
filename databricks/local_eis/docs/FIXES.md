@@ -546,3 +546,23 @@ against B per segment for Rs, R_fast, R_slow, R_pol (hover names the segment).
 Saved as `ecm_compare_interactive.html` and `ecm_compare_params_interactive.html`
 beside the PNGs.
 
+---
+
+## Final version (October 2026)
+
+- **Evaluated band fixed at 0.15 Hz – 2.4 kHz** (`config.eval_f_max_hz`). Above ~2.5 kHz the FAMOS cards do not measure the cell:
+  - cards 3–5 show a filter response (|Z| −30 % / +20 %, phase +50…70°);
+  - cards 1–2 show a ~11 µs lead;
+  - the Gamry's own tail is a ~0.75 nH wiring loop.
+
+  Step detection keeps its wide ceiling, so the 6–20 Hz windows no longer move with the band. Evidence: `figures/band_limit/`, guide §4.
+- **Runner:** the band, SNR, profile, evaluation-mode and stop-after dropdowns are removed, and their values are fixed and in the cache key.
+- **Data source:** datago first, Volumes `.DAT` as the fallback; a failed datago query also falls back.
+- **DRT/KK inductance term:** it is now decided from the top 3 frequencies instead of the top 20 %. With the old rule, L was dropped on spectra whose top end was inductive.
+- **Small fixes:**
+  - the Gamry cell no longer shadows the widget helper `_w`;
+  - the cache list reads the `mode_*/` layout;
+  - `pipeline/main.py` runs standalone;
+  - the ledger tests use an explicit 0 dB gate.
+- **Handover guide:** `PIPELINE_GUIDE.md`.
+

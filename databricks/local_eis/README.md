@@ -7,6 +7,8 @@ j, T), a comparison with the Gamry whole-cell sweep and plausibility checks.
 **Start here:** [`docs/PIPELINE_GUIDE.md`](docs/PIPELINE_GUIDE.md) — the
 complete guide: how to run it, where the data comes from, every module and
 output file, the formulas, the cache, and the known limitations.
+The handover slide deck (22 slides, downloadable as PowerPoint/PDF):
+https://claude.ai/artifact/3NxSSFeV7VuQqMNvYLKSMZ (private until shared from its Share menu).
 
 ## The final version in one paragraph
 

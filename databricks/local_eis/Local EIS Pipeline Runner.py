@@ -580,6 +580,18 @@ for _old in ('plate', 'csv_path', 'csv_dialect', 'csv_tones',
     except Exception:
         pass
  
+# ─── Widgets of earlier versions: removed, their values are fixed now ───
+# The band (0.15 Hz – 2.4 kHz), the SNR gate (0 dB), the evaluation mode
+# (default) and the last stage (gold) are no longer choices -- see the
+# FIXED SETTINGS block below. Databricks keeps a widget until it is removed,
+# so the old ones are taken off the bar here.
+for _old_w in ('param_profile', 'f_min_hz', 'f_max_hz', 'f_band',
+               'min_snr_db', 'stop_after', 'evaluation_mode'):
+    try:
+        dbutils.widgets.remove(_old_w)
+    except Exception:
+        pass
+
 # ─── Create the remaining widgets ───
 # leepa_id is NOT here: it is created above, before the discovery that needs
 # to know which order is selected. The condition dropdown is here because its
@@ -589,47 +601,6 @@ try:
     # ALL (or nothing ticked) evaluates every condition found on disk.
     dbutils.widgets.multiselect('conditions', 'ALL', ['ALL'] + CONDITIONS,
                                 'Conditions (multi-select)')
-    # PARAMETER PROFILE -- see the RECOMMENDED_PARAMS block below.
-    #   recommended  evaluation mode, SNR gate and band are FIXED to the
-    #                values that give clean spectra; the three widgets for
-    #                them are ignored (and the printout says so)
-    #   custom       the Evaluation mode / Min SNR / F min / F max widgets
-    #                decide, exactly as before
-    dbutils.widgets.dropdown('param_profile', 'recommended',
-                             ['recommended', 'custom'], 'Parameter profile')
-    dbutils.widgets.text('f_min_hz', '0.15', 'F min (Hz)')
-    dbutils.widgets.text('f_max_hz', '4500.0', 'F max (Hz)')
-    # BAND -- full: every step of the sweep the FAMOS card can resolve, up to
-    # just below its Nyquist frequency (12.25 kHz at fs = 25 kHz); R_ohmic is
-    # then the measured real-axis intercept. coherent: stop at the limit
-    # where the five cards still agree as pure delays (0.16 fs = 4 kHz at
-    # 25 kHz) and at F max; R_ohmic is the top-band mean. This widget is not
-    # pinned by the parameter profile. With 'full', each card's phase is
-    # calibrated against the condition's Gamry whole-cell sweep (its delay,
-    # and its filter above ~3.8 kHz; phase only, |Z| untouched).
-    dbutils.widgets.dropdown('f_band', 'full', ['full', 'coherent'],
-                             'Band (full = up to fs/2)')
-    dbutils.widgets.dropdown('min_snr_db', '0',
-                             ['-30', '-20', '-10', '-3', '0', '3', '5', '8',
-                              '10'],
-                             'Min SNR (dB)')
-    # stop_after:
-    #   bronze = raw phasor extraction only (fastest, for debugging)
-    #   silver = + de-skew + measurement model + lin-KK validation
-    #   gold   = + spatial field, plate maps, plausibility (full run)
-    dbutils.widgets.dropdown('stop_after', 'gold',
-                             ['bronze', 'silver', 'gold'], 'Stop after')
-    # EVALUATION MODE IS A CHOICE, NOT A DEFAULT.
-    # This notebook used to relax snr_floor_db to -80, max_drift to 2.5 and
-    # max_thd to 1.0 inside the config it built, so every run it produced was
-    # an exploratory run wearing the pipeline's default clothes. Those
-    # settings are legitimate for looking at a noisy top-of-band; they are
-    # not legitimate as the number that goes in a thesis without being named.
-    # 'default' now means the shipped gates, and anything looser has to be
-    # asked for here and is carried into the cache path and the manifest.
-    dbutils.widgets.dropdown('evaluation_mode', 'default',
-                             ['default', 'permissive', 'strict'],
-                             'Evaluation mode')
     # Segments to leave out of the WHOLE evaluation, comma separated, e.g.
     # "33" or "33,59". An excluded segment is skipped in bronze before its
     # channel is read, so it has no spectrum, no scalars, no place in the cell
@@ -766,60 +737,28 @@ if SOURCE_FORMAT == 'csv':
 SELECTED_CONDITIONS = parse_conditions(_w('conditions', 'ALL'), CONDITIONS)
 COND_FILTER = ('ALL' if SELECTED_CONDITIONS == list(CONDITIONS)
                else ', '.join(SELECTED_CONDITIONS))
-F_MIN = float(_w('f_min_hz', '0.15'))
-F_MAX = float(_w('f_max_hz', '4500.0'))
-FULL_BAND = _w('f_band', 'full') == 'full'
-MIN_SNR_DB = float(_w('min_snr_db', '0'))
-STOP_AFTER = _w('stop_after', 'gold')
-EVALUATION_MODE = _w('evaluation_mode', 'default')
-
 # ═══════════════════════════════════════════════════════════════════════════
-#  RECOMMENDED PARAMETERS = THE SETTINGS OF THE SCRIPT THAT DREW CLEAN ARCS
+#  FIXED SETTINGS -- the evaluation every result of this notebook uses
 # ═══════════════════════════════════════════════════════════════════════════
-# Reference: the earlier notebook that gave clean 45 A arcs up to ~1 kHz and
-# clean 150 A / 450 A spectra on RO2612030. Its bronze/silver/gold code is
-# identical to this folder's; what differs is settings only:
-#
-#                               clean script    scattered run
-#   evaluation mode             default         permissive
-#   Min SNR (bronze)            0 dB            0 dB  (then 5 dB, see below)
-#   f_max                       4500 Hz         4500 Hz
-#   fit_common_delay (config)   False           True
-#   silver_snr_gate_db (config) -40 dB          -20 dB
-#
-# The two config values are restored in config.py (and are now part of the
-# cache key). 'permissive' loosens sigma_rel_max to 1.5, zmag_outlier_mad to
-# 8 and thd/drift to 0.5, which keeps noise and spikes -- it is not used here.
-#
-# A 5 dB SNR gate was tried in between and was WRONG for 45 A: bronze uses
-# min_snr_db to accept off-grid steps and to decide which steps the grid fit
-# rests on. The excitation at 45 A is about a tenth of the 450 A one, so the
-# steps above ~90 Hz sit below 5 dB at 45 A and were never detected -- the
-# 45 A spectra stopped at ~90 Hz while 450 A still reached ~900 Hz. 0 dB is
-# what the clean script used; silver's uncertainty gate (sigma_rel_max 0.60)
-# and |Z| outlier gate are what keep noise out, per point.
-#
-# 'recommended' pins these widget values; 'custom' in the Parameter profile
-# widget uses the widgets instead. The mode and all these settings are in the
-# cache key, so different settings never share a cache entry.
-RECOMMENDED_PARAMS = dict(evaluation_mode='default', min_snr_db=0.0,
-                          f_min_hz=0.15, f_max_hz=4500.0)
-PARAM_PROFILE = _w('param_profile', 'recommended')
-if PARAM_PROFILE == 'recommended':
-    _now = dict(evaluation_mode=EVALUATION_MODE, min_snr_db=MIN_SNR_DB,
-                f_min_hz=F_MIN, f_max_hz=F_MAX)
-    _ignored = [f'{k}={v:g}' if isinstance(v, float) else f'{k}={v}'
-                for k, v in _now.items() if v != RECOMMENDED_PARAMS[k]]
-    EVALUATION_MODE = RECOMMENDED_PARAMS['evaluation_mode']
-    MIN_SNR_DB = float(RECOMMENDED_PARAMS['min_snr_db'])
-    F_MIN = float(RECOMMENDED_PARAMS['f_min_hz'])
-    F_MAX = float(RECOMMENDED_PARAMS['f_max_hz'])
-    if _ignored and FULL_BAND:
-        _ignored = [x for x in _ignored if not x.startswith('f_max_hz')]
-    if _ignored:
-        print(f"  Parameter profile 'recommended': widget value(s) "
-              f"{', '.join(_ignored)} ignored. Set the profile to 'custom' "
-              f"to use them.")
+#   band          0.15 Hz – 2.4 kHz. Above ~2.5 kHz the FAMOS cards do not
+#                 measure the cell (cards 3-5: filter response, cards 1-2:
+#                 timing lead), so nothing above 2.4 kHz is evaluated. The
+#                 limit is config.eval_f_max_hz; F_MAX below only bounds the
+#                 blind step DETECTION, which keeps its wide ceiling.
+#   Min SNR       0 dB in bronze. 5 dB cut 45 A off at ~90 Hz; silver's
+#                 uncertainty and |Z| outlier gates keep noise out per point.
+#   mode          'default' = the shipped gates (no permissive loosening).
+#   last stage    gold (spectra, maps, plausibility).
+# All of them are in the cache key, so a result is never served across
+# different settings.
+PARAM_PROFILE = 'fixed'
+F_MIN = 0.15
+F_MAX = 30000.0                 # detection ceiling (evaluation: 2.4 kHz)
+EVAL_F_MAX = 2400.0
+FULL_BAND = False
+MIN_SNR_DB = 0.0
+EVALUATION_MODE = 'default'
+STOP_AFTER = 'gold'
 def _seg_list(name):
     return frozenset(x.strip() for x in
                      _w(name, '').replace(';', ',').split(',') if x.strip())
@@ -837,12 +776,7 @@ print(f"  Leepa:     {LEEPA}"
          else ''))
 print(f"  Condition: {COND_FILTER}   -> {', '.join(SELECTED_CONDITIONS)}")
 print(f"  Profile:   {PARAM_PROFILE}   (mode {EVALUATION_MODE})")
-if FULL_BAND:
-    # the whole sweep; the card's Nyquist frequency is the real ceiling
-    # (config.full_band_frac_fs), F max only stops a 30 kHz sweep record
-    F_MAX = 30000.0
-BAND_TEXT = (f"{F_MIN} Hz – fs/2 (full band; 12.25 kHz at 25 kHz)"
-             if FULL_BAND else f"{F_MIN} – {F_MAX} Hz (coherent band)")
+BAND_TEXT = f"{F_MIN} Hz – {EVAL_F_MAX / 1000:g} kHz (trusted band)"
 print(f"  Band:      {BAND_TEXT}")
 print(f"  Min SNR:   {MIN_SNR_DB} dB")
 print(f"  Stop:      {STOP_AFTER}")
@@ -1394,7 +1328,7 @@ _CACHE_IDENTITY_KEYS = (
     'gamry_delay_max_us', 'gamry_delay_max_resid_deg',
     # the band: full (to fs/2, R_ohmic = intercept) or coherent
     'full_band', 'full_band_frac_fs', 'coherent_f_max_frac_fs',
-    'f_hi_frac_fs', 'r_ohmic_method',
+    'f_hi_frac_fs', 'r_ohmic_method', 'eval_f_max_hz',
     # The build decides WHICH whole-cell sweep the aggregate is compared
     # against, and that comparison is written into the manifest. Two builds
     # are two different references, so they are two different results.
@@ -1431,6 +1365,7 @@ def _run_identity(mode=None, f_min=None, f_max=None, snr=None):
         f_min_hz=F_MIN if f_min is None else f_min,
         f_max_hz=F_MAX if f_max is None else f_max,
         full_band=bool(globals().get('FULL_BAND', False)),
+        eval_f_max_hz=float(globals().get('EVAL_F_MAX', 2400.0)),
         min_snr_db=MIN_SNR_DB if snr is None else float(snr),
         gamry_version=globals().get('GAMRY_VERSION', ''),
         exclude_segments=globals().get('EXCLUDE_SEGMENTS', frozenset()),
@@ -2092,6 +2027,7 @@ for cond in _conditions_to_run:
         condition=cond,
         f_min_hz=F_MIN,
         f_max_hz=F_MAX,
+        eval_f_max_hz=EVAL_F_MAX,
         full_band=FULL_BAND,
         write_png=True,
         write_html=True,

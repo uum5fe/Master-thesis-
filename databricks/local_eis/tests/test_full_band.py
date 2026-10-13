@@ -1,4 +1,6 @@
-"""Full band: evaluate every step the card can resolve, up to just below its
+"""Full band (a developer diagnostic since the shipped evaluation stops at
+2.4 kHz, config.eval_f_max_hz; these tests lift that limit with
+eval_f_max_hz=0): evaluate every step the card can resolve, up to just below its
 Nyquist frequency, with R_ohmic read where the measured spectrum crosses the
 real axis -- the Gamry and bench-tool definition."""
 
@@ -57,7 +59,7 @@ def test_the_band_reaches_nyquist_with_full_band_and_stops_coherent_without():
     sp = _spectrum(f, _z(f))
     kept = f[silver.gate_points(sp, DEFAULT)["keep"]]
     assert kept.max() <= 0.16 * FS                       # 4 kHz
-    full = DEFAULT.replace(full_band=True)
+    full = DEFAULT.replace(full_band=True, eval_f_max_hz=0)
     kept = f[silver.gate_points(sp, full)["keep"]]
     assert kept.max() == pytest.approx(11953.1, rel=1e-3)  # below fs/2
     assert not (kept > 0.5 * FS).any()                   # 15..30 kHz alias
@@ -85,7 +87,7 @@ def test_full_band_r_ohmic_is_the_intercept_and_the_top_band_mean_is_not():
     goes."""
     f = _sweep()
     sp = _spectrum(f, _z(f))
-    full = DEFAULT.replace(full_band=True)
+    full = DEFAULT.replace(full_band=True, eval_f_max_hz=0)
     res = silver.process_segment(sp, _skew(), full)
     assert res is not None
     assert res.R_ohmic == pytest.approx(_true_intercept(), rel=0.02)
@@ -99,7 +101,7 @@ def test_full_band_r_ohmic_is_the_intercept_and_the_top_band_mean_is_not():
 def test_the_channel_lag_fit_stays_below_the_coherent_limit():
     f = _sweep()
     sp = _spectrum(f, _z(f))
-    full = DEFAULT.replace(full_band=True)
+    full = DEFAULT.replace(full_band=True, eval_f_max_hz=0)
     items = silver.channel_lag_items({"1": sp}, {}, full)
     fq, _Z, use = items["1"]
     assert fq[use].max() <= 0.16 * FS
@@ -129,7 +131,7 @@ def test_each_cards_high_frequency_phase_is_taken_out():
     2612030; the per-card offset against the plate median is removed, the
     magnitude is not."""
     f = _sweep()
-    full = DEFAULT.replace(full_band=True)
+    full = DEFAULT.replace(full_band=True, eval_f_max_hz=0)
     offs = {"Karte_1": 0.0, "Karte_2": 0.0, "Karte_4": np.radians(20.0)}
     spectra = {}
     n = 0
@@ -165,7 +167,7 @@ def _gamry(monkeypatch, tmp_path, f, Z):
                                     current_a=450.0, started=None)
     monkeypatch.setattr(gamry_compare, "find_cell_sweeps",
                         lambda *a, **k: [sweep])
-    return DEFAULT.replace(full_band=True, gamry_dir=tmp_path,
+    return DEFAULT.replace(full_band=True, eval_f_max_hz=0, gamry_dir=tmp_path,
                            condition="450A")
 
 
@@ -255,3 +257,14 @@ def test_the_inductance_term_follows_the_top_of_the_band():
     drt = silver.bayesian_drt(f, Z, np.full(f.size, 0.01), DEFAULT)
     assert drt["L"] > 0
     assert abs(drt["R_inf"] - R_TRUE) / R_TRUE < 0.05
+
+
+def test_the_evaluated_band_stops_at_2_4_khz():
+    """The shipped evaluation: the 2390.6 Hz step is the last one kept."""
+    f = np.unique(np.r_[_sweep(), 2390.62, 2987.13])
+    sp = _spectrum(f, _z(f))
+    kept = f[silver.gate_points(sp, DEFAULT)["keep"]]
+    assert np.isclose(kept.max(), 2390.62)
+    assert DEFAULT.f_eval_max() == 2400.0
+    # detection is not limited by it
+    assert DEFAULT.f_hi(25_000.0) == pytest.approx(0.45 * 25_000.0)

@@ -528,7 +528,7 @@ def whole_cell_and_plausibility(cfg: Config, manifest: dict, log,
                 cfg.out_dir, gain_file=cfg.gain_file,
                 bode_dir=getattr(cfg, "abgleich_bode_dir", None),
                 write_png=cfg.write_png,
-                f_top=min(cfg.f_max_hz, 4000.0), log=log)
+                f_top=min(cfg.f_eval_max(), 4000.0), log=log)
             manifest["stages"]["frequency_response"] = frs
             fr_checks = frequency_response.checks(frs)
         except Exception as exc:                            # noqa: BLE001

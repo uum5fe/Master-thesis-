@@ -1271,7 +1271,7 @@ def extrapolate_hf(drt: dict, f_hi: float, n: int = 40) -> dict:
 #: the counts add up to the number dropped instead of double-counting.
 REJECT_REASONS = {
     "not_finite": "the phasor fit did not return a finite Z",
-    "outside_band": "outside cfg.f_min_hz .. min(cfg.f_max_hz, "
+    "outside_band": "outside cfg.f_min_hz .. min(cfg.f_eval_max(), "
                     "cfg.coherent_f_max_frac_fs * fs) -- or "
                     "cfg.full_band_frac_fs * fs with cfg.full_band",
     "snr": "SNR below the gate for this point",
@@ -1311,7 +1311,8 @@ def gate_points(sp: BronzeSpectrum, cfg: Config) -> dict:
 
     keep = gate(np.isfinite(freq) & (freq > 0)
                 & np.isfinite(Z.real) & np.isfinite(Z.imag), "not_finite")
-    f_top = float(cfg.f_max_hz)
+    f_top = float(cfg.f_eval_max() if hasattr(cfg, "f_eval_max")
+                  else cfg.f_max_hz)
     full = bool(getattr(cfg, "full_band", False))
     frac = float((getattr(cfg, "full_band_frac_fs", 0.49) if full else
                   getattr(cfg, "coherent_f_max_frac_fs", 0.0)) or 0.0)

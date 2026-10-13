@@ -193,7 +193,8 @@ def estimate(items: dict, cfg=None, log=None) -> dict[str, ChannelLag]:
         return {}
     model = lag_model(cfg)
     f_lo = float(_opt(cfg, "channel_lag_f_lo_hz", 50.0))
-    f_hi = float(_opt(cfg, "f_max_hz", np.inf))
+    f_hi = float(cfg.f_eval_max() if hasattr(cfg, "f_eval_max")
+                 else _opt(cfg, "f_max_hz", np.inf))
     n_min = int(_opt(cfg, "channel_lag_min_points", 4))
     t_min = 1e-6 * float(_opt(cfg, "channel_lag_min_us", 5.0))
     t_max = 1e-6 * float(_opt(cfg, "channel_lag_max_us", 250.0))

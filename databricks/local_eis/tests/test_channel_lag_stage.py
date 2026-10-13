@@ -276,7 +276,7 @@ def test_the_modelled_band_stops_where_the_cards_stop_agreeing():
                  snr_comb_db=np.full(f.size, 40.0), thd=np.zeros(f.size),
                  drift=np.zeros(f.size), n_per_step=np.full(f.size, 20000),
                  on_grid=np.ones(f.size, bool))
-    cfg = _cfg().replace(f_max_hz=250000.0)
+    cfg = _cfg().replace(f_max_hz=250000.0, eval_f_max_hz=0)
     g = silver.gate_points(sp, cfg)
     assert list(g["freq"][g["keep"]]) == [100.0, 1194.0, 3796.9]
     g = silver.gate_points(sp, cfg.replace(coherent_f_max_frac_fs=0.0))

@@ -49,7 +49,14 @@ def _skew():
 
 
 def _run(sp, cfg=None):
-    cfg = cfg or DEFAULT.replace(coherent_f_max_frac_fs=0.0, f_min_hz=0.15, f_max_hz=4500.0)
+    # An explicit 0 dB SNR gate: the shipped backstop is -40 dB (the clean-
+    # script settings), which no planted defect here would reach, and these
+    # tests are about the ledger naming the gate that fired, not about
+    # where the shipped threshold sits. No band limit for the same reason.
+    cfg = cfg or DEFAULT.replace(coherent_f_max_frac_fs=0.0, f_min_hz=0.15,
+                                 f_max_hz=4500.0, eval_f_max_hz=0,
+                                 silver_snr_gate_db=0.0,
+                                 silver_snr_floor_db=0.0)
     ledger: list[dict] = []
     res = silver.process_segment(sp, _skew(), cfg, None, ledger=ledger)
     return res, ledger

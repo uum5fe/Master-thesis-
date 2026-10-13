@@ -67,8 +67,10 @@ def _spectrum(noise: float = 0.0, seed: int = 1, n: int = 40,
         u_dc=0.77, ref_name="UC2")
 
 
-def _run(noise=0.0, seed=1, nonneg=True, r_mt=R_MT_TRUE):
+def _run(noise=0.0, seed=1, nonneg=True, r_mt=R_MT_TRUE, eval_top=None):
     cfg = DEFAULT.replace(coherent_f_max_frac_fs=0.0, verbose=False, drt_nonneg=nonneg)
+    if eval_top is not None:
+        cfg = cfg.replace(eval_f_max_hz=eval_top)
     res = silver.process_segment(_spectrum(noise, seed, r_mt=r_mt), _skew(),
                                  cfg, None)
     assert res is not None, "fixture was rejected by the gates"
@@ -113,7 +115,7 @@ def test_the_old_behaviour_loses_half_the_transport_arc(monkeypatch) -> None:
     monkeypatch.setattr(mm, "has_inductive_tail", lambda f, Z, n_top=3: bool(
         np.mean(np.imag(np.asarray(Z)[np.asarray(f) >= np.percentile(f, 80)]))
         > 0))
-    _res, split = _run(noise=0.0, nonneg=False)
+    _res, split = _run(noise=0.0, nonneg=False, eval_top=0)   # band then: 3 kHz
     assert split["R_mt"] < 0.6 * R_MT_TRUE
 
 

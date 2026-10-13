@@ -380,6 +380,18 @@ class Config:
     # constant only stops binding before it gets the chance.
     f_min_hz: float = 0.15
     f_max_hz: float = 30000.0
+    # THE EVALUATION BAND STOPS AT 2.4 kHz. f_max_hz above only bounds the
+    # blind step DETECTION (with f_hi_frac_fs); every impedance the pipeline
+    # evaluates, fits and maps lies at or below eval_f_max_hz. Above ~2.5 kHz
+    # neither instrument measures the cell on 2612030: cards 3-5 show a
+    # filter response (|Z| -30 % at 3.8 kHz, +20 % at 5.9 kHz, phase +50..70
+    # deg), cards 1-2 an ~11 us timing lead, and the Gamry's own tail is a
+    # ~0.75 nH wiring loop on a 0.15 mOhm cell. Up to 2.4 kHz all five cards
+    # agree with each other and with the Gamry shape within a few degrees
+    # (docs/PIPELINE_GUIDE.md, "Why the band stops at 2.4 kHz"). The step at
+    # 2390.6 Hz is the last one kept. Detection keeps its wide ceiling on
+    # purpose: lowering it moved the step boundaries at 6-20 Hz.
+    eval_f_max_hz: float = 2400.0
     # THE TOP OF THE BAND SILVER MODELS, as a fraction of the card's fs.
     # Detection may go higher (f_hi_frac_fs); the impedance may not. On
     # 2612030 (fs = 25 kHz) the five cards agree as pure delays up to 3.8 kHz
@@ -1108,6 +1120,11 @@ class Config:
     def f_hi(self, fs: float) -> float:
         """Ceiling of the BLIND step search for a given sampling rate."""
         return min(self.f_max_hz, self.f_hi_frac_fs * fs)
+
+    def f_eval_max(self) -> float:
+        """Top of the EVALUATED band: min(f_max_hz, eval_f_max_hz)."""
+        e = self.eval_f_max_hz
+        return float(min(self.f_max_hz, e)) if e else float(self.f_max_hz)
 
     def f_known_hi(self, fs: float) -> float:
         """Ceiling for steps whose frequency is KNOWN (the Gamry's): a sine

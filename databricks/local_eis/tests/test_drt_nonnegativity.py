@@ -68,7 +68,8 @@ def _spectrum(noise: float = 0.0, seed: int = 1, n: int = 40,
 
 
 def _run(noise=0.0, seed=1, nonneg=True, r_mt=R_MT_TRUE, eval_top=None):
-    cfg = DEFAULT.replace(coherent_f_max_frac_fs=0.0, verbose=False, drt_nonneg=nonneg)
+    cfg = DEFAULT.replace(coherent_f_max_frac_fs=0.0, verbose=False, drt_nonneg=nonneg,
+                          param_method="drt")   # these tests are about the DRT
     if eval_top is not None:
         cfg = cfg.replace(eval_f_max_hz=eval_top)
     res = silver.process_segment(_spectrum(noise, seed, r_mt=r_mt), _skew(),

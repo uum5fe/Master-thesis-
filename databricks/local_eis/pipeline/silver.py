@@ -124,6 +124,7 @@ import numpy as np
 
 import r2d2_geometry as geom
 import eis_measurement_model as mm
+import standard_eis
 from eis_validation import lin_kk, z_hit
 
 import utils
@@ -214,6 +215,19 @@ class SilverSpectrum:
     #: the better one when the arc does not close inside the band. Quoted
     #: beside R_ohmic so the two bracket the answer -- see r_ohmic_axis_fit.
     R_ohmic_xint: float = float("nan")
+    #: the standard equivalent-circuit result (config.param_method == "ecm",
+    #: standard_eis.py): R_ct and R_mt of the two arcs, their peak
+    #: frequencies, the fit's rms relative residual, the graphical
+    #: polarisation resistance (Re Z at f_min - R_ohmic), the top-band mean
+    #: kept for comparison, and how R_ohmic was read
+    R_ct: float = float("nan")
+    R_mt: float = float("nan")
+    f_ct_hz: float = float("nan")
+    f_mt_hz: float = float("nan")
+    ecm_rms_pct: float = float("nan")
+    R_pol_lf: float = float("nan")
+    R_ohmic_topband: float = float("nan")
+    R_ohmic_how: str = ""
     #: Current-chain lag of this segment against the plate (channel_lag.py):
     #: what was fitted, what was removed from Z before R_ohmic was read, and
     #: the verdict. nan / 0 / "" when the stage is off.
@@ -1162,6 +1176,8 @@ def r_ohmic_topband(freq: np.ndarray, Z: np.ndarray, sigma_rel: np.ndarray,
 def r_ohmic_method(cfg) -> str:
     """'intercept' or 'topband' -- config.r_ohmic_method, 'auto' resolved
     by config.full_band."""
+    if str(getattr(cfg, "param_method", "ecm") or "ecm").lower() == "ecm":
+        return "ecm"
     m = str(getattr(cfg, "r_ohmic_method", "auto") or "auto").lower()
     if m == "auto":
         return "intercept" if getattr(cfg, "full_band", False) else "topband"
@@ -1534,7 +1550,28 @@ def process_segment(sp: BronzeSpectrum, skew: SkewModel, cfg: Config,
     n_drop += n_drop_pass
 
     # ---- measurement model -------------------------------------------------
-    if cfg.drt_enable:
+    # "ecm" (default): the standard equivalent-circuit fit, standard_eis.py.
+    # "drt": the Bayesian DRT (the earlier approach).
+    ecm = None
+    method = str(getattr(cfg, "param_method", "ecm") or "ecm").lower()
+    if method == "ecm":
+        ecm = standard_eis.fit_spectrum(f, z_corr)
+        if ecm.get("ok"):
+            p_e = ecm["params"]
+            z_e = standard_eis.z_model(
+                [p_e[k] for k in standard_eis.PARAM_NAMES], f)
+            model = {
+                "ok": True, "freq": f, "Z": z_corr, "Z_model": z_e,
+                "Z_model_sd": 0.01 * ecm["rms_pct"] * np.abs(z_e),
+                "R_inf": ecm["R_ohmic"], "R_inf_sd": ecm["R_ohmic_sd"],
+                "L": ecm["L"], "R_pol": ecm["R_pol"],
+                "gamma": np.zeros(0), "tau": np.zeros(0),
+                "tau_peak": ecm["tau_peak"], "hf_arc_open": 0.0,
+                "hf_closure": 1.0, "sigma_rel": s_rel,
+            }
+        else:
+            model = {"ok": False}
+    elif cfg.drt_enable:
         model = bayesian_drt(f, z_corr, s_rel, cfg)
     else:
         model = {"ok": False}
@@ -1577,6 +1614,14 @@ def process_segment(sp: BronzeSpectrum, skew: SkewModel, cfg: Config,
                                             model.get("sigma_rel", s_rel))
         if np.isfinite(R_int) and R_int > 0:
             R_top, R_top_sd, arc_open, closure = R_int, R_int_sd, 0.0, 1.0
+    R_topband = float(R_top)
+    R_how = "topband"
+    if ecm is not None and ecm.get("ok"):
+        # the standard way: R_ohmic is the high-frequency intercept the
+        # circuit fit was built on (standard_eis.hf_intercept)
+        R_top, R_top_sd = float(ecm["R_ohmic"]), float(ecm["R_ohmic_sd"])
+        arc_open, closure = 0.0, 1.0
+        R_how = str(ecm.get("R_ohmic_method", "ecm"))
     R_drt = float(model["R_inf"])
     if not np.isfinite(R_top):
         R_top, R_top_sd = R_drt, float(model.get("R_inf_sd", np.nan))
@@ -1607,6 +1652,8 @@ def process_segment(sp: BronzeSpectrum, skew: SkewModel, cfg: Config,
         flags.append(f"dropped_{n_drop_out}_zmag_outlier")
     if n_drop_pass:
         flags.append(f"dropped_{n_drop_pass}_non_passive_after_deskew")
+    if ecm is not None and not ecm.get("ok"):
+        flags.append("ecm_failed_kk_model_used")
     if n_card_ph:
         flags.append(f"card_phase_vs_gamry_{n_card_ph}pts"
                      if card_phase_ref == "gamry"
@@ -1659,6 +1706,13 @@ def process_segment(sp: BronzeSpectrum, skew: SkewModel, cfg: Config,
         sigma_rel=model.get("sigma_rel", s_rel),
         R_ohmic=float(R_top), R_ohmic_sd=float(R_sd_total),
         R_ohmic_drt=R_drt, R_ohmic_xint=float(R_xint),
+        R_ohmic_topband=R_topband, R_ohmic_how=R_how,
+        R_ct=(float(ecm["R_ct"]) if ecm and ecm.get("ok") else np.nan),
+        R_mt=(float(ecm["R_mt"]) if ecm and ecm.get("ok") else np.nan),
+        f_ct_hz=(float(ecm["f_ct_hz"]) if ecm and ecm.get("ok") else np.nan),
+        f_mt_hz=(float(ecm["f_mt_hz"]) if ecm and ecm.get("ok") else np.nan),
+        ecm_rms_pct=(float(ecm["rms_pct"]) if ecm and ecm.get("ok") else np.nan),
+        R_pol_lf=(float(ecm["R_pol_lf"]) if ecm and ecm.get("ok") else np.nan),
         hf_arc_open=arc_open, hf_closure=closure,
         R_pol=float(model["R_pol"]), L=float(L), dt_applied=float(dt),
         tau_peak=float(model.get("tau_peak", np.nan)),
@@ -2417,6 +2471,15 @@ def save(sr: SilverRun, cfg: Config, log=None) -> Path:
         if np.isfinite(s.R_ohmic_xint) else "",
         "hf_closure": round(s.hf_closure, 4) if np.isfinite(s.hf_closure) else "",
         "R_pol_mohm_cm2": round(1000 * s.R_pol, 4),
+        "R_ct_mohm_cm2": round(1000 * s.R_ct, 4) if np.isfinite(s.R_ct) else "",
+        "R_mt_mohm_cm2": round(1000 * s.R_mt, 4) if np.isfinite(s.R_mt) else "",
+        "f_ct_hz": round(s.f_ct_hz, 2) if np.isfinite(s.f_ct_hz) else "",
+        "f_mt_hz": round(s.f_mt_hz, 3) if np.isfinite(s.f_mt_hz) else "",
+        "ecm_rms_pct": round(s.ecm_rms_pct, 2) if np.isfinite(s.ecm_rms_pct) else "",
+        "R_pol_lf_mohm_cm2": round(1000 * s.R_pol_lf, 4) if np.isfinite(s.R_pol_lf) else "",
+        "R_ohmic_topband_mohm_cm2": round(1000 * s.R_ohmic_topband, 4)
+        if np.isfinite(s.R_ohmic_topband) else "",
+        "R_ohmic_how": s.R_ohmic_how,
         "L_nH": round(1e9 * s.L, 3),
         "tau_peak_s": f"{s.tau_peak:.4g}" if np.isfinite(s.tau_peak) else "",
         "dt_applied_us": round(1e6 * s.dt_applied, 3),

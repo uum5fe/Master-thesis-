@@ -526,7 +526,7 @@ _PLATE_RENDER = r"""
 
 
 def plate_maps(summaries: dict, title: str = "", fields=PLATE_FIELDS,
-               views=(VIEW_2D, VIEW_SEG), gloss: float | None = None) -> str:
+               views=(VIEW_2D,), gloss: float | None = None) -> str:
     """{condition: plate_summary.csv or list[Field]} -> one heat-map viewer
     with Condition / Parameter / View drop-downs.
 

@@ -159,7 +159,8 @@ Two datago caveats (see §18):
 | Bronze SNR gate | 0 dB | runner `MIN_SNR_DB` |
 | Gates | shipped defaults (no permissive loosening) | `EVALUATION_MODE = 'default'` |
 | Last stage | gold | `STOP_AFTER = 'gold'` |
-| R_ohmic | weighted mean of Re Z over the top third of a decade (≈1.0–2.4 kHz) | `r_ohmic_method = "auto"` → top-band |
+| R_ohmic, R_ct, R_mt, R_pol | **the standard equivalent-circuit evaluation** (§8.3): R_ohmic = high-frequency intercept, then R_ohmic + jωL + (R_ct‖CPE) + (R_mt‖CPE) fitted by CNLS | `param_method = "ecm"` (`pipeline/standard_eis.py`) |
+| Plate maps | **only 2D interpolated maps**, one per parameter | `heatmap_params`, `heatmap_style = "interpolated"` |
 | Full band / card-phase correction against the Gamry | **off** (developer option only) | `full_band = False` |
 
 ### Why 2.4 kHz
@@ -185,7 +186,7 @@ The **relative** timing between channels is a different matter. It is real, larg
 
 Consequences:
 - **The band ends at 2390.6 Hz.** The real-axis crossing (≈3.4 kHz on the Gamry) is never inside it.
-- **R_ohmic is the top-band mean.** It reads ~3–4 mΩ·cm² **above** the true crossing; on the Gamry sweep cut at 2.4 kHz the same estimator gives +3.5. The extrapolated intercept `R_ohmic_xint` is reported beside it and reads ~2.6 below. Together the two bracket the truth.
+- **R_ohmic is the high-frequency intercept, extrapolated.** Re Z is extrapolated to Im Z = 0 along a line through the top 6 points; where the band does reach the axis, the interpolated crossing is used. The top-band mean is kept beside it (`R_ohmic_topband`) for comparison.
 - **Step detection keeps its wide ceiling on purpose.** When the ceiling changed with the band, the step boundaries between 6 and 20 Hz moved, and a 9.45 Hz point appeared or disappeared from run to run.
 
 The full-band machinery (`full_band`, `gamry_card_phase`, `card_hf_phase`) is still in the code and tested. It stays off: it makes the high-frequency median *look* right by imposing the Gamry's shape, which is not an independent measurement.
@@ -386,33 +387,41 @@ The FAMOS cards record the cell's response to the **Gamry's own sweep**. The `.D
 
 A segment with fewer than 8 surviving points is dropped, and its verdict is recorded.
 
-### 8.3 The measurement model: Bayesian DRT (`bayesian_drt`)
+### 8.3 The standard evaluation: equivalent-circuit fit (`pipeline/standard_eis.py`)
+
+`config.param_method = "ecm"`, the default, computes the four resistances the standard way, the way ZView or Gamry Echem Analyst do. **No DRT is involved.**
 
 ```
-Z(f) = R_inf + jωL + Σ_m γ_m / (1 + jωτ_m)
+Z(f) = R_ohmic + jωL + R_ct / (1 + (jωτ_ct)^n_ct) + R_mt / (1 + (jωτ_mt)^n_mt)
+R_pol = R_ct + R_mt
 ```
 
-- τ grid: 10 points per decade, from 1/(2π f_max) to 1/(2π f_min) plus one decade on the slow side.
-- **L is included only if the spectrum is inductive at the top of its band**: mean Im Z of the 3 highest frequencies > 0 (`has_inductive_tail`). With the band ending at 2.4 kHz it is usually off.
-- Gaussian-process prior on γ, a smooth function of log τ (squared-exponential kernel). Hyperparameters (amplitude, length scale, noise scale) are optimised on the marginal likelihood.
-- The posterior is closed-form. Then **γ ≥ 0 is enforced** (`drt_nonneg`), re-solving the constrained quadratic problem.
-- Outputs:
-  - R_inf, L;
-  - **R_pol = Σγ**;
-  - τ_peak;
-  - Z_model with its standard deviation;
-  - `hf_arc_open` = 2·|min(Im Z_model at the band top, 0)|, the part of the arc not closed inside the band, which is added to R_ohmic's uncertainty.
+1. **R_ohmic from the high-frequency end** (`hf_intercept`):
+   - where the spectrum crosses the real axis inside the band, the interpolated crossing;
+   - otherwise Re Z extrapolated to Im Z = 0 along a straight line through the top 6 points (Re Z against Im Z).
 
-### 8.4 R_ohmic
+   It is then **held fixed**. With the band ending at 2.4 kHz, a free R_ohmic trades off against an arc starting above the band: on 10 % of the 450 A segments it fell to ~30 mΩ·cm² instead of ~58.
+2. **Fitted part of the spectrum.** Only the capacitive part is fitted (`capacitive_band`). At high current the spectrum turns inductive below ~1 Hz (the low-frequency loop); the circuit has no element for it, so those lowest points are left out of the fit. They still count for `R_lf`.
+3. **The fit.** Complex non-linear least squares (`scipy.optimize.least_squares`):
+   - **modulus weighting**: real and imaginary residuals divided by |Z|;
+   - **bounds**: R ≥ 0, L ≥ 0, 0.5 ≤ n ≤ 1, τ_mt ≥ 3·τ_ct (the arcs cannot swap), and both arc peaks inside the measured band;
+   - **18 starting points** read off the spectrum (−Im peak, split of the polarisation); the best is kept.
+4. **Reported per segment** (`silver/segments_summary.csv`):
+   - `R_ohmic` and how it was read (`R_ohmic_how`: crossing / extrapolated);
+   - `R_ct`, `R_mt`, R_pol;
+   - the arc peak frequencies `f_ct_hz` and `f_mt_hz`;
+   - the fit's rms relative residual `ecm_rms_pct` (good ≤ 3 %, acceptable ≤ 8 %);
+   - the **graphical** polarisation resistance `R_pol_lf` = Re Z(f_min) − R_ohmic;
+   - `R_ohmic_topband` for comparison.
 
-| Estimator | Code | Used for |
-|---|---|---|
-| **Top-band mean** | `r_ohmic_topband`: inverse-variance weighted mean of Re Z over the top 0.35 decade (3–8 points) | **R_ohmic (shipped)** |
-| Axis extrapolation | `r_ohmic_axis_fit`: line Re Z vs Im Z over the top 6 points, read at Im Z = 0 | `R_ohmic_xint` (cross-check) |
-| Real-axis crossing | `r_ohmic_intercept` | full band only |
-| DRT R_inf | `bayesian_drt` | `R_ohmic_drt` (cross-check) |
+On 2612030 at 450 A (67 segments):
+- the charge-transfer arc peaks at 110–170 Hz and the mass-transport arc at 3–10 Hz;
+- R_pol from the fit (median 112) agrees with the graphical value (107);
+- the fit residual is 3.6 % at the air inlet and 8 % at the air outlet, where the measured low-frequency points scatter (§18).
 
-`R_ohmic_sd = √(sd_topband² + hf_arc_open²)`.
+The notebook's ECM cells (16–20) use the same function, so the fit you see there is the fit behind the maps.
+
+`param_method = "drt"` switches back to the earlier approach (Bayesian DRT, top-band R_ohmic, DRT split at τ = 10⁻⁴ / 10⁻² s). It is kept for comparison only.
 
 ### 8.5 Validation and tiers
 
@@ -452,12 +461,7 @@ Z(f) = R_inf + jωL + Σ_m γ_m / (1 + jωτ_m)
 
 `pipeline/gold.py`.
 
-1. **Process split** (`split_processes`). The DRT is cut at two relaxation times:
-   - `R_ct` = Σγ for 10⁻⁴ s ≤ τ < 10⁻² s (charge transfer, ~16 Hz – 1.6 kHz);
-   - `R_mt` = Σγ for τ ≥ 10⁻² s (mass transport, below ~16 Hz);
-   - `R_hf_extra` = Σγ for τ < 10⁻⁴ s (a diagnostic; not added to R_ohmic).
-
-   A negative bucket gives NaN, never 0.
+1. **R_ct and R_mt** (`split_processes`) are the two arcs of the standard circuit fit (§8.3). Only with `param_method = "drt"` is the DRT split at 10⁻⁴ / 10⁻² s used instead.
 2. **Other parameters** (`collect_parameters`):
    - `ReZ_1kHz`: Re Z interpolated at 1 kHz between the two neighbouring points, never extrapolated;
    - `Z_mag_100Hz` and `phase_100Hz` from the model;
@@ -467,7 +471,7 @@ Z(f) = R_inf + jωL + Σ_m γ_m / (1 + jωτ_m)
    - Excluded segments stay empty. Rebuilt segments take the donors' area-weighted mean.
 4. **Fault labels**, from ratios to the plate median: drying, flooding, starvation, contact_loss (thresholds in `config.FAULT_RULES`).
 5. **Statistics over the 36 tiles** (`plate_stats.tile_stats`, §15).
-6. **Maps**: `map_<param>.png` (values per segment), `plate_<param>_interp.png` (interpolated, parula), `map_<param>.html` (interactive), `nyquist.png/.html`.
+6. **Maps: only 2D interpolated plate maps**, `plate_<param>_interp.png`, one per parameter: R_ohmic, Re Z 1 kHz, R_ct, R_mt, R_pol, j, |Z| and phase at 100 Hz, T. The per-segment value maps are no longer written. Also `nyquist.png/.html`.
 
 ### Gold files (`<run>/gold/`)
 
@@ -475,7 +479,7 @@ Z(f) = R_inf + jωL + Σ_m γ_m / (1 + jωτ_m)
 |---|---|
 | `plate_summary.csv` | **one row per segment, all 72**: class, tier, position, area, fault, flags, and every parameter with its sd. Resistances in mΩ·cm², sigma_rel in %. Exception: `R_hf_extra` is in Ω·cm². |
 | `plate_statistics.csv` | per parameter: n tiles, mean, median, sd, CV, min, max, missing tiles |
-| `map_*.png`, `plate_*_interp.png`, `map_*.html` | the plate maps |
+| `plate_*_interp.png` | the 2D interpolated plate maps, one per parameter |
 | `nyquist.png`, `nyquist.html` | all segments; the HTML also holds the \|Z\| and phase panels |
 | `gold_manifest.json` | statistics, class counts, spatial trends, DC closure |
 
@@ -543,10 +547,11 @@ Units: impedances are area-specific (Ω·cm² inside the code, mΩ·cm² in the 
 | Point uncertainty | σ_rel = √(1/(N·γ)), γ = linear SNR, N = samples per step (CRLB) | `utils.sigma_rel_from_snr` |
 | DC current density | **j = u_dc / K(T)** (A/cm²) | `SilverSpectrum.j_dc` |
 | DRT model | Z = R_inf + jωL + Σ γ_m/(1 + jωτ_m), γ ≥ 0 | `silver.bayesian_drt` |
-| R_pol | Σ_m γ_m | `bayesian_drt` |
-| R_ct | Σ γ_m for 10⁻⁴ ≤ τ_m < 10⁻² s | `gold.split_processes` |
-| R_mt | Σ γ_m for τ_m ≥ 10⁻² s | `gold.split_processes` |
-| R_ohmic | Σ w_i·Re Z_i / Σ w_i over the top 0.35 decade, w = 1/(σ_rel·\|Z\|)² | `silver.r_ohmic_topband` |
+| R_ohmic | high-frequency intercept: Im Z = 0 crossing, or Re Z = a + b·Im Z through the top 6 points read at Im Z = 0 | `standard_eis.hf_intercept` |
+| Standard circuit | Z = R_ohmic + jωL + R_ct/(1+(jωτ_ct)^n_ct) + R_mt/(1+(jωτ_mt)^n_mt), CNLS, weights 1/\|Z\| | `standard_eis.fit_spectrum` |
+| R_pol | R_ct + R_mt (graphical check: Re Z(f_min) − R_ohmic) | `standard_eis.fit_spectrum` |
+| Arc peak frequency | f = 1/(2π·τ) | `standard_eis.fit_spectrum` |
+| R_ohmic_topband (comparison) | Σ w_i·Re Z_i / Σ w_i over the top 0.35 decade, w = 1/(σ_rel·\|Z\|)² | `silver.r_ohmic_topband` |
 | R_ohmic_xint | Re Z = a + b·Im Z fitted to the top 6 points, read at Im Z = 0 | `silver.r_ohmic_axis_fit` |
 | R_ohmic sd | √(sd_top² + hf_arc_open²), hf_arc_open = 2·\|min(Im Z_model(f_top), 0)\| | `silver.process_segment` |
 | Re Z at 1 kHz | linear in ln f between the two kept points around 1 kHz | `gold.re_at` |
@@ -715,7 +720,12 @@ python run.py dc_closure RUN_45A RUN_60A ... -o OUT
 
 ## 18. Known limitations and open items
 
-1. **The top of the band.** R_ohmic is read below the real-axis crossing (§4). Expect ~3–4 mΩ·cm² above the Gamry crossing from the estimator alone. `R_ohmic_xint` brackets it from below.
+1. **The top of the band.** The band ends near or below the real-axis crossing (§4), so R_ohmic is usually the extrapolated intercept, not a crossing. That is why it is held fixed in the circuit fit.
+1b. **Low-frequency scatter at the 450 A air outlet is in the measurement.**
+   - **Not caused by the processing:** silver changes the < 20 Hz values by 0.0 %, and the same scatter is in the old v3 results.
+   - **Larger at the outlet:** the outlet segments (x < 60 mm) scatter 6.5 % rms against 1.7 % at the inlet, with lower SNR (10.7 vs 18 dB) and higher THD.
+   - **Correlated between segments:** the outlet segments scatter together (r = 0.87), so the cell itself changes during the long low-frequency steps (water at the outlet).
+   - **The circuit fit averages over it:** the outlet fits leave about 8 % residual.
 2. **The UC taps include ~13.4 mΩ·cm² the Gamry does not.** That is 44 µΩ of series resistance in the voltage-sense path (`dc_closure.sense_offset`). `uc_series_mohm_cm2` can subtract it; it is 0 by default, so Z is reported as the UC taps see it.
 3. **To be sure about the chain, measure it.**
    - Sweep a known resistor (shunt or dummy load) through every FAMOS channel together with the Gamry: the delay and filter of each card, independent of the cell.

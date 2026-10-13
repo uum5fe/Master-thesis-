@@ -154,5 +154,5 @@ def test_the_heatmap_cell_shows_one_selector_and_writes_static_maps(
                                     "R_mt (mass transport)",
                                     "R_pol (total polarisation)",
                                     "Current density"}
-    assert viewers.VIEW_2D in html[0] and viewers.VIEW_SEG in html[0]
+    assert viewers.VIEW_2D in html[0] and viewers.VIEW_SEG not in html[0]  # interpolated only
     assert saved == ["plate_maps"]              # the selector is saved too

@@ -964,6 +964,16 @@ class Config:
     # |Z| map into three maps that mean different things physically.  The
     # boundaries below are the conventional PEMFC split; they are config, not
     # code, because a different MEA moves them.
+    # HOW R_ohmic, R_ct, R_mt AND R_pol ARE COMPUTED.
+    #   "ecm" (default) -- the standard way, pipeline/standard_eis.py:
+    #       R_ohmic = the high-frequency real-axis intercept (extrapolated to
+    #       Im Z = 0 from the top of the band when the band ends before it),
+    #       then the circuit R_ohmic + jwL + (R_ct||CPE) + (R_mt||CPE) is
+    #       fitted by complex non-linear least squares (modulus weighting) to
+    #       the capacitive part of the spectrum; R_pol = R_ct + R_mt.
+    #   "drt" -- the Bayesian DRT below, R_ohmic = top-band mean, R_ct/R_mt
+    #       from splitting the DRT at tau_split_*_s (the earlier approach).
+    param_method: str = "ecm"
     drt_enable: bool = True
     drt_method: str = "gp"           # {"ridge", "gp"}  -- gp = GP-DRT
     drt_n_tau_per_decade: int = 10
@@ -1021,9 +1031,11 @@ class Config:
     write_json: bool = True
     write_html: bool = True
     write_png: bool = True
+    # every parameter gets one 2D interpolated plate map, gold/
+    # plate_<p>_interp.png (no per-segment value maps)
     heatmap_params: tuple[str, ...] = (
-        "R_ohmic", "ReZ_1kHz", "R_ct", "R_mt", "Z_mag_100Hz", "phase_100Hz",
-        "j_dc",
+        "R_ohmic", "ReZ_1kHz", "R_ct", "R_mt", "R_pol", "j_dc",
+        "Z_mag_100Hz", "phase_100Hz", "T_degC",
     )
     heatmap_colormap: str = "plotly_jet"   # plate_style.JET_STOPS
     verbose: bool = True

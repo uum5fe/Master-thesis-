@@ -59,7 +59,7 @@ def test_the_band_reaches_nyquist_with_full_band_and_stops_coherent_without():
     sp = _spectrum(f, _z(f))
     kept = f[silver.gate_points(sp, DEFAULT)["keep"]]
     assert kept.max() <= 0.16 * FS                       # 4 kHz
-    full = DEFAULT.replace(full_band=True, eval_f_max_hz=0)
+    full = DEFAULT.replace(full_band=True, eval_f_max_hz=0, param_method="drt")
     kept = f[silver.gate_points(sp, full)["keep"]]
     assert kept.max() == pytest.approx(11953.1, rel=1e-3)  # below fs/2
     assert not (kept > 0.5 * FS).any()                   # 15..30 kHz alias
@@ -87,21 +87,22 @@ def test_full_band_r_ohmic_is_the_intercept_and_the_top_band_mean_is_not():
     goes."""
     f = _sweep()
     sp = _spectrum(f, _z(f))
-    full = DEFAULT.replace(full_band=True, eval_f_max_hz=0)
+    full = DEFAULT.replace(full_band=True, eval_f_max_hz=0, param_method="drt")
     res = silver.process_segment(sp, _skew(), full)
     assert res is not None
     assert res.R_ohmic == pytest.approx(_true_intercept(), rel=0.02)
     assert res.hf_closure == 1.0
     assert silver.r_ohmic_method(full) == "intercept"
-    assert silver.r_ohmic_method(DEFAULT) == "topband"
-    assert silver.r_ohmic_method(DEFAULT.replace(r_ohmic_method="intercept")
+    assert silver.r_ohmic_method(DEFAULT) == "ecm"     # the shipped, standard way
+    assert silver.r_ohmic_method(DEFAULT.replace(param_method="drt")) == "topband"
+    assert silver.r_ohmic_method(DEFAULT.replace(r_ohmic_method="intercept", param_method="drt")
                                  ) == "intercept"
 
 
 def test_the_channel_lag_fit_stays_below_the_coherent_limit():
     f = _sweep()
     sp = _spectrum(f, _z(f))
-    full = DEFAULT.replace(full_band=True, eval_f_max_hz=0)
+    full = DEFAULT.replace(full_band=True, eval_f_max_hz=0, param_method="drt")
     items = silver.channel_lag_items({"1": sp}, {}, full)
     fq, _Z, use = items["1"]
     assert fq[use].max() <= 0.16 * FS
@@ -131,7 +132,7 @@ def test_each_cards_high_frequency_phase_is_taken_out():
     2612030; the per-card offset against the plate median is removed, the
     magnitude is not."""
     f = _sweep()
-    full = DEFAULT.replace(full_band=True, eval_f_max_hz=0)
+    full = DEFAULT.replace(full_band=True, eval_f_max_hz=0, param_method="drt")
     offs = {"Karte_1": 0.0, "Karte_2": 0.0, "Karte_4": np.radians(20.0)}
     spectra = {}
     n = 0

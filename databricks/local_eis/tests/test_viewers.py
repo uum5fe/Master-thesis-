@@ -60,9 +60,9 @@ def test_plate_maps_offer_every_parameter_in_both_views(tmp_path):
     assert {k[1] for k in keys} == {"HFR (Rs)", "R_ct (charge transfer)",
                                     "Current density", "Temperature"}
     assert len(keys) == 2 * 4
-    # the View drop-down offers both views; the browser builds the one chosen
+    # only the 2D interpolated view is offered (no per-segment value maps)
     assert h.count("<select") == 3
-    assert viewers.VIEW_2D in h and viewers.VIEW_SEG in h
+    assert viewers.VIEW_2D in h and viewers.VIEW_SEG not in h   # interpolated maps only
     it = P["items"][viewers.SEP.join(("45A", "HFR (Rs)"))]
     assert len(it["v"]) == len(geom.ACTIVE_PLATE.segments)
     nr, nc, _ = it["gs"]

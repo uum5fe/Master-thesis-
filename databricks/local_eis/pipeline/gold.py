@@ -118,6 +118,12 @@ def split_processes(sp: SilverSpectrum, cfg: Config) -> dict[str, float]:
     """
     out = {"R_ohmic": sp.R_ohmic, "R_pol": sp.R_pol,
            "R_ct": np.nan, "R_mt": np.nan}
+    # the standard equivalent-circuit fit (config.param_method == "ecm"):
+    # R_ct and R_mt are the two fitted arcs, no DRT involved
+    if np.isfinite(getattr(sp, "R_ct", np.nan)):
+        out["R_ct"] = float(sp.R_ct)
+        out["R_mt"] = float(sp.R_mt)
+        return out
     if sp.gamma.size == 0 or sp.tau_grid.size != sp.gamma.size:
         return out
     tau, g = sp.tau_grid, sp.gamma
@@ -726,29 +732,22 @@ def save(gr: GoldRun, sr: SilverRun, cfg: Config, log=None) -> Path:
     plate_stats.write_statistics(out / "plate_summary.csv")
 
     if cfg.write_png:
-        for p in cfg.heatmap_params:
-            if p not in params:
-                continue
-            fig = plate_heatmap(gr.records, p, cfg)
-            if fig is None:
-                continue
-            import matplotlib.pyplot as plt
-            fig.savefig(out / f"map_{p}.png", dpi=150, bbox_inches="tight")
-            plt.close(fig)
-        # plate maps in the viewer's layout (ports, flow arrows, sensors),
-        # fixed colour scale per parameter -- plate_figure.py
+        # ONLY 2D INTERPOLATED PLATE MAPS, one per parameter, in the viewer's
+        # layout (ports, flow arrows, sensors) with a fixed colour scale --
+        # plate_figure.py. The per-segment value maps (map_<p>.png/.html)
+        # are no longer written.
         try:
             import plate_figure
             import matplotlib.pyplot as plt
             cls = {s: r.cls for s, r in gr.records.items()}
-            for p in ("R_ohmic", "R_ct", "R_mt", "R_pol"):
+            for p in cfg.heatmap_params:
                 if p not in params:
                     continue
                 sc = PARAM_META.get(p, {}).get("scale", 1.0)
                 vals = {s: r.values.get(p, np.nan) * sc
                         for s, r in gr.records.items()}
                 for rd in plate_figure.renders(
-                        getattr(cfg, "heatmap_style", "segments")):
+                        getattr(cfg, "heatmap_style", "interpolated")):
                     fig = plate_figure.draw_flow_plate(
                         vals, p, classes=cls, render=rd,
                         title=f"{cfg.leepa or ''} / {cfg.condition or ''}"
@@ -769,15 +768,6 @@ def save(gr: GoldRun, sr: SilverRun, cfg: Config, log=None) -> Path:
                                 .strip(" /"))
         except Exception as exc:                            # noqa: BLE001
             log.info(f"  nyquist figure skipped: {type(exc).__name__}: {exc}")
-
-    if cfg.write_html:
-        for p in cfg.heatmap_params:
-            if p not in params:
-                continue
-            f = plate_heatmap_interactive(gr.records, p, cfg)
-            if f is not None:
-                f.write_html(str(out / f"map_{p}.html"),
-                             include_plotlyjs="cdn")
 
     utils.write_json(out / "gold_manifest.json", gr.stats)
     log.info(f"  gold written to {out}")

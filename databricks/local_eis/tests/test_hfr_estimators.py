@@ -76,7 +76,7 @@ def _run(f_hi, seeds=8, extra=None):
                                      None)
         if res is None:
             continue
-        out["topband"].append(res.R_ohmic)
+        out["topband"].append(res.R_ohmic_topband)
         out["xint"].append(res.R_ohmic_xint)
         out["at_fmax"].append(float(np.real(res.Z_corr[np.argmax(res.freq)])))
         out["crossing"].append(_zero_crossing(res.freq, res.Z_corr))
@@ -157,4 +157,4 @@ def test_the_cross_check_is_reported_per_segment() -> None:
     res = silver.process_segment(_spectrum(3000, seed=1), _skew(),
                                  DEFAULT.replace(coherent_f_max_frac_fs=0.0, verbose=False), None)
     assert np.isfinite(res.R_ohmic_xint)
-    assert res.R_ohmic_xint != res.R_ohmic       # genuinely a second estimate
+    assert res.R_ohmic_xint != res.R_ohmic_topband   # genuinely a second estimate

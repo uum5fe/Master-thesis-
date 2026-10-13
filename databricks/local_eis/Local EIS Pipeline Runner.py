@@ -124,7 +124,7 @@ importlib.reload(plate_stats)
 _BUILD_MARKERS = {
     config: ['full_band'], plate_stats: ['tile_stats', 'write_statistics'],
     geom: ['label_xy'], bronze: ['to_own', 'to_common'],
-    silver: ['r_ohmic_intercept', 'gamry_card_phase'], gold: ['plate_stats'],
+    silver: ['r_ohmic_intercept', 'gamry_card_phase', 'standard_eis'], gold: ['plate_stats'],
     plate_figure: ['node_xy'], plate_maps: ['uniformity_stats'],
     plausibility: ['_tile_or_all'], gamry_sync: ['confine_windows'],
 }
@@ -1330,6 +1330,8 @@ _CACHE_IDENTITY_KEYS = (
     # the band: full (to fs/2, R_ohmic = intercept) or coherent
     'full_band', 'full_band_frac_fs', 'coherent_f_max_frac_fs',
     'f_hi_frac_fs', 'r_ohmic_method', 'eval_f_max_hz',
+    # how R_ohmic, R_ct, R_mt and R_pol are computed (standard ECM / DRT)
+    'param_method',
     # The build decides WHICH whole-cell sweep the aggregate is compared
     # against, and that comparison is written into the manifest. Two builds
     # are two different references, so they are two different results.
@@ -3083,9 +3085,13 @@ from plotly.subplots import make_subplots
 from pathlib import Path
  
 import csv_pipeline as _cp
- 
-_Z_MODEL = _cp.z_model
-_CHOOSE  = _cp.choose_n_arcs
+import standard_eis as _se
+
+# THE STANDARD FIT, the same one the pipeline's maps use (standard_eis.py):
+# R_ohmic from the high-frequency intercept, then R_ohmic + jwL +
+# (R_ct||CPE) + (R_mt||CPE) by complex non-linear least squares.
+_Z_MODEL = _cp.z_model          # same circuit and parameter order
+_CHOOSE  = _se.choose_n_arcs
  
  
 def _p_vector(res):
@@ -3179,7 +3185,7 @@ for cond, pr in PIPELINE_RESULTS.items():
     good = [r for r in seg_fits.values() if r['verdict'] == 'good']
     print(f"  {cond}: {len(seg_fits)}/{len(seg_fits)+len(failed)} segments fitted "
           f"({n1} one-arc, {len(seg_fits)-n1} two-arc), "
-          f"{len(good)} with chi2_nu in [0.2, 5]")
+          f"{len(good)} with a fit residual ≤ 3 %")
     if failed:
         print(f"      not fitted: {failed}")
 
@@ -3238,7 +3244,7 @@ for cond, blob in ECM_ALL.items():
     for s in segs:
         r = seg_fits[s]
         clr = _grade(r['params']['Rs'] * 1000, rs_lo, rs_hi)
-        tag = f"{r['n_arcs']} arc, χ²ν={r['chi2_nu']:.2f}"
+        tag = f"{r['n_arcs']} arc, fit rms {r.get('rms_pct', float('nan')):.1f} %"
         _add(f'seg:{s}', go.Scatter(
             x=r['Z_meas'].real, y=-r['Z_meas'].imag, mode='markers',
             marker=dict(size=5, color=clr, opacity=0.75,
@@ -3261,7 +3267,7 @@ for cond, blob in ECM_ALL.items():
  
     if agg_fit is not None:
         a = agg_fit
-        atag = (f"{a['n_arcs']} arc, χ²ν={a['chi2_nu']:.2f}, "
+        atag = (f"{a['n_arcs']} arc, fit rms {a.get('rms_pct', float('nan')):.1f} %, "
                 f"Rs={a['params']['Rs']*1000:.1f} mΩ·cm²")
         _add('agg', go.Scatter(
             x=a['Z_meas'].real, y=-a['Z_meas'].imag, mode='markers',
@@ -3310,7 +3316,7 @@ for cond, blob in ECM_ALL.items():
                   {'title.text': f'<b>Overall ECM fit — whole-cell aggregate — '
                                  f'Leepa {LEEPA}, {cond}</b><br>'
                                  f'<sup>Rs={p["Rs"]*1000:.1f} mΩ·cm², {arcs}, '
-                                 f'χ²ν={a["chi2_nu"]:.2f} ({a["verdict"]})</sup>'}]))
+                                 f'fit rms {a.get("rms_pct", float("nan")):.1f} % ({a["verdict"]})</sup>'}]))
     for s in segs:
         r = seg_fits[s]
         p = r['params']
@@ -3322,7 +3328,7 @@ for cond, blob in ECM_ALL.items():
             args=[{'visible': _mask(lambda o, s=s: o == f'seg:{s}')},
                   {'title.text': f'<b>ECM fit — segment {s} — Leepa {LEEPA}, '
                                  f'{cond}</b><br><sup>Rs={p["Rs"]*1000:.1f} mΩ·cm², '
-                                 f'{arcs}, χ²ν={r["chi2_nu"]:.2f} ({r["verdict"]})</sup>'}]))
+                                 f'{arcs}, fit rms {r.get("rms_pct", float("nan")):.1f} % ({r["verdict"]})</sup>'}]))
  
     fig.add_hline(y=2, line=dict(color='green', dash='dash', width=1), row=1, col=2)
     fig.add_hline(y=5, line=dict(color='orange', dash='dash', width=1), row=1, col=2)
@@ -3436,7 +3442,7 @@ for cond, blob in ECM_ALL.items():
         title=(f'<b>Overall ECM fit — whole-cell aggregate — Leepa {LEEPA}, {cond}</b>'
                f'<br><sup>Rs={_rs:.1f} · L={p["L"]*1e3:.3g} mΩ·cm²·ms · {arcs}'
                f' · R_pol={_rpol:.1f} mΩ·cm²'
-               f' · χ²ν={a["chi2_nu"]:.2f} ({a["verdict"]})'
+               f' · fit rms {a.get("rms_pct", float("nan")):.1f} % ({a["verdict"]})'
                f' · {a["n_arcs"]} arc(s) chosen by AICc</sup>'),
         height=520, width=1550, paper_bgcolor='white', plot_bgcolor='white',
         margin=dict(t=110, r=260), hovermode='closest',
@@ -3446,7 +3452,7 @@ for cond, blob in ECM_ALL.items():
     AGG_ECM[cond] = {'Rs_mohm_cm2': _rs, 'R_pol_mohm_cm2': _rpol,
                      'R_ct_mohm_cm2': a['R_ct'] * 1000,
                      'R_mt_mohm_cm2': a['R_mt'] * 1000,
-                     'n_arcs': a['n_arcs'], 'chi2_nu': a['chi2_nu'],
+                     'n_arcs': a['n_arcs'], 'rms_pct': a.get('rms_pct', np.nan),
                      'verdict': a['verdict'],
                      'max_res_pct': float(a['res_pct'].max())}
 
@@ -3467,7 +3473,7 @@ for cond, blob in ECM_ALL.items():
         r = seg_fits[s]
         p = r['params']
         se = r['stderr']
-        d = {'segment': s, 'n_arcs': r['n_arcs'], 'chi2_nu': r['chi2_nu'],
+        d = {'segment': s, 'n_arcs': r['n_arcs'], 'rms_pct': r.get('rms_pct', np.nan),
              'verdict': r['verdict'],
              'Rs_mohm_cm2': p['Rs'] * 1000, 'Rs_se': se['Rs'] * 1000,
              'L_mohm_cm2_s': p['L'],
@@ -3492,10 +3498,10 @@ for cond, blob in ECM_ALL.items():
         v = df_p[c]
         print(f"  {lbl} median {v.median():8.2f}   IQR "
               f"{v.quantile(.25):7.2f}–{v.quantile(.75):7.2f}   mΩ·cm²")
-    print(f"  χ²ν    median {df_p['chi2_nu'].median():.2f}   "
-          f"good/underfit/overfit = "
-          f"{(df_p.verdict=='good').sum()}/{(df_p.verdict=='underfit').sum()}/"
-          f"{(df_p.verdict.str.startswith('overfit')).sum()}")
+    print(f"  fit rms median {df_p['rms_pct'].median():.1f} %   "
+          f"good/acceptable/poor = "
+          f"{(df_p.verdict=='good').sum()}/{(df_p.verdict=='acceptable').sum()}/"
+          f"{(df_p.verdict=='poor').sum()}")
     print(f"  worst residual: {df_p['max_res_pct'].max():.2f} % "
           f"(segment {int(df_p.loc[df_p['max_res_pct'].idxmax(), 'segment'])})")
  
@@ -3509,7 +3515,7 @@ for cond, blob in ECM_ALL.items():
                   else agg['R_ct'] * 1000 if ck == 'R_ct_mohm_cm2'
                   else agg['R_pol'] * 1000)
             print(f"  {lbl:22s}{av:16.2f}{df_p[ck].median():18.2f}")
-        print(f"  {'χ²ν':22s}{agg['chi2_nu']:16.2f}{df_p['chi2_nu'].median():18.2f}")
+        print(f"  {'fit rms %':22s}{agg.get('rms_pct', float('nan')):16.2f}{df_p['rms_pct'].median():18.2f}")
         print("  The aggregate is the parallel sum, not the mean: a spread in Rs")
         print("  pulls it BELOW the segment median.  A large gap is a real")
         print("  statement about heterogeneity, not a fitting error.")

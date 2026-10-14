@@ -644,7 +644,7 @@ for _old in ('plate', 'csv_path', 'csv_dialect', 'csv_tones',
         pass
  
 # ─── Widgets of earlier versions: removed, their values are fixed now ───
-# The band (0.15 Hz – 2.4 kHz), the SNR gate (0 dB), the evaluation mode
+# The band (BAND below), the SNR gate (0 dB), the evaluation mode
 # (default) and the last stage (gold) are no longer choices -- see the
 # FIXED SETTINGS block below. Databricks keeps a widget until it is removed,
 # so the old ones are taken off the bar here.
@@ -740,8 +740,10 @@ GAMRY_SYNC = 'guide'
 # chain reads 3 % high puts +3 % on all its segments. 'report' measures each
 # card's UC2 against the median card (bronze/card_reference.csv, needs the
 # .DAT files), 'correct' also divides that card's Z by it when the gain is
-# flat over the band and under 10 %, 'off' skips it.
-CARD_GAIN = 'report'
+# flat over the band and under 10 %, 'off' skips it. The gain is read from the
+# AC steps between 1 and 300 Hz, below the inductive pickup of cards 3-5; on
+# 2612030 it is +1.2 % (card 3) and +0.9 % (card 5) -- the raw-signal audit.
+CARD_GAIN = 'correct'
 # Series resistance between the FAMOS UC taps and the Gamry's sense leads,
 # in mOhm*cm2, subtracted from every segment's Re Z (config.uc_series_mohm_cm2).
 # The "Card voltage gain and DC current closure" cell measures it from UC2 DC
@@ -803,11 +805,14 @@ COND_FILTER = ('ALL' if SELECTED_CONDITIONS == list(CONDITIONS)
 # ═══════════════════════════════════════════════════════════════════════════
 #  FIXED SETTINGS -- the evaluation every result of this notebook uses
 # ═══════════════════════════════════════════════════════════════════════════
-#   band          0.15 Hz – 2.4 kHz. Above ~2.5 kHz the FAMOS cards do not
-#                 measure the cell (cards 3-5: filter response, cards 1-2:
-#                 timing lead), so nothing above 2.4 kHz is evaluated. The
-#                 limit is config.eval_f_max_hz; F_MAX below only bounds the
-#                 blind step DETECTION, which keeps its wide ceiling.
+#   band          BAND = 'complete' (default): every step the cards can
+#                 record, 0.15 Hz up to 0.49*fs (12.25 kHz at 25 kHz: the
+#                 11.95 kHz step; 15-30 kHz arrive aliased and are left out),
+#                 with the corrections of the raw-signal audit -- each card's
+#                 UC2 magnitude against card 1 (the cleanest), the card phase
+#                 against the Gamry sweep, the per-channel lag; R_ohmic is the
+#                 measured real-axis crossing. 'trusted': 0.15 Hz - 1.2 kHz,
+#                 where all five cards agree with no correction at all.
 #   Min SNR       0 dB in bronze. 5 dB cut 45 A off at ~90 Hz; silver's
 #                 uncertainty and |Z| outlier gates keep noise out per point.
 #   mode          'default' = the shipped gates (no permissive loosening).
@@ -816,9 +821,10 @@ COND_FILTER = ('ALL' if SELECTED_CONDITIONS == list(CONDITIONS)
 # different settings.
 PARAM_PROFILE = 'fixed'
 F_MIN = 0.15
-F_MAX = 30000.0                 # detection ceiling (evaluation: 2.4 kHz)
-EVAL_F_MAX = 2400.0
-FULL_BAND = False
+F_MAX = 30000.0                 # detection ceiling
+BAND = 'complete'               # 'complete' | 'trusted'
+FULL_BAND = BAND == 'complete'
+EVAL_F_MAX = 0.0 if FULL_BAND else 1200.0   # 0: up to 0.49*fs
 MIN_SNR_DB = 0.0
 EVALUATION_MODE = 'default'
 STOP_AFTER = 'gold'
@@ -839,7 +845,9 @@ print(f"  Leepa:     {LEEPA}"
          else ''))
 print(f"  Condition: {COND_FILTER}   -> {', '.join(SELECTED_CONDITIONS)}")
 print(f"  Profile:   {PARAM_PROFILE}   (mode {EVALUATION_MODE})")
-BAND_TEXT = f"{F_MIN} Hz – {EVAL_F_MAX / 1000:g} kHz (trusted band)"
+BAND_TEXT = (f"{F_MIN} Hz – 0.49·fs (complete band, 12.25 kHz at 25 kHz; "
+             f"corrected in situ, see the band note)" if FULL_BAND else
+             f"{F_MIN} Hz – {EVAL_F_MAX / 1000:g} kHz (trusted band)")
 print(f"  Band:      {BAND_TEXT}")
 print(f"  Min SNR:   {MIN_SNR_DB} dB")
 print(f"  Stop:      {STOP_AFTER}")
@@ -1394,7 +1402,7 @@ _CACHE_IDENTITY_KEYS = (
     'full_band', 'full_band_frac_fs', 'coherent_f_max_frac_fs',
     'f_hi_frac_fs', 'r_ohmic_method', 'eval_f_max_hz',
     # how R_ohmic, R_ct, R_mt and R_pol are computed (standard ECM / DRT)
-    'param_method',
+    'param_method', 'ecm_compare',
     # The build decides WHICH whole-cell sweep the aggregate is compared
     # against, and that comparison is written into the manifest. Two builds
     # are two different references, so they are two different results.
@@ -1416,6 +1424,12 @@ _CACHE_IDENTITY_KEYS = (
     # Both changed between the clean script and the scattered run without
     # changing the key, so a stale entry would have been served as current.
     'fit_common_delay', 'silver_snr_gate_db', 'silver_snr_floor_db',
+    # the corrections of the raw-signal audit (card gain from the AC steps,
+    # faulty segments, clipped windows, the background before the sweep)
+    'card_gain', 'card_gain_min_snr_db', 'card_gain_f_lo_hz',
+    'card_gain_f_hi_hz', 'channel_lag', 'gamry_sync', 'uc_series_mohm_cm2',
+    'segment_fault_ratio', 'adc_full_scale_v', 'background_max_pct',
+    'uc_hf_equalise', 'uc_reference_card',
 )
 # min_ref_channels is deliberately NOT in the key: it is set from the number
 # of cards the condition actually has, which is a property of the data, not
@@ -1431,7 +1445,7 @@ def _run_identity(mode=None, f_min=None, f_max=None, snr=None):
         f_min_hz=F_MIN if f_min is None else f_min,
         f_max_hz=F_MAX if f_max is None else f_max,
         full_band=bool(globals().get('FULL_BAND', False)),
-        eval_f_max_hz=float(globals().get('EVAL_F_MAX', 2400.0)),
+        eval_f_max_hz=float(globals().get('EVAL_F_MAX', 0.0)),
         min_snr_db=MIN_SNR_DB if snr is None else float(snr),
         gamry_version=globals().get('GAMRY_VERSION', ''),
         exclude_segments=globals().get('EXCLUDE_SEGMENTS', frozenset()),
@@ -1439,7 +1453,7 @@ def _run_identity(mode=None, f_min=None, f_max=None, snr=None):
         fill_missing_from_neighbours=globals().get('FILL_GAPS', False),
         channel_lag=globals().get('CHANNEL_LAG', 'correct'),
         gamry_sync=globals().get('GAMRY_SYNC', 'guide'),
-        card_gain=globals().get('CARD_GAIN', 'report'),
+        card_gain=globals().get('CARD_GAIN', 'correct'),
         uc_series_mohm_cm2=float(globals().get('UC_SERIES_MOHM_CM2', 0.0)),
         csv_mirror_x=bool(globals().get('CSV_MIRROR_X', False)))
     if mode and mode != 'default':

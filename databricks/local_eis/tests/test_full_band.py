@@ -93,8 +93,11 @@ def test_full_band_r_ohmic_is_the_intercept_and_the_top_band_mean_is_not():
     assert res.R_ohmic == pytest.approx(_true_intercept(), rel=0.02)
     assert res.hf_closure == 1.0
     assert silver.r_ohmic_method(full) == "intercept"
-    assert silver.r_ohmic_method(DEFAULT) == "ecm"     # the shipped, standard way
-    assert silver.r_ohmic_method(DEFAULT.replace(param_method="drt")) == "topband"
+    # the shipped default: Bayesian DRT, R_ohmic = the high-frequency
+    # intercept (extrapolated when the band ends before the crossing)
+    assert silver.r_ohmic_method(DEFAULT) == "hf_intercept"
+    assert silver.r_ohmic_method(DEFAULT.replace(param_method="ecm")) == "ecm"
+    assert silver.r_ohmic_method(DEFAULT.replace(r_ohmic_method="topband")) == "topband"
     assert silver.r_ohmic_method(DEFAULT.replace(r_ohmic_method="intercept", param_method="drt")
                                  ) == "intercept"
 

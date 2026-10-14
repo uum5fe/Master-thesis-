@@ -382,6 +382,60 @@ def fit7_joint(y_ref: np.ndarray, y_sig: np.ndarray, fs: float, f0: float,
                     n, it, converged)
 
 
+def background_at(xq: np.ndarray, fs: float, f: float, n: int,
+                  n_win: int = 4, off_bins: tuple = (3.0, 5.0)
+                  ) -> tuple[float, float]:
+    """What a channel shows at frequency `f` while nothing is excited.
+
+    `xq` is a stretch recorded before the sweep, `n` the length of the step's
+    fit window. Up to `n_win` windows of that length (shorter when the
+    stretch is short, never below half of it or three periods) are cut from
+    `xq`; in each, the amplitude at `f` and at frequencies `off_bins`
+    resolution bins either side of it is read by projection.
+
+    Returns (coherent, noise): the RMS amplitude at f with the broadband part
+    removed -- a tone at the step frequency: mains, a card's switching tone,
+    the cell's own oscillation -- and the broadband amplitude next to it.
+    The broadband part is already in the Cramer-Rao uncertainty of every
+    point; the coherent part is not, because a fit at f cannot tell it from
+    the response. nan when the stretch is too short.
+    """
+    xq = np.asarray(xq, float)
+    L = xq.size
+    if L < 16 or not np.isfinite(f) or f <= 0:
+        return float("nan"), float("nan")
+    m = int(min(n, L // 2)) if n > L // 2 else int(n)
+    if m < max(n / 2.0, 3.0 * fs / f, 16):
+        return float("nan"), float("nan")
+    # block-average the low frequencies: cheap, and flat to <0.1 % at f
+    q = max(1, int(fs / (40.0 * f)))
+    if q > 1:
+        k = (L // q) * q
+        xq = xq[:k].reshape(-1, q).mean(axis=1)
+        fs_q, m_q = fs / q, max(int(m // q), 8)
+    else:
+        fs_q, m_q = fs, m
+    Lq = xq.size
+    n_w = max(1, min(n_win, Lq // m_q))
+    starts = np.linspace(0, Lq - m_q, n_w).astype(int)
+    t = np.arange(m_q) / fs_q
+    df = fs_q / m_q
+    freqs = [f] + [f + s * k * df for k in off_bins for s in (-1, 1)
+                   if f + s * k * df > 0]
+    E = np.exp(-2j * np.pi * np.outer(freqs, t))
+    amps = []
+    for a in starts:
+        y = xq[a:a + m_q]
+        y = y - y.mean()
+        amps.append(np.abs(E @ y) * 2.0 / m_q)
+    A = np.array(amps)                       # windows x freqs
+    at_f = float(np.sqrt(np.mean(A[:, 0] ** 2)))
+    noise = (float(np.sqrt(np.mean(A[:, 1:] ** 2))) if A.shape[1] > 1
+             else 0.0)
+    coherent = float(np.sqrt(max(at_f ** 2 - noise ** 2, 0.0)))
+    return coherent, noise
+
+
 def harmonic_distortion(y: np.ndarray, fs: float, f: float) -> float:
     """THD from the 2nd and 3rd harmonic -- the linearity check.
 

@@ -35,10 +35,26 @@ THREE MEASUREMENTS, ONE QUESTION
    I_meas = a * I_bench + b.  `a` is the scale error that also sits in every
    impedance; `b` is a zero offset, which does not touch the impedance.
 
-cfg.card_gain = "off" | "report" | "correct"   (default "report")
+cfg.card_gain = "off" | "report" | "correct"   (default "correct")
 "correct" divides each card's Z by its measured UC gain, only when the gain
 is flat over the band and within `card_gain_max_pct`; otherwise it is
 reported and left alone.
+
+WHERE AND HOW THE GAIN IS READ (raw-signal audit, 2612030 450 A)
+-----------------------------------------------------------------
+* From the AC step phasors between card_gain_f_lo_hz and card_gain_f_hi_hz
+  (1-300 Hz). Above ~1 kHz cards 3-5 pick the excitation up inductively
+  (~7 nH, visible even on their temperature channels), so a gain read there
+  is pickup, not gain. The audit found UC2 +1.2 % on card 3 and +0.9 % on
+  card 5 against card 1, flat from 0.19 Hz to 1 kHz.
+* The step gate is the SNR OF THE PHASOR ESTIMATE: the per-sample SNR of
+  fit3 plus 10*log10(n/2) for n samples. UC2 carries only 1.2-5.3 mV of AC
+  under 1-3 mV of noise, so its per-sample SNR is 0-20 dB, while the phasor
+  of a 0.5 s window is known to 40-60 dB. Gating on the per-sample figure
+  left no step, and the gain fell back to the DC level.
+* The DC level is reported, never applied: a DC ratio cannot tell a gain
+  from an input offset. Card 4's UC2 sits 2.3 mV low in every window (an
+  offset); read as a gain it was -0.35 % on every segment of card 4.
 """
 
 from __future__ import annotations
@@ -56,6 +72,7 @@ NOT_FLAT = "not_flat"
 TOO_LARGE = "too_large"
 TOO_FEW = "too_few_steps"
 TWO_CARDS = "only_two_cards"
+DC_ONLY = "dc_only"          # no clean AC step: the DC ratio, report only
 
 
 def _opt(cfg, name, default):
@@ -63,8 +80,17 @@ def _opt(cfg, name, default):
 
 
 def mode(cfg) -> str:
-    m = str(_opt(cfg, "card_gain", "report") or "off").lower()
-    return m if m in MODES else "report"
+    m = str(_opt(cfg, "card_gain", "correct") or "off").lower()
+    return m if m in MODES else "correct"
+
+
+def estimate_snr_db(snr_sample_db: float, n: int) -> float:
+    """SNR of a fitted phasor from the per-sample SNR of its window: the
+    amplitude of an n-sample least-squares fit is known sqrt(n/2) times
+    better than one sample."""
+    if not np.isfinite(snr_sample_db) or n < 2:
+        return float("nan")
+    return float(snr_sample_db + 10.0 * np.log10(n / 2.0))
 
 
 def short(card: str) -> str:
@@ -96,6 +122,12 @@ class CardReference:
     #: response sits at 0-20 dB per step, while the DC level is ~0.8 V and
     #: is read to 1e-4 over the whole record)
     source: str = ""
+    #: ABOVE the gain band: this card's UC magnitude against the reference
+    #: card's at every step, normalised to 1 inside the gain band, smoothed
+    #: over neighbouring steps (hf_response). 1 where not measured. Z on this
+    #: card is divided by it (cfg.uc_hf_equalise).
+    hf_resp: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    hf_ref_card: str = ""
 
     @property
     def gain_pct(self) -> float:
@@ -116,7 +148,12 @@ class CardReference:
                 "phase_deg": r(self.phase_deg, 3), "dt_us": r(self.dt_us, 2),
                 "dc_V": r(self.dc_V, 5), "dc_ratio": r(self.dc_ratio, 5),
                 "applied": r(self.applied, 5), "status": self.status,
-                "source": self.source}
+                "source": self.source,
+                "hf_ref_card": self.hf_ref_card,
+                "hf_resp_min": (r(float(np.nanmin(self.hf_resp)), 4)
+                                if self.hf_resp.size else ""),
+                "hf_resp_max": (r(float(np.nanmax(self.hf_resp)), 4)
+                                if self.hf_resp.size else "")}
 
 
 def _band(freq, vals, lo, hi):
@@ -137,7 +174,10 @@ def compare_phasors(freq: np.ndarray, A: dict[str, np.ndarray],
     """
     freq = np.asarray(freq, float)
     cards = sorted(A)
-    snr_min = float(_opt(cfg, "card_gain_min_snr_db", 20.0))
+    snr_min = float(_opt(cfg, "card_gain_min_snr_db", 30.0))
+    f_lo = float(_opt(cfg, "card_gain_f_lo_hz", 0.0) or 0.0)
+    f_hi = float(_opt(cfg, "card_gain_f_hi_hz", np.inf) or np.inf)
+    in_band = (freq >= f_lo) & (freq <= f_hi)
     n_min = int(_opt(cfg, "card_gain_min_steps", 5))
     tol = float(_opt(cfg, "card_gain_tol_pct", 1.0))
     flat_max = float(_opt(cfg, "card_gain_flat_pct", 2.0))
@@ -145,7 +185,8 @@ def compare_phasors(freq: np.ndarray, A: dict[str, np.ndarray],
 
     M = np.vstack([np.asarray(A[c], complex) for c in cards])
     S = np.vstack([np.asarray(snr[c], float) for c in cards])
-    good = np.isfinite(M) & np.isfinite(S) & (S >= snr_min) & (np.abs(M) > 0)
+    good = (np.isfinite(M) & np.isfinite(S) & (S >= snr_min) & (np.abs(M) > 0)
+            & in_band[None, :])
     Mg = np.where(good, M, np.nan)
     import warnings
     with np.errstate(invalid="ignore", divide="ignore"), \
@@ -177,10 +218,11 @@ def compare_phasors(freq: np.ndarray, A: dict[str, np.ndarray],
         if m.sum() < n_min:
             if not ref.status and np.isfinite(ref.dc_ratio):
                 # the DC level: same cell voltage on every card, read over
-                # the whole record -- a gain to 1e-4, no flatness test
+                # the whole record. Reported, never applied -- a DC ratio
+                # cannot tell a gain from an input offset (card 4 of
+                # 2612030: -2.3 mV offset, which read as a -0.35 % gain)
                 ref.gain, ref.source = ref.dc_ratio, "dc"
-                ref.status = (TOO_LARGE if abs(ref.gain_pct) > big else
-                              OFF if abs(ref.gain_pct) > tol else OK)
+                ref.status = TOO_LARGE if abs(ref.gain_pct) > big else DC_ONLY
             else:
                 ref.status = ref.status or TOO_FEW
             out[c] = ref
@@ -189,8 +231,9 @@ def compare_phasors(freq: np.ndarray, A: dict[str, np.ndarray],
         g = np.abs(r)
         ph = np.angle(r)
         ref.gain = float(np.median(g[m]))
+        # flatness inside the gain band: its lowest decade against 30 Hz up
         ref.gain_lo = _band(freq, np.where(m, g, np.nan), 0.0, 10.0)
-        ref.gain_hi = _band(freq, np.where(m, g, np.nan), 100.0, np.inf)
+        ref.gain_hi = _band(freq, np.where(m, g, np.nan), 30.0, np.inf)
         ref.phase_deg = float(np.degrees(np.median(ph[m])))
         # phase = -w dt for a card that samples late
         ref.dt_us = float(-1e6 * np.sum(w[m] * ph[m]) / np.sum(w[m] ** 2))
@@ -206,6 +249,93 @@ def compare_phasors(freq: np.ndarray, A: dict[str, np.ndarray],
         else:
             ref.status = OK
         out[c] = ref
+    return out
+
+
+def hf_response(freq: np.ndarray, A: dict[str, np.ndarray],
+                snr: dict[str, np.ndarray], cfg=None,
+                ref_card: str = "") -> tuple[str, dict[str, np.ndarray]]:
+    """Each card's UC magnitude against ONE reference card, step by step.
+
+    WHY (raw-signal audit, 2612030 450 A): above ~1 kHz cards 3-5 pick the
+    excitation up inductively (~7 nH; it shows even on their temperature
+    channels). On UC2 that is a 7-18 % dip at 2.4-3.8 kHz and a x3.5-4.3
+    rise by 9.5 kHz -- on EVERY segment of the card, because each card
+    divides by its own UC2. Card 1 picks up ~13x less. UC2 is one physical
+    voltage, so the reference card's |UC2| at the same step is what the
+    other cards should have read.
+
+    Magnitude only: it needs no timing between the cards (a time offset does
+    not change |A| on a stationary step), so the cards' separate clocks
+    (10-36 ppm apart) do not enter. The phase is handled by the card-phase
+    stage of silver.
+
+    Returns (reference card, {card: response per step}); the response is 1
+    inside the gain band and for the reference card, smoothed over three
+    neighbouring steps, and interpolated in log f over steps without a clean
+    phasor on either card.
+    """
+    freq = np.asarray(freq, float)
+    cards = sorted(A)
+    if not cards:
+        return "", {}
+    ref = ref_card if ref_card in A else next(
+        (c for c in cards if ref_card and ref_card in c), "")
+    if not ref:
+        return "", {c: np.ones(freq.size) for c in cards}
+    snr_min = float(_opt(cfg, "card_gain_min_snr_db", 30.0))
+    f_lo = float(_opt(cfg, "card_gain_f_lo_hz", 1.0) or 0.0)
+    f_hi = float(_opt(cfg, "card_gain_f_hi_hz", 300.0) or np.inf)
+    a_ref = np.abs(np.asarray(A[ref], complex))
+    s_ref = np.asarray(snr[ref], float)
+    out = {}
+    for c in cards:
+        h = np.ones(freq.size)
+        if c == ref:
+            out[c] = h
+            continue
+        a = np.abs(np.asarray(A[c], complex))
+        s = np.asarray(snr[c], float)
+        ok = (np.isfinite(a) & np.isfinite(a_ref) & (a_ref > 0)
+              & (s >= snr_min) & (s_ref >= snr_min))
+        with np.errstate(invalid="ignore", divide="ignore"):
+            r = np.where(ok, a / a_ref, np.nan)
+        base_m = ok & (freq >= f_lo) & (freq <= f_hi)
+        if base_m.sum() < 3:
+            out[c] = h
+            continue
+        r = r / float(np.median(r[base_m]))
+        hi = ok & (freq > f_hi)
+        if hi.sum():
+            o = np.argsort(freq)
+            fo, ro = freq[o], r[o]
+            valid = np.isfinite(ro) & (fo > f_hi)
+            sm = ro.copy()
+            idx = np.flatnonzero(valid)
+            for j, k in enumerate(idx):
+                nb = idx[max(0, j - 1):j + 2]
+                sm[k] = float(np.median(ro[nb]))
+            # steps above the band without a clean pair: log-f interpolation
+            need = (fo > f_hi) & ~valid
+            if need.any() and valid.sum() >= 2:
+                sm[need] = np.exp(np.interp(np.log(fo[need]), np.log(fo[valid]),
+                                            np.log(sm[valid])))
+            elif need.any():
+                sm[need] = 1.0
+            hh = np.ones(freq.size)
+            hh[o] = np.where(fo > f_hi, sm, 1.0)
+            h = np.where(np.isfinite(hh) & (hh > 0), hh, 1.0)
+        out[c] = h
+    return ref, out
+
+
+def applied_hf(refs: dict[str, dict[str, "CardReference"]]) -> dict[str, np.ndarray]:
+    """card -> per-step |UC| response its Z is divided by (cfg.uc_hf_equalise)."""
+    out = {}
+    for d in refs.values():
+        for c, r in d.items():
+            if r.used_for_Z and r.hf_resp.size:
+                out[c] = np.asarray(r.hf_resp, float)
     return out
 
 
@@ -257,6 +387,8 @@ def measure_reference(files, cards: dict, schedule, cfg, lags=None,
                 Ai, _r, si = utils.fit3(y, fam.fs, st.freq)
                 if not np.isfinite(Ai):
                     continue
+                # gate on how well the PHASOR is known, not one sample
+                si = estimate_snr_db(si, len(y))
                 Ai = Ai * np.exp(2j * np.pi * st.freq * slot_dt)
                 if not aligned:
                     Ai = complex(abs(Ai), 0.0)
@@ -283,6 +415,27 @@ def measure_reference(files, cards: dict, schedule, cfg, lags=None,
         for r in refs.values():
             if r.used_for_Z and m == "correct" and correctable(r):
                 r.applied = r.gain
+    # above the gain band: each card's |UC| against the reference card's
+    if m == "correct" and bool(_opt(cfg, "uc_hf_equalise", True)):
+        for name, d in per.items():
+            if name not in out or len(d) < 2:
+                continue
+            ref, resp = hf_response(
+                freq, {c: v[0] for c, v in d.items()},
+                {c: v[1] for c, v in d.items()}, cfg,
+                ref_card=str(_opt(cfg, "uc_reference_card", "Karte_1") or ""))
+            for c, h in resp.items():
+                if c in out[name]:
+                    out[name][c].hf_resp = h
+                    out[name][c].hf_ref_card = short(ref)
+            if log is not None and ref:
+                for c, h in sorted(resp.items()):
+                    if c != ref and np.any(h != 1.0):
+                        log.info(f"    {name} {short(c)}: |UC| against "
+                                 f"{short(ref)} above "
+                                 f"{_opt(cfg, 'card_gain_f_hi_hz', 300.0):g} Hz: "
+                                 f"{100 * (np.min(h) - 1):+.1f} .. "
+                                 f"{100 * (np.max(h) - 1):+.1f} %, removed")
     if log is not None:
         _log(out, m, log)
     return out

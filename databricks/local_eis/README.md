@@ -25,24 +25,16 @@ R_ohmic + L + (R_ct‖CPE) + (R_mt‖CPE) (`pipeline/standard_eis.py`; no DRT).
 Every parameter is drawn as one 2D interpolated plate map.
 
 The evaluation is fixed:
-- band **0.15 Hz – 2.4 kHz**: above ~2.5 kHz the FAMOS cards do not measure
-  the cell — see the guide, §4, and `docs/figures/band_limit/`;
-- 0 dB bronze SNR gate;
-- default gates.
+- band: **complete** (0.15 Hz – 0.49·fs, 12.25 kHz at 25 kHz), with the
+  corrections of the raw-signal audit (guide §4); `BAND = 'trusted'` gives
+  0.15 Hz – 1.2 kHz, where all cards agree uncorrected;
+- maximum-likelihood sine fits, Cramér–Rao point uncertainties, Bayesian DRT
+  for R_ct / R_mt / R_pol, the standard circuit fitted beside it;
+- 0 dB bronze SNR gate; default gates.
 
-There are no band, SNR or profile dropdowns any more. Results are cached on
-the Volume under a key made from every setting; after a code change run once
-with `rerun`.
-
-**A separate STANDARD pipeline**, notebook `Local EIS Standard Pipeline`
-(`pipeline/std_pipeline.py`), evaluates the same raw signals the textbook
-way end to end:
-- lock-in step location from the Gamry frequency list;
-- sine-fit phasors and Z = K·U/u_seg;
-- only known calibrations;
-- the standard circuit fit and the measured aggregate.
-
-Results go to `EIS_Results_standard/`. See the guide, §21.
+There are no band, SNR or profile dropdowns. Results are cached on the Volume
+under a key made from every setting; after a code change run once with
+`rerun`.
 
 Full write-up of the gen2 plate and the CSV path:
 [`docs/GEN2_PLATE_AND_CSV_PIPELINE.md`](docs/GEN2_PLATE_AND_CSV_PIPELINE.md).
@@ -161,7 +153,7 @@ python main.py --plate gen2 --source csv --csv /path/run.csv \
 
 The Abgleich delivery ships 72 Gamry sweeps of the current-measurement chain in
 `bode/`. Measured on both plates it is −2.5° of phase at 1 kHz, −11° at 4.5 kHz
-and −24° at 10 kHz (the evaluated band now ends at 2.4 kHz). That is the same order as the
+and −24° at 10 kHz (all inside the complete band). That is the same order as the
 acquisition skew the pipeline works hard to remove, and unlike a skew it moves
 |Z| too. Build the file once:
 
@@ -205,7 +197,7 @@ hover values at the cursor, and the FAMOS plate sensors as °C reference lines.
 ## Per-segment checks that run on every measurement
 
 **Current-chain lag (`channel_lag.py`, silver and the CSV path).**
-`R_ohmic` is Re Z at the top of the kept band (up to 2.4 kHz). Each
+`R_ohmic` is read at the top of the band. Each
 segment's shunt/trace/amplifier chain can add a first-order time constant
 (shunt L/R); on 2612030 up to ~110 µs, i.e. 37° at 1.2 kHz and an R_ohmic
 ~20 mΩ·cm² low — the 44 vs 66 mΩ·cm² between segments 19 and 14. Silver now

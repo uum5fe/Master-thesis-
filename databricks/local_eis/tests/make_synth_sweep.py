@@ -1,4 +1,4 @@
-"""Synthetic raw data for the standard pipeline (std_pipeline.py).
+"""Synthetic raw data: a descending stepped sweep on several cards, and its Gamry .DTA.
 
 Writes, for one condition:
   * FAMOS v1 card files: UC2 + segment channels + 4 temperature channels,

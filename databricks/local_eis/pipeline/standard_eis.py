@@ -91,7 +91,7 @@ def hf_intercept(freq, Z, n_top: int = 6) -> tuple[float, str]:
     The high-frequency real-axis intercept: where Im Z crosses zero, if the
     band reaches it; otherwise Re Z extrapolated to Im Z = 0 along a straight
     line through the top `n_top` points (Re Z against Im Z). The second case
-    is the usual one with the band ending at 2.4 kHz.
+    is the usual one with the band ending at 1.2 kHz.
     Returns (value, how).
     """
     g = graphical(freq, Z)

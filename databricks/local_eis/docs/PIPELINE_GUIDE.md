@@ -12,7 +12,7 @@ The slide deck that goes with this guide is linked from the README.
 1. [What the software does](#1-what-the-software-does)
 2. [Running it on Databricks in five minutes](#2-running-it-on-databricks-in-five-minutes)
 3. [Where the input data comes from](#3-where-the-input-data-comes-from)
-4. [The fixed evaluation settings, and why the band stops at 2.4 kHz](#4-the-fixed-evaluation-settings-and-why-the-band-stops-at-24-khz)
+4. [The fixed evaluation settings, the complete band and its corrections](#4-the-fixed-evaluation-settings-the-complete-band-and-its-corrections)
 5. [Folder and module map](#5-folder-and-module-map)
 6. [End-to-end data flow](#6-end-to-end-data-flow)
 7. [Bronze: raw waveforms → raw impedance](#7-bronze-raw-waveforms--raw-impedance)
@@ -29,7 +29,6 @@ The slide deck that goes with this guide is linked from the README.
 18. [Known limitations and open items](#18-known-limitations-and-open-items)
 19. [Troubleshooting](#19-troubleshooting)
 20. [Glossary](#20-glossary)
-21. [The separate STANDARD pipeline](#21-the-separate-standard-pipeline-local-eis-standard-pipeline-notebook)
 
 ---
 
@@ -151,46 +150,54 @@ Two datago caveats (see §18):
 
 ---
 
-## 4. The fixed evaluation settings, and why the band stops at 2.4 kHz
+## 4. The fixed evaluation settings, the complete band and its corrections
 
 | Setting | Value | Where |
 |---|---|---|
-| Evaluated band | **0.15 Hz – 2.4 kHz** (last step kept: 2390.6 Hz) | `config.eval_f_max_hz = 2400`, runner `EVAL_F_MAX` |
-| Step-detection ceiling | 0.45·fs (11.25 kHz at 25 kHz) | `f_max_hz = 30000`, `f_hi_frac_fs = 0.45` |
-| Bronze SNR gate | 0 dB | runner `MIN_SNR_DB` |
-| Gates | shipped defaults (no permissive loosening) | `EVALUATION_MODE = 'default'` |
-| Last stage | gold | `STOP_AFTER = 'gold'` |
-| R_ohmic, R_ct, R_mt, R_pol | **the standard equivalent-circuit evaluation** (§8.3): R_ohmic = high-frequency intercept, then R_ohmic + jωL + (R_ct‖CPE) + (R_mt‖CPE) fitted by CNLS | `param_method = "ecm"` (`pipeline/standard_eis.py`) |
-| Plate maps | **only 2D interpolated maps**, one per parameter | `heatmap_params`, `heatmap_style = "interpolated"` |
-| Full band / card-phase correction against the Gamry | **off** (developer option only) | `full_band = False` |
+| Evaluated band | **complete**: 0.15 Hz – 0.49·fs (12.25 kHz at 25 kHz, i.e. up to the 11.95 kHz step) | runner `BAND = 'complete'` → `FULL_BAND = True`, `EVAL_F_MAX = 0` |
+| Alternative | `BAND = 'trusted'`: 0.15 Hz – 1.2 kHz, where all five cards agree with no correction | runner `BAND` |
+| Step-detection ceiling | 0.45·fs | `f_max_hz = 30000`, `f_hi_frac_fs = 0.45` |
+| Phasors | maximum-likelihood card frequency + linear least-squares sine fit at it (`phasor_method = "card_ml"`) | bronze |
+| Point uncertainty | Cramér–Rao bound of every phasor (`uncertainty_model = "crlb"`) | silver |
+| R_ct, R_mt, R_pol | **Bayesian DRT** (GP prior, closed-form posterior, CRLB-weighted), split at `tau_split_kinetic_s` | `param_method = "drt"` |
+| Circuit fit | R_ohmic + jωL + (R_ct‖CPE) + (R_mt‖CPE), run **beside** the DRT: `R_ct_ecm`, `R_mt_ecm`, `R_pol_ecm` | `ecm_compare = True` |
+| R_ohmic | the high-frequency real-axis crossing (complete band); extrapolated to Im Z = 0 when a band ends before it | `r_ohmic_method = "auto"` |
+| Plate maps | only 2D interpolated maps, one per parameter | `heatmap_style = "interpolated"` |
 
-### Why 2.4 kHz
+### 4.1 What the raw-signal audit found (2612030, 450 A, all five cards)
 
-Above about 2.5 kHz **the FAMOS cards stop measuring the cell**. Every condition of order 2612030 shows it, and three independent tests agree (figures in `docs/figures/band_limit/`):
+The FAMOS files were audited channel by channel, independently of this pipeline:
 
-1. **Cards 3–5 have a filter response, not a delay.**
-   - Phase: their phase against the Gamry stays flat at ~4° up to 1.5 kHz, then rises to 50–70° by 6–7.5 kHz.
-   - Magnitude: |Z| dips about 30 % near 3.8 kHz and overshoots about 20 % at 5.9 kHz.
-   - A phase correction cannot repair a magnitude error, so these points are wrong whatever is done to them.
-2. **Cards 1–2 carry an ~11 µs timing lead.** Their |Z| stays put while Re Z collapses towards zero at 12 kHz. That is the signature of a rotation, i.e. a timing error.
-3. **The Gamry's own high-frequency tail is wiring.**
-   - The whole cell is only 0.15 mΩ (46 mΩ·cm² over 305 cm²).
-   - Its inductive tail at 12 kHz equals a loop of about 0.75 nH.
-   - So the Gamry is not ground truth up there either.
+- **Each card runs on its own clock**: cards 2–5 are 10–36 ppm slow against card 1, up to 5.2 ms over the sweep. Z = K·U/u is formed on ONE card, so this cancels in every impedance; it matters only when cards are compared with each other.
+- **Up to ~1 kHz all five cards agree**: the shared cell voltage UC2 within ±3 % and ±2°.
+- **Cards 3–5 pick the excitation up inductively** (~7 nH, visible even on their temperature channels). On UC2 this is a 7–18 % dip at 2.4–3.8 kHz and a ×3.5–4.3 rise by 9.5 kHz. That was the "filter response" of cards 3–5, and the "~11 µs lead" of cards 1–2 seen against them.
+- **The segment channels differ from each other above ~1.5 kHz**: ±13° at 1.9 kHz, ±26° at 3 kHz, downstream of the plate amplifiers (which match to ±0.3°).
+- **UC2 gain**: +1.2 % on card 3, +0.9 % on card 5 against card 1; card 4's UC2 has a −2.3 mV input offset.
+- **Faults**: segment 33 reads 18 % of its neighbours' current; segment 58 hit the ADC full scale once.
+- **Interference**: 150 Hz mains on UC2 of cards 4–5 (corrupts the 150 Hz step there); card switching tones at 1000 / 1012.5 Hz; the cell's own 1.75 Hz current see-saw between outlet and inlet.
+- **Aliasing**: the 15–30 kHz steps arrive aliased (no effective anti-aliasing); they are outside the band.
+- **Current formula**: j = u/K (Bosch transfer design; confirmed by the Kashyyyk DC steps). The pipeline has always used it: Z = K·U/u is the same thing.
 
-**Up to 2.4 kHz, all five cards agree with each other and with the Gamry shape** within a few degrees and a few percent in |Z|.
+### 4.2 The corrections, in the order they act
 
-The **relative** timing between channels is a different matter. It is real, large and corrected:
-- channel lags span −57…+76 µs;
-- each channel's lag is reproducible to ±1.5 µs across 45, 60, 150 and 450 A (r = 0.999);
-- the channel-lag stage removes it below the band limit.
+| # | Correction | What it removes | Module |
+|---|---|---|---|
+| 1 | ADC slot delay (slot − slot_UC2)/(n_ch·fs) | the multiplexer's sampling skew (2.5 µs/slot; the audit confirms 2.41 ± 0.75 µs) | silver skew |
+| 2 | Chain gain file | the plate amplifier response per segment (Abgleich bode sweeps) | `gain_file` |
+| 3 | Card voltage gain, **from the AC steps 1–300 Hz** (phasor SNR ≥ 30 dB) | UC2 gain per card (+1.2 % / +0.9 %); a DC ratio is reported but never applied (it cannot tell a gain from an input offset) | `card_gain.py` |
+| 4 | **UC2 magnitude against the cleanest card** above 300 Hz, step by step | the inductive pickup on cards 3–5's UC2 (magnitude); needs no timing between cards | `card_gain.hf_response`, `uc_hf_equalise`, `uc_reference_card = "Karte_1"` |
+| 5 | Per-channel lag | the per-channel delays (−57…+76 µs), as delays below the coherent limit | `channel_lag.py` |
+| 6 | Per-card phase above 1 kHz against the Gamry sweep | the card-common phase above the coherent limit (pickup phase, card response) | `silver.gamry_card_phase` |
+| 7 | Points dropped: ADC full scale; coherent background at the step frequency before the sweep > 5 % | clipped windows; mains / switching tones / the cell's oscillation at a step | bronze, gate `background` |
+| 8 | Segments left out: DC current < 0.5× or > 2× its neighbours | channel faults (segment 33) — rebuilt from neighbours when `FILL_GAPS` is on | `silver.dc_share_faults` |
 
-Consequences:
-- **The band ends at 2390.6 Hz.** The real-axis crossing (≈3.4 kHz on the Gamry) is never inside it.
-- **R_ohmic is the high-frequency intercept, extrapolated.** Re Z is extrapolated to Im Z = 0 along a line through the top 6 points; where the band does reach the axis, the interpolated crossing is used. The top-band mean is kept beside it (`R_ohmic_topband`) for comparison.
-- **Step detection keeps its wide ceiling on purpose.** When the ceiling changed with the band, the step boundaries between 6 and 20 Hz moved, and a 9.45 Hz point appeared or disappeared from run to run.
+### 4.3 What the corrections cannot do
 
-The full-band machinery (`full_band`, `gamry_card_phase`, `card_hf_phase`) is still in the code and tested. It stays off: it makes the high-frequency median *look* right by imposing the Gamry's shape, which is not an independent measurement.
+- **Correction 6 anchors each card's phase to the Gamry above 1 kHz.** Above that frequency the phase of the local spectra therefore follows the Gamry sweep; it is not an independent measurement there. The Gamry's own top decade is ~0.75 nH of wiring on a 0.15 mΩ cell.
+- **The per-channel spread above ~1.5 kHz** (±13–26°) is removed only as far as it is a delay (correction 5). What each channel does beyond that is measurable only with an **injected calibration sweep**: one sine, 1 Hz – 12 kHz, into UC2 and every segment input of each card at once, with the same DASYLab setup. Its result is a per-channel response file in the `gain_file` format (segment, f, re, im); the pipeline applies it as correction 2 with no code change, and correction 6 can then be switched off (`gamry_card_phase = False`).
+- **Hardware for the next measurements**: twist or re-route the UC2 and segment leads on cards 3–5 (pickup); give the five cards a common clock or a shared pilot tone; end the sweep at 11.95 kHz; ≥ 8 periods per step below 10 Hz; scale the excitation with the current.
+
+With `BAND = 'trusted'` none of corrections 4 and 6 is needed: up to 1.2 kHz all five cards agree as recorded.
 
 ---
 
@@ -365,7 +372,7 @@ The FAMOS cards record the cell's response to the **Gamry's own sweep**. The `.D
    - The common delay `dt0` is held at 0 (`fit_common_delay = False`): it cannot be told apart from a series inductance.
 2. **Channel lag** (`channel_lag.py`, mode `correct`).
    - Each segment's shunt, trace and amplifier chain adds its own delay. On 2612030 the lags span −57…+76 µs, i.e. up to ~30° at 1 kHz.
-   - Per segment, the phase of `Z_seg / Z_plate-median` between 50 Hz and 2.4 kHz is fitted with a pure delay τ (`−ωτ`). The fit iterates 3 times as the plate median is rebuilt, and the lags are re-centred on the median segment.
+   - Per segment, the phase of `Z_seg / Z_plate-median` between 50 Hz and the coherent limit (0.16·fs, 4 kHz) is fitted with a pure delay τ (`−ωτ`). The fit iterates 3 times as the plate median is rebuilt, and the lags are re-centred on the median segment.
    - τ is applied only if the rms residual is ≤ 10° and |τ| ≤ 250 µs. Otherwise the segment is flagged (`not_first_order`, `too_large`) and demoted to tier C.
    - **A delay that every channel shares is invisible to this stage** (it is measured against the plate median).
 3. **Card phase against the Gamry.** Full band only, so off in the shipped setup (§4).
@@ -388,9 +395,11 @@ The FAMOS cards record the cell's response to the **Gamry's own sweep**. The `.D
 
 A segment with fewer than 8 surviving points is dropped, and its verdict is recorded.
 
-### 8.3 The standard evaluation: equivalent-circuit fit (`pipeline/standard_eis.py`)
+### 8.3 R_ct, R_mt, R_pol: the Bayesian DRT, and the circuit fit beside it
 
-`config.param_method = "ecm"`, the default, computes the four resistances the standard way, the way ZView or Gamry Echem Analyst do. **No DRT is involved.**
+**The primary method is the Bayesian DRT** (`param_method = "drt"`, `bayesian_drt`): a Gaussian-process prior on the distribution of relaxation times gives a closed-form posterior, every point weighted by its Cramér–Rao uncertainty. R_pol is the area of the DRT, R_ct the part faster than `tau_split_kinetic_s`, R_mt the slower part; R_ohmic is the high-frequency intercept below, with the DRT's own R_∞ reported as `R_ohmic_drt`.
+
+**The standard equivalent circuit is fitted beside it** (`ecm_compare = True`, `pipeline/standard_eis.py`) and written as `R_ct_ecm`, `R_mt_ecm`, `R_pol_ecm`, `ecm_rms_pct`, so both evaluations of every segment come out of one run. `param_method = "ecm"` makes the circuit the primary method instead. The circuit, the way ZView or Gamry Echem Analyst fit it:
 
 ```
 Z(f) = R_ohmic + jωL + R_ct / (1 + (jωτ_ct)^n_ct) + R_mt / (1 + (jωτ_mt)^n_mt)
@@ -401,7 +410,7 @@ R_pol = R_ct + R_mt
    - where the spectrum crosses the real axis inside the band, the interpolated crossing;
    - otherwise Re Z extrapolated to Im Z = 0 along a straight line through the top 6 points (Re Z against Im Z).
 
-   It is then **held fixed**. With the band ending at 2.4 kHz, a free R_ohmic trades off against an arc starting above the band: on 10 % of the 450 A segments it fell to ~30 mΩ·cm² instead of ~58.
+   It is then **held fixed**. With a band ending before the crossing, a free R_ohmic trades off against an arc starting above the band: on 10 % of the 450 A segments it fell to ~30 mΩ·cm² instead of ~58.
 2. **Fitted part of the spectrum.** Only the capacitive part is fitted (`capacitive_band`). At high current the spectrum turns inductive below ~1 Hz (the low-frequency loop); the circuit has no element for it, so those lowest points are left out of the fit. They still count for `R_lf`.
 3. **The fit.** Complex non-linear least squares (`scipy.optimize.least_squares`):
    - **modulus weighting**: real and imaginary residuals divided by |Z|;
@@ -722,7 +731,7 @@ python run.py dc_closure RUN_45A RUN_60A ... -o OUT
 
 ## 18. Known limitations and open items
 
-1. **The top of the band.** The band ends near or below the real-axis crossing (§4), so R_ohmic is usually the extrapolated intercept, not a crossing. That is why it is held fixed in the circuit fit.
+1. **The top of the band.** With `BAND = 'complete'` the spectra cross the real axis inside the band and R_ohmic is that crossing. Above ~1 kHz the card phase is anchored to the Gamry (§4.3), so the crossing is not independent of the Gamry until the injected calibration sweep exists.
 2. **Low-frequency scatter at the 450 A air outlet is in the measurement.**
    - **Not caused by the processing:** silver changes the < 20 Hz values by 0.0 %, and the same scatter is in the old v3 results.
    - **Larger at the outlet:** the outlet segments (x < 60 mm) scatter 6.5 % rms against 1.7 % at the inlet, with lower SNR (10.7 vs 18 dB) and higher THD.
@@ -732,7 +741,7 @@ python run.py dc_closure RUN_45A RUN_60A ... -o OUT
 3. **To be sure about the chain, measure it.**
    - Sweep a known resistor (shunt or dummy load) through every FAMOS channel together with the Gamry: the delay and filter of each card, independent of the cell.
    - Measure a Gamry dummy cell for the Gamry's own chain.
-   - Until then, the band stops at 2.4 kHz.
+   - The injected sweep of §4.3 is the per-channel version of this.
 4. **Low-frequency scatter at high current.** At 150 A and 450 A the air-outlet segments scatter below ~20 Hz (up to ~10 % at the 450 A outlet). The outlet segments move together, which points to a non-stationary cell (water, air-flow drift), not to the computation. Quote R_mt there with the larger uncertainty (`docs/spectra_recheck.md`).
 4a. **Preventing the high-current scatter in future measurements** (it is in the signal, so it must be prevented at the bench):
    - Hold the operating point until the cell voltage drifts < 1 mV/min before the sweep, and repeat one frequency (e.g. 1 kHz) at the start and the end to measure the drift.
@@ -744,7 +753,7 @@ python run.py dc_closure RUN_45A RUN_60A ... -o OUT
    - It is the same in every build: the 12.10 full-band build only *looked* aligned in the Nyquist plane, because its high-frequency points were rotated onto the Gamry's phase (`gamry_card_phase`). Frequency by frequency it was still 8–17 % high, its points lying on the Gamry curve at about half the frequency.
    - About 13 mΩ·cm² of it is an offset: the UC taps carry ~47 µΩ of series resistance the Gamry sense leads do not (UC2 0.652 V vs Gamry Vdc 0.673 V at 450 A; item 2 above).
    - The rest (~+10 % at low frequency, at every current) is not explained by the data: DC current closure is −2.4 %, and the amplifier chain is flat to 0.03 % below 1 kHz. A simultaneous sweep of a known dummy load through both instruments settles it.
-5. **Missing steps.** 2.4 Hz and 9.45 Hz often hold no detectable tone and are then left out, not guessed.
+5. **Missing steps.** 2.4 Hz and 9.45 Hz are sometimes weak; the audit located them on every card (9.45 Hz keeps only ~2 whole periods). A step without a detectable tone is left out, not guessed.
 6. **Datago.**
    - The condition mapping relies on five-file groups per start minute and on the protocol order.
    - The ADC slot order is approximated (UC, then segments, then Temp). The structural de-skew may therefore be a few µs off per channel; the channel-lag stage, which is measured from the data, absorbs that.
@@ -793,42 +802,3 @@ python run.py dc_closure RUN_45A RUN_60A ... -o OUT
 | Bronze / silver / gold | the three processing layers: raw, corrected/modelled, plate field |
 
 ---
-
-## 21. The separate STANDARD pipeline (`Local EIS Standard Pipeline` notebook)
-
-**A second, independent evaluation** of the same raw FAMOS signals. Every step is the textbook one, written out in one file: `pipeline/std_pipeline.py`. It shares only the file readers, calibration, geometry and plotting with the main pipeline, and none of its corrections or methods:
-- no consensus schedule;
-- no card cross-correlation;
-- no Gamry relocation or window confinement;
-- no channel-lag fit;
-- no DRT.
-
-| Step | What it does | Function |
-|---|---|---|
-| 1. Read | the cards (datago first, `readers/datago_source.py`; Volumes `.DAT` otherwise) and the Gamry `.DTA` of the condition, whose ZCURVE table is the list of excitation frequencies in sweep order | `discover_files`, `find_gamry`, `gamry_steps` |
-| 2. Locate | a **lock-in** for every Gamry frequency on each card: demodulate the cell voltage and the 4 strongest segment channels at f and average over ~10 periods. Every instant belongs to the frequency with the strongest normalised tone. Then the **edges** are refined: fit the sine at f in the middle of the step and grow the window while the signal still follows it. Every card is located on its own, so no card alignment is needed. | `locate_steps`, `refine_window` |
-| 3. Phasors | least-squares sine fit (cos, sin, offset, linear trend) at the known f over whole periods, first period dropped (settling); SNR from the residual | `step_window`, `sine_fit` |
-| 4. Impedance | **Z = K(T)·U/u_seg**, then only known corrections: the Abgleich chain calibration (gain file) and the ADC slot delay (slot_seg − slot_ref)/(n_ch·fs); a reversed channel (Re Z < 0 at low f) is flipped | `evaluate_card` |
-| 5. Quality | a point is kept with ≥ 3 periods and SNR ≥ 3 dB on both channels; Lin-KK residual per segment (reported, not used to drop) | `run` |
-| 6. Parameters | the standard circuit fit (§8.3, `standard_eis.py`): R_ohmic, R_ct, R_mt, R_pol, the graphical R_pol, arc frequencies, fit residual; also j = u_dc/K, T, Re Z(1 kHz), \|Z\| and phase at 100 Hz | `run` |
-| 7. Aggregate | the **measured** segment impedances in parallel, Z_cell = A_used / Σ A_s/Z_s, against the Gamry × 304.92 cm² | `run` |
-| 8. Output | `EIS_Results_standard/<order>/<condition>/`: `spectra.csv` (kept), `spectra_all.csv`, `schedule.csv` (where each step was found on each card), `parameters.csv`, `plate_statistics.csv` (36 tiles), `aggregate.csv`, `gamry_comparison.csv` (the Gamry's own point at each measured step, never interpolated), `gamry_full.csv` (the whole sweep as read), `manifest.json`, `nyquist.png/.html` (segments + Gamry in black), `gamry_vs_aggregate.png` (aggregate and Gamry only), `plate_<param>_interp.png` | `write_figures` |
-
-**The notebook** (`Local EIS Standard Pipeline`):
-- widgets: order, conditions, write results;
-- cells: data source → run → Nyquist / Bode / phase of the measured spectra → interpolated plate maps → parameters and 36-tile statistics → aggregate vs Gamry → schedule summary.
-
-**What to expect on real data.** The per-channel delays between the cards' channels (−57…+76 µs on 2612030) are measured from the data in the main pipeline. They are deliberately not corrected here. Above a few hundred hertz the standard result therefore shows them as a phase spread between segments, and R_ohmic, read at the top of the band, carries it.
-
-**Tested** on synthetic raw data (`tests/make_synth_sweep.py`, `tests/test_std_pipeline.py`):
-- cards armed at different moments;
-- a descending stepped sweep with 4-period low-frequency steps;
-- a Gamry `.DTA`;
-- a multiplexer delay per channel;
-- a known circuit per segment.
-
-Results:
-- every step is located on every card, with edges to 0.05 period;
-- impedances are within 0.5 %;
-- R_ohmic, R_ct, R_mt, R_pol, j and T are recovered for all segments.
-

@@ -127,6 +127,12 @@ class BronzeSpectrum:
     T_degC: float
     u_dc: float                  # DC level on the segment channel, V
     ref_name: str
+    #: per point: the coherent background at the step frequency before the
+    #: sweep (mains, a switching tone, the cell's own oscillation), as % of
+    #: the step's response, reference and segment combined (utils.background_at)
+    bg_pct: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    #: steps whose window touched the ADC full scale (dropped)
+    n_clipped: int = 0
 
     @property
     def n_points(self) -> int:
@@ -1821,6 +1827,7 @@ def process_card(fp: Path, cal: PlateCalibration, schedule: list[Step],
                  ref_pool: tuple[np.ndarray, np.ndarray, dict] | None = None,
                  gain: dict | None = None,
                  v_gain: float = 1.0,
+                 v_hf: np.ndarray | None = None,
                  ratio: float = 1.0,
                  ) -> dict[str, BronzeSpectrum]:
     """Raw phasors for every segment on one card.
@@ -1946,6 +1953,26 @@ def process_card(fp: Path, cal: PlateCalibration, schedule: list[Step],
             log.info(f"    card_ml: {n_card_fb}/{len(schedule)} step(s) "
                      f"fell back to joint7 (no in-band card estimate)")
 
+    # ---- before the sweep: what the channels show with nothing excited ----
+    # The stretch ahead of the first step (minus 0.5 s) is where a tone at a
+    # step frequency -- mains, a card's switching tone, the cell's own
+    # oscillation -- can be measured on its own (raw-signal audit: 150 Hz
+    # mains on UC2 of cards 4-5, a 1.75 Hz current see-saw at the outlet).
+    fsv = float(getattr(cfg, "adc_full_scale_v", 0.0) or 0.0)
+    _starts = [int(round(st.start * ratio)) + lag for st in schedule]
+    q_end = (min(_starts) - int(0.5 * fam.fs)) if _starts else 0
+    if not getattr(cfg, "background_check", True) or q_end < int(fam.fs):
+        q_end = 0
+    bg_ref = np.full(len(schedule), np.nan)
+    if q_end > 0:
+        _rq = ref[:q_end]
+        for i, st in enumerate(schedule):
+            n_i = int(round((st.stop - st.start) * ratio))
+            if n_i > 0:
+                bg_ref[i], _ = utils.background_at(_rq, fam.fs, st.freq, n_i)
+        del _rq
+        log.info(f"    background: {q_end / fam.fs:.0f} s before the sweep")
+
     for seg in fam.segment_names:
         if seg in _skip:
             n_excluded += 1
@@ -1965,6 +1992,9 @@ def process_card(fp: Path, cal: PlateCalibration, schedule: list[Step],
         n_per = np.zeros(n_st, int)
 
         n_skip = 0
+        bg = np.full(n_st, np.nan)
+        n_clip = 0
+        xq = x[:q_end] if q_end > 0 else None
         for i, st in enumerate(schedule):
             a, b = (int(round(st.start * ratio)) + lag,
                         int(round(st.stop * ratio)) + lag)
@@ -1973,6 +2003,13 @@ def process_card(fp: Path, cal: PlateCalibration, schedule: list[Step],
                 continue
             yr, ys = ref[a:b], x[a:b]
             n_per[i] = b - a
+            # A WINDOW THAT TOUCHED THE ADC FULL SCALE IS NOT A SINE.
+            # (2612030 450 A: segment 58 sat at +4.9994 V for 87 samples at
+            # the sweep start.) The point is dropped, not fitted.
+            if fsv > 0 and (np.max(np.abs(ys)) >= fsv
+                            or np.max(np.abs(yr)) >= fsv):
+                n_clip += 1
+                continue
 
             if cfg.phasor_method == "card_ml" and np.isfinite(f_card[i]):
                 f_used = float(f_card[i])
@@ -2001,6 +2038,13 @@ def process_card(fp: Path, cal: PlateCalibration, schedule: list[Step],
 
             #  j_s = u_s / K   ->   Z = U_cell / j_s = K * A_ref / A_seg
             Z[i] = K * A_ref / A_seg if A_seg != 0 else complex("nan")
+            # the coherent background at this frequency before the sweep
+            if xq is not None and abs(A_seg) > 0:
+                b_s, _ = utils.background_at(xq, fam.fs, st.freq, b - a)
+                r2 = (b_s / abs(A_seg)) ** 2 if np.isfinite(b_s) else np.nan
+                if A_pool is None and np.isfinite(bg_ref[i]) and abs(A_ref) > 0:
+                    r2 = np.nansum([r2, (bg_ref[i] / abs(A_ref)) ** 2])
+                bg[i] = 100.0 * np.sqrt(r2) if np.isfinite(r2) else np.nan
             thd[i] = utils.harmonic_distortion(ys, fam.fs, f_used)
             if cfg.phasor_method == "card_ml":
                 # effect size where the change is statistically real, 0.0
@@ -2042,6 +2086,11 @@ def process_card(fp: Path, cal: PlateCalibration, schedule: list[Step],
             Z = Z / utils.gain_at(gain, seg, freqs)
         if v_gain and np.isfinite(v_gain) and v_gain != 1.0:
             Z = Z / v_gain
+        # above the gain band: this card's |UC| against the reference card's
+        # at each step (card_gain.hf_response -- the inductive pickup of the
+        # excitation on the card's own UC2)
+        if v_hf is not None and len(v_hf) == len(Z):
+            Z = Z / np.where(np.isfinite(v_hf) & (v_hf > 0), v_hf, 1.0)
         with np.errstate(invalid="ignore"):
             Z = _fix_polarity(Z, freqs, utils.combine_snr_db(snr_r, snr_s), cfg)
 
@@ -2054,7 +2103,11 @@ def process_card(fp: Path, cal: PlateCalibration, schedule: list[Step],
             n_ch_on_card=fam.n_ch, fs=fam.fs,
             K=float(K), K_imputed=bool(imputed), T_degC=float(T),
             u_dc=float(np.mean(x[::cfg_stride(cfg)])), ref_name=ref_name,
+            bg_pct=bg, n_clipped=int(n_clip),
         )
+        if n_clip:
+            log.warning(f"    segment {seg}: {n_clip} step window(s) touched "
+                        f"the ADC full scale ({fsv:g} V) -- dropped")
 
     n_imp = sum(1 for s in out.values() if s.K_imputed)
     slots = [s.channel_slot for s in out.values()]
@@ -2114,23 +2167,24 @@ def run(cfg: Config = DEFAULT, log=None) -> BronzeRun:
     # Each card's voltage chain against the others: the five UC2 channels
     # record one cell voltage, so their step phasors must agree. Non-fatal --
     # a diagnostic must not end a run.
-    card_ref, v_gains = {}, {}
+    card_ref, v_gains, v_hf = {}, {}, {}
     if card_gain.mode(cfg) != "off":
         utils.section("card voltage gain (UC channels, card against card)", log)
         try:
             card_ref = card_gain.measure_reference(files, cards, schedule, cfg,
                                                    lags=lags, log=log)
             v_gains = card_gain.applied_gains(card_ref)
+            v_hf = card_gain.applied_hf(card_ref)
             if ref_pool is not None and any(g != 1.0 for g in v_gains.values()):
                 log.info("  reference pool on: Z divides by the pooled UC "
                          "phasor, so the per-card gain is reported, not applied")
                 for d in card_ref.values():
                     for r in d.values():
                         r.applied = 1.0
-                v_gains = {}
+                v_gains, v_hf = {}, {}
         except Exception as exc:                            # noqa: BLE001
             log.warning(f"  card gain check skipped: {exc}")
-            card_ref, v_gains = {}, {}
+            card_ref, v_gains, v_hf = {}, {}, {}
     gain = utils.load_gain(cfg.gain_file) if cfg.gain_file else {}
     if gain:
         log.info(f"  chain response: {Path(cfg.gain_file).name}, "
@@ -2152,6 +2206,7 @@ def run(cfg: Config = DEFAULT, log=None) -> BronzeRun:
         got = process_card(fp, cal, schedule, grid, cfg, log,
                            T_seg=T_seg, lag=shift, ref_pool=ref_pool,
                            gain=gain, v_gain=v_gains.get(fp.stem, 1.0),
+                           v_hf=v_hf.get(fp.stem),
                            ratio=card_ratio(info))
         for seg, sp in got.items():
             if seg in spectra:
@@ -2257,7 +2312,8 @@ def load(run_dir) -> BronzeRun:
             fs=num(m.get("fs_hz")), K=num(m.get("K")),
             K_imputed=str(m.get("K_imputed", "0")) in ("1", "True", "true"),
             T_degC=num(m.get("T_degC")), u_dc=num(m.get("u_dc_V")),
-            ref_name=m.get("ref_name", ""))
+            ref_name=m.get("ref_name", ""), bg_pct=col("bg_pct"),
+            n_clipped=int(num(m.get("n_clipped"), 0)))
 
     schedule = [Step(freq=num(r["freq_hz"]), start=int(num(r["start"], 0)),
                      stop=int(num(r["stop"], 0)), amp=num(r.get("amp_V")),
@@ -2320,6 +2376,9 @@ def save(run_obj: BronzeRun, cfg: Config, log=None) -> Path:
                 "thd": float(sp.thd[i]), "drift": float(sp.drift[i]),
                 "n_samples": int(sp.n_per_step[i]),
                 "on_grid": int(sp.on_grid[i]),
+                "bg_pct": (round(float(sp.bg_pct[i]), 3)
+                           if i < len(sp.bg_pct) and np.isfinite(sp.bg_pct[i])
+                           else ""),
             })
     utils.write_table(out / "raw_spectra.csv", rows)
 
@@ -2338,6 +2397,7 @@ def save(run_obj: BronzeRun, cfg: Config, log=None) -> Path:
             "T_degC": round(sp.T_degC, 2), "u_dc_V": sp.u_dc,
             "j_dc_A_cm2": round(sp.j_dc(), 6),
             "n_points": sp.n_points, "ref_name": sp.ref_name,
+            "n_clipped": int(getattr(sp, "n_clipped", 0)),
         })
     utils.write_table(out / "segment_meta.csv", meta)
 

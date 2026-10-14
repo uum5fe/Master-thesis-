@@ -265,6 +265,11 @@ def collect_parameters(sr: SilverRun, cfg: Config
         put("R_ct", s, proc["R_ct"])
         put("R_mt", s, proc["R_mt"])
         put("R_pol", s, sp.R_pol)
+        # the circuit fit beside the DRT (config.ecm_compare)
+        for _k in ("R_ct_ecm", "R_mt_ecm", "R_pol_ecm"):
+            _v = getattr(sp, _k, np.nan)
+            if np.isfinite(_v):
+                put(_k, s, _v)
         put("j_dc", s, sp.j_dc)
         put("T_degC", s, sp.T_degC)
         put("tau_peak", s, sp.tau_peak)

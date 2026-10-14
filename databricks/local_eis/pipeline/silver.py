@@ -117,7 +117,7 @@ P. M. Ramos, A. Cruz Serra, Measurement 41 (2008) 135      -- joint sine fit
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as _dc_replace
 from pathlib import Path
 
 import numpy as np
@@ -228,6 +228,11 @@ class SilverSpectrum:
     R_pol_lf: float = float("nan")
     R_ohmic_topband: float = float("nan")
     R_ohmic_how: str = ""
+    #: the circuit fit run beside the DRT (config.ecm_compare): R_ct, R_mt
+    #: and R_pol of the standard circuit, whichever method is primary
+    R_ct_ecm: float = float("nan")
+    R_mt_ecm: float = float("nan")
+    R_pol_ecm: float = float("nan")
     #: Current-chain lag of this segment against the plate (channel_lag.py):
     #: what was fitted, what was removed from Z before R_ohmic was read, and
     #: the verdict. nan / 0 / "" when the stage is off.
@@ -284,6 +289,8 @@ class SilverRun:
     card_hf_phase: dict = field(default_factory=dict)
     gamry_card_phase: dict = field(default_factory=dict)
     card_phase_ref: str = "plate"
+    #: segments left out as channel faults: {segment: reason}
+    faulty: dict = field(default_factory=dict)
 
     def card_factors(self) -> dict:
         """card -> card_gain.CardFactor: |Z| per band and j_dc vs the plate."""
@@ -1176,11 +1183,11 @@ def r_ohmic_topband(freq: np.ndarray, Z: np.ndarray, sigma_rel: np.ndarray,
 def r_ohmic_method(cfg) -> str:
     """'intercept' or 'topband' -- config.r_ohmic_method, 'auto' resolved
     by config.full_band."""
-    if str(getattr(cfg, "param_method", "ecm") or "ecm").lower() == "ecm":
+    if str(getattr(cfg, "param_method", "drt") or "drt").lower() == "ecm":
         return "ecm"
     m = str(getattr(cfg, "r_ohmic_method", "auto") or "auto").lower()
     if m == "auto":
-        return "intercept" if getattr(cfg, "full_band", False) else "topband"
+        return "intercept" if getattr(cfg, "full_band", False) else "hf_intercept"
     return m
 
 
@@ -1301,6 +1308,9 @@ REJECT_REASONS = {
     "cycles": "fewer than cfg.min_cycles_per_dwell cycles in the dwell",
     "zmag_outlier": "local |Z| outlier against its neighbours",
     "passivity": "Re Z negative above the passivity gate, after de-skew",
+    "background": "a coherent tone at the step frequency before the sweep "
+                  "(mains, switching tone, the cell's own oscillation) above "
+                  "cfg.background_max_pct of the response",
 }
 
 
@@ -1377,6 +1387,13 @@ def gate_points(sp: BronzeSpectrum, cfg: Config) -> dict:
         keep &= gate(ok_tone, "off_tone")
     keep &= gate(~(np.isfinite(sp.thd) & (sp.thd > cfg.max_thd)), "thd")
     keep &= gate(~(np.isfinite(sp.drift) & (sp.drift > cfg.max_drift)), "drift")
+    # a tone at the step frequency, measured before the sweep: the Cramer-Rao
+    # uncertainty counts only broadband noise, and a fit at f cannot tell a
+    # coherent tone from the response (bronze, utils.background_at)
+    bg = np.asarray(getattr(sp, "bg_pct", np.zeros(0)), float)
+    bg_max = float(getattr(cfg, "background_max_pct", 0.0) or 0.0)
+    if bg_max > 0 and bg.size == freq.size:
+        keep &= gate(~(np.isfinite(bg) & (bg > bg_max)), "background")
 
     # Plausibility on the magnitude always; on the SIGN of the real part only
     # above passivity_gate_min_hz.  See the note in config.py: a negative real
@@ -1550,10 +1567,11 @@ def process_segment(sp: BronzeSpectrum, skew: SkewModel, cfg: Config,
     n_drop += n_drop_pass
 
     # ---- measurement model -------------------------------------------------
-    # "ecm" (default): the standard equivalent-circuit fit, standard_eis.py.
-    # "drt": the Bayesian DRT (the earlier approach).
-    ecm = None
-    method = str(getattr(cfg, "param_method", "ecm") or "ecm").lower()
+    # "drt" (default): the Bayesian DRT, with the standard circuit fitted
+    # beside it (config.ecm_compare). "ecm": the circuit fit is the method.
+    ecm = None           # the circuit fit as THE method ("ecm")
+    ecm_cmp = None       # the circuit fit beside the DRT (ecm_compare)
+    method = str(getattr(cfg, "param_method", "drt") or "drt").lower()
     if method == "ecm":
         ecm = standard_eis.fit_spectrum(f, z_corr)
         if ecm.get("ok"):
@@ -1573,8 +1591,15 @@ def process_segment(sp: BronzeSpectrum, skew: SkewModel, cfg: Config,
             model = {"ok": False}
     elif cfg.drt_enable:
         model = bayesian_drt(f, z_corr, s_rel, cfg)
+        if getattr(cfg, "ecm_compare", True):
+            try:
+                ecm_cmp = standard_eis.fit_spectrum(f, z_corr)
+            except Exception:                               # noqa: BLE001
+                ecm_cmp = None
     else:
         model = {"ok": False}
+    ecm_any = ecm if ecm is not None else ecm_cmp
+    ecm_ok = bool(ecm_any is not None and ecm_any.get("ok"))
     if not model.get("ok"):
         r = mm.fit_kk_model(f, z_corr, s_rel, mu_crit=cfg.mu_crit,
                             ridge=cfg.kk_ridge)
@@ -1609,19 +1634,31 @@ def process_segment(sp: BronzeSpectrum, skew: SkewModel, cfg: Config,
     # With the full band the spectrum crosses the real axis inside it: R_ohmic
     # is then that crossing, as the Gamry and the bench tool define it, and
     # the arc is closed by construction.
+    crossed = False
     if r_ohmic_method(cfg) == "intercept":
         R_int, R_int_sd = r_ohmic_intercept(f_m, z_m,
                                             model.get("sigma_rel", s_rel))
         if np.isfinite(R_int) and R_int > 0:
             R_top, R_top_sd, arc_open, closure = R_int, R_int_sd, 0.0, 1.0
+            crossed = True
     R_topband = float(R_top)
-    R_how = "topband"
-    if ecm is not None and ecm.get("ok"):
-        # the standard way: R_ohmic is the high-frequency intercept the
-        # circuit fit was built on (standard_eis.hf_intercept)
-        R_top, R_top_sd = float(ecm["R_ohmic"]), float(ecm["R_ohmic_sd"])
+    R_how = "crossing" if crossed else "topband"
+    # the complete band without a crossing in it falls back to the same
+    # extrapolated intercept, not to the top-band mean
+    if r_ohmic_method(cfg) in ("ecm", "hf_intercept") or (
+            r_ohmic_method(cfg) == "intercept" and not crossed):
+        # the standard definition: the high-frequency real-axis intercept,
+        # or Re Z extrapolated to Im Z = 0 from the top of the band
+        # (standard_eis.hf_intercept) -- the value the circuit fit holds
+        if ecm_ok:
+            R_top, R_top_sd = (float(ecm_any["R_ohmic"]),
+                               float(ecm_any["R_ohmic_sd"]))
+            R_how = str(ecm_any.get("R_ohmic_method", "hf_intercept"))
+        else:
+            _r, _how = standard_eis.hf_intercept(f, z_corr)
+            if np.isfinite(_r) and _r > 0:
+                R_top, R_how = float(_r), str(_how)
         arc_open, closure = 0.0, 1.0
-        R_how = str(ecm.get("R_ohmic_method", "ecm"))
     R_drt = float(model["R_inf"])
     if not np.isfinite(R_top):
         R_top, R_top_sd = R_drt, float(model.get("R_inf_sd", np.nan))
@@ -1709,10 +1746,13 @@ def process_segment(sp: BronzeSpectrum, skew: SkewModel, cfg: Config,
         R_ohmic_topband=R_topband, R_ohmic_how=R_how,
         R_ct=(float(ecm["R_ct"]) if ecm and ecm.get("ok") else np.nan),
         R_mt=(float(ecm["R_mt"]) if ecm and ecm.get("ok") else np.nan),
-        f_ct_hz=(float(ecm["f_ct_hz"]) if ecm and ecm.get("ok") else np.nan),
-        f_mt_hz=(float(ecm["f_mt_hz"]) if ecm and ecm.get("ok") else np.nan),
-        ecm_rms_pct=(float(ecm["rms_pct"]) if ecm and ecm.get("ok") else np.nan),
-        R_pol_lf=(float(ecm["R_pol_lf"]) if ecm and ecm.get("ok") else np.nan),
+        f_ct_hz=(float(ecm_any["f_ct_hz"]) if ecm_ok else np.nan),
+        f_mt_hz=(float(ecm_any["f_mt_hz"]) if ecm_ok else np.nan),
+        ecm_rms_pct=(float(ecm_any["rms_pct"]) if ecm_ok else np.nan),
+        R_pol_lf=(float(ecm_any["R_pol_lf"]) if ecm_ok else np.nan),
+        R_ct_ecm=(float(ecm_any["R_ct"]) if ecm_ok else np.nan),
+        R_mt_ecm=(float(ecm_any["R_mt"]) if ecm_ok else np.nan),
+        R_pol_ecm=(float(ecm_any["R_pol"]) if ecm_ok else np.nan),
         hf_arc_open=arc_open, hf_closure=closure,
         R_pol=float(model["R_pol"]), L=float(L), dt_applied=float(dt),
         tau_peak=float(model.get("tau_peak", np.nan)),
@@ -2229,9 +2269,51 @@ def cell_aggregate_full(spectra: dict, filled: dict | None = None,
 # ===========================================================================
 
 
+def dc_share_faults(spectra: dict, cfg: Config) -> dict[str, str]:
+    """Segments whose DC current density says the CHANNEL is broken.
+
+    Neighbouring segments on one plate carry similar current: on 2612030
+    450 A the plate CV of j_dc is 6.8 %. A segment at 18 % of its neighbours
+    (segment 33) is a channel fault -- a shunt, a contact or a K that is
+    wrong -- and its impedance, K * U / u, is off by the same factor. Judged
+    against the median of the edge neighbours that were measured; a
+    segment with fewer than two measured neighbours is not judged.
+    """
+    ratio = float(getattr(cfg, "segment_fault_ratio", 0.0) or 0.0)
+    if ratio <= 0 or ratio >= 1:
+        return {}
+    import neighbours
+    adj = neighbours.adjacency()
+    j = {s: float(sp.j_dc()) for s, sp in spectra.items()}
+    out = {}
+    for s, js in j.items():
+        ring = [j[n] for n in adj.get(s, ()) if n in j and np.isfinite(j[n])]
+        if len(ring) < 2 or not np.isfinite(js):
+            continue
+        med = float(np.median(ring))
+        if med <= 0:
+            continue
+        r = js / med
+        if r < ratio or r > 1.0 / ratio:
+            out[s] = (f"DC current density {js:.3f} A/cm2 = {100 * r:.0f} % of "
+                      f"its {len(ring)} neighbours' median {med:.3f}")
+    return out
+
+
 def run(bronze_run: BronzeRun, cfg: Config = DEFAULT, log=None) -> SilverRun:
     log = log or utils.get_logger(cfg.verbose)
     utils.banner("SILVER  --  correction, modelling, validation", log)
+
+    # ---- 0. channel faults: a segment far from its neighbours in DC -------
+    unwired = list(bronze_run.segments_missing())
+    faulty = dc_share_faults(bronze_run.spectra, cfg)
+    if faulty:
+        utils.section("channel faults (DC current against the neighbours)", log)
+        for s_, why in sorted(faulty.items(), key=lambda kv: int(kv[0])):
+            log.warning(f"  segment {s_}: {why} -- left out as a channel "
+                        f"fault (cfg.segment_fault_ratio)")
+        bronze_run = _dc_replace(bronze_run, spectra={
+            k: v for k, v in bronze_run.spectra.items() if k not in faulty})
 
     # ---- 1. skew, per card -------------------------------------------------
     utils.section(f"acquisition skew  (model: {cfg.skew_model})", log)
@@ -2390,7 +2472,7 @@ def run(bronze_run: BronzeRun, cfg: Config = DEFAULT, log=None) -> SilverRun:
         f_cell, Z_cell, n_cell = cell_aggregate(spectra)
 
     return SilverRun(point_ledger=point_ledger,
-                     unwired=list(bronze_run.segments_missing()),
+                     unwired=unwired, faulty=faulty,
                      spectra=spectra, skew=skew, dc_closure=dcc,
                      cell_freq=f_cell, Z_cell=Z_cell, cell_n_seg=n_cell,
                      filled=filled, fill_info=fill_info, aggregate=agg,
@@ -2473,6 +2555,10 @@ def save(sr: SilverRun, cfg: Config, log=None) -> Path:
         "R_pol_mohm_cm2": round(1000 * s.R_pol, 4),
         "R_ct_mohm_cm2": round(1000 * s.R_ct, 4) if np.isfinite(s.R_ct) else "",
         "R_mt_mohm_cm2": round(1000 * s.R_mt, 4) if np.isfinite(s.R_mt) else "",
+        "R_ct_ecm_mohm_cm2": round(1000 * s.R_ct_ecm, 4) if np.isfinite(s.R_ct_ecm) else "",
+        "R_mt_ecm_mohm_cm2": round(1000 * s.R_mt_ecm, 4) if np.isfinite(s.R_mt_ecm) else "",
+        "R_pol_ecm_mohm_cm2": round(1000 * s.R_pol_ecm, 4) if np.isfinite(s.R_pol_ecm) else "",
+        "R_ohmic_drt_mohm_cm2": round(1000 * s.R_ohmic_drt, 4) if np.isfinite(s.R_ohmic_drt) else "",
         "f_ct_hz": round(s.f_ct_hz, 2) if np.isfinite(s.f_ct_hz) else "",
         "f_mt_hz": round(s.f_mt_hz, 3) if np.isfinite(s.f_mt_hz) else "",
         "ecm_rms_pct": round(s.ecm_rms_pct, 2) if np.isfinite(s.ecm_rms_pct) else "",
@@ -2573,6 +2659,7 @@ def save(sr: SilverRun, cfg: Config, log=None) -> Path:
                      "cost_gain": v.cost_gain, "note": v.note}
                  for k, v in sr.skew.items()},
         "card_phase_reference": sr.card_phase_ref,
+        "faulty_segments": getattr(sr, "faulty", {}),
         "card_phase_deg": sr.card_hf_phase,
         "gamry_card_phase": sr.gamry_card_phase,
     })

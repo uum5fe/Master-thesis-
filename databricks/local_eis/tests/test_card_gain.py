@@ -274,9 +274,10 @@ def test_dc_closure_tool_reads_run_folders(tmp_path, capsys):
     assert (tmp_path / "o" / "dc_closure_cards.csv").is_file()
 
 
-def test_noisy_steps_fall_back_to_the_dc_level():
-    """2612030: the UC2 AC response is 0-20 dB per step, so no card had five
-    clean steps and every gain came out nan. The DC level decides then."""
+def test_noisy_steps_report_the_dc_level_but_never_apply_it():
+    """Without five clean AC steps the DC ratio is reported -- and not applied:
+    a DC ratio cannot tell a gain from an input offset (card 4 of 2612030:
+    a -2.3 mV offset read as a -0.35 % gain)."""
     f = np.array(FREQS)
     A = {c: np.exp(1j * 0.3) * np.ones(f.size) for c in GAIN}
     snr = {c: np.full(f.size, 6.0) for c in GAIN}            # all too noisy
@@ -285,10 +286,26 @@ def test_noisy_steps_fall_back_to_the_dc_level():
                                     used_for_Z={c: True for c in GAIN})
     assert out["Karte_3"].source == "dc"
     assert out["Karte_3"].gain == pytest.approx(1.04, abs=1e-6)
-    assert out["Karte_3"].status == card_gain.OFF
-    assert out["Karte_1"].status == card_gain.OK
+    assert out["Karte_3"].status == card_gain.DC_ONLY
+    assert not card_gain.correctable(out["Karte_3"])
     c = plausibility.card_voltage_check({"UC2": out})
     assert c.verdict == plausibility.WARN and "DC level" in c.detail
+
+
+def test_the_gate_is_the_phasor_snr_and_the_band_stops_below_the_pickup():
+    """UC2: ~5 dB per sample, but a 0.5 s window knows the phasor to ~40 dB.
+    And a card that reads 15 % high only at 700 Hz (pickup) is not a gain."""
+    assert card_gain.estimate_snr_db(5.0, 12500) == pytest.approx(
+        5.0 + 10 * np.log10(6250))
+    f = np.array(FREQS)
+    A = {c: np.exp(1j * 0.3) * g * np.ones(f.size) for c, g in GAIN.items()}
+    A["Karte_4"] = A["Karte_4"] * np.where(f > 500, 1.15, 1.0)
+    snr = {c: np.full(f.size, 40.0) for c in GAIN}
+    dc = {c: np.full(f.size, U_DC) for c in GAIN}
+    out = card_gain.compare_phasors(f, A, snr, dc, DEFAULT)
+    assert out["Karte_4"].gain == pytest.approx(0.98, abs=1e-6)
+    assert out["Karte_4"].status == card_gain.OFF          # flat 1-300 Hz
+    assert out["Karte_3"].gain == pytest.approx(1.04, abs=1e-6)
 
 
 def test_nothing_measurable_is_not_a_pass():

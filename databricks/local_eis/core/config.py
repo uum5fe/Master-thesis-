@@ -294,7 +294,7 @@ class Config:
     # divides each card's Z by that gain when it is flat over the band (low vs
     # high band within card_gain_flat_pct) and within card_gain_max_pct --
     # larger is a different tap or a wiring fault, and is reported instead.
-    card_gain: str = "report"              # off | report | correct
+    card_gain: str = "correct"             # off | report | correct
     # SERIES RESISTANCE BETWEEN THE UC TAP AND THE REFERENCE'S SENSE LEADS.
     # Every card's UC2 and the Gamry's Vdc measure the cell voltage at
     # different points. On 2612030 UC2 - Vdc = -1.6 mV - I x 44 uOhm over
@@ -318,7 +318,38 @@ class Config:
     # bench's MATLAB maps, written as plate_<param>_interp.png; "both".
     heatmap_style: str = "interpolated"    # segments | interpolated | both
     abgleich_bode_dir: Path | None = None
-    card_gain_min_snr_db: float = 20.0     # steps below: not used
+    # step gate on the SNR of the PHASOR estimate (per-sample SNR +
+    # 10 log10(n/2)); the gain is read only between f_lo and f_hi, below the
+    # inductive pickup of cards 3-5 (raw-signal audit, card_gain.py)
+    card_gain_min_snr_db: float = 30.0     # steps below: not used
+    card_gain_f_lo_hz: float = 1.0
+    card_gain_f_hi_hz: float = 300.0
+
+    # ---- found by the raw-signal audit of 2612030 450 A ---------------------
+    # ADC full scale of the FAMOS cards (+-5 V, 14 bit: +8191 = 4.9994 V). A
+    # step window that touches it is dropped, not fitted (segment 58 sat at
+    # full scale for 87 samples at the sweep start). 0 switches it off.
+    adc_full_scale_v: float = 4.99
+    # The stretch before the sweep is measured at every step frequency
+    # (utils.background_at). A point whose COHERENT background there exceeds
+    # background_max_pct of its response is dropped (silver gate
+    # "background"): 150 Hz mains on UC2 of cards 4-5, the cell's own
+    # 1.75 Hz current see-saw at the air outlet, card switching tones. The
+    # broadband noise is already in every point's Cramer-Rao uncertainty.
+    background_check: bool = True
+    background_max_pct: float = 5.0
+    # A segment whose DC current density is below segment_fault_ratio x (or
+    # above 1/segment_fault_ratio x) the median of its plate neighbours is a
+    # channel fault, not the cell (segment 33: 18 % of its neighbours). It is
+    # left out of the evaluation -- and rebuilt from its neighbours when
+    # fill_missing_from_neighbours is on. 0 switches it off.
+    segment_fault_ratio: float = 0.5
+    # Above card_gain_f_hi_hz, divide each card's Z by its UC magnitude
+    # against the reference card's, step by step (card_gain.hf_response):
+    # cards 3-5 pick the excitation up inductively on UC2, card 1 ~13x less.
+    # Magnitude only, so the cards' separate clocks do not enter.
+    uc_hf_equalise: bool = True
+    uc_reference_card: str = "Karte_1"
     card_gain_min_steps: int = 5
     card_gain_tol_pct: float = 1.0         # within: "ok"
     card_gain_flat_pct: float = 2.0        # low vs high band, else "not flat"
@@ -380,17 +411,24 @@ class Config:
     # constant only stops binding before it gets the chance.
     f_min_hz: float = 0.15
     f_max_hz: float = 30000.0
-    # THE EVALUATION BAND STOPS AT 2.4 kHz. f_max_hz above only bounds the
-    # blind step DETECTION (with f_hi_frac_fs); every impedance the pipeline
-    # evaluates, fits and maps lies at or below eval_f_max_hz. Above ~2.5 kHz
-    # neither instrument measures the cell on 2612030: cards 3-5 show a
-    # filter response (|Z| -30 % at 3.8 kHz, +20 % at 5.9 kHz, phase +50..70
-    # deg), cards 1-2 an ~11 us timing lead, and the Gamry's own tail is a
-    # ~0.75 nH wiring loop on a 0.15 mOhm cell. Up to 2.4 kHz all five cards
-    # agree with each other and with the Gamry shape within a few degrees
-    # (docs/PIPELINE_GUIDE.md, "Why the band stops at 2.4 kHz"). The step at
-    # 2390.6 Hz is the last one kept. Detection keeps its wide ceiling on
-    # purpose: lowering it moved the step boundaries at 6-20 Hz.
+    # TOP OF THE EVALUATED BAND (with full_band off). f_max_hz above only
+    # bounds the blind step DETECTION (with f_hi_frac_fs). The runner sets
+    # the band itself (BAND = 'complete' | 'trusted'):
+    #   complete  full_band on, eval_f_max_hz 0: every step up to
+    #             full_band_frac_fs * fs (12.25 kHz at 25 kHz, i.e. up to the
+    #             11.95 kHz step; the 15-30 kHz steps arrive aliased), with
+    #             the corrections the raw-signal audit made possible: each
+    #             card's UC2 magnitude against the cleanest card
+    #             (uc_hf_equalise), the per-card phase against the Gamry
+    #             sweep (gamry_card_phase), the per-channel lag.
+    #   trusted   0.15 Hz - 1.2 kHz: where all five cards agree without any
+    #             correction (UC2 within +-3 % / +-2 deg, raw-signal audit).
+    # Above ~1.5 kHz the segment channels differ from each other by +-13 deg
+    # (1.9 kHz) to +-26 deg (3 kHz) downstream of the plate amplifiers; the
+    # in-situ corrections bring every channel onto the plate, only an
+    # injected calibration sweep through every channel measures each one.
+    # Detection keeps its wide ceiling on purpose: lowering it moved the step
+    # boundaries at 6-20 Hz.
     eval_f_max_hz: float = 2400.0
     # THE TOP OF THE BAND SILVER MODELS, as a fraction of the card's fs.
     # Detection may go higher (f_hi_frac_fs); the impedance may not. On
@@ -965,15 +1003,21 @@ class Config:
     # boundaries below are the conventional PEMFC split; they are config, not
     # code, because a different MEA moves them.
     # HOW R_ohmic, R_ct, R_mt AND R_pol ARE COMPUTED.
-    #   "ecm" (default) -- the standard way, pipeline/standard_eis.py:
-    #       R_ohmic = the high-frequency real-axis intercept (extrapolated to
-    #       Im Z = 0 from the top of the band when the band ends before it),
-    #       then the circuit R_ohmic + jwL + (R_ct||CPE) + (R_mt||CPE) is
-    #       fitted by complex non-linear least squares (modulus weighting) to
-    #       the capacitive part of the spectrum; R_pol = R_ct + R_mt.
-    #   "drt" -- the Bayesian DRT below, R_ohmic = top-band mean, R_ct/R_mt
-    #       from splitting the DRT at tau_split_*_s (the earlier approach).
-    param_method: str = "ecm"
+    #   "drt" (default) -- the Bayesian DRT (GP prior, closed-form posterior,
+    #       points weighted by their Cramer-Rao uncertainties): R_pol is the
+    #       area of the DRT, R_ct / R_mt its parts below / above
+    #       tau_split_kinetic_s. R_ohmic is the high-frequency intercept
+    #       (r_ohmic_method "auto" -> "hf_intercept": the real-axis crossing,
+    #       or Re Z extrapolated to Im Z = 0 from the top of the band), the
+    #       DRT's own R_inf is reported beside it (R_ohmic_drt).
+    #   "ecm" -- the standard circuit, pipeline/standard_eis.py:
+    #       R_ohmic + jwL + (R_ct||CPE) + (R_mt||CPE) by complex non-linear
+    #       least squares, R_ohmic fixed from the intercept; R_pol = sum.
+    # With ecm_compare on (the default) the circuit fit runs in "drt" mode
+    # too and is written beside the DRT numbers (R_ct_ecm, R_mt_ecm,
+    # R_pol_ecm, ecm_rms_pct): both evaluations of every segment, one run.
+    param_method: str = "drt"
+    ecm_compare: bool = True
     drt_enable: bool = True
     drt_method: str = "gp"           # {"ridge", "gp"}  -- gp = GP-DRT
     drt_n_tau_per_decade: int = 10
@@ -1392,6 +1436,12 @@ PARAM_META = {
     "R_mt":        dict(label="R_mt (mass transport)", unit="m\u03a9\u00b7cm\u00b2",
                         scale=1000.0, cmap="plotly_jet"),
     "R_pol":       dict(label="R_pol (total polarisation)", unit="m\u03a9\u00b7cm\u00b2",
+                        scale=1000.0, cmap="plotly_jet"),
+    "R_ct_ecm":    dict(label="R_ct (circuit fit)", unit="m\u03a9\u00b7cm\u00b2",
+                        scale=1000.0, cmap="plotly_jet"),
+    "R_mt_ecm":    dict(label="R_mt (circuit fit)", unit="m\u03a9\u00b7cm\u00b2",
+                        scale=1000.0, cmap="plotly_jet"),
+    "R_pol_ecm":   dict(label="R_pol (circuit fit)", unit="m\u03a9\u00b7cm\u00b2",
                         scale=1000.0, cmap="plotly_jet"),
     "ReZ_1kHz":    dict(label="Re Z @ 1 kHz (band-independent HF)",
                         unit="m\u03a9\u00b7cm\u00b2", scale=1000.0,

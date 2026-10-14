@@ -615,3 +615,17 @@ beside the PNGs.
   | outlet 0.8–1 | 12.1 % | 1.9 % | 1.5 % | 10 dB | 6.5 % |
 
   Only the low frequencies scatter, and only towards the outlet (r = 0.95 with position). The outlet segments' deviations move together (pairwise r = 0.99): the outlet region changes during the long low-frequency steps.
+
+## One pipeline, the complete band, the raw-signal audit (October 2026)
+
+- **One pipeline.** The separate `Local EIS Standard Pipeline` notebook and `pipeline/std_pipeline.py` (+ `readers/datago_source.py`) are removed; their circuit fit lives on in the runner (`ecm_compare`). They remain in the git history.
+- **Methods**: maximum-likelihood card frequency + least-squares sine fits, Cramér–Rao point uncertainties, **Bayesian DRT as the primary method** for R_ct / R_mt / R_pol, the standard circuit fitted beside it (`R_ct_ecm`, `R_mt_ecm`, `R_pol_ecm`), R_ohmic = the high-frequency intercept (`R_ohmic_drt` = the DRT's R_∞ beside it).
+- **The complete band by default** (`BAND = 'complete'`: 0.15 Hz – 0.49·fs, up to the 11.95 kHz step), with the corrections the audit made possible:
+  - each card's UC2 magnitude against card 1 above 300 Hz, step by step (`card_gain.hf_response`): the inductive pickup on cards 3–5 (UC2 −7…−18 % at 2.4–3.8 kHz, ×3.5–4.3 at 9.5 kHz);
+  - the per-card phase against the Gamry above 1 kHz (`gamry_card_phase`) and the per-channel lag, as before.
+  `BAND = 'trusted'` evaluates 0.15 Hz – 1.2 kHz, where all five cards agree uncorrected.
+- **Card voltage gain from the AC steps (1–300 Hz)**, gated on the SNR of the phasor (per-sample SNR + 10·log10(n/2)) instead of one sample's: UC2 has 0–20 dB per sample but 40–60 dB per phasor. Before, no step passed and the gain fell back to the DC level, which read card 4's −2.3 mV input offset as a −0.35 % gain. A DC ratio is now reported only. `CARD_GAIN = 'correct'` by default (card 3 +1.2 %, card 5 +0.9 %).
+- **Channel faults**: a segment whose DC current is < 0.5× or > 2× its neighbours' median is left out (segment 33: 18 %), and rebuilt from its neighbours when `FILL_GAPS` is on (`segment_fault_ratio`, `silver_manifest.json: faulty_segments`).
+- **Clipping**: a step window touching the ADC full scale (4.99 V) is dropped (segment 58 at the sweep start).
+- **Background before the sweep**: every channel is measured at every step frequency in the stretch before the first step (`utils.background_at`); a point whose coherent background exceeds 5 % of its response is dropped (silver gate `background`): 150 Hz mains on UC2 of cards 4–5, the cell's 1.75 Hz see-saw at the outlet, switching tones.
+- Confirmed unchanged: j = u/K; the air inlet is at x = 252 mm, the outlet at x ≈ 0 (matches the audit's data-based orientation).

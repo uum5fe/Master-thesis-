@@ -935,7 +935,8 @@ def card_voltage_check(card_ref: dict) -> Check:
     big = [cg.short(c) for c, r in used.items() if r.status == cg.TOO_LARGE]
     flat = [cg.short(c) for c, r in used.items() if r.status == cg.NOT_FLAT]
     off = [cg.short(c) for c, r in used.items()
-           if r.status == cg.OFF and r.applied == 1.0]
+           if r.status in (cg.OFF, getattr(cg, "DC_ONLY", "dc_only"))
+           and r.applied == 1.0 and abs(after(r)) > 1.0]
     ch = next(iter({r.channel for r in used.values()})) + how
     if big:
         return Check("card voltage gain", FAIL,
@@ -946,7 +947,9 @@ def card_voltage_check(card_ref: dict) -> Check:
         why = []
         if off:
             why.append(f"{', '.join(off)} off by a flat gain that is still in "
-                       f"their Z (card_gain='correct' removes it)")
+                       f"their Z (card_gain='correct' removes it"
+                       + ("; a DC-level ratio is never applied -- it can be "
+                          "an input offset" if srcs == {"dc"} else "") + ")")
         if flat:
             why.append(f"{', '.join(flat)} with a gain that changes over the "
                        f"band (timing or filter, not a scale)")

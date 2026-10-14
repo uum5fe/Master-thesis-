@@ -199,10 +199,11 @@ def test_the_settings_are_fixed_whatever_old_widgets_say(volume, capsys) -> None
     assert ns["EVALUATION_MODE"] == "default"
     assert ns["MIN_SNR_DB"] == 0.0
     assert ns["F_MIN"] == 0.15
-    assert ns["EVAL_F_MAX"] == 2400.0
-    assert ns["FULL_BAND"] is False
+    # the complete band by default: no evaluation cap below 0.49*fs
+    assert ns["BAND"] == "complete" and ns["FULL_BAND"] is True
+    assert ns["EVAL_F_MAX"] == 0.0
     assert ns["STOP_AFTER"] == "gold"
-    assert "2.4 kHz" in ns["BAND_TEXT"]
+    assert "complete band" in ns["BAND_TEXT"]
     left = ns["dbutils"].widgets.vals
     for w in ("param_profile", "f_min_hz", "f_max_hz", "f_band",
               "min_snr_db", "stop_after", "evaluation_mode"):

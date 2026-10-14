@@ -92,13 +92,20 @@ def test_the_pipeline_reports_the_circuit_values():
     skew = SkewModel(card="Karte_1", basis="structural", dt0=0.0, k_slot=0.0,
                      k_nominal=0.0, cost_gain=0.0, n_segments=1,
                      applied=False, note="")
-    res = silver.process_segment(_bronze(F, _z(F)), skew, DEFAULT)
+    ecm = DEFAULT.replace(param_method="ecm")
+    res = silver.process_segment(_bronze(F, _z(F)), skew, ecm)
     assert res is not None
     assert res.R_ohmic_how in ("extrapolated", "crossing")
     assert res.R_ct == pytest.approx(R_CT, rel=0.10)
     assert res.R_mt == pytest.approx(R_MT, rel=0.10)
     assert res.R_pol == pytest.approx(R_CT + R_MT, rel=0.05)
     assert res.gamma.size == 0                      # no DRT was computed
-    split = gold.split_processes(res, DEFAULT)
+    split = gold.split_processes(res, ecm)
     assert split["R_ct"] == res.R_ct and split["R_mt"] == res.R_mt
-    assert silver.r_ohmic_method(DEFAULT) == "ecm"
+    assert silver.r_ohmic_method(ecm) == "ecm"
+    # the default: the Bayesian DRT, with the circuit fitted beside it
+    drt = silver.process_segment(_bronze(F, _z(F)), skew, DEFAULT)
+    assert drt is not None and drt.gamma.size > 0
+    assert drt.R_ct_ecm == pytest.approx(R_CT, rel=0.10)
+    assert drt.R_mt_ecm == pytest.approx(R_MT, rel=0.10)
+    assert drt.R_ohmic == pytest.approx(res.R_ohmic, rel=1e-6)

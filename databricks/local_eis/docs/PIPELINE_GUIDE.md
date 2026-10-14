@@ -217,6 +217,15 @@ What the four runs of 2612030 still showed, and what was done:
 - **The per-segment scale factors (sd 5.6 %, 28 segments repeatable) are not applied.** If they were K errors, |Z| and j_dc would be anti-correlated with slope −1 at every current; they are at 450 A (r = −0.88) but hardly at 45–60 A (r = −0.4) — the high-current anticorrelation is the cell redistributing current. They stay reported (`segment_scale.py`); a cable swap between two channels tells a channel factor (it moves) from a segment one (it stays).
 - **Card j_dc**: card 4 goes from +5.4 % (45 A) to −4.4 % (450 A) — load-dependent, the cell; card 3 is +3…5 % at every current — a candidate K offset for that card, to check with the same swap test.
 
+**Card diagnostics against the Gamry** (`checks/card_diagnostics.py`, runner cell of the same name): per operating point, the median Nyquist, Bode |Z| and Bode phase of every card with the Gamry in black, and the card-to-Gamry transfer H = Z_card/Z_Gamry. `cross_current.png` puts H of every card at every current side by side. Read it like this: a deviation that is the same at every current comes from the acquisition; one that every card shares comes from the chain or the comparison; one that changes with current and differs between cards comes from the cell. On 2612030 (before the hf_response file):
+
+| finding | 45 A | 60 A | 150 A | 450 A | verdict |
+|---|---|---|---|---|---|
+| plate − Gamry, Re, 100–3000 Hz [mΩ·cm²] | +9.8 | +8.1 | +11.0 | +12.1 | series R in the voltage path (Im ≈ 0) → `uc_series_mohm_cm2` ≈ 10 |
+| cards 3–5 \|H\| at 10 kHz | ≈ −15 % | ≈ −15 % | ≈ −15 % | ≈ −15 % | card hardware → `hf_response` |
+| card phases < 1 kHz | ±3° | ±3° | ±3° | ±3° | no synchronisation error |
+| outlet cards 1/4/5, 3–10 Hz | small | small | larger | +20…+60 %, −10…−20° | the cell (outlet mass transport) |
+
 
 ---
 

@@ -2482,6 +2482,46 @@ else:
 
 # COMMAND ----------
 
+# DBTITLE 1,Card diagnostics against the Gamry — median Nyquist / Bode per card, card-to-Gamry transfer
+# ═══════════════════════════════════════════════════════════════════════════════
+# FOUR PLOTS THAT SEPARATE THE CARDS, THE CHAIN AND THE CELL (card_diagnostics.py)
+#   1-3  median Nyquist, |Z| and phase per card, with the Gamry whole cell
+#   4    card-to-Gamry transfer  Z_card-median / Z_Gamry
+# and, over all selected conditions, each card's transfer at every current:
+#   the same at every current        -> acquisition (card or chain)
+#   shared by every card             -> common to the chain / the comparison
+#   changing with current, by card   -> the cell's own spatial behaviour
+# It also prints the plate-minus-Gamry offset (100-3000 Hz): a real offset at
+# every current is series resistance in the voltage path (UC_SERIES_MOHM_CM2).
+# ═══════════════════════════════════════════════════════════════════════════════
+import card_diagnostics
+importlib.reload(card_diagnostics)
+_cd_runs = []
+for _c in (selected_conditions() if 'selected_conditions' in globals()
+           else list(PIPELINE_RESULTS)):
+    _d, _prov = result_dir(LEEPA, _c)
+    if _d is not None and (Path(_d) / 'silver' / 'spectra_clean.csv').is_file():
+        _cd_runs.append(Path(_d))
+if not _cd_runs:
+    print("  no results to plot -- run the pipeline cell first")
+else:
+    _cd_out = Path(_TMP_BASE) / LEEPA / 'card_diagnostics'
+    _cd = card_diagnostics.build(_cd_runs, _cd_out)
+    _imgs = {Path(p).stem.replace('cards_', ''): viewers.img_html(p)
+             for p in _cd['figures']}
+    displayHTML(viewers.by_condition(
+        _imgs, title=f'Leepa {LEEPA} — card diagnostics against the Gamry '
+                     f'(cross_current: every card at every current)'))
+    for _d in viewer_dirs():
+        try:
+            import shutil
+            shutil.copytree(_cd_out, Path(_d).parent / 'card_diagnostics',
+                            dirs_exist_ok=True)
+        except Exception:                                  # noqa: BLE001
+            pass
+
+# COMMAND ----------
+
 # DBTITLE 1,Via resistance vs temperature per card (Abgleich DC calibration)
 # ═══════════════════════════════════════════════════════════════════════════════
 # Each segment's current is the voltage drop over its vias, amplified. The

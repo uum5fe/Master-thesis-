@@ -350,6 +350,12 @@ class Config:
     # Magnitude only, so the cards' separate clocks do not enter.
     uc_hf_equalise: bool = True
     uc_reference_card: str = "Karte_1"
+    # The frozen high-frequency response of every channel (checks/
+    # hf_response.py): per-segment phase and per-card magnitude above 1 kHz,
+    # measured on all operating points of the plate and validated on a
+    # current it was not fitted on. Silver divides each segment's Z by it
+    # after the per-card phase. None: not applied.
+    hf_response_file: Path | None = None
     card_gain_min_steps: int = 5
     card_gain_tol_pct: float = 1.0         # within: "ok"
     card_gain_flat_pct: float = 2.0        # low vs high band, else "not flat"

@@ -724,6 +724,25 @@ CHAIN_GAIN_DEFAULT = Path('/Workspace/Users/uum5fe@bosch.com') / f'chain_gain_{P
 GAIN_FILE = (globals().get('GAIN_FILE')
              or (str(CHAIN_GAIN_DEFAULT) if CHAIN_GAIN_DEFAULT.is_file() else ''))
 print(f"  chain response: {GAIN_FILE or 'NONE -- run the Chain response cell once'}")
+# The frozen high-frequency response (checks/hf_response.py): per-segment phase
+# and per-card magnitude above 1 kHz, built by the "High-frequency response
+# across conditions" cell from ALL operating points of the order and
+# validated on a current it was not fitted on. 'auto' applies
+# <EIS_Results>/<order>/hf_response/hf_response.csv when it exists; '' never;
+# a path applies that file.
+HF_RESPONSE = 'auto'
+
+
+def hf_response_file(leepa):
+    """The response file the runs of this order apply (HF_RESPONSE), or None."""
+    _hr = str(globals().get('HF_RESPONSE', 'auto') or '')
+    if not _hr:
+        return None
+    if _hr != 'auto':
+        return Path(_hr) if Path(_hr).is_file() else None
+    _p = (Path('/Volumes/ps_xplatform_dev/rvadvtec_dev/ev_rvadvtec_dev/'
+               'EIS_Results') / str(leepa) / 'hf_response' / 'hf_response.csv')
+    return _p if _p.is_file() else None
 # Current-chain lag per segment (channel_lag.py), measured on every run:
 # 'correct' removes it before R_ohmic is read, 'report' only records it,
 # 'off' skips the stage. See silver/channel_lag.csv and the "channel lag"
@@ -1470,6 +1489,16 @@ def _run_identity(mode=None, f_min=None, f_max=None, snr=None):
         return v
 
     payload = {k: _norm(getattr(base, k, None)) for k in _CACHE_IDENTITY_KEYS}
+    # the CONTENT of the calibration files, not only their path: the chain
+    # gain file is rebuilt in place (5-500 Hz normalisation, October 2026),
+    # and the high-frequency response is refined in place
+    for _k, _f in (('gain_file_sha', globals().get('GAIN_FILE') or ''),
+                   ('hf_response_sha', str((globals().get('hf_response_file') or (lambda _l: None))(globals().get('LEEPA', '')) or ''))):
+        try:
+            payload[_k] = (_hashlib.sha256(Path(_f).read_bytes()).hexdigest()[:12]
+                           if _f and Path(_f).is_file() else '')
+        except Exception:                                  # noqa: BLE001
+            payload[_k] = ''
     blob = json.dumps(payload, sort_keys=True, default=str)
     return _hashlib.sha256(blob.encode('utf-8')).hexdigest()[:10]
 
@@ -2098,6 +2127,7 @@ for cond in _conditions_to_run:
         csv_tones=CSV_TONES,
         csv_mirror_x=bool(globals().get('CSV_MIRROR_X', False)),
         gain_file=Path(GAIN_FILE) if GAIN_FILE else None,
+        hf_response_file=hf_response_file(LEEPA),
         channel_lag=CHANNEL_LAG,
         gamry_sync=GAMRY_SYNC,
         card_gain=CARD_GAIN,
@@ -2404,6 +2434,51 @@ if not skip_for_csv('frequency response of the FAMOS chain'):
         _fr_items[(f'In-situ, {_c}',)] = _h
     if _fr_items:
         displayHTML(viewers.selector_html(_fr_items, ['Frequency response']))
+
+# COMMAND ----------
+
+# DBTITLE 1,High-frequency response across conditions (frozen correction)
+# ═══════════════════════════════════════════════════════════════════════════════
+# THE CHANNELS' HIGH-FREQUENCY RESPONSE, MEASURED ON ALL OPERATING POINTS
+# After every other correction, each segment's spectrum against the plate
+# median still carries, above ~1 kHz, a phase that is a straight line in f
+# (the ~19 deg spread at 11.95 kHz of the in-situ check) and a magnitude step
+# per card that grows with f (card 1 +15 %, card 3 -13 % at 7-13 kHz on
+# 2612030). Both are identical at 45, 60, 150 and 450 A: the acquisition, not
+# the cell. checks/hf_response.py measures them on all selected conditions,
+# tests the correction on each current with the model built from the others
+# (leave one out), and writes <EIS_Results>/<order>/hf_response/hf_response.csv.
+# With HF_RESPONSE = 'auto' (settings cell) the next run of the pipeline cell
+# applies it -- the file's content is in the cache key, so the conditions are
+# re-evaluated, not served from the cache.
+# Needs at least two conditions; all four is what it was validated on.
+# ═══════════════════════════════════════════════════════════════════════════════
+import hf_response
+importlib.reload(hf_response)
+_hr_runs = []
+for _c in (selected_conditions() if 'selected_conditions' in globals()
+           else list(PIPELINE_RESULTS)):
+    _d, _prov = result_dir(LEEPA, _c)
+    if _d is not None and (Path(_d) / 'silver' / 'spectra_clean.csv').is_file():
+        _hr_runs.append(Path(_d))
+if len(_hr_runs) < 2:
+    print(f"  needs two or more conditions with results; found {len(_hr_runs)}")
+else:
+    _hr_out = (_CACHE_VOL / LEEPA / 'hf_response') if CACHE_WRITE else \
+        (Path(_TMP_BASE) / LEEPA / 'hf_response')
+    try:
+        _hr = hf_response.build(_hr_runs, _hr_out)
+        _bad = [r for r in _hr['validation']
+                if r['phase_sd_after_deg'] > 5 or r['card_step_after_pct'] > 5]
+        if _bad:
+            print("  NOT within the acceptance limits on: "
+                  + ", ".join(r['held_out'] for r in _bad)
+                  + " (phase sd <= 5 deg, card step <= 5 %) -- inspect before "
+                    "applying; set HF_RESPONSE = '' to keep it off")
+        print("  Re-run the pipeline cell: with HF_RESPONSE = 'auto' every "
+              "condition is re-evaluated with it.")
+    except Exception as _he:                               # noqa: BLE001
+        print(f"  high-frequency response not built: {_he}")
 
 # COMMAND ----------
 

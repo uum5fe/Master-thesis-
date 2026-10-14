@@ -629,3 +629,10 @@ beside the PNGs.
 - **Clipping**: a step window touching the ADC full scale (4.99 V) is dropped (segment 58 at the sweep start).
 - **Background before the sweep**: every channel is measured at every step frequency in the stretch before the first step (`utils.background_at`); a point whose coherent background exceeds 5 % of its response is dropped (silver gate `background`): 150 Hz mains on UC2 of cards 4–5, the cell's 1.75 Hz see-saw at the outlet, switching tones.
 - Confirmed unchanged: j = u/K; the air inlet is at x = 252 mm, the outlet at x ≈ 0 (matches the audit's data-based orientation).
+
+## Multi-condition review: segment 36 and the frozen high-frequency response (October 2026)
+
+- **Chain sweeps normalised by their 5–500 Hz median**, not by their first point: Kashyyyk segment 36 has a glitch at 1 Hz that put −4.1 % on its Z at every frequency (`gamry_dta.GamrySweep.z_flat`; also used by the curr.csv cross-check). Re-run the Chain response cell once.
+- **`checks/hf_response.py`**: the channels' high-frequency response (per-segment phase, per-card magnitude above 1 kHz), measured on all operating points, validated leave-one-current-out, applied by silver after the per-card phase (`hf_response_file`; runner `HF_RESPONSE = 'auto'` and the "High-frequency response across conditions" cell). On 2612030, blind: phase spread at 11.95 kHz 14° → 0.8–2.2°, largest card step 13 % → 1.9–4.6 %.
+- **Cache key includes the content** of the chain gain file and of the response file, so a rewritten file re-evaluates instead of serving old results.
+- Per-segment scale factors examined and **not** applied (the |Z|–j_dc anticorrelation is load-dependent: cell, not calibration). See guide §4.4.

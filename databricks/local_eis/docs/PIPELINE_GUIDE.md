@@ -199,6 +199,25 @@ The FAMOS files were audited channel by channel, independently of this pipeline:
 
 With `BAND = 'trusted'` none of corrections 4 and 6 is needed: up to 1.2 kHz all five cards agree as recorded.
 
+### 4.4 The multi-condition review (45 / 60 / 150 / 450 A, all corrections on)
+
+What the four runs of 2612030 still showed, and what was done:
+
+- **Segment 36 was 4.1 % low at every frequency.** Its Abgleich sweep has a glitch at its first point (1 Hz), and every sweep used to be normalised to that point. Sweeps are now normalised to their **median over 5–500 Hz** (`gamry_dta.GamrySweep.z_flat`). Re-run the "Chain response" cell once to rewrite `chain_gain_gen1.csv`; the file's content is in the cache key, so the next runs are re-evaluated.
+- **A ~19° phase spread at 11.95 kHz and card |Z| steps up to ±13 % remained above 1 kHz.** Per segment the phase against the plate is a straight line in f over 2–12.5 kHz (0.9° rms after one line, 0.4° after a quadratic); per card the magnitude step grows with f (card 1 +15 %, card 3 −13 % at 7–13 kHz). Both are **identical at all four currents** (r = 1.00), so they are the acquisition, not the cell, and a regional ohmic difference cannot make them (it is flat in f). `checks/hf_response.py` measures them on all conditions, validates leave-one-current-out and writes a frozen per-segment response; silver divides by it after the per-card phase (`hf_response_file`, runner `HF_RESPONSE = 'auto'`, cell "High-frequency response across conditions").
+
+  | held-out current | phase sd at 11.95 kHz | largest card step ≥ 4 kHz |
+  |---|---|---|
+  | 45 A | 14.3° → 0.9° | 13.8 % → 2.2 % |
+  | 60 A | 14.3° → 1.3° | 12.7 % → 2.9 % |
+  | 150 A | 14.0° → 0.8° | 13.5 % → 1.9 % |
+  | 450 A | 14.3° → 2.2° | 13.3 % → 4.6 % |
+
+  Confirmed end to end: 450 A re-evaluated with the file built from 45/60/150 A only gives 2.2° and 4.6 %.
+- **The per-segment scale factors (sd 5.6 %, 28 segments repeatable) are not applied.** If they were K errors, |Z| and j_dc would be anti-correlated with slope −1 at every current; they are at 450 A (r = −0.88) but hardly at 45–60 A (r = −0.4) — the high-current anticorrelation is the cell redistributing current. They stay reported (`segment_scale.py`); a cable swap between two channels tells a channel factor (it moves) from a segment one (it stays).
+- **Card j_dc**: card 4 goes from +5.4 % (45 A) to −4.4 % (450 A) — load-dependent, the cell; card 3 is +3…5 % at every current — a candidate K offset for that card, to check with the same swap test.
+
+
 ---
 
 ## 5. Folder and module map

@@ -1314,6 +1314,20 @@ REJECT_REASONS = {
 }
 
 
+_HF_CACHE: dict = {}
+
+
+def _hf_response(path) -> dict:
+    """utils.load_gain of the frozen high-frequency response, read once."""
+    if not path:
+        return {}
+    key = str(path)
+    if key not in _HF_CACHE:
+        p = Path(key)
+        _HF_CACHE[key] = utils.load_gain(p) if p.is_file() else {}
+    return _HF_CACHE[key]
+
+
 def gate_points(sp: BronzeSpectrum, cfg: Config) -> dict:
     """The point-level gates of process_segment, on their own.
 
@@ -1532,6 +1546,12 @@ def process_segment(sp: BronzeSpectrum, skew: SkewModel, cfg: Config,
             if d is not None:
                 z_corr[k] = z_corr[k] * np.exp(-1j * d)
                 n_card_ph += 1
+    # ---- the frozen high-frequency response (checks/hf_response.py): per
+    # ---- segment phase and per card magnitude above 1 kHz, measured across
+    # ---- operating points at exactly this stage -------------------------
+    hf = _hf_response(getattr(cfg, "hf_response_file", None))
+    if hf:
+        z_corr = z_corr / utils.gain_at(hf, str(sp.segment), f)
     # ---- the UC taps' own series resistance (cfg.uc_series_mohm_cm2) -----
     r_tap = float(getattr(cfg, "uc_series_mohm_cm2", 0.0) or 0.0)
     if r_tap:

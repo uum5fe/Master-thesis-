@@ -103,6 +103,10 @@ def _f(s: str) -> float:
     return float(s)
 
 
+#: the band a chain sweep is normalised over (median), see GamrySweep.z_flat
+FLAT_BAND_HZ = (5.0, 500.0)
+
+
 @dataclass(frozen=True)
 class GamrySweep:
     path: Path
@@ -121,9 +125,28 @@ class GamrySweep:
         """Impedance at the lowest recorded frequency."""
         return complex(self.Z[np.argmin(self.freq)])
 
+    @property
+    def z_flat(self) -> complex:
+        """The flat-band level: median |Z| over FLAT_BAND_HZ (5-500 Hz).
+
+        Normalising at ONE point imports whatever that point carries: on
+        Kashyyyk the 1 Hz point of segment 36 sits 4.1 % above the rest of
+        its sweep, so the whole curve came out 0.96 and segment 36's Z was
+        4.1 % low at every frequency. The median over the flat band is what
+        the chain does where it is flat. Falls back to z_lf when the sweep
+        has fewer than three points there."""
+        lo, hi = FLAT_BAND_HZ
+        m = (self.freq >= lo) & (self.freq <= hi)
+        if m.sum() < 3:
+            return self.z_lf
+        # the LEVEL from the flat band, the phase reference from the lowest
+        # point as before: the glitch is a level step, and a band median of
+        # the phase would carry the chain's own lag into the reference
+        return float(np.median(np.abs(self.Z[m]))) * np.exp(1j * np.angle(self.z_lf))
+
     def normalised(self) -> np.ndarray:
-        """H(f): the sweep divided by its own low-frequency value."""
-        return self.Z / self.z_lf
+        """H(f): the sweep divided by its flat-band level (z_flat)."""
+        return self.Z / self.z_flat
 
 
 def read_dta(path) -> GamrySweep:
@@ -241,7 +264,7 @@ def cross_check_abgleich(sweeps: dict[str, GamrySweep], curr_csv) -> dict:
     if len(keys) < 8:
         return {"ok": False, "n": len(keys), "reason": "too few common segments"}
 
-    lf = np.array([abs(sweeps[k].z_lf) for k in keys])
+    lf = np.array([abs(sweeps[k].z_flat) for k in keys])
     dc = np.array([c0[k] for k in keys])
     r = float(np.corrcoef(lf, dc)[0, 1])
     ratio = lf / dc
@@ -264,7 +287,7 @@ def cross_check_abgleich(sweeps: dict[str, GamrySweep], curr_csv) -> dict:
 def _normalised(sw: GamrySweep, f_ref_hz: float | None) -> np.ndarray:
     sw = sw.sorted()
     if f_ref_hz is None:
-        z0 = sw.z_lf
+        z0 = sw.z_flat
     else:
         z0 = complex(np.interp(f_ref_hz, sw.freq, sw.Z.real)
                      + 1j * np.interp(f_ref_hz, sw.freq, sw.Z.imag))
@@ -303,8 +326,8 @@ def write_gain_csv(sweeps: dict[str, GamrySweep], path,
     convention="pipeline"  gain = 1/H, the factor the pipeline DIVIDES Z by
     convention="chain"     gain = H, the response itself (for plots)
 
-    `f_ref_hz` picks the normalisation point; the default is the lowest
-    frequency in each sweep, where the chain is flat.  Pass `curr_csv` to run
+    `f_ref_hz` picks the normalisation point; the default is the median of
+    the flat band (GamrySweep.z_flat, 5-500 Hz), not one point.  Pass `curr_csv` to run
     cross_check_abgleich() first -- a failed check raises unless force=True
     or shared=True.
 

@@ -808,17 +808,10 @@ def plot(comparisons: list[Comparison], path="gamry_comparison.png"):
     fig, axes = plt.subplots(2, n, figsize=(4.2 * n, 7.4), squeeze=False)
     for j, c in enumerate(comparisons):
         ax = axes[0][j]
-        if c.Z_ref_full.size:
-            # the part of the sweep above (and below) the local band: drawn,
-            # but not compared -- there is no local point to compare it with
-            out = ((c.freq_ref_full > c.freq.max())
-                   | (c.freq_ref_full < c.freq.min()))
-            zf = np.where(out, c.Z_ref_full, np.nan)
-            ax.plot(1e3 * zf.real, -1e3 * zf.imag, "o--", ms=2, lw=.8,
-                    color="0.6", label=f"Gamry outside the local band "
-                    f"(to {c.freq_ref_full.max() / 1e3:.0f} kHz)")
-        ax.plot(1e3 * c.Z_ref.real, -1e3 * c.Z_ref.imag, "o-", ms=3, lw=1,
-                color="0.35", label="whole cell (Gamry)")
+        # the whole sweep, every point as recorded -- no band applied
+        zf = c.Z_ref_full if c.Z_ref_full.size else c.Z_ref
+        ax.plot(1e3 * zf.real, -1e3 * zf.imag, "D-", ms=3, lw=1.6,
+                color="black", label="whole cell (Gamry)")
         ax.plot(1e3 * c.Z_local.real, -1e3 * c.Z_local.imag, "s-", ms=3, lw=1,
                 color="tab:red", label="local, aggregated")
         ax.set(xlabel="Z'  [mΩ·cm²]", ylabel="-Z''  [mΩ·cm²]",

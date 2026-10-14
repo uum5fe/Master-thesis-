@@ -763,7 +763,13 @@ def save(gr: GoldRun, sr: SilverRun, cfg: Config, log=None) -> Path:
         # spectra_clean.csv by now
         try:
             import nyquist as _nyq
-            _nyq.save_run(cfg.out_dir, out_dir=out,
+            # with the condition's whole-cell Gamry sweep in black, every
+            # point of the file (the comparison stage that writes
+            # gamry_reference_full.csv runs after gold)
+            _g = _nyq.find_gamry(getattr(cfg, "gamry_dir", None),
+                                 cfg.condition, order_id=cfg.leepa,
+                                 version=getattr(cfg, "gamry_version", ""))
+            _nyq.save_run(cfg.out_dir, out_dir=out, gamry=_g,
                           title=f"{cfg.leepa or ''} / {cfg.condition or ''}"
                                 .strip(" /"))
         except Exception as exc:                            # noqa: BLE001

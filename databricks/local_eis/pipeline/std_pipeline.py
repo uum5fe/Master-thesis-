@@ -523,13 +523,18 @@ def run(cfg: StdConfig, log=print) -> dict:
                     "area_coverage": float(A.sum() / A_CELL_CM2)})
     AG = pd.DataFrame(agg).sort_values("freq_hz")
 
-    # ---- Gamry whole cell on the same frequencies
-    import gamry_compare
-    sw = gamry_compare.read_cell_sweep(dta)
-    zg = sw.Z_ohm * A_CELL_CM2 * 1e3
+    # ---- Gamry whole cell: every point as recorded (G), and the comparison
+    # at the frequencies both have -- the Gamry's own point at the same step
+    # (nearest frequency within 2 %), never an interpolated value
+    import nyquist
+    G = nyquist.gamry_frame(dta, A_CELL_CM2)
     GC = AG[["freq_hz", "z_re_mohm_cm2", "z_im_mohm_cm2", "area_coverage"]].copy()
-    GC["gamry_re_mohm_cm2"] = np.interp(np.log(GC.freq_hz), np.log(sw.freq), zg.real)
-    GC["gamry_im_mohm_cm2"] = np.interp(np.log(GC.freq_hz), np.log(sw.freq), zg.imag)
+    lf = np.log(G.freq_hz.to_numpy(float))
+    k = np.abs(np.log(GC.freq_hz.to_numpy(float))[:, None] - lf[None, :]).argmin(axis=1)
+    near = np.abs(np.log(GC.freq_hz.to_numpy(float)) - lf[k]) <= np.log(1.02)
+    GC["gamry_freq_hz"] = np.where(near, G.freq_hz.to_numpy(float)[k], np.nan)
+    GC["gamry_re_mohm_cm2"] = np.where(near, G.z_re_mohm_cm2.to_numpy(float)[k], np.nan)
+    GC["gamry_im_mohm_cm2"] = np.where(near, G.z_im_mohm_cm2.to_numpy(float)[k], np.nan)
     zl = GC.z_re_mohm_cm2 + 1j * GC.z_im_mohm_cm2
     zr = GC.gamry_re_mohm_cm2 + 1j * GC.gamry_im_mohm_cm2
     GC["mag_diff_pct"] = 100 * (np.abs(zl) / np.abs(zr) - 1)
@@ -544,6 +549,7 @@ def run(cfg: StdConfig, log=print) -> dict:
     P.to_csv(out / "parameters.csv", index=False)
     AG.to_csv(out / "aggregate.csv", index=False)
     GC.to_csv(out / "gamry_comparison.csv", index=False)
+    G.to_csv(out / "gamry_full.csv", index=False)
     import plate_stats
     plate_stats.write_statistics(out / "parameters.csv", out / "plate_statistics.csv")
     manifest = {"pipeline": "standard", "config": cfg.to_dict(),
@@ -552,11 +558,12 @@ def run(cfg: StdConfig, log=print) -> dict:
                 "n_points_kept": int(df.kept.sum()), "n_points": int(len(df)),
                 "elapsed_s": round(time.time() - t0, 1)}
     (out / "manifest.json").write_text(json.dumps(manifest, indent=1, default=str))
-    figs = write_figures(out, sp[sp.kept], P, AG, GC, cfg) if cfg.write_png else {}
+    figs = write_figures(out, sp[sp.kept], P, AG, G, cfg) if cfg.write_png else {}
     log(f"  done in {time.time() - t0:.0f} s: {len(measured)} segments, "
         f"{int(df.kept.sum())}/{len(df)} points kept -> {out}")
     return {"out_dir": out, "spectra": sp, "parameters": P, "aggregate": AG,
-            "gamry": GC, "schedule": pd.DataFrame(sched), "figures": figs,
+            "gamry": GC, "gamry_full": G, "schedule": pd.DataFrame(sched),
+            "figures": figs,
             "manifest": manifest}
 
 
@@ -564,7 +571,10 @@ def run(cfg: StdConfig, log=print) -> dict:
 # 8. figures
 # ---------------------------------------------------------------------------
 
-def write_figures(out: Path, spectra, P, AG, GC, cfg: StdConfig) -> dict:
+def write_figures(out: Path, spectra, P, AG, G, cfg: StdConfig) -> dict:
+    """nyquist.png/.html (segments + the Gamry in black), one interpolated
+    map per parameter, gamry_vs_aggregate.png (the aggregate and the Gamry,
+    nothing else). G is the Gamry sweep, every point as recorded."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -573,10 +583,10 @@ def write_figures(out: Path, spectra, P, AG, GC, cfg: StdConfig) -> dict:
     written = {}
     title = f"{cfg.leepa} / {cfg.condition} — standard evaluation"
     try:
-        nyquist.save_png(spectra, out / "nyquist.png", title=title)
+        nyquist.save_png(spectra, out / "nyquist.png", title=title, gamry=G)
         written["nyquist_png"] = out / "nyquist.png"
         if cfg.write_html:
-            fig = nyquist.figure(spectra, title=title)
+            fig = nyquist.figure(spectra, title=title, gamry=G)
             fig.write_html(str(out / "nyquist.html"), include_plotlyjs="cdn")
             written["nyquist_html"] = out / "nyquist.html"
     except Exception as exc:                                # noqa: BLE001
@@ -596,20 +606,9 @@ def write_figures(out: Path, spectra, P, AG, GC, cfg: StdConfig) -> dict:
         fig.savefig(path, dpi=200, bbox_inches="tight", facecolor=fig.get_facecolor())
         plt.close(fig)
         written[f"map_{p}"] = path
-    # aggregate of the measured spectra vs the Gamry
-    fig, ax = plt.subplots(1, 2, figsize=(14, 5.2))
-    ax[0].plot(GC.gamry_re_mohm_cm2, -GC.gamry_im_mohm_cm2, "k.-", lw=2, label="Gamry whole cell")
-    ax[0].plot(AG.z_re_mohm_cm2, -AG.z_im_mohm_cm2, "r.-", lw=1.5,
-               label="measured segments in parallel")
-    ax[0].set_xlabel("Z' / mΩ·cm²"); ax[0].set_ylabel("-Z'' / mΩ·cm²")
-    ax[0].axhline(0, color="grey", lw=.5); ax[0].legend(); ax[0].set_title("Nyquist")
-    ax[1].semilogx(GC.freq_hz, GC.mag_diff_pct, "b.-", label="|Z| difference %")
-    ax[1].semilogx(GC.freq_hz, GC.phase_diff_deg, "g.-", label="phase difference °")
-    ax[1].axhline(0, color="grey", lw=.5); ax[1].legend(); ax[1].set_xlabel("f / Hz")
-    ax[1].set_title("aggregate − Gamry")
-    fig.suptitle(title)
-    fig.tight_layout()
-    fig.savefig(out / "gamry_vs_aggregate.png", dpi=140)
-    plt.close(fig)
+    # the aggregate of the measured spectra against the Gamry, those two only
+    nyquist.comparison_png(AG, G, out / "gamry_vs_aggregate.png",
+                           title=f"{cfg.leepa} / {cfg.condition} — aggregate "
+                                 f"of the measured segments vs Gamry")
     written["gamry_png"] = out / "gamry_vs_aggregate.png"
     return written

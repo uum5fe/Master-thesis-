@@ -129,11 +129,17 @@ def _shell(dims: list[str], opts: list[list[str]], payload: str,
     foot = (f'<div style="font:11px sans-serif;color:#666;margin-top:4px">'
             f'{_html.escape(note)}</div>' if note else "")
     hpx = f"min-height:{int(height)}px;" if height else ""
+    # charset on the script tag: displayHTML hosts this fragment in a page
+    # without a declared charset, and plotly.js carries "−" (U+2212, the
+    # minus of every negative tick) and a zero-width space in its source --
+    # read as Windows-1252 they showed as "â^'5" and "â€‹" on the axes and
+    # around the titles
     return f"""
+<meta charset="utf-8">
 {head}<div style="margin-bottom:8px">{ctl}</div>
 <div id="{uid}_plot" style="{hpx}"></div>
 <div id="{uid}_html"></div>{foot}
-<script src="{_plotlyjs_url()}"></script>
+<script src="{_plotlyjs_url()}" charset="utf-8"></script>
 <script>
 (function() {{
   var B64 = "{payload}";

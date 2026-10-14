@@ -596,3 +596,22 @@ beside the PNGs.
 - **`readers/datago_source.py`:** the runner's datago reader as a module (Spark passed in), so both notebooks read datago first.
 - **Tested end to end** on synthetic raw data with cards armed at different times (`tests/test_std_pipeline.py`).
 
+
+## The Gamry drawn as recorded; 450 A scatter quantified (October 2026)
+
+- **The Gamry is plotted exactly as in the `.dta`:** every point, at its own frequency, 0.19 Hz – 30 kHz.
+  - The comparison cell used to subtract a fitted series inductance from it, cut it to the local band (the rest drawn as a separate "outside local band" trace) and scale the aggregate by the DC-closure error. All gone.
+  - Hover labels showed f with one decimal (0.378 Hz read "0.4"); now 5 significant digits everywhere.
+  - The standard pipeline interpolated the Gamry onto the measured frequencies; it now uses the Gamry's own point at each step and writes the whole sweep to `gamry_full.csv`.
+- **Gamry in black with the segments** in the Nyquist / |Z| / phase viewer of both notebooks and in `gold/nyquist.png/.html`.
+- **The Gamry-vs-aggregate cell shows two curves only:** the aggregate and the Gamry (`nyquist.comparison_figure`), no segment or rebuilt traces.
+- **"â^'5" / "â€‹" on the axes and titles:** plotly.js was read as Windows-1252 inside `displayHTML`; the viewer now loads it with `charset="utf-8"`.
+- **450 A, 2612030, scatter along the air path** (13.10 run, point-to-point roughness of Z):
+
+  | zone (inlet → outlet) | < 10 Hz | 10–300 Hz | > 300 Hz | SNR < 10 Hz | THD < 10 Hz |
+  |---|---|---|---|---|---|
+  | inlet 0–0.2 | 1.5 % | 0.9 % | 1.7 % | 18 dB | 2.8 % |
+  | 0.6–0.8 | 7.4 % | 1.2 % | 1.6 % | 17 dB | 2.8 % |
+  | outlet 0.8–1 | 12.1 % | 1.9 % | 1.5 % | 10 dB | 6.5 % |
+
+  Only the low frequencies scatter, and only towards the outlet (r = 0.95 with position). The outlet segments' deviations move together (pairwise r = 0.99): the outlet region changes during the long low-frequency steps.

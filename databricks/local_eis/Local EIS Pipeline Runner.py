@@ -127,6 +127,7 @@ _BUILD_MARKERS = {
     silver: ['r_ohmic_intercept', 'gamry_card_phase', 'standard_eis'], gold: ['plate_stats'],
     plate_figure: ['node_xy'], plate_maps: ['uniformity_stats'],
     plausibility: ['_tile_or_all'], gamry_sync: ['confine_windows'],
+    nyquist: ['gamry_frame', 'comparison_figure'],
 }
 _stale = []
 for _m, _need in _BUILD_MARKERS.items():
@@ -561,6 +562,68 @@ def gamry_files(leepa, version=None):
         print(f"  no sweep names build {version}; falling back to "
               f"{len(silent)} file(s) that name no build at all")
     return silent, version
+
+
+def gamry_spectra(leepa, quiet=False):
+    """{condition: DataFrame(freq_hz, z_re_mohm_cm2, z_im_mohm_cm2)} -- the
+    order's whole-cell Gamry sweeps, EVERY point exactly as in the file
+    (nyquist.gamry_frame): no band limit, no interpolation, no inductance
+    removed. From the .dta files of gamry_files(); from the MF4 export when
+    the folder has no .dta. Used by the Nyquist cell (Gamry in black with the
+    segments) and by the Gamry-vs-aggregate cell."""
+    import re as _re
+    out = {}
+    files, _build = gamry_files(leepa)
+    for fp in files:
+        try:
+            sw = gamry_compare.read_cell_sweep(fp)
+        except Exception as _e:                            # noqa: BLE001
+            if not quiet:
+                print(f"    {fp.name}: not read ({_e})")
+            continue
+        _m = _re.search(r'CurrVal_(\d+)', fp.stem)
+        key = sw.condition if sw.condition != '?' else (
+            _m.group(1) + 'A' if _m else fp.stem)
+        if key in out:
+            if not quiet:
+                print(f"    WARNING: {key} claimed by more than one file "
+                      f"({fp.name}); keeping the first")
+            continue
+        out[key] = nyquist.gamry_frame(sw)
+        if not quiet:
+            print(f"    Gamry {key}: {len(out[key])} points "
+                  f"{out[key].freq_hz.min():.4g}–{out[key].freq_hz.max():.5g} Hz "
+                  f"({fp.name})")
+    if out:
+        return out
+    # no .dta: the MF4 export of the sweeps, if there is one
+    root = gamry_root_for(leepa) or Path(
+        '/Volumes/ps_xplatform_dev/rvadvtec_dev/ev_rvadvtec_dev/Gamry')
+    try:
+        from asammdf import MDF
+        mf4 = (sorted(Path(root).glob(f'*{leepa}*.mf4'))
+               or sorted(Path(root).glob('*HFR*CurrVal*.mf4')))
+        for fp in mf4:
+            _m = _re.search(r'CurrVal_(\d+)', fp.stem)
+            key = _m.group(1) + 'A' if _m else fp.stem
+            mdf = MDF(str(fp))
+            f = mdf.get('freq').samples
+            zr, zi = mdf.get('zreal').samples, mdf.get('zimag').samples
+            mdf.close()
+            if len(f) >= 3:
+                out[key] = nyquist.gamry_frame(pd.DataFrame({
+                    'freq_hz': f, 'z_re_mohm_cm2': zr * nyquist.A_CELL_CM2 * 1e3,
+                    'z_im_mohm_cm2': zi * nyquist.A_CELL_CM2 * 1e3}))
+                if not quiet:
+                    print(f"    Gamry {key}: {len(f)} points from {fp.name} (MF4)")
+    except ImportError:
+        if not quiet:
+            print("    no .dta sweeps, and asammdf is not installed for the "
+                  "MF4 export (%pip install asammdf)")
+    except Exception as _e:                                # noqa: BLE001
+        if not quiet:
+            print(f"    MF4 read error: {_e}")
+    return out
 
 
 # Gamry reference: auto-discover per Leepa (may not exist for every order)
@@ -2381,11 +2444,23 @@ if not skip_for_csv('via resistance (Abgleich)'):
 # Segments rebuilt from neighbours are drawn dotted grey. Every finite point
 # silver accepted is shown; nothing is filtered for display.
 #
+# THE GAMRY, BLACK, IN EVERY VIEW (Nyquist, |Z|, phase): the condition's
+# whole-cell sweep with every point of the .dta at the frequency the file
+# gives (gamry_spectra) -- no band limit, nothing interpolated or removed --
+# so any segment can be read against it. Click a legend entry to hide one.
+#
 # The run already saved the same plot per condition (gold/nyquist.html and
 # gold/nyquist.png); this cell also saves the selector itself as
 # viewers/nyquist.html next to the cached results (save_viewer).
 # ═══════════════════════════════════════════════════════════════════════════════
 NYQUIST_COLOUR = 'flow'
+
+try:
+    GAMRY_SPECTRA = ({} if str(globals().get('SOURCE_FORMAT', 'famos')).lower() == 'csv'
+                     else gamry_spectra(LEEPA))
+except Exception as _ge:                                   # noqa: BLE001
+    print(f"  Gamry sweeps not read ({_ge}) -- segments only")
+    GAMRY_SPECTRA = {}
 
 _nyq_figs = {}
 for cond, pr in PIPELINE_RESULTS.items():
@@ -2408,7 +2483,8 @@ for cond, pr in PIPELINE_RESULTS.items():
             and cond in CSV_FOLDERS else f"Leepa {LEEPA}")
     _nyq_figs[cond] = nyquist.figure(
         df, title=f"Local EIS — {_src}, {cond}", colour=NYQUIST_COLOUR,
-        rebuilt=_rec)
+        rebuilt=_rec, gamry=GAMRY_SPECTRA.get(cond),
+        gamry_name=f"Gamry {cond}")
     print(f"  {cond}: {df['segment'].nunique()} segments plotted"
           + (f" + {_rec['segment'].nunique()} rebuilt from neighbours"
              if _rec is not None and len(_rec) else ""))
@@ -2424,421 +2500,69 @@ show_by_condition(_nyq_figs, title=f'Local EIS spectra — {LEEPA}',
 
 # DBTITLE 1,Gamry vs pipeline aggregate — Condition and View drop-downs
 # ═══════════════════════════════════════════════════════════════════════════════
-# GAMRY vs PIPELINE OVERLAY (Volume-based)
-# Loads Gamry from DTA files, pipeline from Volume cache.
-# No datago dependency, no kernel state needed.
+# THE AGGREGATE OF THE SEGMENTS AGAINST THE WHOLE-CELL GAMRY
+# Two curves, nothing else (no segments, no rebuilt ones):
+#   red    the aggregate of the segments in parallel, silver/cell_aggregate.csv
+#          of the selected run, exactly as the pipeline wrote it
+#   black  the condition's Gamry sweep, EVERY point of the .dta at the
+#          frequency in the file (0.4783 Hz is 0.4783 Hz) -- no band limit,
+#          no interpolation onto the local grid, no inductance removed,
+#          nothing rescaled (gamry_spectra / nyquist.gamry_frame)
+# Views: Nyquist, |Z| and phase. Hover shows f with 5 significant digits.
+# The numbers of the comparison (|Z| and phase difference per frequency) are
+# in the run's gamry_comparison.csv / gamry_comparison_curves.csv.
 # ═══════════════════════════════════════════════════════════════════════════════
 if not skip_for_csv('Gamry vs aggregate'):
-    import re, os
-    import numpy as np
-    import pandas as pd
-    import plotly.graph_objects as go
-    from plotly.subplots import make_subplots
-    from pathlib import Path
-
     try:
         _LEEPA = LEEPA
     except NameError:
-        _LEEPA = dbutils.widgets.get('leepa_id')
-    try:
-        _COND = dbutils.widgets.get('conditions')
-    except Exception:
-        _COND = 'ALL'
+        _LEEPA = dbutils.widgets.get('order')
 
-    A_CELL_CM2 = 304.92
-    # Auto-detect Gamry folder for current Leepa
-    # Priority: per-Leepa folder > common Gamry folder (files matching Leepa ID)
-    _VOL_BASE = '/Volumes/ps_xplatform_dev/rvadvtec_dev/ev_rvadvtec_dev'
-    # The paths live in the setup cell (GAMRY_SEARCH_ROOTS) -- one place to edit.
-    # This cell used to carry its own copy of the folder list and then read every
-    # .dta in whichever folder it found, keyed by current: with a shared folder
-    # holding several campaigns, each key was overwritten by whichever file sorted
-    # last, so the overlay could compare this cell against another cell's sweep.
-    _GAMRY_VOL = gamry_root_for(_LEEPA) or Path(f'{_VOL_BASE}/Gamry')
-    _CACHE_VOL = Path('/Volumes/ps_xplatform_dev/rvadvtec_dev/ev_rvadvtec_dev/EIS_Results')
-
-
-    # ─── 1. Gamry DTA parser ───
-    def _parse_dta(fp):
-        text = fp.read_text(encoding='latin-1')
-        m = re.search(r'ZCURVE\s+TABLE\s*\n([^\n]*\n){2}', text)
-        if not m:
-            return None
-        rows = []
-        for ln in text[m.end():].strip().split('\n'):
-            ln = ln.strip()
-            if not ln or not ln[0].isdigit():
-                if ln.startswith('STOPABORT'):
-                    break
-                continue
-            p = ln.replace(',', '.').split('\t')
-            if len(p) >= 8:
-                rows.append((float(p[2]), float(p[3]), float(p[4]), float(p[6])))
-        if not rows:
-            return None
-        f, zr, zi, zm = zip(*rows)
-        return dict(freq=np.array(f), Zreal=np.array(zr),
-                    Zimag=np.array(zi), Zmod=np.array(zm), name=fp.stem)
-
-
-    # ─── 2. Load the sweeps that belong to THIS order ───
-    _GAMRY_FILES, _GAMRY_BUILD = gamry_files(_LEEPA)
-    print(f"  Gamry source: {_GAMRY_VOL}")
-    print(f"  Order {_LEEPA} -> build {_GAMRY_BUILD or 'UNKNOWN'}"
-          f"   ({len(_GAMRY_FILES)} sweep file(s) selected)")
-    if not _GAMRY_BUILD:
-        print("    No build token found for this order. Every .dta that does not "
-              "name a build is being read; if that folder holds more than one "
-              "campaign, set PLATE_VERSION_OVERRIDE in the setup cell.")
-
-    _gamry = {}
-    for fp in _GAMRY_FILES:
-        sp = _parse_dta(fp)
-        if not sp:
-            continue
-        k = A_CELL_CM2 * 1e3  # ohm -> mohm.cm2
-        # Condition from CurrVal_{number} in the filename -> e.g. "60A"
-        _cm = re.search(r'CurrVal_(\d+)', fp.stem)
-        _gamry_key = (_cm.group(1) + 'A') if _cm else sp['name']
-        if _gamry_key in _gamry:
-            # Two files for one current, after filtering by build, is a real
-            # ambiguity rather than something to resolve by sort order.
-            print(f"    WARNING: {_gamry_key} claimed by more than one file "
-                  f"({fp.name}); keeping the first and ignoring this one")
-            continue
-        _gamry[_gamry_key] = pd.DataFrame({
-            'freq_hz': sp['freq'],
-            'z_re': sp['Zreal'] * k,
-            'z_im': sp['Zimag'] * k,
-        }).sort_values('freq_hz').reset_index(drop=True)
-        print(f"    {_gamry_key}: {len(sp['freq'])} pts  ({fp.name})")
-
-
-    # ─── 2b. Load Gamry from MF4 files (if no DTA found) ───
+    # every Gamry point of this order, as recorded
+    _gamry = globals().get('GAMRY_SPECTRA') or gamry_spectra(_LEEPA)
     if not _gamry:
-        try:
-            from asammdf import MDF
-            # Search for MF4 files matching this Leepa ID (any naming convention)
-            _mf4_files = sorted(_GAMRY_VOL.glob(f'*{_LEEPA}*.mf4')) or sorted(_GAMRY_VOL.glob(f'*RO{_LEEPA}*.mf4'))
-            if not _mf4_files:
-                _mf4_files = sorted(_GAMRY_VOL.glob('*HFR*CurrVal*.mf4'))
-            for fp in _mf4_files:
-                # Try multiple naming patterns for condition extraction
-                m = re.search(r'CurrVal_(\d+)', fp.stem)
-                if m:
-                    cond_key = m.group(1) + 'A'
-                else:
-                    # Fallback: use filename as-is for the Gamry key
-                    cond_key = fp.stem
-                mdf = MDF(str(fp))
-                freq = mdf.get('freq').samples
-                zreal = mdf.get('zreal').samples
-                zimag = mdf.get('zimag').samples
-                mdf.close()
-                if len(freq) < 3:
-                    print(f"    {fp.name}: only {len(freq)} pts — skipped")
-                    continue
-                k = A_CELL_CM2 * 1e3  # ohm -> mohm.cm2
-                _gamry[cond_key] = pd.DataFrame({
-                    'freq_hz': freq,
-                    'z_re': zreal * k,
-                    'z_im': zimag * k,
-                }).sort_values('freq_hz').reset_index(drop=True)
-                print(f"    {cond_key}: {len(freq)} pts from {fp.name} (MF4)")
-        except ImportError:
-            print("    asammdf not installed — run: %pip install asammdf")
-        except Exception as e:
-            print(f"    MF4 read error: {e}")
+        print(f"  no Gamry sweep found for order {_LEEPA} "
+              f"(searched: {', '.join(map(str, gamry_search_roots(_LEEPA)))})")
 
-
-    # ─── 3. Load pipeline spectra from Volume cache ───
-    def _load_pipeline(leepa, cond):
-        """Per-segment and aggregate spectra for ONE condition, newest first.
-
-        This used to try `<leepa>/<cond>/` on the Volume before anything else --
-        the unversioned tree, which belongs to whichever run wrote last at
-        whatever settings. It therefore drew a Gamry overlay against a run the
-        operator had not selected and could not identify. It now asks
-        result_dir(), the same resolver the heat maps and the run cell use, so
-        the overlay and the maps can never disagree about which run they show.
-        """
+    def _load_aggregate(leepa, cond):
+        """(aggregate DataFrame, run folder, provenance, area coverage) of the
+        run result_dir() selects -- the same run the maps and Nyquist show."""
         d, prov = result_dir(leepa, cond)
         if d is None:
-            return None, None, None, prov, None, None
-        for sub in ('silver', 'csv'):
-            sp = Path(d) / sub / 'spectra_clean.csv'
-            if not sp.exists():
-                continue
-            seg = pd.read_csv(sp)
-            # RECONSTRUCTED SEGMENTS BELONG ON THIS PLOT TOO.
-            # They are kept out of spectra_clean.csv on purpose -- that file is
-            # measurements only -- but leaving them off the overlay meant the
-            # aggregate was drawn over 72 segments while the segment lines behind
-            # it were 67, and the missing five were exactly the ones the operator
-            # had asked to rebuild. They are read from their own file and marked
-            # so nothing can mistake one for a measurement.
-            rec_p = Path(d) / 'silver' / 'spectra_reconstructed.csv'
-            rec = pd.read_csv(rec_p) if rec_p.exists() else None
+            return None, None, prov, None
+        ap = Path(d) / 'silver' / 'cell_aggregate.csv'
+        if not ap.exists():
+            return None, d, f'{prov} (no silver/cell_aggregate.csv in it)', None
+        agg = pd.read_csv(ap)
+        cov = (float(np.nanmedian(agg['area_coverage']))
+               if 'area_coverage' in agg.columns else None)
+        return agg, d, prov, cov
 
-            agg_p = Path(d) / 'silver' / 'cell_aggregate.csv'
-            agg = pd.read_csv(agg_p) if agg_p.exists() else None
-            cov = None
-            if agg is not None:
-                if 'area_coverage' in agg.columns:
-                    cov = float(np.nanmedian(agg['area_coverage']))
-                agg = pd.DataFrame({
-                    'freq_hz': agg['freq_hz'],
-                    'z_re': agg['z_re_mohm_cm2'],
-                    'z_im': agg['z_im_mohm_cm2'],
-                }).sort_values('freq_hz').reset_index(drop=True)
-                if np.nanmedian(agg['z_im']) > 0:
-                    agg['z_im'] = -agg['z_im']
-            return seg, agg, str(d), f'{prov}|{rec_p.name if rec is not None else ""}', rec, cov
-        return None, None, None, f'{prov} (no spectra_clean.csv in it)', None, None
-
-
-    # ─── 4. Plot overlay for each condition ───
-    # The condition list comes from the widgets, through the same function the
-    # heat maps use, rather than from a literal list of every condition ever
-    # measured -- which is how a cell "for the selected condition" ended up
-    # drawing four.
     try:
         _conds = selected_conditions()
     except NameError:
-        _conds = parse_conditions(_COND, ['45A', '60A', '150A', '450A'])
+        _conds = list(PIPELINE_RESULTS)
 
     _ov_figs = {}
     for cond in _conds:
-        seg_df, agg_df, src, _prov, rec_df, _cov = _load_pipeline(_LEEPA, cond)
-        _prov = _prov.split('|')[0]
-        if seg_df is None:
-            print(f"  {cond}: no pipeline results found ({_prov})")
+        agg_df, src, _prov, _cov = _load_aggregate(_LEEPA, cond)
+        g = _gamry.get(cond)
+        if agg_df is None and g is None:
+            print(f"  {cond}: no aggregate ({_prov}) and no Gamry sweep")
             continue
-        try:
-            print(describe_source(cond, Path(src), _prov))
-        except NameError:
-            print(f"  {cond}: {_prov}  {src}")
-
-        # Match Gamry condition
-        gamry_df = _gamry.get(cond, None)
-        LIKE_FOR_LIKE = True          # set False to see the uncorrected overlay
-        # The comparison uses only the band BOTH instruments covered, so the
-        # Gamry curve used to stop where the local band stops (~4 kHz) although
-        # the sweep goes to 30 kHz. GAMRY_FULL_RANGE draws the rest of the sweep
-        # as a separate dashed trace -- shown, not compared.
-        GAMRY_FULL_RANGE = globals().get('GAMRY_FULL_RANGE', True)
-        gamry_full = None
-        _I_err, _L, _lo, _hi = 0.0, 0.0, float('nan'), float('nan')
-        if LIKE_FOR_LIKE:
-            # (1) shunt-calibration scale, from DC closure — NOT fitted to the Gamry
-            _sp = {'45A':45., '60A':60., '150A':150., '450A':450.}.get(cond)
-            _ss = Path(src) / 'silver' / 'segments_summary.csv'
-            if _sp and _ss.exists() and agg_df is not None:
-                _s = pd.read_csv(_ss)
-                if {'j_dc_A_cm2', 'area_cm2'} <= set(_s.columns):
-                    _A = _s['area_cm2'].sum()
-                    _I = (_s['j_dc_A_cm2'] * _s['area_cm2']).sum() * A_CELL_CM2 / _A
-                    _I_err = _I / _sp - 1.0
-                    agg_df = agg_df.copy()
-                    agg_df[['z_re', 'z_im']] *= (1.0 + _I_err)
-
-            # (2) strip the Gamry's OWN series inductance so both curves are L-free
-            if gamry_df is not None:
-                _fg = gamry_df['freq_hz'].values
-                _k  = _fg >= _fg.max() / 10.0          # top decade
-                if _k.sum() >= 4:
-                    # not `_w`: that name is the widget reader of cell 3
-                    _om = 2 * np.pi * _fg[_k]
-                    _L = float(np.sum(_om * gamry_df['z_im'].values[_k]) / np.sum(_om * _om))
-                    gamry_df = gamry_df.copy()
-                    gamry_df['z_im'] = gamry_df['z_im'] - 2 * np.pi * _fg * _L
-
-            # (3) restrict both curves to the overlapping band
-            gamry_full = gamry_df
-            if gamry_df is not None and agg_df is not None and len(agg_df) > 3:
-                _lo = max(agg_df['freq_hz'].min(), gamry_df['freq_hz'].min())
-                _hi = min(agg_df['freq_hz'].max(), gamry_df['freq_hz'].max())
-                gamry_df = gamry_df[(gamry_df['freq_hz'] >= _lo) &
-                                    (gamry_df['freq_hz'] <= _hi)]
-            print(f"  {cond}: I_err {100*_I_err:+.1f}% applied | "
-                  f"Gamry L {1e6*_L:.0f} nH.cm2 removed | band {_lo:.2f}-{_hi:.1f} Hz")
-
-        fig = make_subplots(rows=1, cols=3,
-            subplot_titles=['Nyquist', '|Z|(f) Bode', 'Phase(f)'],
-            horizontal_spacing=0.06)
-
-        segments = sorted(seg_df['segment'].unique())
-        n_seg = len(segments)
-        colors = [f'hsl({int(i*360/n_seg)}, 60%, 55%)' for i in range(n_seg)]
-
-        # Per-segment spectra (thin)
-        for i, seg in enumerate(segments):
-            sd = seg_df[seg_df['segment'] == seg].sort_values('freq_hz')
-            f = sd['freq_hz'].values
-            zr = sd['z_re_mohm_cm2'].values
-            zi = sd['z_im_mohm_cm2'].values
-            ok = np.isfinite(zr) & np.isfinite(zi) & (zr > 0) & (zr <= 500)
-            f, zr, zi = f[ok], zr[ok], zi[ok]
-            if len(f) < 3:
-                continue
-            clr = colors[i]
-            fig.add_trace(go.Scatter(
-                x=zr, y=-zi, mode='lines', line=dict(width=0.8, color=clr),
-                opacity=0.4, name='Segments' if i == 0 else f'Seg {seg}',
-                legendgroup='seg', showlegend=(i == 0),
-                hovertemplate=f'Seg {seg}<br>f=%{{customdata:.1f}} Hz<br>'
-                    f"Z'=%{{x:.1f}}<br>-Z''=%{{y:.1f}}<extra></extra>",
-                customdata=f,
-            ), row=1, col=1)
-            fig.add_trace(go.Scatter(x=f, y=np.abs(zr + 1j*zi), mode='lines',
-                line=dict(width=0.8, color=clr), opacity=0.4,
-                legendgroup='seg', showlegend=False), row=1, col=2)
-            fig.add_trace(go.Scatter(x=f, y=np.degrees(np.angle(zr + 1j*zi)),
-                mode='lines', line=dict(width=0.8, color=clr), opacity=0.4,
-                legendgroup='seg', showlegend=False), row=1, col=3)
-
-        # Reconstructed segments (dashed, so they read as estimates at a glance)
-        if rec_df is not None and len(rec_df):
-            for j, seg in enumerate(sorted(rec_df['segment'].unique(),
-                                           key=lambda x: int(x))):
-                rd = rec_df[rec_df['segment'] == seg].sort_values('freq_hz')
-                zr = rd['z_re_mohm_cm2'].values
-                zi = rd['z_im_mohm_cm2'].values
-                f = rd['freq_hz'].values
-                ok = np.isfinite(zr) & np.isfinite(zi)
-                if ok.sum() < 3:
-                    continue
-                donors = str(rd['donors'].iloc[0])
-                fig.add_trace(go.Scatter(
-                    x=zr[ok], y=-zi[ok], mode='lines',
-                    line=dict(width=1.6, color='#444', dash='dot'),
-                    opacity=0.8,
-                    name='Rebuilt from neighbours' if j == 0 else f'Seg {seg} (rebuilt)',
-                    legendgroup='rebuilt', showlegend=(j == 0),
-                    customdata=f[ok],
-                    hovertemplate=(f'<b>Seg {seg}</b> — REBUILT from {donors}<br>'
-                                   'f=%{customdata:.1f} Hz<br>'
-                                   "Z'=%{x:.1f}<br>-Z''=%{y:.1f}<extra></extra>"),
-                ), row=1, col=1)
-                Z = zr[ok] + 1j * zi[ok]
-                fig.add_trace(go.Scatter(x=f[ok], y=np.abs(Z), mode='lines',
-                    line=dict(width=1.6, color='#444', dash='dot'), opacity=0.8,
-                    legendgroup='rebuilt', showlegend=False), row=1, col=2)
-                fig.add_trace(go.Scatter(x=f[ok], y=np.degrees(np.angle(Z)),
-                    mode='lines', line=dict(width=1.6, color='#444', dash='dot'),
-                    opacity=0.8, legendgroup='rebuilt', showlegend=False), row=1, col=3)
-
-        # Cell aggregate (thick red)
-        if agg_df is not None and len(agg_df) > 3:
-            Z_agg = agg_df['z_re'].values + 1j * agg_df['z_im'].values
-            fig.add_trace(go.Scatter(
-                x=agg_df['z_re'], y=-agg_df['z_im'],
-                mode='lines+markers', line=dict(width=3, color='#c0392b'),
-                marker=dict(size=5, color='#c0392b'),
-                name=f'Pipeline aggregate ({n_seg} seg)', legendgroup='agg',
-                customdata=agg_df['freq_hz'].values,
-                hovertemplate="Aggregate<br>f=%{customdata:.1f} Hz<br>"
-                    "Z'=%{x:.1f}<br>-Z''=%{y:.1f}<extra></extra>",
-            ), row=1, col=1)
-            fig.add_trace(go.Scatter(x=agg_df['freq_hz'], y=np.abs(Z_agg),
-                mode='lines+markers', line=dict(width=3, color='#c0392b'),
-                marker=dict(size=4, color='#c0392b'),
-                legendgroup='agg', showlegend=False), row=1, col=2)
-            fig.add_trace(go.Scatter(x=agg_df['freq_hz'], y=np.degrees(np.angle(Z_agg)),
-                mode='lines+markers', line=dict(width=3, color='#c0392b'),
-                marker=dict(size=4, color='#c0392b'),
-                legendgroup='agg', showlegend=False), row=1, col=3)
-
-        # Gamry outside the local band (dashed grey): the rest of the sweep, to
-        # its own top frequency (30 kHz), with the same corrections applied
-        if GAMRY_FULL_RANGE and gamry_full is None:
-            gamry_full = gamry_df
-        if GAMRY_FULL_RANGE and gamry_full is not None and gamry_df is not None \
-                and len(gamry_full) > len(gamry_df):
-            _in = gamry_full['freq_hz'].between(gamry_df['freq_hz'].min(),
-                                                gamry_df['freq_hz'].max())
-            _ext = gamry_full.copy()
-            _ext.loc[_in & ~_ext['freq_hz'].isin([gamry_df['freq_hz'].min(),
-                                                  gamry_df['freq_hz'].max()]),
-                     ['z_re', 'z_im']] = np.nan
-            Z_e = _ext['z_re'].values + 1j * _ext['z_im'].values
-            _fmax = gamry_full['freq_hz'].max()
-            fig.add_trace(go.Scatter(
-                x=_ext['z_re'], y=-_ext['z_im'], mode='lines+markers',
-                line=dict(width=2, color='grey', dash='dash'),
-                marker=dict(size=4, color='grey', symbol='diamond-open'),
-                name=f'Gamry {cond} outside local band (to {_fmax/1e3:.0f} kHz)',
-                legendgroup='gamry_full', connectgaps=False,
-                customdata=_ext['freq_hz'].values,
-                hovertemplate=f"Gamry {cond} (not compared)<br>f=%{{customdata:.0f}} Hz"
-                    "<br>Z'=%{x:.1f}<br>-Z''=%{y:.1f}<extra></extra>",
-            ), row=1, col=1)
-            for _col, _y in ((2, np.abs(Z_e)), (3, np.degrees(np.angle(Z_e)))):
-                fig.add_trace(go.Scatter(x=_ext['freq_hz'], y=_y, mode='lines+markers',
-                    line=dict(width=2, color='grey', dash='dash'),
-                    marker=dict(size=3, color='grey'), connectgaps=False,
-                    legendgroup='gamry_full', showlegend=False), row=1, col=_col)
-
-        # Gamry reference (thick black)
-        if gamry_df is not None:
-            Z_g = gamry_df['z_re'].values + 1j * gamry_df['z_im'].values
-            fig.add_trace(go.Scatter(
-                x=gamry_df['z_re'], y=-gamry_df['z_im'],
-                mode='lines+markers', line=dict(width=3.5, color='black'),
-                marker=dict(size=6, color='black', symbol='diamond'),
-                name=f'Gamry {cond}', legendgroup='gamry',
-                customdata=gamry_df['freq_hz'].values,
-                hovertemplate=f"Gamry {cond}<br>f=%{{customdata:.1f}} Hz<br>"
-                    "Z'=%{x:.1f}<br>-Z''=%{y:.1f}<extra></extra>",
-            ), row=1, col=1)
-            fig.add_trace(go.Scatter(x=gamry_df['freq_hz'], y=np.abs(Z_g),
-                mode='lines+markers', line=dict(width=3.5, color='black'),
-                marker=dict(size=5, color='black', symbol='diamond'),
-                legendgroup='gamry', showlegend=False), row=1, col=2)
-            fig.add_trace(go.Scatter(x=gamry_df['freq_hz'], y=np.degrees(np.angle(Z_g)),
-                mode='lines+markers', line=dict(width=3.5, color='black'),
-                marker=dict(size=5, color='black', symbol='diamond'),
-                legendgroup='gamry', showlegend=False), row=1, col=3)
-
-        fig.update_xaxes(title_text="Z' [mohm.cm2]", row=1, col=1)
-        fig.update_yaxes(title_text="-Z'' [mohm.cm2]", row=1, col=1)
-        fig.update_xaxes(title_text="f [Hz]", type="log", row=1, col=2)
-        fig.update_yaxes(title_text="|Z| [mohm.cm2]", type="log", row=1, col=2)
-        fig.update_xaxes(title_text="f [Hz]", type="log", row=1, col=3)
-        fig.update_yaxes(title_text="Phase [deg]", row=1, col=3)
-
-        _gstr = f' + Gamry {cond}' if gamry_df is not None else ''
-        _nrec = 0 if rec_df is None else rec_df['segment'].nunique()
-        # THE AGGREGATE'S COVERAGE IS PART OF WHAT IT MEANS.
-        # Compared against a whole-cell Gamry sweep, an aggregate over 96 % of the
-        # plate is not the same quantity as the instrument's, and the difference
-        # is exactly the missing 4 %. Say which it is, on the figure.
-        _covstr = ('' if _cov is None else
-                   f' — aggregate covers {100*_cov:.0f} % of the plate area'
-                   + ('' if _cov > 0.995 else
-                      '; the Gamry measures 100 %, so this comparison is '
-                      'short by the difference'))
-        fig.update_layout(
-            title=f'<b>Leepa {_LEEPA} / {cond}: {n_seg} measured'
-                  + (f' + {_nrec} rebuilt' if _nrec else '')
-                  + f' segments{_gstr}</b><br>'
-                  f'<sup>Source: {_prov} — {src}{_covstr}</sup>',
-            height=580, width=1550,
-            paper_bgcolor='white', plot_bgcolor='white',
-            margin=dict(t=100, b=55, r=280), hovermode='closest',
-            legend=dict(font=dict(size=10), y=0.5, yanchor='middle'))
-        _ov_figs[cond] = fig
-
-        print(f"\n  {cond}: {n_seg} measured"
-              + (f" + {_nrec} rebuilt from neighbours" if _nrec else "")
-              + f" segments from {src}")
-        if _cov is not None:
-            print(f"  aggregate covers {100*_cov:.1f} % of the plate area")
-        if gamry_df is not None:
-            print(f"  Gamry: {len(gamry_df)} pts")
+        _note = ('' if _cov is None else
+                 f'aggregate covers {100 * _cov:.0f} % of the plate area')
+        _ov_figs[cond] = nyquist.comparison_figure(
+            agg_df, g, title=f'Leepa {_LEEPA} / {cond}: aggregate of the '
+                             f'segments vs Gamry {cond}',
+            gamry_name=f'Gamry {cond}', note=_note)
+        print(f"  {cond}: aggregate {0 if agg_df is None else len(agg_df)} "
+              f"frequencies ({_prov}: {src}); Gamry "
+              f"{'none' if g is None else f'{len(g)} points, {g.freq_hz.min():.4g}–{g.freq_hz.max():.5g} Hz'}")
 
     # ONE plot: pick the condition and the view (Nyquist, |Z|, phase)
-    show_by_condition(_ov_figs, title=f'Gamry vs pipeline aggregate — Leepa {_LEEPA}')
+    show_by_condition(_ov_figs, title=f'Gamry vs pipeline aggregate — Leepa {_LEEPA}',
+                      save='gamry_vs_aggregate')
 
 # COMMAND ----------
 

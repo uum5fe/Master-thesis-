@@ -164,9 +164,13 @@ for cond in CONDITIONS:
 
 # COMMAND ----------
 
-# DBTITLE 1,Nyquist / Bode / phase of the measured spectra — Condition and Plot drop-downs
+# DBTITLE 1,Nyquist / Bode / phase of the measured spectra + Gamry (black) — Condition and Plot drop-downs
+# every segment, coloured inlet -> outlet, and the condition's whole-cell
+# Gamry sweep in black in all three views: every point of the .dta at the
+# frequency the file gives, no band limit, nothing interpolated or removed
 _figs = {c: nyquist.figure(r['spectra'][r['spectra'].kept],
-                           title=f'{LEEPA} / {c} — standard evaluation (measured)')
+                           title=f'{LEEPA} / {c} — standard evaluation (measured)',
+                           gamry=r.get('gamry_full'), gamry_name=f'Gamry {c}')
          for c, r in STD_RESULTS.items()}
 displayHTML(viewers.by_condition(_figs, title=f'Leepa {LEEPA} — measured spectra',
                                  panel_height=560, panel_width=1150))
@@ -194,12 +198,18 @@ for c, r in STD_RESULTS.items():
 
 # COMMAND ----------
 
-# DBTITLE 1,Measured segments in parallel vs the Gamry whole cell
+# DBTITLE 1,Measured segments in parallel vs the Gamry whole cell — Condition and Plot drop-downs
+# two curves only: the aggregate of the measured segments (red) and the
+# Gamry (black, every point of the file). The per-frequency differences are
+# in gamry_comparison.csv; the whole sweep as read is in gamry_full.csv.
 displayHTML(viewers.by_condition(
-    {c: viewers.img_html(Path(r['out_dir']) / 'gamry_vs_aggregate.png')
-     for c, r in STD_RESULTS.items()
-     if (Path(r['out_dir']) / 'gamry_vs_aggregate.png').exists()},
-    title=f'Leepa {LEEPA} — aggregate of the measured spectra vs Gamry'))
+    {c: nyquist.comparison_figure(
+            r['aggregate'], r.get('gamry_full'),
+            title=f'{LEEPA} / {c} — aggregate of the measured segments vs Gamry {c}',
+            gamry_name=f'Gamry {c}')
+     for c, r in STD_RESULTS.items()},
+    title=f'Leepa {LEEPA} — aggregate of the measured spectra vs Gamry',
+    panel_height=560, panel_width=1150))
 
 # COMMAND ----------
 

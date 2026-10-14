@@ -498,7 +498,8 @@ The notebook's ECM cells (16–20) use the same function, so the fit you see the
   - `gamry_comparison.csv` (one row per condition, including the bench current at the time of the sweep);
   - `gamry_comparison_curves.csv`;
   - `gamry_reference_full.csv`;
-  - `gamry_comparison.png`.
+  - `gamry_comparison.png` (the whole Gamry sweep in black, the aggregate in red).
+- The numbers compare the aggregate with the Gamry's own point at the same step. **The plots draw the Gamry as recorded**: all points, exact frequencies (hover shows 5 significant digits), no band limit, no inductance removed (`nyquist.gamry_frame`).
 
 ### 10.2 Chain frequency response (`checks/frequency_response.py`)
 
@@ -606,8 +607,8 @@ One run folder per condition:
 | 9 | Card gain and DC closure | UC gain per card, card impedance factors, plate current vs bench current over all conditions, per-segment scale. |
 | 10 | Frequency response | Ex-situ amplifiers and in-situ per condition. |
 | 11 | Via resistance | Via slope against temperature per card (needs the Abgleich folder). |
-| 12 | Nyquist / Bode | Every segment coloured along the air path (inlet blue → outlet red). Rebuilt segments are dotted. |
-| 13 | Gamry vs aggregate | The local parallel sum against the whole-cell sweep, like for like: current-error scaled, Gamry series L removed, shared band. |
+| 12 | Nyquist / Bode | Every segment coloured along the air path (inlet blue → outlet red), and the condition's **Gamry in black** in all three views (Nyquist, \|Z\|, phase): every point of the `.dta` at the frequency the file gives (`gamry_spectra`). Rebuilt segments are dotted. |
+| 13 | Gamry vs aggregate | **Two curves only:** the aggregate of the segments (red, `cell_aggregate.csv` as written) and the Gamry (black, every point of the file, 0.19 Hz – 30 kHz). Nothing scaled, cut to a band, interpolated or removed (`nyquist.comparison_figure`). |
 | 14 | Plate heat maps | Condition × parameter × view (interpolated / per segment). Fixed colour scales. Also writes the static PNGs. |
 | 15 | MF4 test-stand | Every bench channel of the order, with the FAMOS plate temperatures as reference lines. |
 | 16 | ECM fitting | Rs + L + (R_ct‖CPE) [+ (R_mt‖CPE)] per segment and for the aggregate; arc count chosen by AICc. Defines `ECM_ALL`. |
@@ -733,6 +734,16 @@ python run.py dc_closure RUN_45A RUN_60A ... -o OUT
    - Measure a Gamry dummy cell for the Gamry's own chain.
    - Until then, the band stops at 2.4 kHz.
 4. **Low-frequency scatter at high current.** At 150 A and 450 A the air-outlet segments scatter below ~20 Hz (up to ~10 % at the 450 A outlet). The outlet segments move together, which points to a non-stationary cell (water, air-flow drift), not to the computation. Quote R_mt there with the larger uncertainty (`docs/spectra_recheck.md`).
+4a. **Preventing the high-current scatter in future measurements** (it is in the signal, so it must be prevented at the bench):
+   - Hold the operating point until the cell voltage drifts < 1 mV/min before the sweep, and repeat one frequency (e.g. 1 kHz) at the start and the end to measure the drift.
+   - Keep the air outlet from flooding at high current: higher cathode stoichiometry, lower inlet RH or slightly higher temperature for the EIS point.
+   - Scale the excitation with the current. 7 A rms is 1.6 % of 450 A; ~15 A rms keeps the response near 12 mV (|Z| ≈ 0.55 mΩ) and doubles the outlet SNR.
+   - Use more periods at the low frequencies, or repeat the sweep 2–3 times and compare; stop at 0.5–1 Hz at 450 A if the lowest points do not repeat.
+   - Record the Gamry's AC current on a spare FAMOS channel and start both with one trigger: an AC current closure per step and exact step positions.
+4b. **The aggregate is 7–18 % above the Gamry, at every frequency** (2612030: 45 A +8 %, 60 A +7 %, 150 A +13 %, 450 A +18 %; median |Z|). The phase agrees within ±3° up to 1 kHz.
+   - It is the same in every build: the 12.10 full-band build only *looked* aligned in the Nyquist plane, because its high-frequency points were rotated onto the Gamry's phase (`gamry_card_phase`). Frequency by frequency it was still 8–17 % high, its points lying on the Gamry curve at about half the frequency.
+   - About 13 mΩ·cm² of it is an offset: the UC taps carry ~47 µΩ of series resistance the Gamry sense leads do not (UC2 0.652 V vs Gamry Vdc 0.673 V at 450 A; item 2 above).
+   - The rest (~+10 % at low frequency, at every current) is not explained by the data: DC current closure is −2.4 %, and the amplifier chain is flat to 0.03 % below 1 kHz. A simultaneous sweep of a known dummy load through both instruments settles it.
 5. **Missing steps.** 2.4 Hz and 9.45 Hz often hold no detectable tone and are then left out, not guessed.
 6. **Datago.**
    - The condition mapping relies on five-file groups per start minute and on the protocol order.
@@ -801,7 +812,7 @@ python run.py dc_closure RUN_45A RUN_60A ... -o OUT
 | 5. Quality | a point is kept with ≥ 3 periods and SNR ≥ 3 dB on both channels; Lin-KK residual per segment (reported, not used to drop) | `run` |
 | 6. Parameters | the standard circuit fit (§8.3, `standard_eis.py`): R_ohmic, R_ct, R_mt, R_pol, the graphical R_pol, arc frequencies, fit residual; also j = u_dc/K, T, Re Z(1 kHz), \|Z\| and phase at 100 Hz | `run` |
 | 7. Aggregate | the **measured** segment impedances in parallel, Z_cell = A_used / Σ A_s/Z_s, against the Gamry × 304.92 cm² | `run` |
-| 8. Output | `EIS_Results_standard/<order>/<condition>/`: `spectra.csv` (kept), `spectra_all.csv`, `schedule.csv` (where each step was found on each card), `parameters.csv`, `plate_statistics.csv` (36 tiles), `aggregate.csv`, `gamry_comparison.csv`, `manifest.json`, `nyquist.png/.html`, `gamry_vs_aggregate.png`, `plate_<param>_interp.png` | `write_figures` |
+| 8. Output | `EIS_Results_standard/<order>/<condition>/`: `spectra.csv` (kept), `spectra_all.csv`, `schedule.csv` (where each step was found on each card), `parameters.csv`, `plate_statistics.csv` (36 tiles), `aggregate.csv`, `gamry_comparison.csv` (the Gamry's own point at each measured step, never interpolated), `gamry_full.csv` (the whole sweep as read), `manifest.json`, `nyquist.png/.html` (segments + Gamry in black), `gamry_vs_aggregate.png` (aggregate and Gamry only), `plate_<param>_interp.png` | `write_figures` |
 
 **The notebook** (`Local EIS Standard Pipeline`):
 - widgets: order, conditions, write results;

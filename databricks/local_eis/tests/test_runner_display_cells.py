@@ -135,17 +135,25 @@ def test_the_nyquist_cell_filters_nothing_and_colours_by_air_path(
     assert "nyquist.figure(" in src and "NYQUIST_COLOUR = 'flow'" in src
 
 
-def test_both_nyquist_cells_read_the_reconstructions(tmp_path) -> None:
-    """The aggregate already included them; the segment traces did not."""
-    for marker in ("INTERACTIVE NYQUIST + BODE PER CONDITION",
-                   "GAMRY vs PIPELINE OVERLAY"):
-        assert "spectra_reconstructed.csv" in _cell(marker), marker
+OVERLAY = "THE AGGREGATE OF THE SEGMENTS AGAINST THE WHOLE-CELL GAMRY"
 
 
-def test_the_overlay_reports_the_aggregate_coverage() -> None:
-    """Against a whole-cell instrument, an aggregate over 96 % of the plate
-    is not the same quantity, and the figure has to say which it is."""
-    src = _cell("GAMRY vs PIPELINE OVERLAY")
+def test_the_nyquist_cell_reads_the_reconstructions_and_the_gamry(tmp_path) -> None:
+    """The segment view draws the rebuilt segments and, in black, the Gamry."""
+    src = _cell("INTERACTIVE NYQUIST + BODE PER CONDITION")
+    assert "spectra_reconstructed.csv" in src
+    assert "gamry=GAMRY_SPECTRA.get(cond)" in src
+
+
+def test_the_overlay_is_the_aggregate_and_the_gamry_only() -> None:
+    """Two curves: no segment traces, no band cut, nothing rescaled -- and
+    the coverage of the aggregate still said on the figure."""
+    src = _cell(OVERLAY)
+    assert "nyquist.comparison_figure(" in src
+    assert "spectra_clean.csv" not in src
+    assert "spectra_reconstructed.csv" not in src
+    for gone in ("LIKE_FOR_LIKE", "GAMRY_FULL_RANGE", "outside local band"):
+        assert gone not in src, gone
     assert "area_coverage" in src
     assert "covers" in src
 

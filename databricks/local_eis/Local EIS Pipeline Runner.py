@@ -711,7 +711,11 @@ def _widget(*names, default=''):
  
  
 # ─── Read widget values ───
-PLATE = 'gen1'  # always gen1 for FAMOS
+# The measuring plate: 'gen1' = green / Kashyyyk (order 2612030), 'gen2' =
+# blue / Naboo. It selects the segment map and areas (r2d2_geometry), the
+# chain gain file (chain_gain_<plate>.csv) and travels into the cache key, so
+# runs of the two plates never share a result. Set it before the first run.
+PLATE = globals().get('PLATE', 'gen1')
 # SOURCE_FORMAT, CSV_ROOT and CSV_FOLDERS are set at the top of this cell.
 CSV_PATH = ''
 CSV_DIALECT = 'auto'
@@ -861,7 +865,7 @@ SUBSTITUTE_SEGMENTS = _seg_list('substitute_segments')
 FILL_GAPS = _w('fill_gaps', 'no') == 'yes'
  
 # Select the plate for the whole session
-_plate = geom.use_plate(PLATE)
+_plate = geom.use_plate((globals().get('PLATE') if globals().get('PLATE') in ('gen1', 'gen2') else 'gen1'))
  
 print(f"  Leepa:     {LEEPA}"
       + (f"   (CSV: {CSV_ROOT / CSV_CAMPAIGN})" if SOURCE_FORMAT == 'csv'
@@ -1493,6 +1497,11 @@ def _run_identity(mode=None, f_min=None, f_max=None, snr=None):
         return v
 
     payload = {k: _norm(getattr(base, k, None)) for k in _CACHE_IDENTITY_KEYS}
+    # the plate: only when it is not gen1, so the existing gen1 entries keep
+    # their key and a gen2 run never shares one with them
+    _pl = (globals().get('PLATE') if globals().get('PLATE') in ('gen1', 'gen2') else 'gen1')
+    if _pl != 'gen1':
+        payload['plate'] = _pl
     # the CONTENT of the calibration files, not only their path: the chain
     # gain file is rebuilt in place (5-500 Hz normalisation, October 2026),
     # and the high-frequency response is refined in place
@@ -2123,7 +2132,7 @@ for cond in _conditions_to_run:
     _out_dir.mkdir(parents=True, exist_ok=True)
     
     cfg = DEFAULT.replace(
-        plate='gen1',  # hardcode string; PLATE var can be corrupted by module reload
+        plate=(globals().get('PLATE') if globals().get('PLATE') in ('gen1', 'gen2') else 'gen1'),  # validated; PLATE can be corrupted by a module reload
         source_format=SOURCE_FORMAT,
         csv_path=(CSV_FOLDERS.get(cond) if SOURCE_FORMAT == 'csv'
                   else Path(CSV_PATH) if CSV_PATH else None),

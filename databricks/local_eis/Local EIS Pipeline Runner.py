@@ -765,9 +765,13 @@ GAMRY_SYNC = 'guide'
 CARD_GAIN = 'correct'
 # Series resistance between the FAMOS UC taps and the Gamry's sense leads,
 # in mOhm*cm2, subtracted from every segment's Re Z (config.uc_series_mohm_cm2).
-# The "Card voltage gain and DC current closure" cell measures it from UC2 DC
-# against the Gamry Vdc over all conditions: 13.4 on 2612030. 0 = Z as the UC
-# taps see it (the default); 13.4 = on the Gamry's reference plane.
+# KEEP 0 on 2612030. The plate sits +8..+12 above the Gamry over 0.1-3 kHz,
+# but within -1..+2 at the Gamry's HFR crossing (3.4-3.8 kHz), at all four
+# currents: the difference depends on frequency, so it is not a resistance.
+# Tested with 10 (150 A, 450 A, HF_RESPONSE = 'auto'): the arc band matched,
+# but the HFR fell ~11 below the Gamry, 14-17 segments lost their real-axis
+# crossing and the segment phase spread at 4.7-12 kHz rose from <2 deg to
+# ~7 deg. The "Card diagnostics" cell prints both numbers for every order.
 UC_SERIES_MOHM_CM2 = 0.0
 # Frequency response of the measuring chain (frequency_response.py), after
 # every run: the ex-situ amplifier response G_d of each segment (from the

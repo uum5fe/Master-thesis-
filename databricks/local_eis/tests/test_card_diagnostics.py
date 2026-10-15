@@ -55,3 +55,19 @@ def test_series_offset_recovers_an_additive_real_offset():
     o = cd.series_offset(cd.card_medians(_plate(offset=10.0)), _gamry())
     assert o["dRe_mohm_cm2"] == pytest.approx(10.0)
     assert o["dIm_mohm_cm2"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_series_offset_tells_a_resistance_from_a_frequency_dependent_offset():
+    f = np.geomspace(1, 12000, 40)
+    zg = 45 + 100 / (1 + 1j * f / 150) + 1j * 2 * np.pi * f * 6e-4
+    g = pd.DataFrame({"freq_hz": f, "z_re_mohm_cm2": zg.real, "z_im_mohm_cm2": zg.imag})
+
+    def plate(dz):
+        z = zg + dz
+        return pd.DataFrame({"card": "plate", "fk": f, "Z": z})
+
+    o = cd.series_offset(plate(10.0), g)                         # a resistance
+    assert o["dRe_at_hfr_mohm_cm2"] == pytest.approx(10.0, abs=0.5)
+    o = cd.series_offset(plate(10.0 / (1 + (f / 1500) ** 4)), g)  # gone at the HFR
+    assert o["dRe_mohm_cm2"] > 7
+    assert abs(o["dRe_at_hfr_mohm_cm2"]) < 3

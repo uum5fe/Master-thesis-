@@ -87,14 +87,22 @@ def transfer(cm: pd.DataFrame, gamry: pd.DataFrame) -> pd.DataFrame:
 
 
 def series_offset(cm: pd.DataFrame, gamry: pd.DataFrame,
-                  band=(100.0, 3000.0)) -> dict:
-    """Plate median minus Gamry over `band`: median dRe and dIm [mOhm.cm2].
+                  band=(100.0, 3000.0), card: str = "plate") -> dict:
+    """`card` (the plate median, or the cell aggregate -- the parallel sum
+    of the segments, which is what the Gamry measures) minus the Gamry:
+    median dRe and dIm over `band`, and dRe at the Gamry's own real-axis
+    crossing (its HFR) [mOhm.cm2]. Judge a series resistance on the
+    aggregate: a median of segments is not a whole-cell impedance, and at the
+    HFR it sits 7-9 above the parallel sum when the segments spread.
 
-    On 2612030 dRe is +8..+12 with dIm ~0 at every current above 100 Hz: a
-    series resistance in the FAMOS voltage path the Gamry's sense leads do
-    not see (config.uc_series_mohm_cm2 removes it), not a card and not the
-    cell."""
-    p = cm[cm.card == "plate"].sort_values("fk")
+    A series resistance between the two sense points would show the SAME
+    dRe at every frequency. On 2612030 it does not: dRe is +8..+12 over
+    100-3000 Hz but -1..+2 at the HFR crossing (3.4-3.8 kHz), the same at
+    45/60/150/450 A. Subtracting a constant (config.uc_series_mohm_cm2)
+    therefore fixes the arc band and puts the HFR ~11 below the Gamry; it is
+    left at 0. `dRe_at_hfr` is what a constant correction would have to
+    match."""
+    p = cm[cm.card == card].sort_values("fk")
     gf = gamry["freq_hz"].to_numpy(float)
     gz = (gamry["z_re_mohm_cm2"].to_numpy(float)
           + 1j * gamry["z_im_mohm_cm2"].to_numpy(float))
@@ -102,8 +110,21 @@ def series_offset(cm: pd.DataFrame, gamry: pd.DataFrame,
     k = np.abs(np.log(f)[:, None] - np.log(gf)[None, :]).argmin(axis=1)
     dz = p["Z"].to_numpy() - gz[k]
     m = (f >= band[0]) & (f < band[1])
+    # the Gamry's HFR: first capacitive -> inductive crossing above 100 Hz
+    o = np.argsort(gf)
+    gfo, gzo = gf[o], gz[o]
+    at_hfr = float("nan")
+    for i in range(len(gfo) - 1):
+        if gfo[i] >= 100 and gzo[i].imag < 0 <= gzo[i + 1].imag:
+            w = gzo[i].imag / (gzo[i].imag - gzo[i + 1].imag)
+            fx = gfo[i] * (gfo[i + 1] / gfo[i]) ** w
+            lf, pz = np.log(f), p["Z"].to_numpy()
+            at_hfr = float(np.interp(np.log(fx), lf, pz.real)
+                           - (gzo[i].real + w * (gzo[i + 1].real - gzo[i].real)))
+            break
     return {"dRe_mohm_cm2": float(np.median(dz.real[m])) if m.any() else float("nan"),
             "dIm_mohm_cm2": float(np.median(dz.imag[m])) if m.any() else float("nan"),
+            "dRe_at_hfr_mohm_cm2": at_hfr,
             "band_hz": list(band)}
 
 
@@ -224,24 +245,39 @@ def build(run_dirs, out_dir, log=print) -> dict:
                               z_im=cm["Z"].to_numpy().imag).drop(columns="Z"))
         if g is not None:
             trs[cond] = transfer(cm, g)
-            offs[cond] = series_offset(cm, g)
+            agg = Path(d) / "silver" / "cell_aggregate.csv"
+            if agg.is_file():
+                a = pd.read_csv(agg)
+                cma = pd.DataFrame({"card": "aggregate", "fk": a["freq_hz"],
+                                    "Z": a["z_re_mohm_cm2"].to_numpy()
+                                    + 1j * a["z_im_mohm_cm2"].to_numpy()})
+                offs[cond] = series_offset(cma, g, card="aggregate")
+            else:
+                offs[cond] = series_offset(cm, g)
     pd.concat(meds).to_csv(out / "card_median_spectra.csv", index=False)
     if trs:
         pd.concat([t.assign(condition=c) for c, t in trs.items()]).round(3) \
             .to_csv(out / "card_gamry_transfer.csv", index=False)
         written.append(figure_cross_current(trs, out / "cross_current.png"))
     if offs:
-        pd.DataFrame(offs).T.drop(columns="band_hz").round(2).to_csv(
+        pd.DataFrame(offs).T.drop(columns="band_hz").astype(float).round(2).to_csv(
             out / "plate_vs_gamry_offset.csv")
     if log:
         log(f"  card diagnostics for {len(run_dirs)} run(s) -> {out}")
         for c, o in sorted(offs.items(), key=lambda kv: _amps(kv[0])):
-            log(f"    {c:>6}: plate - Gamry over 100-3000 Hz: dRe "
-                f"{o['dRe_mohm_cm2']:+.1f}, dIm {o['dIm_mohm_cm2']:+.1f} mOhm.cm2")
+            log(f"    {c:>6}: aggregate - Gamry, dRe over 100-3000 Hz "
+                f"{o['dRe_mohm_cm2']:+.1f} (dIm {o['dIm_mohm_cm2']:+.1f}), "
+                f"at the Gamry HFR {o['dRe_at_hfr_mohm_cm2']:+.1f} mOhm.cm2")
         if offs:
-            med = float(np.median([o["dRe_mohm_cm2"] for o in offs.values()]))
-            log(f"    a real offset at every current = series resistance in the "
-                f"voltage path; uc_series_mohm_cm2 = {med:.1f} would remove it")
+            mid = float(np.median([o["dRe_mohm_cm2"] for o in offs.values()]))
+            hfr = float(np.nanmedian([o["dRe_at_hfr_mohm_cm2"] for o in offs.values()]))
+            if abs(mid - hfr) > 3:
+                log(f"    the offset depends on frequency ({mid:+.1f} in the arc band, "
+                    f"{hfr:+.1f} at the HFR): not a series resistance -- leave "
+                    f"UC_SERIES_MOHM_CM2 = 0")
+            else:
+                log(f"    the same offset in the arc band and at the HFR: a series "
+                    f"resistance; UC_SERIES_MOHM_CM2 = {hfr:.1f} would remove it")
     return {"figures": written, "transfer": trs, "offset": offs}
 
 

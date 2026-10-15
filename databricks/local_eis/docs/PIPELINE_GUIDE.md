@@ -226,14 +226,14 @@ What the four runs of 2612030 still showed, and what was done:
 | card phases < 1 kHz | ±3° | ±3° | ±3° | ±3° | no synchronisation error |
 | outlet cards 1/4/5, 3–10 Hz | small | small | larger | +20…+60 %, −10…−20° | the cell (outlet mass transport) |
 
-**Series resistance tested and rejected (final 150 / 450 A runs, `HF_RESPONSE = 'auto'`, `UC_SERIES_MOHM_CM2` = 0 and 10).** The plate-minus-Gamry offset is the same at every current but not the same at every frequency: about +25 below 10 Hz, +7…+12 from 20 Hz to 1 kHz, and −1…+2 at the Gamry's HFR crossing (3.4–3.8 kHz). Compared like for like, uc_series = 0 already gives the Gamry's HFR:
+**Series resistance tested and rejected (final runs at all four currents, `HF_RESPONSE = 'auto'`, `UC_SERIES_MOHM_CM2` = 0 and 10).** The plate-minus-Gamry offset is the same at every current but not the same at every frequency: about +25 below 10 Hz, +7…+12 from 20 Hz to 1 kHz, and −1…+2 at the Gamry's HFR crossing (3.4–3.8 kHz). Compared like for like, uc_series = 0 already gives the Gamry's HFR:
 
-| HFR [mΩ·cm²] | 150 A | 450 A |
-|---|---|---|
-| Gamry whole cell (crossing) | 45.2 (3.8 kHz) | 44.4 (3.4 kHz) |
-| FAMOS, area-weighted harmonic mean of the segment HFRs, uc = 0 | 44.7 | 46.7 |
-| FAMOS aggregate Re at the Gamry's crossing, uc = 0 / 10 | 45.0 / 32.9 | 46.6 / 33.6 |
-| bench tool CSV (separate test, 65 °C), harmonic mean | 45.8 | 46.9 |
+| HFR [mΩ·cm²] | 45 A | 60 A | 150 A | 450 A |
+|---|---|---|---|---|
+| Gamry whole cell (crossing) | 46.7 | 47.1 | 45.2 | 44.4 |
+| FAMOS, area-weighted harmonic mean of the segment HFRs, uc = 0 | 46.1 | 44.8 | 44.7 | 46.7 |
+| FAMOS aggregate Re at the Gamry's crossing, uc = 0 / 10 | 45.8 / 33.8 | 44.5 / 32.4 | 45.0 / 32.9 | 46.6 / 33.6 |
+| bench tool CSV (separate test, 65 °C), harmonic mean | 50.4 | 49.0 | 45.8 | 46.9 |
 
 The plate *median* (52–54) is higher than the Gamry because the whole cell is a parallel (harmonic) mean, not because of a series resistance. With 10 subtracted, 14–17 segments lose their real-axis crossing (points pushed to Re ≤ 0 are removed by the passivity gate), the segment phase spread at 4.7–12 kHz rises from < 2° to ~7°, and R_pol drops by 13–24 mΩ·cm². The remaining arc-band and low-frequency excess (whole-cell R_pol 196 vs 168 at 150 A, 122 vs 95 at 450 A) is open: candidates are the current chain's AC gain against its DC calibration (the gain file is normalised to 1 over 5–500 Hz) or a contact with capacitance in the voltage path. A four-wire impedance measurement between the UC2 tap and the Gamry sense point decides it.
 

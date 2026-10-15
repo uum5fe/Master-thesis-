@@ -2495,8 +2495,9 @@ else:
 #   the same at every current        -> acquisition (card or chain)
 #   shared by every card             -> common to the chain / the comparison
 #   changing with current, by card   -> the cell's own spatial behaviour
-# It also prints the plate-minus-Gamry offset (100-3000 Hz): a real offset at
-# every current is series resistance in the voltage path (UC_SERIES_MOHM_CM2).
+# It also prints the aggregate-minus-Gamry offset in the arc band (100-3000 Hz)
+# and at the Gamry's HFR crossing: only if the two are equal is it a series
+# resistance (UC_SERIES_MOHM_CM2); on 2612030 they are not, so it stays 0.
 # ═══════════════════════════════════════════════════════════════════════════════
 import card_diagnostics
 importlib.reload(card_diagnostics)

@@ -1,0 +1,3768 @@
+# Databricks notebook source
+# fresh Python for a clean module reload -- skipped when the extras notebook
+# runs this one with %run (it sets _EIS_NO_RESTART first)
+if not globals().get('_EIS_NO_RESTART'):
+    dbutils.library.restartPython()
+
+# COMMAND ----------
+
+# DBTITLE 1,Setup: sys.path + module imports
+# ═══════════════════════════════════════════════════════════════════════════════
+# LOCAL EIS PIPELINE RUNNER
+# ═══════════════════════════════════════════════════════
+#
+# Notebook entry point for the modular bronze/silver/gold pipeline.
+# Selects measurement by Order ID (Leepa) from datago, runs the full
+# pipeline, and displays Nyquist + heatmap results inline.
+#
+# Folder layout (eis_paths.py puts every folder on sys.path):
+#   core/      config, utils, plate geometry      pipeline/  bronze -> silver -> gold
+#   checks/    plausibility + per-run checks       analysis/  ECM / DRT, polcurves
+#   plotting/  maps, viewers, figure helpers       readers/   Gamry, Abgleich, CSV
+# ═══════════════════════════════════════════════════════════════════════════════
+import sys
+from pathlib import Path
+ 
+# ─── Find the module directory: the folder this notebook sits in ───
+# Hard-coding a workspace path means the notebook only runs for whoever
+# uploaded it, and breaks silently when the folder is renamed.  The modules
+# are always beside the notebook, so ask Databricks where the notebook is and
+# work from there.  `_PIPELINE_DIR_OVERRIDE` is the escape hatch for the case
+# where they are deliberately kept somewhere else.
+_PIPELINE_DIR_OVERRIDE = ''      # e.g. '/Workspace/Users/you@bosch.com/Local_EIS_pipeline'
+
+
+def _my_workspace_home():
+    """/Workspace/Users/<whoever runs this notebook>, or None.
+
+    Taken from the notebook context, so the notebook works for every user
+    without editing a name into it.
+    """
+    try:
+        _u = (dbutils.notebook.entry_point.getDbutils().notebook()
+              .getContext().userName().get())
+        return f'/Workspace/Users/{_u}' if _u else None
+    except Exception:
+        return None
+
+
+def _find_pipeline_dir():
+    if _PIPELINE_DIR_OVERRIDE:
+        return _PIPELINE_DIR_OVERRIDE
+    try:
+        nb = (dbutils.notebook.entry_point.getDbutils().notebook()
+              .getContext().notebookPath().get())
+        cand = '/Workspace' + str(Path(nb).parent)
+        if (Path(cand) / 'eis_paths.py').exists():
+            return cand
+    except Exception:
+        pass
+    # Repos, a local checkout, or anything else: fall back to the cwd and to
+    # the CURRENT user's own workspace folder -- never to somebody else's.
+    _home = _my_workspace_home()
+    for cand in [str(Path.cwd())] + ([str(Path(_home) / n) for n in
+                                      ('local_eis_final', 'Local_EIS_pipeline')]
+                                     if _home else []):
+        if (Path(cand) / 'eis_paths.py').exists():
+            return cand
+    raise FileNotFoundError(
+        "cannot find the pipeline modules. eis_paths.py should sit in the same "
+        "folder as this notebook; if it does not, set "
+        "_PIPELINE_DIR_OVERRIDE at the top of this cell.")
+ 
+ 
+_PIPELINE_DIR = _find_pipeline_dir()
+if _PIPELINE_DIR not in sys.path:
+    sys.path.insert(0, _PIPELINE_DIR)
+ 
+import eis_paths            # core/, pipeline/, checks/, ... on sys.path
+ 
+import importlib
+importlib.invalidate_caches()
+import numpy as np
+import pandas as pd
+ 
+# Import pipeline modules
+import config
+import utils
+import eis_local
+import gamry_sync
+import channel_lag
+import card_gain
+import bronze
+import silver
+import gold
+import main as pipeline_main
+import r2d2_geometry as geom
+import csv_source
+import csv_pipeline
+import gamry_dta
+import gamry_compare
+import abgleich
+import site_paths
+import ladder_snap
+import tone_estimation
+import eis_measurement_model
+import figure_panels
+import plate_style
+import plate_maps
+import plate_figure
+import plate_plotly
+import bench_plots
+import polcurve
+import ecm_drt
+import plausibility
+import dc_closure
+import segment_scale
+import frequency_response
+import via_resistance
+import viewers
+import nyquist
+ 
+# Force reload during development (plate_style before the maps that use it)
+for mod in [config, utils, eis_local, gamry_sync, channel_lag, card_gain,
+            bronze, silver, gold, plausibility, dc_closure, segment_scale,
+            frequency_response, via_resistance, viewers, pipeline_main,
+            geom, csv_source, csv_pipeline, gamry_dta, gamry_compare, abgleich,
+            site_paths, ladder_snap, tone_estimation, eis_measurement_model,
+            figure_panels, plate_style, plate_maps, plate_figure, plate_plotly,
+            bench_plots, polcurve, ecm_drt, nyquist]:
+    importlib.reload(mod)
+
+# ─── ARE ALL MODULES FROM THIS BUILD? ───
+# A folder updated file by file can mix builds: on 2612030 450 A the new
+# config/silver ran (full band, R_ohmic at the intercept) next to an OLD gold
+# and plotting -- maps with the old statistics and the old segment marks, and
+# no plate_statistics.csv. Each module must come from this notebook's folder
+# and carry what this build added; anything else stops the run here, naming
+# the file.
+import plate_stats
+importlib.reload(plate_stats)
+_BUILD_MARKERS = {
+    config: ['full_band'], plate_stats: ['tile_stats', 'write_statistics'],
+    geom: ['label_xy'], bronze: ['to_own', 'to_common'],
+    silver: ['r_ohmic_intercept', 'gamry_card_phase', 'standard_eis'], gold: ['plate_stats'],
+    plate_figure: ['node_xy'], plate_maps: ['uniformity_stats'],
+    plausibility: ['_tile_or_all'], gamry_sync: ['confine_windows'],
+    nyquist: ['gamry_frame', 'comparison_figure'],
+    site_paths: ['resolve', 'matches_plate'],
+}
+_stale = []
+for _m, _need in _BUILD_MARKERS.items():
+    _f = str(getattr(_m, '__file__', ''))
+    _missing = [a for a in _need
+                if not (hasattr(_m, a) or hasattr(getattr(_m, 'Config', None), a)
+                        or a in getattr(getattr(_m, 'Config', None),
+                                        '__dataclass_fields__', {}))]
+    if _missing or not _f.startswith(str(_PIPELINE_DIR)):
+        _stale.append(f"  {_m.__name__:14s} {_f}"
+                      + (f"   missing: {', '.join(_missing)}" if _missing else
+                         "   (outside this notebook's folder)"))
+# modules whose new code has no new name: look for it in the source
+import inspect as _inspect
+for _m, _txt in {plate_plotly: 'plate_stats', viewers: 'node_xy',
+                 nyquist: 'def save_run'}.items():
+    try:
+        _ok = _txt in _inspect.getsource(_m)
+    except (OSError, TypeError):
+        _ok = False
+    if not _ok:
+        _stale.append(f"  {_m.__name__:14s} {getattr(_m, '__file__', '')}"
+                      f"   missing: {_txt}")
+if _stale:
+    raise RuntimeError(
+        "These modules are not from this build:\n" + "\n".join(_stale)
+        + f"\nDelete the whole folder {_PIPELINE_DIR} in the workspace and "
+          "import the new zip into an EMPTY folder -- importing on top of an "
+          "existing folder can leave old files in place.")
+print(f"  modules: all {len(_BUILD_MARKERS)} checked modules from {_PIPELINE_DIR}")
+
+# ─── ONE PLOT PER FIGURE ───
+# Every spectrum cell below still builds its multi-panel figure (Nyquist, |Z|,
+# phase side by side, or a grid of segments) and hands it to show_fig(), which
+# draws each panel as its own full-width figure, one below the other. Set
+# PLOTS_ONE_BY_ONE = False to get the old side-by-side rows back.
+PLOTS_ONE_BY_ONE = True
+PANEL_HEIGHT = 560        # px, per single plot
+PANEL_WIDTH = 1150        # px; None = fill the cell width
+
+
+def show_by_condition(figs, title='', note='', save=None):
+    """{condition: figure} -> ONE plot with Condition (and Plot) drop-downs.
+
+    save='nyquist' also writes the same viewer as <save>.html (save_viewer)."""
+    html = viewers.by_condition(figs, title=title, note=note,
+                                panel_height=PANEL_HEIGHT,
+                                panel_width=PANEL_WIDTH)
+    displayHTML(html)
+    if save and any(v is not None for v in figs.values()):
+        save_viewer(html, save, title)
+
+
+def viewer_dirs():
+    """Where the selector viewers are saved: the run folder of this plate on
+    the results Volume (when cache writing is on) and the local run folder."""
+    _key = str(globals().get('LEEPA', 'run')) + str(globals().get('PLATE_TAG', ''))
+    out = []
+    if globals().get('CACHE_WRITE') and globals().get('_CACHE_VOL'):
+        out.append(Path(_CACHE_VOL) / _key / 'viewers')
+    if globals().get('_TMP_BASE'):
+        out.append(Path(_TMP_BASE) / _key / 'viewers')
+    return out
+
+
+def save_viewer(html, name, title=''):
+    """Save a viewer exactly as shown (drop-downs and all) as <name>.html."""
+    for d in viewer_dirs():
+        try:
+            p = viewers.save_page(html, Path(d) / f'{name}.html', title=title)
+            print(f"  saved viewer: {p}")
+        except Exception as _se:                           # noqa: BLE001
+            print(f"  viewer not saved to {d}: {_se}")
+
+
+def skip_for_csv(what):
+    """True (and says so) when the selected format is CSV: the cell needs
+    FAMOS .DAT files, an order ID, the Abgleich or the Gamry sweeps, which a
+    CSV measurement does not have. Use as the first line of such a cell:
+
+        if not skip_for_csv('card gain'):
+            ...
+    """
+    if str(globals().get('SOURCE_FORMAT', 'famos')).lower() == 'csv':
+        print(f"  [skipped] {what}: FAMOS only -- the selected format is "
+              f"CSV (no order ID / .DAT cards / Gamry sweeps)")
+        return True
+    return False
+
+
+def show_fig(fig, html=False):
+    """Show a (possibly multi-panel) Plotly figure, one panel at a time."""
+    figs = (figure_panels.split_subplots(fig, panel_height=PANEL_HEIGHT,
+                                         panel_width=PANEL_WIDTH)
+            if PLOTS_ONE_BY_ONE else [fig])
+    for f in figs:
+        if html:
+            displayHTML(f.to_html(full_html=False, include_plotlyjs='cdn'))
+        else:
+            f.show()
+ 
+from config import Config, DEFAULT
+ 
+print("═" * 75)
+print("  LOCAL EIS PIPELINE — Notebook Runner")
+print(f"  Modules loaded from: {_PIPELINE_DIR}")
+for _k, _p in geom.PLATES.items():
+    _chk = geom.self_check(verbose=False, plate_name=_k)
+    print(f"  Plate {_k:5s} ({_p.colour}/{_p.name}): {_chk['n_segments']} "
+          f"segments, {_chk['area_min_cm2']:.2f}–{_chk['area_max_cm2']:.2f} cm², "
+          f"{'OK' if not _chk['problems'] else 'PROBLEM: ' + '; '.join(_chk['problems'])}")
+print("═" * 75)
+
+# COMMAND ----------
+
+# DBTITLE 1,Widgets: Order ID, Conditions, Segments + the fixed settings
+# ═══════════════════════════════════════════════════════════════════════════════
+# WIDGETS  —  Order ID, Condition, Band, SNR gate, Pipeline stage
+# ═══════════════════════════════════════════════════════════════════════════════
+ 
+# ─── Discover available Order IDs from datago + Volumes ───
+_META_TBL = 'ps_xplatform_dev.rvadvtec_ops.datago_advtec_metadata'
+_GP_TBL = 'ps_xplatform_dev.rvadvtec_ops.datago_advtec_generalproperties'
+ 
+try:
+    _rows = spark.sql(f"""
+        SELECT DISTINCT m.orderId
+        FROM {_META_TBL} m
+        JOIN {_GP_TBL} gp ON m.measurement_id = gp.measurement_id
+        WHERE gp.measurement_type = 'GALVEIS'
+        ORDER BY m.orderId
+    """).collect()
+    AVAILABLE_ORDERS = [r['orderId'].replace('RO', '') for r in _rows if r['orderId']]
+except Exception:
+    AVAILABLE_ORDERS = ['2611976']
+ 
+# Also scan Volumes for Leepa IDs not in datago (e.g. 2612025)
+try:
+    import re as _re
+    _vol_root = Path('/Volumes/ps_xplatform_dev/rvadvtec_dev/ev_rvadvtec_dev/Famos')
+    _vol_ids = set()
+    for _f in _vol_root.glob('*_Current_*_Karte_*.DAT'):
+        _m = _re.search(r'(?:Leepa_|RO)(\d{7})', _f.name)
+        if _m:
+            _vol_ids.add(_m.group(1))
+    _new = sorted(_vol_ids - set(AVAILABLE_ORDERS))
+    if _new:
+        AVAILABLE_ORDERS = sorted(set(AVAILABLE_ORDERS) | _vol_ids)
+        print(f"  +{len(_new)} Leepa IDs from Volumes (not in datago): {_new}")
+except Exception:
+    pass
+ 
+# ─── Fixed paths ───
+FAMOS_ROOT = Path('/Volumes/ps_xplatform_dev/rvadvtec_dev/ev_rvadvtec_dev/Famos')
+_EV_ROOT = Path('/Volumes/ps_xplatform_dev/rvadvtec_dev/ev_rvadvtec_dev')
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  WHICH ORDER, DECIDED BEFORE ANYTHING THAT DEPENDS ON IT
+# ═══════════════════════════════════════════════════════════════════════════
+# Everything below this point -- the condition list, the Gamry folders, the
+# build token -- is a property of ONE order, so the order has to be known
+# first. It was being read at the bottom of the cell instead, which on a
+# fresh kernel meant LEEPA did not exist yet when those blocks ran.
+#
+# That did not fail loudly, which is worse: the condition discovery sits in a
+# try/except, so the NameError was swallowed and CONDITIONS silently fell
+# back to the hard-coded ['450A', '60A', '45A', '150A'] -- the dropdown was
+# never actually reading the disk on the first run of a session. It worked on
+# the SECOND run, because by then LEEPA was left over from the first.
+#
+# The widget is therefore created here, read here, and the order-dependent
+# discovery follows it.
+def _w(name, default=''):
+    try:
+        return dbutils.widgets.get(name)
+    except Exception:
+        return default
+
+
+_default = '2612025' if '2612025' in AVAILABLE_ORDERS else AVAILABLE_ORDERS[-1]
+try:
+    dbutils.widgets.dropdown('leepa_id', _default, AVAILABLE_ORDERS,
+                             'Order ID (Leepa)')
+except Exception:
+    pass
+LEEPA = _w('leepa_id', _default)
+
+# FAMOS or CSV, decided here too: the condition list below comes from the
+# FAMOS folder for 'famos' and from csv_files/ for 'csv'.
+try:
+    dbutils.widgets.dropdown('source_format', 'famos', ['famos', 'csv'],
+                             'Measurement file format')
+except Exception:
+    pass
+SOURCE_FORMAT = _w('source_format', 'famos').strip().lower()
+
+def condition_sort_key(cond):
+    """'45A' < '60A' < '150A' < '450A': by the number, then by the text."""
+    import re as _re_k
+    m = _re_k.match(r'\s*([0-9]+(?:\.[0-9]+)?)', str(cond))
+    return (float(m.group(1)) if m else float('inf'), str(cond))
+
+
+def parse_conditions(raw, available):
+    """The multi-select value -> the conditions to evaluate.
+
+    Databricks hands a multiselect back as one comma-separated string
+    ("45A,450A"). Empty, or anything containing ALL, means every condition
+    on disk. The result is in current order whatever order they were
+    clicked in, and a name that is not on disk is kept (and reported by the
+    run cell as "nothing found") rather than silently dropped.
+    """
+    picked = [x.strip() for x in str(raw or '').split(',') if x.strip()]
+    if not picked or any(x.upper() == 'ALL' for x in picked):
+        return list(available)
+    out = []
+    for c in picked:
+        if c not in out:
+            out.append(c)
+    return sorted(out, key=condition_sort_key)
+
+
+# Discover conditions from filenames on disk for the SELECTED Leepa
+# This handles both Leepa_{id} and Leepa_RO{id} naming conventions
+try:
+    import re as _re2
+    _all_conds = set()
+    for _pat in [f'Leepa_{LEEPA}_Current_*_Karte_*.DAT',
+                 f'Leepa_RO{LEEPA}_Current_*_Karte_*.DAT',
+                 f'RO{LEEPA}-*_Current_*_Karte_*.DAT']:
+        for _f in FAMOS_ROOT.glob(_pat):
+            _cm = _re2.search(r'_Current_([^_]+)_', _f.name)
+            if _cm:
+                _all_conds.add(_cm.group(1))
+    # Ordered by current (45A, 60A, 150A, 450A), not as strings -- the
+    # plots come out one condition after another in this order.
+    CONDITIONS = (sorted(_all_conds, key=condition_sort_key) if _all_conds
+                  else ['450A', '60A', '45A', '150A'])
+    if not _all_conds:
+        print(f"  no FAMOS files found for order {LEEPA} under {FAMOS_ROOT}; "
+              f"condition list is the hard-coded fallback")
+except Exception as _ce:                                   # noqa: BLE001
+    # Say WHY. A silent fallback here is indistinguishable from a plate that
+    # genuinely has these four conditions, and it is how a broken discovery
+    # went unnoticed.
+    print(f"  condition discovery failed ({type(_ce).__name__}: {_ce}); "
+          f"falling back to the hard-coded list")
+    CONDITIONS = ['450A', '60A', '45A', '150A']
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  CSV MEASUREMENTS: csv_files/ -> one folder per condition
+# ═══════════════════════════════════════════════════════════════════════════
+# With 'csv' selected, the conditions are the operating-point folders under
+# CSV_ROOT -- e.g. Spectrum2_65degC_449A, Spectrum9_65degC_45A (finished
+# spectra from the bench tool) or R2-D2 point-file sweeps -- each labelled
+# by its setpoint (449 A -> "450A"). Ticking 450A in the Conditions widget
+# then runs Spectrum2_65degC_449A. A CSV measurement has no order ID: the
+# "CSV folder" widget picks the folder that holds the operating points
+# ("." = directly in csv_files/), and its name replaces the order in titles
+# and in the cache path: EIS_Results/csv/<condition>/ for ".",
+# EIS_Results/csv_<folder>/<condition>/ otherwise.
+CSV_ROOT = _EV_ROOT / 'csv_files'
+CSV_CAMPAIGN = ''
+CSV_FOLDERS = {}                       # {'450A': Path(.../Spectrum2_65degC_449A)}
+if SOURCE_FORMAT == 'csv':
+    try:
+        _camps = csv_source.campaigns(CSV_ROOT)
+    except Exception as _ce:                               # noqa: BLE001
+        print(f"  CSV discovery under {CSV_ROOT} failed "
+              f"({type(_ce).__name__}: {_ce})")
+        _camps = {}
+    _camp_names = sorted(_camps) or ['(none found)']
+    try:
+        dbutils.widgets.dropdown('csv_campaign', _camp_names[0], _camp_names,
+                                 'CSV folder (under csv_files)')
+    except Exception:
+        pass
+    CSV_CAMPAIGN = _w('csv_campaign', _camp_names[0])
+    if CSV_CAMPAIGN not in _camps:
+        CSV_CAMPAIGN = _camp_names[0]
+    CSV_FOLDERS = csv_source.condition_map(_camps.get(CSV_CAMPAIGN, []))
+    if CSV_FOLDERS:
+        CONDITIONS = sorted(CSV_FOLDERS, key=condition_sort_key)
+        print(f"  CSV folder {CSV_ROOT / CSV_CAMPAIGN}:")
+        for _c in CONDITIONS:
+            print(f"    {_c:>6} -> {CSV_FOLDERS[_c].name}")
+        for _c, _ds in csv_source.condition_map.duplicates.items():
+            print(f"    {_c}: {len(_ds)} folders, using {CSV_FOLDERS[_c].name} "
+                  f"(pick another CSV folder to use the others)")
+    else:
+        print(f"  no CSV operating-point folders under {CSV_ROOT}"
+              + (f" / {CSV_CAMPAIGN}" if _camps else ""))
+ 
+# ═══════════════════════════════════════════════════════════════════════════
+#  GAMRY REFERENCE FILES — THE ONE BLOCK TO EDIT IF THE PATHS EVER MOVE
+# ═══════════════════════════════════════════════════════════════════════════
+# A whole-cell sweep is named        V26_092_HFR_101_CurrVal_45.dta
+# and the measurement file for the
+# same cell is named                 ..._RO2612030-01_V26_092_lokale_EIS_...mf4
+#
+# The sweep carries the BUILD TOKEN and no order number; the measurement file
+# carries both. So the chain is
+#
+#     Leepa 2612030  ->  build V26_092  ->  V26_092_*.dta
+#
+# and the middle step is read off the measurement filenames rather than
+# hard-coded. Selecting a different order in the dashboard therefore selects
+# a different build and a different set of sweeps, with no table to maintain.
+#
+# Why this matters more than it looks: a shared Gamry folder holds several
+# campaigns, the sweeps are keyed by CURRENT downstream, and every campaign
+# has a 45 A. Reading the folder whole does not fail loudly -- the last file
+# read replaces the earlier one, and the cell is then compared against another
+# cell's reference with nothing visibly wrong.
+
+#: Folders searched for .dta sweeps, in order. ADD NEW LOCATIONS HERE.
+#: Written as TEMPLATES rather than as finished paths: a list built once from
+#: whatever LEEPA happened to hold is wrong twice over -- it cannot be built
+#: before the order is known, and it silently keeps the old order's folders
+#: if the widget changes and only the later cells are re-run.
+GAMRY_SEARCH_ROOT_TEMPLATES = [
+    '{ev}/RO{leepa}_Gamry',       # per-order folder, if there is one
+    '{ev}/{leepa}_Gamry',
+    '{ev}/Gamry',                 # the shared folder
+]
+
+
+def gamry_search_roots(leepa):
+    return [Path(t.format(ev=_EV_ROOT, leepa=leepa))
+            for t in GAMRY_SEARCH_ROOT_TEMPLATES]
+
+#: Folders searched for the measurement files that carry order AND build.
+GAMRY_VERSION_SOURCES = [
+    _EV_ROOT / 'Gamry',
+    _EV_ROOT,
+    FAMOS_ROOT,
+]
+
+#: Last resort when no filename states the build: '2612030': 'V26_092'.
+#: Prefer fixing the filenames; a table here is a fact that can go stale.
+PLATE_VERSION_OVERRIDE: dict[str, str] = {}
+
+
+def plate_version(leepa, quiet=True):
+    """The build token for this order, e.g. 'V26_092', or None.
+
+    Read from any measurement filename that names BOTH the order and a build.
+    """
+    leepa = str(leepa)
+    if leepa in PLATE_VERSION_OVERRIDE:
+        return PLATE_VERSION_OVERRIDE[leepa]
+    digits = ''.join(ch for ch in leepa if ch.isdigit())
+    seen: dict[str, int] = {}
+    for root in GAMRY_VERSION_SOURCES:
+        try:
+            if not Path(root).is_dir():
+                continue
+            for f in Path(root).iterdir():
+                if digits not in f.name:
+                    continue
+                v = gamry_compare.version_of(f.name)
+                if v:
+                    seen[v] = seen.get(v, 0) + 1
+        except Exception:                                  # noqa: BLE001
+            continue
+    if not seen:
+        return None
+    if len(seen) > 1 and not quiet:
+        # Two builds naming one order is a question about the data, not
+        # something to average away.
+        print(f"  WARNING: order {leepa} appears with more than one build "
+              f"{dict(seen)}; using the most frequent. Set "
+              f"PLATE_VERSION_OVERRIDE['{leepa}'] to choose.")
+    return max(seen, key=lambda v: seen[v])
+
+
+def gamry_root_for(leepa):
+    """First folder from the search roots that holds any .dta, or None."""
+    for root in gamry_search_roots(leepa):
+        try:
+            r = Path(root)
+            if r.is_dir() and (any(r.glob('*.dta')) or any(r.glob('*.DTA'))):
+                return r
+        except Exception:                                  # noqa: BLE001
+            continue
+    return None
+
+
+def gamry_files(leepa, version=None):
+    """The .dta sweeps that belong to this order. Never another campaign's.
+
+    A file naming a different build is excluded. A file naming no build is
+    kept only when nothing names this one -- the same last-resort rule
+    gamry_compare uses for order numbers, because a folder holding exactly
+    one campaign has no reason to spell the build out.
+    """
+    root = gamry_root_for(leepa)
+    if root is None:
+        return [], None
+    version = version or plate_version(leepa)
+    files = sorted(list(root.glob('*.dta')) + list(root.glob('*.DTA')))
+    files = [f for f in files if '_raw' not in f.stem.lower()]
+
+    if not version:
+        # No build for this order. That is survivable in a folder holding ONE
+        # campaign and not survivable in a folder holding several: the sweeps
+        # are keyed by current downstream and every campaign has a 45 A, so
+        # handing back a mix means one of them silently wins. Refuse instead.
+        builds = {gamry_compare.version_of(f.name) for f in files}
+        builds.discard(None)
+        if len(builds) > 1:
+            print(f"  REFUSING to pick Gamry sweeps for order {leepa}: "
+                  f"{root} holds {len(builds)} campaigns "
+                  f"({', '.join(sorted(builds))}) and nothing names the build "
+                  f"for this order.\n"
+                  f"    Fix: add the order's measurement .mf4 (the one named "
+                  f"..._RO{leepa}-01_V26_xxx_...) to GAMRY_VERSION_SOURCES, "
+                  f"or set PLATE_VERSION_OVERRIDE['{leepa}'] = 'V26_xxx' in "
+                  f"the setup cell.")
+            return [], None
+        return files, (builds.pop() if builds else None)
+
+    named = [f for f in files
+             if gamry_compare.names_version(f.name, version) is True]
+    if named:
+        return named, version
+    # Nothing names this build. Files that name ANOTHER one are already out;
+    # what is left is silent and may legitimately be this campaign's.
+    silent = [f for f in files
+              if gamry_compare.names_version(f.name, version) is None]
+    if silent:
+        print(f"  no sweep names build {version}; falling back to "
+              f"{len(silent)} file(s) that name no build at all")
+    return silent, version
+
+
+def gamry_spectra(leepa, quiet=False):
+    """{condition: DataFrame(freq_hz, z_re_mohm_cm2, z_im_mohm_cm2)} -- the
+    order's whole-cell Gamry sweeps, EVERY point exactly as in the file
+    (nyquist.gamry_frame): no band limit, no interpolation, no inductance
+    removed. From the .dta files of gamry_files(); from the MF4 export when
+    the folder has no .dta. Used by the Nyquist cell (Gamry in black with the
+    segments) and by the Gamry-vs-aggregate cell."""
+    import re as _re
+    out = {}
+    files, _build = gamry_files(leepa)
+    for fp in files:
+        try:
+            sw = gamry_compare.read_cell_sweep(fp)
+        except Exception as _e:                            # noqa: BLE001
+            if not quiet:
+                print(f"    {fp.name}: not read ({_e})")
+            continue
+        _m = _re.search(r'CurrVal_(\d+)', fp.stem)
+        key = sw.condition if sw.condition != '?' else (
+            _m.group(1) + 'A' if _m else fp.stem)
+        if key in out:
+            if not quiet:
+                print(f"    WARNING: {key} claimed by more than one file "
+                      f"({fp.name}); keeping the first")
+            continue
+        out[key] = nyquist.gamry_frame(sw)
+        if not quiet:
+            print(f"    Gamry {key}: {len(out[key])} points "
+                  f"{out[key].freq_hz.min():.4g}–{out[key].freq_hz.max():.5g} Hz "
+                  f"({fp.name})")
+    if out:
+        return out
+    # no .dta: the MF4 export of the sweeps, if there is one
+    root = gamry_root_for(leepa) or Path(
+        '/Volumes/ps_xplatform_dev/rvadvtec_dev/ev_rvadvtec_dev/Gamry')
+    try:
+        from asammdf import MDF
+        mf4 = (sorted(Path(root).glob(f'*{leepa}*.mf4'))
+               or sorted(Path(root).glob('*HFR*CurrVal*.mf4')))
+        for fp in mf4:
+            _m = _re.search(r'CurrVal_(\d+)', fp.stem)
+            key = _m.group(1) + 'A' if _m else fp.stem
+            mdf = MDF(str(fp))
+            f = mdf.get('freq').samples
+            zr, zi = mdf.get('zreal').samples, mdf.get('zimag').samples
+            mdf.close()
+            if len(f) >= 3:
+                out[key] = nyquist.gamry_frame(pd.DataFrame({
+                    'freq_hz': f, 'z_re_mohm_cm2': zr * nyquist.A_CELL_CM2 * 1e3,
+                    'z_im_mohm_cm2': zi * nyquist.A_CELL_CM2 * 1e3}))
+                if not quiet:
+                    print(f"    Gamry {key}: {len(f)} points from {fp.name} (MF4)")
+    except ImportError:
+        if not quiet:
+            print("    no .dta sweeps, and asammdf is not installed for the "
+                  "MF4 export (%pip install asammdf)")
+    except Exception as _e:                                # noqa: BLE001
+        if not quiet:
+            print(f"    MF4 read error: {_e}")
+    return out
+
+
+# Gamry reference: auto-discover per Leepa (may not exist for every order)
+try:
+    GAMRY_ROOT = gamry_root_for(LEEPA)
+    GAMRY_VERSION = plate_version(LEEPA, quiet=False) or ''
+except Exception:                                          # noqa: BLE001
+    GAMRY_ROOT, GAMRY_VERSION = None, ''
+ 
+# ─── Remove old widgets that are no longer needed ───
+# 'condition' was a single-choice dropdown; it is replaced by the
+# 'conditions' multi-select below (a widget cannot change type in place).
+# 'plate' is NOT in this list any more: it is a live choice again (gen1/gen2).
+for _old in ('csv_path', 'csv_dialect', 'csv_tones',
+             'gain_file', 'gamry_dir', 'bench_log', 'condition'):
+    try:
+        dbutils.widgets.remove(_old)
+    except Exception:
+        pass
+ 
+# ─── Widgets of earlier versions: removed, their values are fixed now ───
+# The band (BAND below), the SNR gate (0 dB), the evaluation mode
+# (default) and the last stage (gold) are no longer choices -- see the
+# FIXED SETTINGS block below. Databricks keeps a widget until it is removed,
+# so the old ones are taken off the bar here.
+for _old_w in ('param_profile', 'f_min_hz', 'f_max_hz', 'f_band',
+               'min_snr_db', 'stop_after', 'evaluation_mode'):
+    try:
+        dbutils.widgets.remove(_old_w)
+    except Exception:
+        pass
+
+# ─── Create the remaining widgets ───
+# leepa_id is NOT here: it is created above, before the discovery that needs
+# to know which order is selected. The condition dropdown is here because its
+# choices come from that discovery.
+try:
+    # MULTI-SELECT: tick e.g. 45A and 450A to evaluate only those two.
+    # ALL (or nothing ticked) evaluates every condition found on disk.
+    dbutils.widgets.multiselect('conditions', 'ALL', ['ALL'] + CONDITIONS,
+                                'Conditions (multi-select)')
+    # Segments to leave out of the WHOLE evaluation, comma separated, e.g.
+    # "33" or "33,59". An excluded segment is skipped in bronze before its
+    # channel is read, so it has no spectrum, no scalars, no place in the cell
+    # aggregate and no inferred value on any map -- and the run says so rather
+    # than leaving a silent hole. Empty is the default on purpose: excluding a
+    # segment before its data is seen removes the only evidence that could
+    # ever overturn the exclusion.
+    dbutils.widgets.text('exclude_segments', '', 'Exclude segments (e.g. 33)')
+    # Segments whose OWN measurement is discarded and rebuilt from the
+    # segments touching them. Different from excluding: the plate still has
+    # that area and it still conducts, so it stays in the aggregate and on
+    # the map -- as an estimate, labelled, with its donors recorded.
+    dbutils.widgets.text('substitute_segments', '',
+                         'Rebuild from neighbours (e.g. 33)')
+    # The same reconstruction for every segment that has no spectrum at all.
+    # Off by default: it changes the cell aggregate, so it is a choice that
+    # has to be made deliberately and it is recorded in the cache key.
+    dbutils.widgets.dropdown('fill_gaps', 'no', ['no', 'yes'],
+                             'Fill unmeasured segments from neighbours')
+except Exception:
+    pass
+ 
+ 
+# _w is defined above, with the order resolution it serves.
+
+def _widget(*names, default=''):
+    """First widget that exists, else a notebook global, else the default.
+
+    Written this way because widget names have differed between versions of
+    this runner and a NameError in a display cell kills the whole cell.
+    Defined HERE, once, rather than re-pasted in each display cell: the copies
+    are what let those cells drift apart about which run they were showing.
+    """
+    for n in names:
+        try:
+            v = dbutils.widgets.get(n)
+            if v not in (None, ''):
+                return v
+        except Exception:
+            pass
+        g = globals().get(n) or globals().get(n.upper())
+        if g not in (None, ''):
+            return g
+    return default
+ 
+ 
+# ─── Read widget values ───
+# PLATE GENERATION. Same FAMOS cards, same channel names "1".."72" -- but on
+# gen2 (blue / Naboo) segments 37..72 are cut differently and several interior
+# segments have other areas. The choice is applied to EVERYTHING: the
+# calibration files (EIS_config/<plate>/), the areas and centroids, the cell
+# aggregate, the DC closure, the 36-tile statistics, the plausibility checks
+# and every plate map. It is also part of the cache key, so a gen1 result is
+# never shown for gen2.
+try:
+    dbutils.widgets.dropdown('plate', 'gen1', ['gen1', 'gen2'],
+                             'Plate (gen1 green/Kashyyyk, gen2 blue/Naboo)')
+except Exception:
+    pass
+PLATE = geom.plate_key(_w('plate', 'gen1'))
+# Suffix for per-order folders that must not be shared between the plates
+# ('' for gen1, so existing gen1 folders keep their names).
+PLATE_TAG = '' if PLATE == 'gen1' else f'_{PLATE}'
+
+# ─── PLATE FILES: shared on the Volume, one folder per plate ───
+# curr.csv, temp.csv, chain_gain.csv and the Abgleich delivery belong to the
+# plate, not to the person running the notebook. They are read from
+#     <EIS_CONFIG_ROOT>/<plate>/          (shared Volume folder, first)
+#     <this notebook's folder>/EIS_config/<plate>/
+#     gen1 only: your own /Workspace/Users/<you>/ (the old location)
+# A gen2 run never borrows a gen1 file. See core/site_paths.py.
+import site_paths
+EIS_CONFIG_ROOT = _EV_ROOT / 'EIS_config'
+_home_fn = globals().get('_my_workspace_home')
+PLATE_FILES = site_paths.resolve(PLATE, root=EIS_CONFIG_ROOT,
+                                 package_dir=globals().get('_PIPELINE_DIR'),
+                                 user_home=_home_fn() if _home_fn else None)
+for _l in site_paths.describe(PLATE_FILES):
+    print('  ' + _l)
+if PLATE_FILES['missing']:
+    print('  !! ' + site_paths.missing_message(PLATE_FILES).replace('\n', '\n  !! '))
+# SOURCE_FORMAT, CSV_ROOT and CSV_FOLDERS are set at the top of this cell.
+CSV_PATH = ''
+CSV_DIALECT = 'auto'
+CSV_TONES = ()
+# The per-segment chain response, built ONCE by the "Chain response" cell from
+# the Abgleich bode/ sweeps and kept beside curr.csv. If it exists it is used
+# on every run (bronze divides each segment's Z by it); set GAIN_FILE = '' to
+# switch it off, or to another path to override it.
+# Written by the "Chain response" cell into the plate's shared folder.
+CHAIN_GAIN_DEFAULT = Path(PLATE_FILES['target_dir']) / 'chain_gain.csv'
+# None = use the plate's chain_gain.csv when it exists; '' = switch it off;
+# a path = use that file. Re-derived on every run of this cell, so switching
+# the plate can never keep the other plate's gain file.
+GAIN_FILE_OVERRIDE = None
+GAIN_FILE = (GAIN_FILE_OVERRIDE if GAIN_FILE_OVERRIDE is not None
+             else (str(PLATE_FILES['gain']) if PLATE_FILES['gain'] else ''))
+print(f"  chain response: {GAIN_FILE or 'NONE -- run the Chain response cell once'}")
+# The frozen high-frequency response (checks/hf_response.py): per-segment phase
+# and per-card magnitude above 1 kHz, built by the "High-frequency response
+# across conditions" cell from ALL operating points of the order and
+# validated on a current it was not fitted on. 'auto' applies
+# <EIS_Results>/<order>/hf_response/hf_response.csv when it exists; '' never;
+# a path applies that file.
+HF_RESPONSE = 'auto'
+
+
+def hf_response_file(leepa):
+    """The response file the runs of this order apply (HF_RESPONSE), or None."""
+    _hr = str(globals().get('HF_RESPONSE', 'auto') or '')
+    if not _hr:
+        return None
+    if _hr != 'auto':
+        return Path(_hr) if Path(_hr).is_file() else None
+    _p = (Path('/Volumes/ps_xplatform_dev/rvadvtec_dev/ev_rvadvtec_dev/'
+               'EIS_Results') / str(leepa) / f'hf_response{PLATE_TAG}'
+          / 'hf_response.csv')
+    return _p if _p.is_file() else None
+# Current-chain lag per segment (channel_lag.py), measured on every run:
+# 'correct' removes it before R_ohmic is read, 'report' only records it,
+# 'off' skips the stage. See silver/channel_lag.csv and the "channel lag"
+# plausibility check after each run.
+CHANNEL_LAG = 'correct'
+# Gamry clock (gamry_sync.py): the FAMOS cards record the Gamry's own sweep,
+# so its .dta gives every step's exact frequency and time. 'guide' uses the
+# exact frequencies, applies a refused card lag the Gamry corroborates, and
+# re-locates misplaced high-frequency windows (verified by a CFAR test);
+# 'frequency' does the first two; 'report' only writes bronze/gamry_sync.csv.
+GAMRY_SYNC = 'guide'
+# Card voltage gain (card_gain.py): every card records the same cell voltage
+# on UC2, and each card's Z divides by ITS OWN UC2 -- so a card whose voltage
+# chain reads 3 % high puts +3 % on all its segments. 'report' measures each
+# card's UC2 against the median card (bronze/card_reference.csv, needs the
+# .DAT files), 'correct' also divides that card's Z by it when the gain is
+# flat over the band and under 10 %, 'off' skips it. The gain is read from the
+# AC steps between 1 and 300 Hz, below the inductive pickup of cards 3-5; on
+# 2612030 it is +1.2 % (card 3) and +0.9 % (card 5) -- the raw-signal audit.
+CARD_GAIN = 'correct'
+# Series resistance between the FAMOS UC taps and the Gamry's sense leads,
+# in mOhm*cm2, subtracted from every segment's Re Z (config.uc_series_mohm_cm2).
+# KEEP 0 on 2612030. The plate sits +8..+12 above the Gamry over 0.1-3 kHz,
+# but within -1..+2 at the Gamry's HFR crossing (3.4-3.8 kHz), at all four
+# currents: the difference depends on frequency, so it is not a resistance.
+# Tested with 10 (150 A, 450 A, HF_RESPONSE = 'auto'): the arc band matched,
+# but the HFR fell ~11 below the Gamry, 14-17 segments lost their real-axis
+# crossing and the segment phase spread at 4.7-12 kHz rose from <2 deg to
+# ~7 deg. The "Card diagnostics" cell prints both numbers for every order.
+UC_SERIES_MOHM_CM2 = 0.0
+# Frequency response of the measuring chain (frequency_response.py), after
+# every run: the ex-situ amplifier response G_d of each segment (from the
+# Abgleich bode/ sweeps when ABGLEICH_DIR is set in the "Chain response" cell,
+# otherwise from GAIN_FILE) and the in-situ response of each segment against
+# the plate median, before and after the timing correction. Writes
+# RUN_DIR/frequency_response/ and two plausibility checks; it never changes Z.
+# 'off' skips it. See the "Frequency response" cell after the runs.
+FREQ_RESPONSE = 'report'
+# Static plate maps: 'segments' (each segment filled and labelled),
+# 'interpolated' (2D linear interpolation between segment centres, squares
+# on the measured segments, no numbers, parula with a soft gloss -- like the
+# bench's MATLAB maps; plate_<param>_interp.png), or 'both'.
+HEATMAP_STYLE = 'interpolated'
+# CSV spectra folders only: re-assign every segment to its left-right mirror
+# (x -> 252 mm - x). The Spectrum<n>_65degC_<I>A delivery matches the FAMOS
+# evaluation of 2612030 only when mirrored (450 A: R_pol r = -0.78 as
+# delivered, +0.97 mirrored; the temperature gradient is reversed too), so
+# its x axis may run from the other end of the plate. Leave False until the
+# bench / tool convention is confirmed -- see docs/csv_vs_famos.md.
+CSV_MIRROR_X = False
+
+
+def _bode_dir():
+    """The Abgleich bode/ folder, when the "Chain response" cell has one."""
+    _ab = globals().get('ABGLEICH_DIR') or ''
+    _b = Path(_ab) / 'bode' if _ab else None
+    return _b if _b is not None and _b.is_dir() else None
+
+
+# The current-closure check compares the segment currents with the bench's
+# measured I_S at the Gamry sweep; without a readable bench log it uses the
+# current in the condition name (45A -> 45 A). Nothing to set here.
+GAMRY_DIR = str(GAMRY_ROOT) if GAMRY_ROOT else ''
+# The build token that ties this order to its sweeps. It travels into the
+# Config, so the pipeline's own whole-cell comparison filters on it too --
+# not just the display cells below.
+GAMRY_VERSION = globals().get('GAMRY_VERSION', '')
+BENCH_LOG = ''
+# LEEPA was resolved at the top of this cell, before the discovery that uses
+# it. Re-read here only so that changing the widget and re-running from this
+# point still picks the change up.
+LEEPA = _w('leepa_id', _default)
+if SOURCE_FORMAT == 'csv':
+    # No order ID, no Gamry sweeps, no FAMOS chain: the CSV folder names the
+    # run, and everything that belongs to a FAMOS order is switched off.
+    import re as _re3
+    LEEPA = ('csv' if CSV_CAMPAIGN in ('', '.') else
+             'csv_' + _re3.sub(r'[^A-Za-z0-9]+', '_', CSV_CAMPAIGN).strip('_'))
+    GAMRY_ROOT, GAMRY_DIR, GAMRY_VERSION, GAIN_FILE = None, '', '', ''
+SELECTED_CONDITIONS = parse_conditions(_w('conditions', 'ALL'), CONDITIONS)
+COND_FILTER = ('ALL' if SELECTED_CONDITIONS == list(CONDITIONS)
+               else ', '.join(SELECTED_CONDITIONS))
+# ═══════════════════════════════════════════════════════════════════════════
+#  FIXED SETTINGS -- the evaluation every result of this notebook uses
+# ═══════════════════════════════════════════════════════════════════════════
+#   band          BAND = 'complete' (default): every step the cards can
+#                 record, 0.15 Hz up to 0.49*fs (12.25 kHz at 25 kHz: the
+#                 11.95 kHz step; 15-30 kHz arrive aliased and are left out),
+#                 with the corrections of the raw-signal audit -- each card's
+#                 UC2 magnitude against card 1 (the cleanest), the card phase
+#                 against the Gamry sweep, the per-channel lag; R_ohmic is the
+#                 measured real-axis crossing. 'trusted': 0.15 Hz - 1.2 kHz,
+#                 where all five cards agree with no correction at all.
+#   Min SNR       0 dB in bronze. 5 dB cut 45 A off at ~90 Hz; silver's
+#                 uncertainty and |Z| outlier gates keep noise out per point.
+#   mode          'default' = the shipped gates (no permissive loosening).
+#   last stage    gold (spectra, maps, plausibility).
+# All of them are in the cache key, so a result is never served across
+# different settings.
+PARAM_PROFILE = 'fixed'
+F_MIN = 0.15
+F_MAX = 30000.0                 # detection ceiling
+BAND = 'complete'               # 'complete' | 'trusted'
+FULL_BAND = BAND == 'complete'
+EVAL_F_MAX = 0.0 if FULL_BAND else 1200.0   # 0: up to 0.49*fs
+MIN_SNR_DB = 0.0
+EVALUATION_MODE = 'default'
+STOP_AFTER = 'gold'
+def _seg_list(name):
+    return frozenset(x.strip() for x in
+                     _w(name, '').replace(';', ',').split(',') if x.strip())
+
+
+EXCLUDE_SEGMENTS = _seg_list('exclude_segments')
+SUBSTITUTE_SEGMENTS = _seg_list('substitute_segments')
+FILL_GAPS = _w('fill_gaps', 'no') == 'yes'
+ 
+# Select the plate for the whole session
+_plate = geom.use_plate(PLATE)
+ 
+print(f"  Leepa:     {LEEPA}"
+      + (f"   (CSV: {CSV_ROOT / CSV_CAMPAIGN})" if SOURCE_FORMAT == 'csv'
+         else ''))
+print(f"  Condition: {COND_FILTER}   -> {', '.join(SELECTED_CONDITIONS)}")
+print(f"  Profile:   {PARAM_PROFILE}   (mode {EVALUATION_MODE})")
+BAND_TEXT = (f"{F_MIN} Hz – 0.49·fs (complete band, 12.25 kHz at 25 kHz; "
+             f"corrected in situ, see the band note)" if FULL_BAND else
+             f"{F_MIN} Hz – {EVAL_F_MAX / 1000:g} kHz (trusted band)")
+print(f"  Band:      {BAND_TEXT}")
+print(f"  Min SNR:   {MIN_SNR_DB} dB")
+print(f"  Stop:      {STOP_AFTER}")
+print(f"  Format:    {SOURCE_FORMAT}")
+print(f"  Plate:     {_plate.title}")
+
+# COMMAND ----------
+
+# DBTITLE 1,Chain response: build the gain file from the Abgleich bode sweeps
+# ═══════════════════════════════════════════════════════════════════════════════
+# The Abgleich delivery carries, next to curr.csv/temp.csv, a bode/ folder of
+# per-segment Gamry sweeps: the current-measurement chain swept 1 Hz–100 kHz
+# at 500 mA rms with no DC bias.  Measured on both plates it is flat to 1 kHz
+# and then rolls off — -11° at 4.5 kHz, -24° at 10 kHz.  4500 Hz is the top of
+# the default analysis band, so this is the same order as the acquisition skew
+# the pipeline works hard to remove, and unlike a skew it moves |Z| too.
+#
+# Set ABGLEICH_DIR to the folder holding coefficients/ and bode/ and run this
+# cell ONCE. The file is written to the plate's shared folder
+# (CHAIN_GAIN_DEFAULT = <EIS_CONFIG_ROOT>/<plate>/chain_gain.csv) and GAIN_FILE
+# is set to it, here and -- because the settings cell looks for it -- in every
+# later session and for every user. Nothing to paste.
+#
+# WHAT IT FIXES AND WHAT IT DOES NOT. It removes the chain roll-off every
+# segment shares (-2.5 deg at 1 kHz, -11 deg at 4.5 kHz). The per-segment
+# lags the in-situ stage measures (channel_lag.py, up to ~100 us on 2612030)
+# are another matter: on the delivered sweeps the segments differ by only
+# ~2 deg at 4.5 kHz, i.e. ~1 us. The comparison printed below says, on your
+# data, how much of the in-situ lag the ex-situ chain explains; whatever it
+# does not explain stays with the in-situ stage (CHANNEL_LAG = 'correct').
+# ═══════════════════════════════════════════════════════════════════════════════
+# THE FOLDER TO PUT HERE is the plate's calibration ("Abgleich") delivery --
+# the one that holds BOTH of these sub-folders:
+#
+#     <ABGLEICH_DIR>/
+#         coefficients/curr.csv        72 rows "c0;c1"  (the same kind of file
+#         coefficients/temp.csv         4 rows           as your curr.csv)
+#         bode/<name>_100kHz_1Hz_500mA_#1.DTA   one Gamry sweep per segment,
+#         bode/<name>_100kHz_1Hz_500mA_#2.DTA   #1 .. #72 (the "_Raw.DTA"
+#         ...                                   files beside them are ignored)
+#         Step1_<T>Grad.csv, Step2_...          (the DC calibration steps)
+#
+# The shared place for it is <EIS_CONFIG_ROOT>/<plate>/Abgleich/ (one per
+# plate: gen1 = green / Kashyyyk, gen2 = blue / Naboo); it is used
+# automatically. Otherwise point ABGLEICH_DIR at the folder ABOVE bode/, or
+# leave it empty and the Volume is searched -- only deliveries that do not name
+# the OTHER plate are accepted, so a gen2 run never uses the Kashyyyk sweeps.
+#
+# The gain file is built ONCE. If chain_gain.csv already exists for this
+# plate it is used as it is; set CHAIN_GAIN_REBUILD = True to rebuild it.
+# (Rewriting it on every run is pointless, and its content is part of the
+# cache key.)
+CHAIN_GAIN_REBUILD = False
+if not skip_for_csv('chain response (Abgleich bode sweeps)'):
+    ABGLEICH_DIR = str(PLATE_FILES['abgleich'] or '')
+    ABGLEICH_SEARCH_ROOTS = [
+        str(PLATE_FILES['target_dir']),
+        '/Volumes/ps_xplatform_dev/rvadvtec_dev/ev_rvadvtec_dev',
+    ]
+
+    if not ABGLEICH_DIR:
+        _cand = [c for c in gamry_dta.find_abgleich_dirs(ABGLEICH_SEARCH_ROOTS)
+                 if site_paths.matches_plate(c, PLATE)]
+        if _cand:
+            print(f"  ABGLEICH_DIR is empty; found {len(_cand)} candidate(s) "
+                  f"(a bode/ with per-segment #n.DTA sweeps):")
+            for _c in _cand:
+                _ok = (_c / 'coefficients' / 'curr.csv').is_file()
+                _n = len([p for p in (_c / 'bode').glob('*.DTA')
+                          if not p.stem.endswith('_Raw')])
+                print(f"    {_c}   ({_n} sweeps, coefficients/curr.csv "
+                      f"{'present' if _ok else 'MISSING'})")
+            _ready = [c for c in _cand
+                      if (c / 'coefficients' / 'curr.csv').is_file()]
+            if len(_ready) == 1:
+                ABGLEICH_DIR = str(_ready[0])
+                print(f"  -> using the only complete one: {ABGLEICH_DIR}")
+            else:
+                print("  -> more than one (or none complete): copy the right path "
+                      "into ABGLEICH_DIR above and re-run this cell, or put the "
+                      f"delivery into {PLATE_FILES['target_dir']}/Abgleich/. "
+                      f"For {PLATE} it is the "
+                      f"{'green / Kashyyyk' if PLATE == 'gen1' else 'blue / Naboo'} "
+                      "delivery.")
+
+    if ABGLEICH_DIR and Path(CHAIN_GAIN_DEFAULT).is_file() and not CHAIN_GAIN_REBUILD:
+        GAIN_FILE = (GAIN_FILE_OVERRIDE if GAIN_FILE_OVERRIDE is not None
+                     else str(CHAIN_GAIN_DEFAULT))
+        print(f"  Abgleich: {ABGLEICH_DIR}")
+        print(f"  chain gain file already built for {PLATE}: {CHAIN_GAIN_DEFAULT}"
+              f"  (set CHAIN_GAIN_REBUILD = True to rebuild it)")
+    elif ABGLEICH_DIR:
+        import csv
+        _ab = Path(ABGLEICH_DIR)
+        _sweeps = gamry_dta.read_bode_folder(_ab / 'bode')
+        print(f"  {len(_sweeps)} segment sweeps")
+        for _row in gamry_dta.chain_summary(_sweeps):
+            print(f"    {_row['freq_hz']:9.0f} Hz  |H| = {_row['mag_median']:.4f}  "
+                  f"arg H = {_row['phase_deg_median']:+7.2f}°  "
+                  f"(p5–p95 spread {_row['phase_deg_spread']:.2f}°)")
+
+        _curr = _ab / 'coefficients' / 'curr.csv'
+        _chk_g = gamry_dta.cross_check_abgleich(_sweeps, _curr)
+        print(f"  cross-check vs curr.csv: r = {_chk_g.get('corr', float('nan')):+.4f}, "
+              f"ratio spread {100*_chk_g.get('ratio_cv', float('nan')):.1f} %  "
+              f"→ {'consistent' if _chk_g['ok'] else 'SUSPECT'}")
+        if not _chk_g['ok']:
+            print('  ' + _chk_g['reason'])
+            print('  Writing the index-free plate median instead, which still '
+                  'removes the common roll-off.')
+
+        _gain_out = Path(CHAIN_GAIN_DEFAULT)
+        gamry_dta.write_gain_csv(_sweeps, _gain_out,
+                                 curr_csv=_curr, shared=not _chk_g['ok'])
+        GAIN_FILE = (GAIN_FILE_OVERRIDE if GAIN_FILE_OVERRIDE is not None
+                     else str(_gain_out))
+        print(f"  written: {_gain_out}  -> GAIN_FILE is set; every run from now "
+              f"on applies it")
+
+        # per segment: the chain's own time constant, to set beside the in-situ
+        # lag of a finished run (silver/channel_lag.csv, CHANNEL_LAG stage)
+        _btau = gamry_dta.chain_tau(_sweeps)
+        if _btau:
+            _bt = np.array(list(_btau.values())) * 1e6
+            print(f"  ex-situ chain tau over {len(_bt)} segments: median "
+                  f"{np.median(_bt):+.1f} us, spread (sd) {np.std(_bt):.1f} us")
+            _lag_csvs = sorted(Path('/Volumes/ps_xplatform_dev/rvadvtec_dev/'
+                                    'ev_rvadvtec_dev/EIS_Results').rglob(
+                                        'silver/channel_lag.csv'))[-1:] \
+                if Path('/Volumes/ps_xplatform_dev/rvadvtec_dev/ev_rvadvtec_dev/'
+                        'EIS_Results').exists() else []
+            for _lc in _lag_csvs:
+                _ins = {r['segment']: float(r['tau_us']) * 1e-6
+                        for r in csv.DictReader(open(_lc))
+                        if r.get('tau_us') not in ('', None)}
+                _c = gamry_dta.compare_chain_tau(_btau, _ins)
+                if _c.get('ok'):
+                    print(f"  vs in-situ lag of {_lc.parent.parent.name}: "
+                          f"r = {_c['r']:+.2f}, in-situ spread "
+                          f"{_c['sd_insitu_us']:.0f} us, {100*_c['explained']:.0f} % "
+                          f"explained by the ex-situ chain")
+
+        # And check the DC calibration itself while we are here.
+        _rep = abgleich.verify(_ab, _curr, _ab / 'coefficients' / 'temp.csv')
+        print(f"\n  Abgleich: {_rep['n_steps']} temperature steps "
+              f"{_rep['temps_C']}, linearity r² ≥ {_rep['linearity_r2_min']:.6f}")
+        print(f"  copper TCR {_rep['tcr_percent_per_K']['median']:.3f} %/K "
+              f"({_rep['tcr_percent_per_K']['min']:.3f}–"
+              f"{_rep['tcr_percent_per_K']['max']:.3f})")
+        _ia = _rep.get('implied_area', {})
+        print(f"  R(T)/K(T) = {_ia.get('median_cm2', float('nan')):.4f} cm², "
+              f"constant to {100*_ia.get('cv', float('nan')):.2f} % across segments"
+              f"{'' if not _ia.get('outliers') else '  — outliers: ' + ', '.join(_ia['outliers'])}")
+    elif GAIN_FILE:
+        print(f"  no Abgleich folder for {PLATE}, but the chain gain file is "
+              f"there and is applied: {GAIN_FILE}")
+    else:
+        print("  ABGLEICH_DIR is empty and no Abgleich delivery (a folder with "
+              "bode/*_#<n>.DTA and coefficients/curr.csv) was found under "
+              f"{ABGLEICH_SEARCH_ROOTS} -- skipping. Ask for / upload the plate's "
+              "calibration delivery and set ABGLEICH_DIR to it; without it the "
+              "top decade of the band carries -11 deg of uncorrected phase "
+              "(the in-situ CHANNEL_LAG stage still runs).")
+
+# COMMAND ----------
+
+# DBTITLE 1,Datago Source: discover + read FAMOS waveforms from Delta table
+# ═══════════════════════════════════════════════════════════════════════════════
+# DATAGO SOURCE: FamosFile-compatible reader from Delta table
+#
+# Replaces the Volumes-based file reader with a datago query backend.
+# The pipeline (bronze.py) calls FamosFile(path) to get waveform data.
+# This cell provides DatagoFamosFile that has the SAME interface but
+# reads from ps_xplatform_dev.rvadvtec_ops.datago_advtec_values_delta.
+#
+# PERFORMANCE NOTE:
+#   Each card = 16 channels × 2.5M samples = 40M rows from Delta.
+#   ~30-60s per card vs ~5s from Volumes binary. Use Volumes when available.
+#   DATA_SOURCE is chosen automatically below: datago when it has the
+#   order's FAMOS cards, else the Volumes .DAT files.
+# ═══════════════════════════════════════════════════════════════════════════════
+import numpy as np
+import time
+from pathlib import Path
+from dataclasses import dataclass, field
+ 
+_VAL_TBL = 'ps_xplatform_dev.rvadvtec_ops.datago_advtec_values_delta'
+_META_TBL = 'ps_xplatform_dev.rvadvtec_ops.datago_advtec_metadata'
+_GP_TBL = 'ps_xplatform_dev.rvadvtec_ops.datago_advtec_generalproperties'
+ 
+# ─── Data source selection ───
+# Priority: try datago (Delta table) first; fall back to Volumes if not found.
+# DATA_SOURCE is set automatically after discovery below.
+print("  Data source: auto-detect (datago preferred, Volumes fallback)")
+ 
+ 
+# ─── Discover FAMOS file_ids from datago ───
+def discover_famos_file_ids(leepa: str) -> dict:
+    """Find FAMOS card recordings in datago for a Leepa.
+    
+    Returns: {condition: [file_id_1, ..., file_id_5]} (one per card)
+    """
+    # Find NULL measurement_type entries (FAMOS files have no type set)
+    df = spark.sql(f"""
+        SELECT DISTINCT gp.file_id, gp.measurementBegin
+        FROM {_META_TBL} m
+        JOIN {_GP_TBL} gp ON m.measurement_id = gp.measurement_id
+        WHERE m.orderId = 'RO{leepa}'
+          AND gp.measurement_type IS NULL
+        ORDER BY gp.measurementBegin
+    """).toPandas()
+    
+    if df.empty:
+        return {}
+    
+    # Exclude TOM bench file (first one, usually much earlier timestamp)
+    # TOM bench has 80+ channels; FAMOS cards have exactly 16
+    # Heuristic: group by minute, groups of 5 = card sets
+    df['minute'] = df['measurementBegin'].dt.floor('min')
+    groups = df.groupby('minute')['file_id'].apply(list).to_dict()
+    
+    # Filter: only groups with exactly 5 files (= 5 cards per condition)
+    card_groups = {k: v for k, v in groups.items() if len(v) == 5}
+    
+    # Map to conditions by order (ascending current = test protocol order)
+    # Try Volumes filenames first; use only when they cover ALL groups
+    PROTOCOL_ORDER = ['45A', '60A', '150A', '450A']
+    conditions_ordered = []
+    famos_root = Path('/Volumes/ps_xplatform_dev/rvadvtec_dev/ev_rvadvtec_dev/Famos')
+    try:
+        vol_files = sorted(famos_root.glob(f'Leepa_{leepa}_Current_*_Karte_1.DAT'))
+        conditions_ordered = [f.name.split('_')[3] for f in vol_files]
+    except Exception:
+        pass
+    
+    if len(conditions_ordered) < len(card_groups):
+        # Volumes incomplete — use ascending protocol order
+        conditions_ordered = PROTOCOL_ORDER
+    
+    result = {}
+    for idx, (ts, file_ids) in enumerate(sorted(card_groups.items())):
+        cond = conditions_ordered[idx] if idx < len(conditions_ordered) else f'Cond-{idx+1}'
+        result[cond] = file_ids
+    
+    return result
+ 
+ 
+# ─── DatagoFamosFile: drop-in replacement for FamosFile ───
+class DatagoFamosFile:
+    """FamosFile-compatible reader that pulls waveform data from datago.
+    
+    Interface matches eis_local.FamosFile:
+        .path, .fs, .n_ch, .n_samples, .names,
+        .segment_names, .uc_names, .temp_names,
+        .channel(name) -> np.ndarray
+    """
+    
+    def __init__(self, file_id: str, card_label: str = 'datago'):
+        self.file_id = file_id
+        self.path = Path(f'/datago/{card_label}.DAT')  # fake path for compatibility
+        self._channels = {}  # lazy-loaded
+        self._metadata_loaded = False
+        self._load_metadata()
+    
+    def _load_metadata(self):
+        """Load channel list and sample counts (lightweight query)."""
+        df = spark.sql(f"""
+            SELECT channel, COUNT(*) as n_pts,
+                   MIN(CAST(time_value AS DOUBLE)) as t_min,
+                   MAX(CAST(time_value AS DOUBLE)) as t_max
+            FROM {_VAL_TBL}
+            WHERE file_id = '{self.file_id}'
+            GROUP BY channel
+            ORDER BY channel
+        """).toPandas()
+        
+        self.names = df['channel'].tolist()
+        self.n_ch = len(self.names)
+        
+        # Determine sampling rate from first channel
+        if not df.empty:
+            row0 = df.iloc[0]
+            duration = row0['t_max'] - row0['t_min']
+            self.n_samples = int(row0['n_pts'])
+            self.fs = round(self.n_samples / duration) if duration > 0 else 10000
+        else:
+            self.n_samples = 0
+            self.fs = 10000
+        
+        # Classify channels
+        self.segment_names = [n for n in self.names if n.isdigit()]
+        self.uc_names = [n for n in self.names if n.startswith('UC')]
+        self.temp_names = [n for n in self.names if n.startswith('Temp')]
+        
+        # Acquisition slot positions (channel index = multiplexing order)
+        # In real FAMOS, this is the binary header order. Here we approximate
+        # using the standard R2D2 card layout: UC first, then segments, then Temp
+        _ordered = self.uc_names + self.segment_names + self.temp_names
+        self._position_map = {name: idx for idx, name in enumerate(_ordered)}
+        self.positions = _ordered
+        self._metadata_loaded = True
+    
+    def position(self, channel_name: str) -> int:
+        """Return acquisition slot index for a channel (0-based)."""
+        return self._position_map.get(channel_name, 0)
+    
+    def channel(self, name: str) -> np.ndarray:
+        """Get waveform data for a channel (loads from datago on first access)."""
+        if name not in self._channels:
+            self._load_channel(name)
+        return self._channels[name]
+    
+    def _load_channel(self, name: str):
+        """Query datago for a single channel's waveform."""
+        df = spark.sql(f"""
+            SELECT CAST(time_value AS DOUBLE) as t,
+                   CAST(value AS DOUBLE) as v
+            FROM {_VAL_TBL}
+            WHERE file_id = '{self.file_id}'
+              AND channel = '{name}'
+            ORDER BY t
+        """).toPandas()
+        self._channels[name] = df['v'].values
+    
+    def load_all_channels(self):
+        """Bulk-load all channels at once (more efficient than one-by-one)."""
+        t0 = time.time()
+        df = spark.sql(f"""
+            SELECT channel,
+                   CAST(time_value AS DOUBLE) as t,
+                   CAST(value AS DOUBLE) as v
+            FROM {_VAL_TBL}
+            WHERE file_id = '{self.file_id}'
+            ORDER BY channel, t
+        """).toPandas()
+        
+        for ch_name, grp in df.groupby('channel'):
+            self._channels[ch_name] = grp['v'].values
+        
+        dt = time.time() - t0
+        print(f"    [{self.path.stem}] loaded {self.n_ch} channels, "
+              f"{self.n_samples:,} pts/ch in {dt:.1f}s")
+    
+    def __getitem__(self, name: str) -> np.ndarray:
+        """Array-style access: fam['UC2'] -> waveform."""
+        return self.channel(name)
+ 
+ 
+# ─── Discover for current Leepa ───
+try:
+    DATAGO_FAMOS_MAP = discover_famos_file_ids(LEEPA)
+except Exception as _dg_exc:          # no table access, no Spark SQL, ...
+    print(f"  datago lookup failed ({type(_dg_exc).__name__}: {_dg_exc}) "
+          f"-> Volumes")
+    DATAGO_FAMOS_MAP = {}
+ 
+if DATAGO_FAMOS_MAP:
+    DATA_SOURCE = 'datago'
+    print(f"\n  Datago FAMOS files found for Leepa {LEEPA} -> using datago")
+    for cond, fids in sorted(DATAGO_FAMOS_MAP.items()):
+        print(f"    {cond}: {len(fids)} cards ({fids[0][:12]}...)")
+    print(f"  Total: {sum(len(v) for v in DATAGO_FAMOS_MAP.values())} files")
+else:
+    DATA_SOURCE = 'volumes'
+    print(f"\n  No FAMOS data in datago for Leepa {LEEPA} -> falling back to Volumes")
+ 
+# ─── Monkey-patch bronze.py to use datago when selected ───
+if DATA_SOURCE == 'datago' and DATAGO_FAMOS_MAP:
+    import bronze as _bronze_mod
+    _orig_FamosFile = _bronze_mod.FamosFile  # keep reference to original
+    
+    # Build a lookup: condition+card_index -> file_id
+    _DATAGO_CARD_LOOKUP = {}
+    for cond, fids in DATAGO_FAMOS_MAP.items():
+        for card_idx, fid in enumerate(fids, start=1):
+            _DATAGO_CARD_LOOKUP[(cond, card_idx)] = fid
+    
+    # Create a wrapper that intercepts FamosFile(path) calls
+    class _FamosFileDatagoShim:
+        """Intercepts FamosFile(path) and routes to datago if file_id known."""
+        def __new__(cls, path, *args, **kwargs):
+            path = Path(path)
+            # Try to extract condition + card from filename
+            # Expected: Leepa_2611976_Current_60A_Test_01_Karte_1.DAT
+            name = path.name
+            parts = name.split('_')
+            try:
+                cond = parts[3]           # e.g. '60A'
+                card = int(parts[-1].replace('.DAT', ''))  # e.g. 1
+                key = (cond, card)
+                if key in _DATAGO_CARD_LOOKUP:
+                    fid = _DATAGO_CARD_LOOKUP[key]
+                    reader = DatagoFamosFile(fid, card_label=f'Karte_{card}')
+                    reader.load_all_channels()  # pre-fetch everything
+                    return reader
+            except (IndexError, ValueError):
+                pass
+            # Fall back to original file-based reader
+            return _orig_FamosFile(path, *args, **kwargs)
+    
+    _bronze_mod.FamosFile = _FamosFileDatagoShim
+
+    # Also patch discover_files so the pipeline finds datago-backed cards
+    # even when Volumes has no .DAT files for this Leepa/condition
+    _orig_discover = _bronze_mod.discover_files
+
+    def _discover_datago_shim(cfg):
+        """Return synthetic paths for datago conditions; else original discover."""
+        cond = getattr(cfg, 'condition', None)
+        leepa = getattr(cfg, 'leepa', None)
+        if cond and cond in DATAGO_FAMOS_MAP:
+            n_cards = len(DATAGO_FAMOS_MAP[cond])
+            dat_dir = getattr(cfg, 'dat_dir', Path('.'))
+            return [
+                Path(dat_dir) / f'Leepa_{leepa}_Current_{cond}_Test_01_Karte_{i+1}.DAT'
+                for i in range(n_cards)
+            ]
+        return _orig_discover(cfg)
+
+    _bronze_mod.discover_files = _discover_datago_shim
+    print(f"\n   Bronze patched: FamosFile + discover_files now use datago")
+    print(f"    (Note: ~30-60s per card due to Delta row scan)")
+else:
+    print(f"\n  Using Volumes path (fast binary read)")
+
+# COMMAND ----------
+
+# MAGIC %skip
+# MAGIC %sql
+# MAGIC -- Clean summary: distinct FAMOS file_ids per order, with channel counts from values table
+# MAGIC WITH famos_files AS (
+# MAGIC   SELECT DISTINCT
+# MAGIC     m.orderId,
+# MAGIC     gp.file_id,
+# MAGIC     gp.measurementBegin
+# MAGIC   FROM
+# MAGIC     ps_xplatform_dev.rvadvtec_ops.datago_advtec_metadata m
+# MAGIC       JOIN ps_xplatform_dev.rvadvtec_ops.datago_advtec_generalproperties gp
+# MAGIC         ON m.measurement_id = gp.measurement_id
+# MAGIC   WHERE
+# MAGIC     m.orderId IN ('RO2611922', 'RO2611976')
+# MAGIC     AND gp.measurement_type IS NULL
+# MAGIC )
+# MAGIC SELECT
+# MAGIC   f.orderId,
+# MAGIC   f.file_id,
+# MAGIC   f.measurementBegin,
+# MAGIC   v.n_channels,
+# MAGIC   v.n_data_points,
+# MAGIC   CASE
+# MAGIC     WHEN v.n_channels IS NOT NULL THEN 'YES'
+# MAGIC     ELSE 'NO'
+# MAGIC   END AS has_values_data
+# MAGIC FROM
+# MAGIC   famos_files f
+# MAGIC     LEFT JOIN (
+# MAGIC       SELECT
+# MAGIC         file_id,
+# MAGIC         COUNT(DISTINCT channel) AS n_channels,
+# MAGIC         COUNT(*) AS n_data_points
+# MAGIC       FROM
+# MAGIC         ps_xplatform_dev.rvadvtec_ops.datago_advtec_values_delta
+# MAGIC       WHERE
+# MAGIC         file_id IN (
+# MAGIC           SELECT DISTINCT
+# MAGIC             gp.file_id
+# MAGIC           FROM
+# MAGIC             ps_xplatform_dev.rvadvtec_ops.datago_advtec_metadata m
+# MAGIC               JOIN ps_xplatform_dev.rvadvtec_ops.datago_advtec_generalproperties gp
+# MAGIC                 ON m.measurement_id = gp.measurement_id
+# MAGIC           WHERE
+# MAGIC             m.orderId IN ('RO2611922', 'RO2611976')
+# MAGIC             AND gp.measurement_type IS NULL
+# MAGIC         )
+# MAGIC       GROUP BY
+# MAGIC         file_id
+# MAGIC     ) v
+# MAGIC       ON f.file_id = v.file_id
+# MAGIC ORDER BY
+# MAGIC   f.orderId,
+# MAGIC   f.measurementBegin
+
+# COMMAND ----------
+
+# DBTITLE 1,Run Dashboard: Volume cache inventory + run plan (cache vs fresh rerun)
+# ═══════════════════════════════════════════════════════════════════════════════
+# RUN DASHBOARD — decide, and SHOW, where each condition's numbers come from
+#
+# A pipeline run costs 5-10 minutes per condition, so results are copied to a
+# UC Volume and reused.  That reuse used to be governed by
+#
+#       FORCE_RERUN = True      # set True to ignore cache and re-run
+#
+# a bare literal two hundred lines into the run cell.  Left at True it threw
+# away a good cache on every execution; flipped to False and forgotten, it
+# quietly served month-old numbers from a superseded pipeline while the
+# notebook printed plots as if they were fresh.  Neither state is visible
+# from the output, which is the actual problem: you cannot tell, from a
+# Nyquist plot, whether the spectrum behind it was computed today.
+#
+# So the choice is a widget, the consequence is printed before anything runs,
+# and the cache is inventoried: what is stored, how old it is, which stages
+# it holds, and which pipeline version wrote it.
+#
+#   Run mode         cache      reuse a cached condition, run the rest
+#                    rerun      ignore the cache and recompute everything
+#                    cache-only reuse what is cached, SKIP the rest
+#                               (no cluster time, no source files needed)
+#   Write to cache   yes        a fresh run overwrites its cache entry
+#                    no         a fresh run leaves the cache untouched
+#                               -- a trial run that cannot clobber good data
+#
+# Everything below reads these two widgets.  cache_plan() is the single place
+# the decision is made; the run cell calls the same function, so the plan on
+# screen is the plan that executes.
+# ═══════════════════════════════════════════════════════════════════════════════
+import os, shutil, tempfile, json, time
+import numpy as np
+import pandas as pd
+from pathlib import Path
+ 
+_CACHE_VOL = Path('/Volumes/ps_xplatform_dev/rvadvtec_dev/ev_rvadvtec_dev/EIS_Results')
+ 
+# Use a user-specific temp base to avoid permission conflicts on shared cluster
+_TMP_BASE = Path(tempfile.gettempdir()) / f'eis_{os.getuid()}'
+_TMP_BASE.mkdir(parents=True, exist_ok=True)
+ 
+try:
+    dbutils.widgets.dropdown('run_mode', 'cache',
+                             ['cache', 'rerun', 'cache-only'],
+                             'Run mode')
+    dbutils.widgets.dropdown('cache_write', 'yes', ['yes', 'no'],
+                             'Write results to cache')
+except Exception:
+    pass
+ 
+RUN_MODE = _w('run_mode', 'cache')
+CACHE_WRITE = _w('cache_write', 'yes') == 'yes'
+ 
+# Kept as a name because older cells and notes refer to it; it is now derived
+# rather than typed, and nothing reads it that does not go through
+# cache_plan() first.
+FORCE_RERUN = (RUN_MODE == 'rerun')
+ 
+ 
+# ─── Cache identity ───
+# A CACHE KEY MUST NAME EVERY SETTING THAT CHANGED THE NUMBERS.
+# The key used to be the SNR widget alone, so a permissive run and a default
+# run of the same condition wrote to the same directory and whichever ran
+# last was served to both. Drift, THD, consensus, the frequency band and
+# every alignment setting were invisible to the key while being perfectly
+# visible in the results.
+#
+# The key is now the evaluation mode plus a digest of the settings that
+# decide what survives. Caches written before this change live under the old
+# path and are simply not found -- which is the correct outcome, because
+# nothing recorded what produced them.
+_CACHE_IDENTITY_KEYS = (
+    'f_min_hz', 'f_max_hz', 'ppd', 'grid_tol',
+    'min_snr_db', 'snr_floor_db', 'max_thd', 'max_drift',
+    'sigma_rel_max', 'min_cycles_per_dwell', 'zmag_outlier_mad',
+    'min_points_per_spectrum',
+    # a mirrored CSV evaluation is a different map of the same files
+    'csv_mirror_x',
+    # where each step's window sits decides every low-frequency point
+    'window_confine', 'window_min_interval_s', 'window_guard_s',
+    'window_settle_periods', 'window_min_snr_db',
+    # which frequency every fit uses, and the two scatter fixes
+    'freq_refine', 'freq_refine_pct', 'fit_at_exact_frequency',
+    'off_tone_drop_db', 'card_hf_phase',
+    # each card's phase calibrated against the Gamry sweep
+    'gamry_card_phase', 'gamry_phase_f_lo_hz', 'gamry_phase_fit_hi_frac_fs',
+    'gamry_delay_max_us', 'gamry_delay_max_resid_deg',
+    # the band: full (to fs/2, R_ohmic = intercept) or coherent
+    'full_band', 'full_band_frac_fs', 'coherent_f_max_frac_fs',
+    'f_hi_frac_fs', 'r_ohmic_method', 'eval_f_max_hz',
+    # how R_ohmic, R_ct, R_mt and R_pol are computed (standard ECM / DRT)
+    'param_method', 'ecm_compare',
+    # The build decides WHICH whole-cell sweep the aggregate is compared
+    # against, and that comparison is written into the manifest. Two builds
+    # are two different references, so they are two different results.
+    'gamry_version',
+    # Excluding a segment changes the cell aggregate, the area weighting and
+    # every plate map. A run with segment 33 and a run without it are two
+    # different results and must not share a cache entry.
+    'exclude_segments',
+    # Reconstruction changes the aggregate and the maps, so it changes the
+    # result and therefore the cache entry.
+    'substitute_segments', 'fill_missing_from_neighbours', 'fill_max_hops',
+    'drt_nonneg',
+    'ref_channel', 'align_cards', 'align_max_lag_s',
+    'align_min_corr', 'align_min_prominence', 'align_f_lo_hz',
+    'align_f_hi_hz', 'align_guard_s', 'align_agree_tol_s',
+    'align_corroborate_min_prominence',
+    'ladder_snap', 'window_sanity', 'hf_use_ensemble',
+    'phasor_method', 'drift_alpha', 'skew_model', 'uncertainty_model',
+    # Both changed between the clean script and the scattered run without
+    # changing the key, so a stale entry would have been served as current.
+    'fit_common_delay', 'silver_snr_gate_db', 'silver_snr_floor_db',
+    # the corrections of the raw-signal audit (card gain from the AC steps,
+    # faulty segments, clipped windows, the background before the sweep)
+    'card_gain', 'card_gain_min_snr_db', 'card_gain_f_lo_hz',
+    'card_gain_f_hi_hz', 'channel_lag', 'gamry_sync', 'uc_series_mohm_cm2',
+    'segment_fault_ratio', 'adc_full_scale_v', 'background_max_pct',
+    'uc_hf_equalise', 'uc_reference_card',
+)
+# min_ref_channels is deliberately NOT in the key: it is set from the number
+# of cards the condition actually has, which is a property of the data, not
+# an operator choice, and folding it in would give the same measurement two
+# different cache entries for no reason.
+
+
+def _run_identity(mode=None, f_min=None, f_max=None, snr=None):
+    """Short digest of the settings that decide what a run keeps."""
+    import hashlib as _hashlib
+    mode = EVALUATION_MODE if mode is None else mode
+    base = DEFAULT.replace(
+        f_min_hz=F_MIN if f_min is None else f_min,
+        f_max_hz=F_MAX if f_max is None else f_max,
+        full_band=bool(globals().get('FULL_BAND', False)),
+        eval_f_max_hz=float(globals().get('EVAL_F_MAX', 0.0)),
+        min_snr_db=MIN_SNR_DB if snr is None else float(snr),
+        gamry_version=globals().get('GAMRY_VERSION', ''),
+        exclude_segments=globals().get('EXCLUDE_SEGMENTS', frozenset()),
+        substitute_segments=globals().get('SUBSTITUTE_SEGMENTS', frozenset()),
+        fill_missing_from_neighbours=globals().get('FILL_GAPS', False),
+        channel_lag=globals().get('CHANNEL_LAG', 'correct'),
+        gamry_sync=globals().get('GAMRY_SYNC', 'guide'),
+        card_gain=globals().get('CARD_GAIN', 'correct'),
+        uc_series_mohm_cm2=float(globals().get('UC_SERIES_MOHM_CM2', 0.0)),
+        csv_mirror_x=bool(globals().get('CSV_MIRROR_X', False)))
+    if mode and mode != 'default':
+        base = base.preset(mode)
+    # A set has no order, and json's default=str would spell the SAME
+    # exclusion differently from one session to the next -- a cache key that
+    # changes when nothing did, so every run misses and re-computes. Sets are
+    # normalised to sorted lists, and Paths to strings.
+    def _norm(v):
+        if isinstance(v, (set, frozenset)):
+            return sorted(str(x) for x in v)
+        if isinstance(v, (tuple, list)):
+            return [str(x) for x in v]
+        return v
+
+    payload = {k: _norm(getattr(base, k, None)) for k in _CACHE_IDENTITY_KEYS}
+    # The plate decides the areas, the aggregate, every map. Added only for
+    # gen2, so every gen1 entry cached before the plate drop-down existed
+    # keeps its key and is still found.
+    _pl = str(globals().get('PLATE', 'gen1'))
+    if _pl != 'gen1':
+        payload['plate'] = _pl
+    # the CONTENT of the calibration files, not only their path: the chain
+    # gain file is rebuilt in place (5-500 Hz normalisation, October 2026),
+    # and the high-frequency response is refined in place
+    for _k, _f in (('gain_file_sha', globals().get('GAIN_FILE') or ''),
+                   ('hf_response_sha', str((globals().get('hf_response_file') or (lambda _l: None))(globals().get('LEEPA', '')) or ''))):
+        try:
+            payload[_k] = (_hashlib.sha256(Path(_f).read_bytes()).hexdigest()[:12]
+                           if _f and Path(_f).is_file() else '')
+        except Exception:                                  # noqa: BLE001
+            payload[_k] = ''
+    blob = json.dumps(payload, sort_keys=True, default=str)
+    return _hashlib.sha256(blob.encode('utf-8')).hexdigest()[:10]
+
+
+# ─── Cache paths ───
+def _cache_dir(leepa, cond, snr=None, mode=None):
+    base = _CACHE_VOL / leepa / cond
+    if snr is None:
+        return base
+    mode = EVALUATION_MODE if mode is None else mode
+    return base / f'mode_{mode}' / f'snr_{snr}_{_run_identity(mode=mode, snr=snr)}'
+ 
+ 
+def _cache_exists(leepa, cond, snr=None):
+    """True if usable cached results exist on the Volume.
+ 
+    "Usable" means silver spectra, the minimum any display cell needs.  A
+    directory holding only a manifest is a failed run, not a cache hit.
+    """
+    cd = _cache_dir(leepa, cond, snr)
+    if not cd.exists():
+        return False
+    for sub in ('silver', 'csv'):
+        if (cd / sub / 'spectra_clean.csv').exists():
+            return True
+    return False
+ 
+ 
+def _save_to_cache(out_dir, leepa, cond, snr=None):
+    """Copy pipeline output to Volume for persistence across sessions."""
+    src = Path(out_dir)
+    dst = _cache_dir(leepa, cond, snr)
+    dst.mkdir(parents=True, exist_ok=True)
+    n_copied = 0
+    for stage in ('bronze', 'silver', 'gold', 'csv'):
+        stage_src = src / stage
+        if not stage_src.exists():
+            continue
+        stage_dst = dst / stage
+        stage_dst.mkdir(parents=True, exist_ok=True)
+        for f in stage_src.iterdir():
+            if f.is_file():
+                shutil.copy2(str(f), str(stage_dst / f.name))
+                n_copied += 1
+    for f in src.iterdir():
+        if f.is_file():
+            shutil.copy2(str(f), str(dst / f.name))
+            n_copied += 1
+    return n_copied
+ 
+ 
+def _load_from_cache(leepa, cond, snr=None):
+    """Return a PIPELINE_RESULTS-compatible dict pointing to the cached dir.
+ 
+    The manifest is read back off the Volume rather than left empty, so a
+    cached condition reports the same summary numbers as a fresh one and the
+    summary cells below do not have to special-case it.
+    """
+    cd = _cache_dir(leepa, cond, snr)
+    man = {}
+    mp = cd / 'run_manifest.json'
+    if mp.exists():
+        try:
+            man = json.loads(mp.read_text())
+        except Exception:                                  # noqa: BLE001
+            man = {}
+    return {'manifest': man, 'cfg': None, 'out_dir': cd, 'cached': True}
+ 
+ 
+# ─── The decision, in one place ───
+def cache_plan(leepa, cond, snr=None, mode=None):
+    """What happens to this condition: ('load'|'run'|'skip', why)."""
+    mode = RUN_MODE if mode is None else mode
+    have = _cache_exists(leepa, cond, snr)
+    if mode == 'rerun':
+        return 'run', ('recompute (cache present, will be '
+                       + ('overwritten)' if CACHE_WRITE else 'left alone)')
+                       if have else 'recompute (nothing cached)')
+    if have:
+        return 'load', 'cached'
+    if mode == 'cache-only':
+        return 'skip', 'nothing cached, and mode is cache-only'
+    return 'run', 'nothing cached'
+ 
+ 
+# ─── What is actually in a cache entry ───
+def _entry_info(cd: Path) -> dict:
+    """Describe one cache directory without trusting it to be complete."""
+    info = {'stages': [], 'n_segments': None, 'n_freq': None,
+            'n_ecm_ok': None, 'age_days': None, 'size_mb': 0.0,
+            'source': None, 'elapsed_s': None, 'f_lo': None, 'f_hi': None}
+    if not cd.exists():
+        return info
+ 
+    newest = 0.0
+    for f in cd.rglob('*'):
+        if f.is_file():
+            try:
+                st = f.stat()
+            except OSError:
+                continue
+            info['size_mb'] += st.st_size / 1e6
+            newest = max(newest, st.st_mtime)
+    if newest:
+        info['age_days'] = (time.time() - newest) / 86400.0
+ 
+    for stage in ('bronze', 'silver', 'gold', 'csv'):
+        if (cd / stage).exists() and any((cd / stage).iterdir()):
+            info['stages'].append(stage)
+ 
+    for sub in ('silver', 'csv'):
+        sp = cd / sub / 'spectra_clean.csv'
+        if sp.exists():
+            try:
+                d = pd.read_csv(sp, usecols=['segment', 'freq_hz'])
+                info['n_segments'] = int(d['segment'].nunique())
+                info['n_freq'] = int(d['freq_hz'].nunique())
+                info['f_lo'] = float(d['freq_hz'].min())
+                info['f_hi'] = float(d['freq_hz'].max())
+            except Exception:                              # noqa: BLE001
+                pass
+            break
+ 
+    ep = cd / 'csv' / 'ecm_parameters.csv'
+    if ep.exists():
+        try:
+            de = pd.read_csv(ep)
+            info['n_ecm_ok'] = int(de['ok'].astype(str).str.lower()
+                                   .isin(['true', '1']).sum())
+        except Exception:                                  # noqa: BLE001
+            pass
+ 
+    mp = cd / 'run_manifest.json'
+    if mp.exists():
+        try:
+            m = json.loads(mp.read_text())
+            info['source'] = m.get('source', 'famos')
+            info['elapsed_s'] = m.get('elapsed_s')
+            if info['n_ecm_ok'] is None:
+                info['n_ecm_ok'] = m.get('n_ecm_ok')
+            g = m.get('stages', {}).get('gold', {})
+            if info['n_segments'] is None and g:
+                info['n_segments'] = g.get('n_measured')
+        except Exception:                                  # noqa: BLE001
+            pass
+    return info
+ 
+ 
+def _cache_conditions(leepa) -> list:
+    """Every (condition, snr_tag, dir) cached under this Leepa."""
+    root = _CACHE_VOL / leepa
+    out = []
+    if not root.exists():
+        return out
+    for cdir in sorted(root.iterdir()):
+        if not cdir.is_dir() or cdir.name == 'viewers':
+            continue
+        # current layout <cond>/mode_<mode>/snr_<v>_<id>; older ones had the
+        # snr_ folders directly under <cond>, or nothing below it
+        snr_subs = [d for d in sorted(cdir.iterdir())
+                    if d.is_dir() and d.name.startswith('snr_')]
+        for m in sorted(cdir.iterdir()):
+            if m.is_dir() and m.name.startswith('mode_'):
+                snr_subs += [d for d in sorted(m.iterdir())
+                             if d.is_dir() and d.name.startswith('snr_')]
+        if snr_subs:
+            for d in snr_subs:
+                tag = d.name[4:]
+                if d.parent.name.startswith('mode_'):
+                    tag = f"{d.parent.name[5:]}/{tag}"
+                out.append((cdir.name, tag, d))
+        else:
+            out.append((cdir.name, None, cdir))
+    return out
+ 
+ 
+# ─── ONE PLACE THAT ANSWERS "WHERE ARE THIS RUN'S RESULTS?" ──────────────
+# Every display cell below used to answer this for itself, by pasting a path
+# shape. That is why the heat map could show 60 A while the widget said
+# 450 A: nothing it read was tied to the condition that was selected, and
+# nothing it read was tied to the cache layout that the run cell writes.
+#
+# The two functions below are the only correct answers, and each display cell
+# now calls them instead of rebuilding a path.
+
+def selected_conditions():
+    """The conditions the widgets asked for -- NOT whatever is on the Volume.
+
+    A display cell that iterates the cache directory shows every condition
+    ever run for this plate, in whatever order the filesystem returns them.
+    With one figure per condition the LAST one drawn is the one on screen,
+    which is how selecting 450 A produces a 60 A heat map: 60 A simply sorts
+    last among 150A, 450A, 45A, 60A.
+    """
+    try:
+        return list(_conditions_to_run)
+    except NameError:
+        pass
+    return parse_conditions(_w('conditions', 'ALL'), CONDITIONS)
+
+
+def result_dir(leepa, cond, snr=None, mode=None, prefer_live=True):
+    """(directory, provenance) for one condition, newest evidence first.
+
+    Order, and why:
+      1. What THIS kernel just computed. A fresh run's output is the most
+         recent thing there is, and it may not have reached the Volume at all
+         if cache writing is off. The old cells consulted it only when the
+         run-mode widget said 'rerun', so a normal run displayed the previous
+         run's cache.
+      2. The cache entry for the CURRENT identity -- mode and settings digest
+         included, via _cache_dir, so this cannot drift from what the run
+         cell writes.
+      3. Older layouts (snr_<v>/ then the unversioned tree), clearly marked.
+         They are readable but they are not evidence about the current
+         settings, and the provenance string says so in words the display
+         cells print.
+    """
+    snr = MIN_SNR_DB if snr is None else snr
+    mode = EVALUATION_MODE if mode is None else mode
+
+    def _usable(d):
+        d = Path(d)
+        if not (d.is_dir() and any((d / sub).is_dir()
+                                   for sub in ('gold', 'silver', 'csv'))):
+            return False
+        # a result evaluated for the other plate is not a result for this one
+        try:
+            _cu = json.loads((d / 'config_used.json').read_text())
+            _pl = _cu.get('plate', 'gen1')
+        except Exception:                                  # noqa: BLE001
+            _pl = 'gen1'
+        return _pl == str(globals().get('PLATE', 'gen1'))
+
+    if prefer_live:
+        try:
+            pr = PIPELINE_RESULTS.get(cond)
+        except NameError:
+            pr = None
+        if pr and not pr.get('cached') and _usable(pr['out_dir']):
+            return Path(pr['out_dir']), 'this session\'s run'
+
+    d = _cache_dir(leepa, cond, snr, mode)
+    if _usable(d):
+        return d, f'cache: mode_{mode}/{Path(d).name}'
+
+    base = _CACHE_VOL / str(leepa) / str(cond)
+    for name in _legacy_snr_names(snr):
+        if _usable(base / name):
+            return base / name, (f'LEGACY cache {name}/ -- written before the '
+                                 f'cache key included the evaluation mode and '
+                                 f'the settings digest, so it may not match '
+                                 f'the settings shown above')
+    if _usable(base):
+        return base, ('LEGACY unversioned cache -- belongs to whichever run '
+                      'wrote last, at unknown settings')
+    try:
+        tmp = _TMP_BASE / (str(leepa) + PLATE_TAG) / str(cond)
+        if _usable(tmp):
+            return tmp, 'local /tmp output from an earlier run in this session'
+    except NameError:
+        pass
+    return None, 'not found'
+
+
+def _legacy_snr_names(snr):
+    """The snr_<value> spellings the old cache layout used."""
+    out, text = [], str(snr).strip()
+    if text:
+        out.append(f'snr_{text}')
+    try:
+        f = float(text)
+        for spelling in (repr(f), f'{f:g}'):
+            if f'snr_{spelling}' not in out:
+                out.append(f'snr_{spelling}')
+    except (TypeError, ValueError):
+        pass
+    return out
+
+
+def describe_source(cond, d, prov):
+    """One line naming what is about to be plotted, and how old it is."""
+    if d is None:
+        return (f'  {cond}: NO RESULTS for the current selection '
+                f'(mode {EVALUATION_MODE}, SNR {MIN_SNR_DB:g}). '
+                f'Run the pipeline cell for this condition.')
+    newest = max((f.stat().st_mtime for f in Path(d).rglob('*.csv')),
+                 default=0.0)
+    age_h = (time.time() - newest) / 3600.0 if newest else float('nan')
+    age = ('unknown age' if not newest else
+           f'{age_h*60:.0f} min old' if age_h < 1 else
+           f'{age_h:.1f} h old' if age_h < 48 else f'{age_h/24:.0f} d old')
+    flag = '   <-- NOT the current settings' if prov.startswith('LEGACY') else ''
+    return f'  {cond}: {prov}, {age}{flag}\n    {d}'
+
+
+# ─── Which conditions this execution covers ───
+# The multi-select, already parsed: e.g. ['45A', '450A'], in current order.
+# For CSV each condition is one operating-point folder (CSV_FOLDERS); a
+# ticked condition with no folder is reported and left out.
+_conditions_to_run = list(SELECTED_CONDITIONS)
+if SOURCE_FORMAT == 'csv':
+    _no_csv = [c for c in _conditions_to_run if c not in CSV_FOLDERS]
+    if _no_csv:
+        print(f"  no CSV folder for {', '.join(_no_csv)} under "
+              f"{CSV_ROOT / CSV_CAMPAIGN} -- left out")
+    _conditions_to_run = [c for c in _conditions_to_run if c in CSV_FOLDERS]
+ 
+RUN_PLAN = {c: cache_plan(LEEPA, c, MIN_SNR_DB) for c in _conditions_to_run}
+ 
+ 
+# ─── Render ───
+def _esc(x):
+    return (str(x).replace('&', '&amp;').replace('<', '&lt;')
+            .replace('>', '&gt;'))
+ 
+ 
+def _fmt(v, spec='', dash='—'):
+    if v is None or (isinstance(v, float) and not np.isfinite(v)):
+        return dash
+    return format(v, spec) if spec else str(v)
+ 
+ 
+def _age_cell(days):
+    """Age, coloured.  Stale cache is the failure mode this panel exists for."""
+    if days is None:
+        return f'<td style="{_TD}color:#999">—</td>'
+    if days < 1:
+        txt, col = f'{days*24:.1f} h', '#1a7f37'
+    elif days < 30:
+        txt, col = f'{days:.0f} d', '#1a7f37' if days < 7 else '#9a6700'
+    else:
+        txt, col = f'{days:.0f} d', '#cf222e'
+    return f'<td style="{_TD}color:{col};font-weight:600">{txt}</td>'
+ 
+ 
+_TD = ('padding:6px 10px;border-bottom:1px solid #eaeef2;'
+       'font-variant-numeric:tabular-nums;')
+_TH = ('padding:7px 10px;text-align:left;font-size:11px;'
+       'text-transform:uppercase;letter-spacing:.04em;color:#57606a;'
+       'border-bottom:2px solid #d0d7de;font-weight:600;')
+_BADGE = ('display:inline-block;padding:2px 9px;border-radius:10px;'
+          'font-size:11px;font-weight:700;letter-spacing:.02em;')
+_ACTION_STYLE = {
+    'load': (_BADGE + 'background:#dafbe1;color:#0a5c26', 'LOAD FROM CACHE'),
+    'run':  (_BADGE + 'background:#fff1e5;color:#9a4f00', 'RUN PIPELINE'),
+    'skip': (_BADGE + 'background:#f0f1f3;color:#57606a', 'SKIP'),
+}
+ 
+_n_load = sum(1 for a, _ in RUN_PLAN.values() if a == 'load')
+_n_run = sum(1 for a, _ in RUN_PLAN.values() if a == 'run')
+_n_skip = sum(1 for a, _ in RUN_PLAN.values() if a == 'skip')
+ 
+_mode_note = {
+    'cache': 'cached conditions are reused; the rest are computed',
+    'rerun': 'the cache is ignored and every condition is recomputed',
+    'cache-only': 'only cached conditions are shown; nothing is computed',
+}.get(RUN_MODE, '')
+ 
+_h = [f'''
+<div style="font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;
+            max-width:1180px;color:#1f2328">
+  <div style="display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;
+              border-bottom:2px solid #1f2328;padding-bottom:8px;margin-bottom:4px">
+    <span style="font-size:19px;font-weight:700">Run plan</span>
+    <span style="font-size:13px;color:#57606a">
+      Leepa <b>{_esc(LEEPA)}</b> &middot; {_esc(COND_FILTER)} &middot;
+      {_esc(SOURCE_FORMAT)} &middot; {_esc(BAND_TEXT)} &middot;
+      SNR &ge; {MIN_SNR_DB:g} dB &middot; stop after {_esc(STOP_AFTER)}
+    </span>
+  </div>
+  <div style="margin:10px 0 14px;font-size:13px">
+    <span style="{_BADGE}background:#ddf4ff;color:#0550ae">MODE: {_esc(RUN_MODE.upper())}</span>
+    <span style="color:#57606a;margin-left:8px">{_esc(_mode_note)}</span>
+    <span style="margin-left:14px;color:#57606a">write to cache:
+      <b style="color:{'#1a7f37' if CACHE_WRITE else '#cf222e'}">
+      {'yes' if CACHE_WRITE else 'no'}</b></span>
+  </div>
+  <div style="font-size:13px;margin-bottom:10px">
+    <b>{_n_load}</b> to load &middot; <b>{_n_run}</b> to run
+    {f'&middot; <b>{_n_skip}</b> skipped' if _n_skip else ''}
+    &middot; est. cluster time
+    <b>{'~0 min' if not _n_run else f'~{5*_n_run}&ndash;{10*_n_run} min'}</b>
+  </div>
+  <table style="border-collapse:collapse;width:100%;font-size:13px">
+    <tr>
+      <th style="{_TH}">Condition</th><th style="{_TH}">Action</th>
+      <th style="{_TH}">Why</th><th style="{_TH}">Age</th>
+      <th style="{_TH}">Seg</th><th style="{_TH}">Freq</th>
+      <th style="{_TH}">Band [Hz]</th><th style="{_TH}">ECM ok</th>
+      <th style="{_TH}">Stages</th><th style="{_TH}">MB</th>
+    </tr>''']
+ 
+for cond in _conditions_to_run:
+    action, why = RUN_PLAN[cond]
+    style, label = _ACTION_STYLE[action]
+    cd = _cache_dir(LEEPA, cond, MIN_SNR_DB)
+    inf = _entry_info(cd) if cd.exists() else _entry_info(Path('/nonexistent'))
+    band = ('—' if inf['f_lo'] is None
+            else f"{inf['f_lo']:.2f}&ndash;{inf['f_hi']:.0f}")
+    _h.append(f'''
+    <tr>
+      <td style="{_TD}font-weight:600">{_esc(cond)}</td>
+      <td style="{_TD}"><span style="{style}">{label}</span></td>
+      <td style="{_TD}color:#57606a">{_esc(why)}</td>
+      {_age_cell(inf['age_days'])}
+      <td style="{_TD}">{_fmt(inf['n_segments'])}</td>
+      <td style="{_TD}">{_fmt(inf['n_freq'])}</td>
+      <td style="{_TD}">{band}</td>
+      <td style="{_TD}">{_fmt(inf['n_ecm_ok'])}</td>
+      <td style="{_TD}color:#57606a">{'&middot;'.join(inf['stages']) or '—'}</td>
+      <td style="{_TD}">{inf['size_mb']:.1f}</td>
+    </tr>''')
+ 
+_h.append('</table>')
+ 
+# ─── Everything else cached under this Leepa (earlier settings / versions) ───
+_others = [(c, s, d) for c, s, d in _cache_conditions(LEEPA)
+           if not (c in _conditions_to_run
+                   and d == _cache_dir(LEEPA, c, MIN_SNR_DB))]
+if _others:
+    _h.append(f'''
+  <div style="margin-top:22px;font-size:14px;font-weight:700">
+    Also cached under Leepa {_esc(LEEPA)}
+    <span style="font-weight:400;color:#57606a;font-size:12px">
+      &mdash; results of earlier pipeline versions or settings, and
+      conditions this run does not touch. Every setting is part of the
+      cache key, so they are never served as the current result.</span>
+  </div>
+  <table style="border-collapse:collapse;width:100%;font-size:13px;margin-top:6px">
+    <tr><th style="{_TH}">Condition</th><th style="{_TH}">Entry (mode/snr_id)</th>
+        <th style="{_TH}">Age</th><th style="{_TH}">Seg</th>
+        <th style="{_TH}">Stages</th><th style="{_TH}">MB</th></tr>''')
+    for c, s, d in _others:
+        inf = _entry_info(d)
+        _h.append(f'''
+    <tr><td style="{_TD}">{_esc(c)}</td>
+        <td style="{_TD}">{_esc(s) if s is not None else '—'}</td>
+        {_age_cell(inf['age_days'])}
+        <td style="{_TD}">{_fmt(inf['n_segments'])}</td>
+        <td style="{_TD}color:#57606a">{'&middot;'.join(inf['stages']) or '—'}</td>
+        <td style="{_TD}">{inf['size_mb']:.1f}</td></tr>''')
+    _h.append('</table>')
+ 
+# ─── Other Leepa IDs on the Volume ───
+try:
+    _other_leepa = sorted(d.name for d in _CACHE_VOL.iterdir()
+                          if d.is_dir() and d.name != LEEPA)
+except Exception:                                          # noqa: BLE001
+    _other_leepa = []
+if _other_leepa:
+    _h.append(f'''
+  <div style="margin-top:18px;font-size:12px;color:#57606a">
+    Other Leepa IDs cached on the Volume:
+    {_esc(', '.join(_other_leepa))}
+    &mdash; switch the Order ID widget to load one without re-running.
+  </div>''')
+ 
+_h.append(f'''
+  <div style="margin-top:16px;font-size:12px;color:#57606a">
+    Cache root: <code>{_esc(_CACHE_VOL)}</code><br>
+    Scratch:&nbsp;&nbsp;&nbsp;&nbsp; <code>{_esc(_TMP_BASE)}</code>
+    (per-user, cleared when the cluster restarts)
+  </div>
+</div>''')
+ 
+try:
+    displayHTML('\n'.join(_h))
+except Exception:                                          # noqa: BLE001
+    # No displayHTML (plain python, or a job run): the plan still has to be
+    # legible, because it is what decides whether anything runs at all.
+    print(f"\n  RUN PLAN — Leepa {LEEPA}, mode={RUN_MODE}, "
+          f"write_cache={CACHE_WRITE}")
+    for cond in _conditions_to_run:
+        action, why = RUN_PLAN[cond]
+        print(f"    {cond:>12s}  {action.upper():<5s}  {why}")
+ 
+# Count the entries that actually exist, not the conditions being run: a
+# condition with nothing cached overwrites nothing.
+_n_clobber = sum(1 for c in _conditions_to_run
+                 if RUN_PLAN[c][0] == 'run' and _cache_exists(LEEPA, c, MIN_SNR_DB))
+if _n_clobber and RUN_MODE == 'rerun' and CACHE_WRITE:
+    print(f"   rerun + write: {_n_clobber} existing cache entr"
+          f"{'y' if _n_clobber == 1 else 'ies'} for Leepa {LEEPA} will be "
+          f"overwritten.  Set 'Write results to cache' to no for a trial run.")
+if RUN_MODE == 'cache-only' and _n_skip:
+    print(f"   cache-only: {_n_skip} condition(s) have nothing cached and "
+          f"will be missing from every plot below.")
+ 
+
+# COMMAND ----------
+
+# DBTITLE 1,Build Config + Run Pipeline (with persistent Volume cache)
+ 
+# ═══════════════════════════════════════════════════════════════════════════════
+# RUN PIPELINE PER CONDITION (fixes the cross-condition deduplication bug)
+#
+# When condition=ALL, bronze.py merges all files and deduplicates segments
+# ACROSS conditions (keeping best-SNR only). This is wrong: each current
+# setpoint (45A, 60A, 150A, 450A) is a SEPARATE EIS experiment.
+#
+# Fix: iterate conditions individually, producing separate results per condition.
+# ═══════════════════════════════════════════════════════════════════════════════
+# Re-imported rather than inherited from the dashboard cell, so this cell
+# still runs on its own after a "Clear state".
+import os, shutil, tempfile, gc
+ 
+ 
+def spectra_csv(out_dir):
+    """Where this run's per-segment spectra ended up.
+ 
+    The FAMOS path writes silver/spectra_clean.csv; the CSV path writes
+    csv/spectra_clean.csv.  Same columns, same units (mΩ·cm²), different
+    stage name — so every display cell asks here rather than hard-coding a
+    stage that only exists on one of the two routes.
+    """
+    out_dir = Path(out_dir)
+    for sub in ('silver', 'csv'):
+        p = out_dir / sub / 'spectra_clean.csv'
+        if p.exists():
+            return p
+    return None
+ 
+ 
+def maps_dir(out_dir):
+    """Where the plate maps and summary tables ended up."""
+    out_dir = Path(out_dir)
+    return out_dir / 'gold' if (out_dir / 'gold').exists() else out_dir
+ 
+ 
+_DAT_DIR = FAMOS_ROOT
+# The plate is read from the widget again here and applied once more, so a
+# module reload between the cells cannot leave the geometry on the other plate.
+PLATE = geom.plate_key(_w('plate', PLATE))
+_plate = geom.use_plate(PLATE)
+_CURR_CAL = PLATE_FILES['curr']
+_TEMP_CAL = PLATE_FILES['temp']
+if PLATE_FILES['plate'] != PLATE:
+    raise RuntimeError(f"the plate changed to {PLATE} after the widgets cell "
+                       f"resolved the {PLATE_FILES['plate']} files -- re-run "
+                       f"the widgets cell first")
+if SOURCE_FORMAT == 'famos' and PLATE_FILES['missing']:
+    raise FileNotFoundError(site_paths.missing_message(PLATE_FILES))
+print(f"  Plate:      {_plate.title}")
+ 
+# _CACHE_VOL, _TMP_BASE, _cache_dir, _cache_exists, _save_to_cache,
+# _load_from_cache, cache_plan, RUN_MODE, CACHE_WRITE, RUN_PLAN and
+# _conditions_to_run all come from the Run Dashboard cell above.  They live
+# there so that the cache policy is decided and DISPLAYED in one place
+# instead of being a literal buried in this cell.
+ 
+print(f"  DAT dir:    {_DAT_DIR}" if SOURCE_FORMAT == 'famos' else
+      f"  CSV folder: {CSV_ROOT / CSV_CAMPAIGN}")
+print(f"  Curr cal:   {_CURR_CAL}")
+print(f"  Gamry ref:  {GAMRY_DIR or '(none - whole-cell check skipped)'}")
+print(f"  Gamry build:{' ' + GAMRY_VERSION if GAMRY_VERSION else ''}"
+      + ('' if GAMRY_VERSION else ' (UNKNOWN — if that folder holds more than '
+                                 'one campaign, the sweeps may be another '
+                                 "cell's)"))
+print(f"  Conditions: {_conditions_to_run}")
+print(f"  Band:       {BAND_TEXT}")
+print(f"  Stop after: {STOP_AFTER}")
+# The mode decides the gates AND the cache entry, so it is printed with the
+# rest of the run identity rather than left to be inferred from the results.
+print(f"  Rebuilt:    "
+      + (", ".join(sorted(SUBSTITUTE_SEGMENTS, key=lambda x: int(x)
+                          if x.isdigit() else 0))
+         + "   <-- own measurement discarded, value from neighbours"
+         if SUBSTITUTE_SEGMENTS else "(none)")
+      + ("   + every unmeasured segment" if FILL_GAPS else ""))
+print(f"  Excluded:   "
+      + (", ".join(sorted(EXCLUDE_SEGMENTS, key=lambda x: int(x)
+                          if x.isdigit() else 0))
+         + "   <-- left out of every stage" if EXCLUDE_SEGMENTS else "(none)"))
+print(f"  Eval mode:  {EVALUATION_MODE}"
+      + ("" if EVALUATION_MODE == 'default'
+         else "   <-- NOT the pipeline defaults; exploratory"))
+print(f"  Run id:     {_run_identity()}   (cache key: settings digest)\n")
+ 
+# ─── Run pipeline once per condition (or load from cache) ───
+PIPELINE_RESULTS = {}  # {condition_str: manifest_dict}
+ 
+for cond in _conditions_to_run:
+    # ── Same decision the dashboard displayed, taken from the same function
+    #    so the two cannot drift apart ──
+    _action, _why = cache_plan(LEEPA, cond, MIN_SNR_DB)
+ 
+    if _action == 'skip':
+        print(f"  – {cond}: SKIPPED ({_why})")
+        PIPELINE_RESULTS[cond] = None
+        continue
+ 
+    if _action == 'load':
+        PIPELINE_RESULTS[cond] = _load_from_cache(LEEPA, cond, MIN_SNR_DB)
+        _cd = _cache_dir(LEEPA, cond, MIN_SNR_DB)
+        _sp = spectra_csv(_cd)
+        _n = 0
+        if _sp and _sp.exists():
+            import pandas as _pd
+            _n = _pd.read_csv(_sp)['segment'].nunique()
+        _inf = _entry_info(_cd)
+        _age = ('unknown age' if _inf['age_days'] is None
+                else f"{_inf['age_days']*24:.1f} h old" if _inf['age_days'] < 1
+                else f"{_inf['age_days']:.0f} d old")
+        # Say how old it is every time.  A cached number that is not marked
+        # as cached is the whole reason this path needed a dashboard.
+        print(f"   {cond}: FROM CACHE ({_n} segments, {_age}) — "
+              f"pipeline not run")
+        print(f"    {_cd}")
+        continue
+ 
+    # ── Count the cards for THIS condition, before the run ───────────────
+    # The consensus requirement is relaxed below only for a genuine
+    # single-card condition, so the count has to come from the files that
+    # were selected -- not from a discovery that failed, which would make
+    # "nothing matched" indistinguishable from "one card".
+    _selected_files = []
+    if SOURCE_FORMAT == 'famos':
+        try:
+            _selected_files = bronze.discover_files(
+                DEFAULT.replace(dat_dir=_DAT_DIR, leepa=LEEPA, condition=cond))
+        except SystemExit as _de:
+            print(f"   {cond}: file discovery found nothing ({_de})")
+            _selected_files = []
+        _src_label = 'datago' if (DATA_SOURCE == 'datago' and cond in DATAGO_FAMOS_MAP) else 'Volumes'
+        print(f"   {cond}: {len(_selected_files)} card file(s) from {_src_label}")
+
+    _out_dir = _TMP_BASE / (LEEPA + PLATE_TAG) / cond
+    # Force-clean if stale directory with wrong permissions exists
+    if _out_dir.exists():
+        try:
+            # Test write access
+            (_out_dir / '.writetest').touch()
+            (_out_dir / '.writetest').unlink()
+        except PermissionError:
+            shutil.rmtree(_out_dir, ignore_errors=True)
+    _out_dir.mkdir(parents=True, exist_ok=True)
+    
+    cfg = DEFAULT.replace(
+        plate=PLATE,   # from the 'plate' widget, re-read at the top of this cell
+        source_format=SOURCE_FORMAT,
+        csv_path=(CSV_FOLDERS.get(cond) if SOURCE_FORMAT == 'csv'
+                  else Path(CSV_PATH) if CSV_PATH else None),
+        csv_dialect=CSV_DIALECT,
+        csv_tones=CSV_TONES,
+        csv_mirror_x=bool(globals().get('CSV_MIRROR_X', False)),
+        gain_file=Path(GAIN_FILE) if GAIN_FILE else None,
+        hf_response_file=hf_response_file(LEEPA),
+        channel_lag=CHANNEL_LAG,
+        gamry_sync=GAMRY_SYNC,
+        card_gain=CARD_GAIN,
+        uc_series_mohm_cm2=float(UC_SERIES_MOHM_CM2),
+        freq_response=FREQ_RESPONSE,
+        abgleich_bode_dir=_bode_dir(),
+        heatmap_style=HEATMAP_STYLE,
+        gamry_dir=Path(GAMRY_DIR) if GAMRY_DIR else None,
+        gamry_version=GAMRY_VERSION,
+        bench_log=Path(BENCH_LOG) if BENCH_LOG else None,
+        dat_dir=_DAT_DIR,
+        out_dir=_out_dir,
+        curr_cal=_CURR_CAL,
+        temp_cal=_TEMP_CAL,
+        leepa=LEEPA,
+        condition=cond,
+        f_min_hz=F_MIN,
+        f_max_hz=F_MAX,
+        eval_f_max_hz=EVAL_F_MAX,
+        full_band=FULL_BAND,
+        write_png=True,
+        write_html=True,
+        infer_missing_segments=False,  # Don't infer unmeasured segments (36,66,70,71)
+        min_snr_db=MIN_SNR_DB,   
+        # A five-card FAMOS campaign must keep REAL consensus: a step seen by
+        # one card only is carried by grid membership, not by lowering the
+        # vote. min_ref_channels=1 is restored below, explicitly and out
+        # loud, when the run genuinely has one card.
+        min_ref_channels=2,
+        exclude_segments=EXCLUDE_SEGMENTS,
+        substitute_segments=SUBSTITUTE_SEGMENTS,
+        fill_missing_from_neighbours=FILL_GAPS,
+    )
+
+    # ── Gate preset: named, not smuggled ──────────────────────────────────
+    # Everything that relaxes a quality gate now comes from Config.preset(),
+    # so the mode is a single word that travels into the cache path, the
+    # manifest and the printout below. Nothing here silently edits a
+    # threshold the pipeline documents elsewhere.
+    if EVALUATION_MODE != 'default':
+        cfg = cfg.preset(EVALUATION_MODE)
+        print(f"\n  EVALUATION MODE: {EVALUATION_MODE.upper()} — gates are "
+              f"NOT the pipeline defaults. These results are exploratory and "
+              f"are cached separately from the default-mode results.")
+
+    # ── Single-card exception, stated rather than assumed ─────────────────
+    # Counted from the files actually selected, never inferred from a failed
+    # discovery: "no files matched" must not read as "one card".
+    _n_cards = len(_selected_files) if _selected_files else 0
+    if SOURCE_FORMAT == 'famos' and _n_cards == 1:
+        cfg = cfg.replace(min_ref_channels=1)
+        print(f"  Consensus reduced to 1 reference channel: this condition "
+              f"has exactly one card ({Path(_selected_files[0]).name}). "
+              f"Cross-card agreement is unavailable, so every step rests on "
+              f"grid membership alone.")
+    elif SOURCE_FORMAT == 'famos' and _n_cards == 0:
+        print("  WARNING: no FAMOS files were counted for this condition; "
+              "consensus settings left at the default rather than relaxed.")
+ 
+    print(f"\n{'═'*75}")
+    print(f"  CONDITION: {cond}   [{PLATE}]"
+          + (f"   <- {CSV_FOLDERS[cond].name}" if SOURCE_FORMAT == 'csv'
+             else ''))
+    print(f"{'═'*75}")
+    
+    try:
+        manifest = pipeline_main.run_pipeline(cfg, stop_after=STOP_AFTER)
+        PIPELINE_RESULTS[cond] = {
+            'manifest': manifest,
+            'cfg': cfg,
+            'out_dir': _out_dir,
+        }
+        # ── Persist to Volume ──
+        if CACHE_WRITE:
+            try:
+                _nc = _save_to_cache(_out_dir, LEEPA, cond, MIN_SNR_DB)
+                print(f"   Saved {_nc} files to Volume cache: "
+                      f"{_cache_dir(LEEPA, cond, MIN_SNR_DB)}")
+            except Exception as _ce:                       # noqa: BLE001
+                print(f"   Cache save failed (results still in /tmp): {_ce}")
+        else:
+            print(f"   Cache write disabled — results stay in {_out_dir} "
+                  f"and are lost when the cluster restarts")
+        # The FAMOS manifest reports per stage; the CSV manifest is flat.
+        gs = manifest.get('stages', {}).get('gold', {})
+        if gs:
+            n_meas = gs.get('n_measured', '?')
+            n_total = gs.get('n_total', '?')
+            r_ohmic = gs.get('R_ohmic', {})
+            if r_ohmic:
+                print(f"  {cond}: {n_meas}/{n_total} segments | "
+                      f"Rs = {1000*r_ohmic['mean']:.1f} ± {1000*r_ohmic['sd']:.1f} mΩ·cm²")
+            else:
+                print(f"  {cond}: {n_meas}/{n_total} segments")
+        else:
+            sch = manifest.get('schedule', {})
+            print(f"   {cond}: {manifest.get('n_segments', '?')} segments, "
+                  f"{manifest.get('n_ecm_ok', '?')} ECM fits, "
+                  f"KK {manifest.get('kk_pass', '?')}/{manifest.get('kk_total', '?')}"
+                  f" | excitation: {sch.get('mode', '?')}, "
+                  f"{len(sch.get('tones', []))} tones")
+    except Exception as e:
+        print(f"   {cond}: FAILED — {e}")
+        PIPELINE_RESULTS[cond] = None
+    # Release memory between conditions to prevent driver OOM
+    gc.collect()
+    spark.catalog.clearCache()
+ 
+_n_ok = len([v for v in PIPELINE_RESULTS.values() if v])
+_n_cached = len([v for v in PIPELINE_RESULTS.values()
+                 if v and v.get('cached')])
+print(f"\n{'═'*75}")
+print(f"  PIPELINE COMPLETE — {_n_ok} condition(s) available "
+      f"({_n_cached} from cache, {_n_ok - _n_cached} freshly computed)")
+if _n_cached and RUN_MODE != 'rerun':
+    print(f"  Set the Run mode widget to 'rerun' to recompute the cached ones.")
+print(f"{'═'*75}")
+ 
+
+# COMMAND ----------
+
+# DBTITLE 1,Card voltage gain and DC current closure (all conditions)
+# ═══════════════════════════════════════════════════════════════════════════════
+# 1. CARD VOLTAGE GAIN -- per condition, from bronze/card_reference.csv:
+#    each card's UC2 against the median of the cards. All cards record the
+#    same cell voltage, so anything but 0 % is that card's voltage chain, and
+#    it sits on every segment of the card (each card divides by its own UC2).
+# 2. CARD IMPEDANCE FACTOR -- per condition, from silver/card_factors.csv:
+#    the card's |Z| against the plate in four frequency bands and its j_dc.
+#    A scale error is the same in every band with j_dc off the other way.
+# 3. DC CURRENT CLOSURE across every condition run (45 / 60 / 150 / 450 A):
+#    the plate current from the segments against the bench current, fitted as
+#    I_plate = a * I_bench + b. a - 1 is the current-scale error, and it is in
+#    every impedance too; b is a zero offset, which is not.
+# ═══════════════════════════════════════════════════════════════════════════════
+if not skip_for_csv('card voltage gain / DC closure'):
+    from IPython.display import Image as IPImage
+    importlib.reload(card_gain)
+    importlib.reload(dc_closure)
+    importlib.reload(segment_scale)
+
+    _cg_runs = [Path(pr['out_dir']) for pr in PIPELINE_RESULTS.values()
+                if pr and pr.get('out_dir')]
+    for _rd in _cg_runs:
+        print(f"\n── {_rd.name} ──")
+        _cr = _rd / 'bronze' / 'card_reference.csv'
+        if _cr.is_file():
+            _t = pd.read_csv(_cr)
+            _t['card'] = _t['card'].map(card_gain.short)
+            print("  UC channels, card against the median card "
+                  "(gain_pct: what Z carries if 'applied' is 1):")
+            print(_t[['channel', 'card', 'used_for_Z', 'gain_pct', 'flat_pct',
+                      'dt_us', 'dc_V', 'applied', 'status']]
+                  .to_string(index=False))
+        else:
+            print("  no bronze/card_reference.csv -- this result predates the UC "
+                  "check or came from the cache; re-run with Run mode 'rerun'")
+        _cf = _rd / 'silver' / 'card_factors.csv'
+        if _cf.is_file():
+            _t = pd.read_csv(_cf)
+            _t['card'] = _t['card'].map(card_gain.short)
+            print("  |Z| per card against the plate [%], by band, and j_dc [%]:")
+            print(_t.to_string(index=False))
+
+    if _cg_runs:
+        _bench = Path(BENCH_LOG) if BENCH_LOG else None
+        if _bench is None and GAMRY_DIR:
+            try:
+                _bench = gamry_compare.find_bench_log(
+                    GAMRY_DIR, order_id=LEEPA, version=GAMRY_VERSION or None)
+            except Exception:                                   # noqa: BLE001
+                _bench = None
+        _dcc = dc_closure.analyse(_cg_runs, bench_log=_bench,
+                                  gamry_dir=GAMRY_DIR or None)
+        _dcc_dir = _TMP_BASE / LEEPA / 'dc_closure'
+        _dcc_dir.mkdir(parents=True, exist_ok=True)
+        utils.write_table(_dcc_dir / 'dc_closure.csv', _dcc['rows'])
+        utils.write_table(_dcc_dir / 'dc_closure_cards.csv', _dcc['cards'])
+        dc_closure.plot(_dcc, _dcc_dir / 'dc_closure.png')
+        print(f"\n{'═'*75}\n  DC CURRENT CLOSURE across {len(_cg_runs)} condition(s)"
+              f"\n{'═'*75}")
+        _t = pd.DataFrame(_dcc['rows'])[['condition', 'i_ref_A', 'i_ref_source',
+                                         'i_full_A', 'dev_pct']]
+        print(_t.round(2).to_string(index=False))
+        if 'scale' in _dcc:
+            print(f"\n  I_plate = {_dcc['scale']:.4f} * I_bench "
+                  f"{_dcc['offset_A']:+.2f} A  -> current scale "
+                  f"{_dcc['scale_pct']:+.2f} % (in every impedance as "
+                  f"{-_dcc['scale_pct']:+.2f} %), zero offset "
+                  f"{_dcc['offset_A']:+.2f} A (not in the impedance)")
+        dc_closure.print_sense(_dcc)
+        _ct = pd.DataFrame(_dcc['cards'])
+        if not _ct.empty:
+            print("\n  card current density against the plate [%] -- a K error on "
+                  "a card is the same at every current:")
+            _pv = _ct.pivot_table(index='card', columns='condition',
+                                  values='j_vs_plate_pct')
+            _pv = _pv[sorted(_pv.columns, key=card_gain.current_of)]
+            print(_pv.round(2).to_string())
+        if (_dcc_dir / 'dc_closure.png').is_file():
+            display(IPImage(filename=str(_dcc_dir / 'dc_closure.png')))
+
+        # 4. PER-SEGMENT SCALE (segment_scale.py): is a segment's |Z| off by one
+        #    constant factor at every frequency AND every current? That is a
+        #    scale error in its current path (K in situ, or the area it really
+        #    collects from), not the cell -- and on 2612030 it is most of the
+        #    neighbour-to-neighbour HFR scatter. Written as a gain file, NOT
+        #    applied: trace it first (swap two channels' cables).
+        _ss_runs = [r for r in _cg_runs
+                    if (r / 'silver' / 'spectra_clean.csv').is_file()]
+        if len(_ss_runs) >= 2:
+            _ssr = segment_scale.analyse(_ss_runs)
+            print(f"\n{'═'*75}\n  PER-SEGMENT SCALE FACTOR across "
+                  f"{len(_ss_runs)} condition(s)\n{'═'*75}")
+            segment_scale.report(_ssr, log=lambda m: print(m))
+            _ssr['table'].to_csv(_dcc_dir / 'segment_scale.csv')
+            _ss_gain = segment_scale.write_gain(
+                _dcc_dir / 'segment_scale_gain.csv', _ssr['table'].scale,
+                note=', '.join(_ssr['conditions']))
+            print(f"  factors as a gain file (NOT applied): {_ss_gain}")
+            print("  to test it on these results without the .DAT files:\n"
+                  "    pipeline_main.reevaluate(<run_dir>, out_dir=<new_dir>, "
+                  "gain_file=<that file>)")
+        print(f"\n  written to {_dcc_dir}")
+ 
+
+# COMMAND ----------
+
+# DBTITLE 1,Frequency response of the measuring chain (ex-situ + in-situ, all conditions)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Z = K * U_cell / u_seg is a ratio of two measured signals, so whatever the
+# measuring chain does to either signal lands in Z -- hardest at the top of
+# the band, where a phase error rotates the points that set the HFR.
+#
+# 1. EX-SITU G_d(f) = j_sigma / j_r of each segment's current amplifier, from
+#    the Abgleich bode/ sweeps (ABGLEICH_DIR in the "Chain response" cell) or
+#    from GAIN_FILE. Absolute, but it sees only the amplifiers.
+# 2. IN-SITU Z_s / plate median of each segment during the measurement,
+#    before (chain file divided out, no timing correction) and after (mux
+#    de-skew + channel lag). Relative -- what all segments share cancels --
+#    but it sees the whole chain: cards, multiplexer slots, scale factors.
+#
+# Each run already wrote RUN_DIR/frequency_response/ (FREQ_RESPONSE =
+# 'report'); results from the cache that predate it are computed here.
+# Nothing in this cell changes Z.
+# ═══════════════════════════════════════════════════════════════════════════════
+if not skip_for_csv('frequency response of the FAMOS chain'):
+    importlib.reload(frequency_response)
+
+    _fr_runs = [Path(pr['out_dir']) for pr in PIPELINE_RESULTS.values()
+                if pr and pr.get('out_dir')]
+    _fr_rows, _fr_imgs, _fr_ex = [], {}, None
+    for _rd in _fr_runs:
+        print(f"\n{'═'*75}\n  {_rd.name}\n{'═'*75}")
+        _frd = _rd / frequency_response.OUT
+        _sj = _frd / 'summary.json'
+        if _sj.is_file():
+            _frs = json.loads(_sj.read_text())
+            frequency_response.report(_frs, say=print)
+        else:
+            # a read-only cache folder gets its results beside the other tmp output
+            try:
+                _frd.mkdir(parents=True, exist_ok=True)
+                (_frd / '.w').touch()
+                (_frd / '.w').unlink()
+            except OSError:
+                _frd = _TMP_BASE / LEEPA / 'frequency_response' / _rd.name
+            _frs = frequency_response.run(
+                _rd, gain_file=GAIN_FILE or None, bode_dir=_bode_dir(),
+                out_dir=_frd, f_top=min(float(F_MAX), 4000.0),
+                title=f"In-situ response, {_rd.name}")
+        for _c in frequency_response.checks(_frs):
+            print(f"  {_c}")
+        if _fr_ex is None and (_frd / 'freq_response_exsitu.png').is_file():
+            _fr_ex = _frd / 'freq_response_exsitu.png'
+        if (_frd / 'freq_response_insitu.png').is_file():
+            _fr_imgs[_rd.name] = viewers.img_html(_frd / 'freq_response_insitu.png')
+        _ins = _frs.get('insitu', {})
+        if _ins.get('available'):
+            _k = f"{_ins['f_top_hz']:g}"
+            _row = {'run': _rd.name}
+            for _st in ('raw', 'clean'):
+                _r = _ins['stages'].get(_st, {}).get(_k)
+                if _r:
+                    _row[f'phase_sd_{_st}_deg'] = round(_r['phase_deg_sd'], 1)
+            for _c in _ins.get('card_residual', []):
+                _row[f"{_c['card']}_step_pct"] = _c['mag_step_hf_pct']
+            _fr_rows.append(_row)
+
+    if _fr_rows:
+        print(f"\n{'═'*75}\n  IN-SITU, ALL CONDITIONS: phase spread at the top of the "
+              f"band (sd over segments) and |H| step per card above "
+              f"{frequency_response.F_HF:g} Hz\n{'═'*75}")
+        print(pd.DataFrame(_fr_rows).to_string(index=False))
+        print("  A card step that is the same at every current is the hardware; "
+              "one that changes with load is the cell.")
+
+    # one plot: the ex-situ amplifier response, or the in-situ response of the
+    # condition chosen in the drop-down
+    _fr_items = {}
+    if _fr_ex is not None:
+        _fr_items[('Ex-situ amplifiers (Abgleich)',)] = viewers.img_html(_fr_ex)
+    for _c, _h in _fr_imgs.items():
+        _fr_items[(f'In-situ, {_c}',)] = _h
+    if _fr_items:
+        displayHTML(viewers.selector_html(_fr_items, ['Frequency response']))
+
+# COMMAND ----------
+
+# DBTITLE 1,High-frequency response across conditions (frozen correction)
+# ═══════════════════════════════════════════════════════════════════════════════
+# THE CHANNELS' HIGH-FREQUENCY RESPONSE, MEASURED ON ALL OPERATING POINTS
+# After every other correction, each segment's spectrum against the plate
+# median still carries, above ~1 kHz, a phase that is a straight line in f
+# (the ~19 deg spread at 11.95 kHz of the in-situ check) and a magnitude step
+# per card that grows with f (card 1 +15 %, card 3 -13 % at 7-13 kHz on
+# 2612030). Both are identical at 45, 60, 150 and 450 A: the acquisition, not
+# the cell. checks/hf_response.py measures them on all selected conditions,
+# tests the correction on each current with the model built from the others
+# (leave one out), and writes <EIS_Results>/<order>/hf_response/hf_response.csv.
+# With HF_RESPONSE = 'auto' (settings cell) the next run of the pipeline cell
+# applies it -- the file's content is in the cache key, so the conditions are
+# re-evaluated, not served from the cache.
+# Needs at least two conditions; all four is what it was validated on.
+# ═══════════════════════════════════════════════════════════════════════════════
+import hf_response
+importlib.reload(hf_response)
+# BUILT ONCE, THEN FROZEN. Each build composes the existing file with a new
+# residual, so rebuilding on every "Run all" changed the file every time --
+# and its content is part of the cache key, so the NEXT session could never
+# find a cache entry and re-ran every condition. Now: built when the order has
+# no file yet; set HF_RESPONSE_REBUILD = True for one deliberate refinement.
+HF_RESPONSE_REBUILD = False
+_hr_existing = hf_response_file(LEEPA)
+_hr_runs = []
+for _c in (selected_conditions() if 'selected_conditions' in globals()
+           else list(PIPELINE_RESULTS)):
+    _d, _prov = result_dir(LEEPA, _c)
+    if _d is not None and (Path(_d) / 'silver' / 'spectra_clean.csv').is_file():
+        _hr_runs.append(Path(_d))
+if _hr_existing is not None and not HF_RESPONSE_REBUILD:
+    print(f"  high-frequency response already built for {LEEPA} ({PLATE}): "
+          f"{_hr_existing}")
+    print("  kept as it is (frozen) -- set HF_RESPONSE_REBUILD = True to "
+          "refine it; the next run then re-evaluates every condition once.")
+elif len(_hr_runs) < 2:
+    print(f"  needs two or more conditions with results; found {len(_hr_runs)}")
+else:
+    _hr_out = (_CACHE_VOL / LEEPA / f'hf_response{PLATE_TAG}') if CACHE_WRITE else \
+        (Path(_TMP_BASE) / LEEPA / f'hf_response{PLATE_TAG}')
+    try:
+        _hr = hf_response.build(_hr_runs, _hr_out)
+        _bad = [r for r in _hr['validation']
+                if r['phase_sd_after_deg'] > 5 or r['card_step_after_pct'] > 5]
+        if _bad:
+            print("  NOT within the acceptance limits on: "
+                  + ", ".join(r['held_out'] for r in _bad)
+                  + " (phase sd <= 5 deg, card step <= 5 %) -- inspect before "
+                    "applying; set HF_RESPONSE = '' to keep it off")
+        print("  Re-run the pipeline cell: with HF_RESPONSE = 'auto' every "
+              "condition is re-evaluated with it.")
+    except Exception as _he:                               # noqa: BLE001
+        print(f"  high-frequency response not built: {_he}")
+
+# COMMAND ----------
+
+# DBTITLE 1,Card diagnostics against the Gamry — median Nyquist / Bode per card, card-to-Gamry transfer
+# ═══════════════════════════════════════════════════════════════════════════════
+# FOUR PLOTS THAT SEPARATE THE CARDS, THE CHAIN AND THE CELL (card_diagnostics.py)
+#   1-3  median Nyquist, |Z| and phase per card, with the Gamry whole cell
+#   4    card-to-Gamry transfer  Z_card-median / Z_Gamry
+# and, over all selected conditions, each card's transfer at every current:
+#   the same at every current        -> acquisition (card or chain)
+#   shared by every card             -> common to the chain / the comparison
+#   changing with current, by card   -> the cell's own spatial behaviour
+# It also prints the plate-minus-Gamry offset (100-3000 Hz): a real offset at
+# every current is series resistance in the voltage path (UC_SERIES_MOHM_CM2).
+# ═══════════════════════════════════════════════════════════════════════════════
+import card_diagnostics
+importlib.reload(card_diagnostics)
+_cd_runs = []
+for _c in (selected_conditions() if 'selected_conditions' in globals()
+           else list(PIPELINE_RESULTS)):
+    _d, _prov = result_dir(LEEPA, _c)
+    if _d is not None and (Path(_d) / 'silver' / 'spectra_clean.csv').is_file():
+        _cd_runs.append(Path(_d))
+if not _cd_runs:
+    print("  no results to plot -- run the pipeline cell first")
+else:
+    _cd_out = Path(_TMP_BASE) / LEEPA / 'card_diagnostics'
+    _cd = card_diagnostics.build(_cd_runs, _cd_out)
+    _imgs = {Path(p).stem.replace('cards_', ''): viewers.img_html(p)
+             for p in _cd['figures']}
+    displayHTML(viewers.by_condition(
+        _imgs, title=f'Leepa {LEEPA} — card diagnostics against the Gamry '
+                     f'(cross_current: every card at every current)'))
+    for _d in viewer_dirs():
+        try:
+            import shutil
+            shutil.copytree(_cd_out, Path(_d).parent / 'card_diagnostics',
+                            dirs_exist_ok=True)
+        except Exception:                                  # noqa: BLE001
+            pass
+
+# COMMAND ----------
+
+# DBTITLE 1,Via resistance vs temperature per card (Abgleich DC calibration)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Each segment's current is the voltage drop over its vias, amplified. The
+# Abgleich DC calibration (Step1_20Grad .. Step5_90Grad, Step6_20Grad back)
+# gives, per segment, the slope k = du/di at 20..90 degC: proportional to the
+# via resistance. Plotted per card, with the operating temperatures of the
+# runs below shaded.
+#
+# Why it matters for the current density: j = u / K(T), so a via whose real
+# temperature differs from the one the pipeline assumes for it (interpolated
+# from T1..T4) shifts j by -alpha per kelvin (alpha ~ 0.39 %/K, copper) and
+# every impedance of that segment by +alpha per kelvin.
+# Needs ABGLEICH_DIR (set in the "Chain response" cell).
+# ═══════════════════════════════════════════════════════════════════════════════
+if not skip_for_csv('via resistance (Abgleich)'):
+    from IPython.display import Image as IPImage
+    importlib.reload(via_resistance)
+
+    _ab = globals().get('ABGLEICH_DIR') or ''
+    if not _ab or not Path(_ab).is_dir():
+        print("  ABGLEICH_DIR is not set -- run the 'Chain response' cell first "
+              "(it finds the Abgleich folder), or set ABGLEICH_DIR to the folder "
+              "that holds Step1_20Grad.csv and coefficients/.")
+    else:
+        _via_runs = [Path(pr['out_dir']) for pr in PIPELINE_RESULTS.values()
+                     if pr and pr.get('out_dir')]
+        _via_out = _TMP_BASE / LEEPA / 'via_resistance'
+        _via = via_resistance.run(_ab, _via_runs, out_dir=_via_out)
+        for _png in ('via_vs_temperature.png', 'via_alpha.png'):
+            if (_via_out / _png).is_file():
+                display(IPImage(filename=str(_via_out / _png)))
+        print(f"  written to {_via_out}")
+
+
+# COMMAND ----------
+
+# DBTITLE 1,Nyquist / Bode — Condition and View drop-downs
+# ═══════════════════════════════════════════════════════════════════════════════
+# INTERACTIVE NYQUIST + BODE PER CONDITION
+# One plot: Condition and View (Nyquist, |Z|, phase) drop-downs. FAMOS and CSV
+# runs alike -- both write silver/spectra_clean.csv in mΩ·cm².
+#
+# NYQUIST_COLOUR
+#   'flow'     each segment coloured by its place on the air path, cathode
+#              inlet (dark blue) -> cathode outlet (dark red), jet scale with
+#              a colour bar -- a drying / flooding gradient along the channel
+#              shows as a colour trend through the arcs
+#   'segment'  one hue per segment (the old look)
+# Segments rebuilt from neighbours are drawn dotted grey. Every finite point
+# silver accepted is shown; nothing is filtered for display.
+#
+# THE GAMRY, BLACK, IN EVERY VIEW (Nyquist, |Z|, phase): the condition's
+# whole-cell sweep with every point of the .dta at the frequency the file
+# gives (gamry_spectra) -- no band limit, nothing interpolated or removed --
+# so any segment can be read against it. Click a legend entry to hide one.
+#
+# The run already saved the same plot per condition (gold/nyquist.html and
+# gold/nyquist.png); this cell also saves the selector itself as
+# viewers/nyquist.html next to the cached results (save_viewer).
+# ═══════════════════════════════════════════════════════════════════════════════
+NYQUIST_COLOUR = 'flow'
+
+try:
+    GAMRY_SPECTRA = ({} if str(globals().get('SOURCE_FORMAT', 'famos')).lower() == 'csv'
+                     else gamry_spectra(LEEPA))
+except Exception as _ge:                                   # noqa: BLE001
+    print(f"  Gamry sweeps not read ({_ge}) -- segments only")
+    GAMRY_SPECTRA = {}
+
+_nyq_figs = {}
+for cond, pr in PIPELINE_RESULTS.items():
+    if pr is None:
+        continue
+    out_dir = Path(pr['out_dir'])
+    _spectra_path = spectra_csv(out_dir)
+    if _spectra_path is None or not Path(_spectra_path).exists():
+        _png = maps_dir(out_dir) / 'nyquist.png'
+        if _png.exists():
+            print(f"  {cond}: no spectra table, showing gold/nyquist.png")
+            _nyq_figs[cond] = viewers.img_html(_png)
+        else:
+            print(f"  {cond}: no spectra found")
+        continue
+    df = pd.read_csv(_spectra_path)
+    _rec_path = out_dir / 'silver' / 'spectra_reconstructed.csv'
+    _rec = pd.read_csv(_rec_path) if _rec_path.exists() else None
+    _src = (f"CSV {CSV_FOLDERS[cond].name}" if SOURCE_FORMAT == 'csv'
+            and cond in CSV_FOLDERS else f"Leepa {LEEPA}")
+    _nyq_figs[cond] = nyquist.figure(
+        df, title=f"Local EIS — {_src}, {cond}", colour=NYQUIST_COLOUR,
+        rebuilt=_rec, gamry=GAMRY_SPECTRA.get(cond),
+        gamry_name=f"Gamry {cond}")
+    print(f"  {cond}: {df['segment'].nunique()} segments plotted"
+          + (f" + {_rec['segment'].nunique()} rebuilt from neighbours"
+             if _rec is not None and len(_rec) else ""))
+
+# ONE plot: pick the condition and the view (Nyquist, |Z|, phase)
+show_by_condition(_nyq_figs, title=f'Local EIS spectra — {LEEPA}',
+                  note=('colour: position along the air path, cathode inlet '
+                        '(blue) -> cathode outlet (red)'
+                        if NYQUIST_COLOUR == 'flow' else ''),
+                  save='nyquist')
+
+# COMMAND ----------
+
+# DBTITLE 1,Gamry vs pipeline aggregate — Condition and View drop-downs
+# ═══════════════════════════════════════════════════════════════════════════════
+# THE AGGREGATE OF THE SEGMENTS AGAINST THE WHOLE-CELL GAMRY
+# Two curves, nothing else (no segments, no rebuilt ones):
+#   red    the aggregate of the segments in parallel, silver/cell_aggregate.csv
+#          of the selected run, exactly as the pipeline wrote it
+#   black  the condition's Gamry sweep, EVERY point of the .dta at the
+#          frequency in the file (0.4783 Hz is 0.4783 Hz) -- no band limit,
+#          no interpolation onto the local grid, no inductance removed,
+#          nothing rescaled (gamry_spectra / nyquist.gamry_frame)
+# Views: Nyquist, |Z| and phase. Hover shows f with 5 significant digits.
+# The numbers of the comparison (|Z| and phase difference per frequency) are
+# in the run's gamry_comparison.csv / gamry_comparison_curves.csv.
+# ═══════════════════════════════════════════════════════════════════════════════
+if not skip_for_csv('Gamry vs aggregate'):
+    try:
+        _LEEPA = LEEPA
+    except NameError:
+        _LEEPA = dbutils.widgets.get('order')
+
+    # every Gamry point of this order, as recorded
+    _gamry = globals().get('GAMRY_SPECTRA') or gamry_spectra(_LEEPA)
+    if not _gamry:
+        print(f"  no Gamry sweep found for order {_LEEPA} "
+              f"(searched: {', '.join(map(str, gamry_search_roots(_LEEPA)))})")
+
+    def _load_aggregate(leepa, cond):
+        """(aggregate DataFrame, run folder, provenance, area coverage) of the
+        run result_dir() selects -- the same run the maps and Nyquist show."""
+        d, prov = result_dir(leepa, cond)
+        if d is None:
+            return None, None, prov, None
+        ap = Path(d) / 'silver' / 'cell_aggregate.csv'
+        if not ap.exists():
+            return None, d, f'{prov} (no silver/cell_aggregate.csv in it)', None
+        agg = pd.read_csv(ap)
+        cov = (float(np.nanmedian(agg['area_coverage']))
+               if 'area_coverage' in agg.columns else None)
+        return agg, d, prov, cov
+
+    try:
+        _conds = selected_conditions()
+    except NameError:
+        _conds = list(PIPELINE_RESULTS)
+
+    _ov_figs = {}
+    for cond in _conds:
+        agg_df, src, _prov, _cov = _load_aggregate(_LEEPA, cond)
+        g = _gamry.get(cond)
+        if agg_df is None and g is None:
+            print(f"  {cond}: no aggregate ({_prov}) and no Gamry sweep")
+            continue
+        _note = ('' if _cov is None else
+                 f'aggregate covers {100 * _cov:.0f} % of the plate area')
+        _ov_figs[cond] = nyquist.comparison_figure(
+            agg_df, g, title=f'Leepa {_LEEPA} / {cond}: aggregate of the '
+                             f'segments vs Gamry {cond}',
+            gamry_name=f'Gamry {cond}', note=_note)
+        print(f"  {cond}: aggregate {0 if agg_df is None else len(agg_df)} "
+              f"frequencies ({_prov}: {src}); Gamry "
+              f"{'none' if g is None else f'{len(g)} points, {g.freq_hz.min():.4g}–{g.freq_hz.max():.5g} Hz'}")
+
+    # ONE plot: pick the condition and the view (Nyquist, |Z|, phase)
+    show_by_condition(_ov_figs, title=f'Gamry vs pipeline aggregate — Leepa {_LEEPA}',
+                      save='gamry_vs_aggregate')
+
+# COMMAND ----------
+
+# DBTITLE 1,Plate heat maps — Condition / Parameter / View
+# ═══════════════════════════════════════════════════════════════════════════════
+# PLATE HEAT MAPS — ONE plot, chosen from three drop-downs:
+#   Condition   the conditions the widgets selected (never others)
+#   Parameter   HFR, Re Z at 1 kHz, R_ct, R_mt, R_pol, current density,
+#               |Z| and phase at 100 Hz, temperature, chain lag
+#   View        "2D spatial (interpolated)": linear interpolation between the
+#               segment centres, a square on every measured segment, parula
+#               with a soft gloss -- the bench's MATLAB layout;
+#               "Values per segment": every segment filled, value printed
+# Hover any square / segment for its number and value. Colour scales are the
+# fixed per-parameter scales of config.HEATMAP_LIMITS.
+#
+# WRITE_STATIC_MAPS writes the thesis PNGs into each run's gold folder WITHOUT
+# displaying them: the 2D interpolated maps (plate_<param>_interp.png) with
+# HEATMAP_STYLE = 'interpolated' (the default), the numbered segment maps
+# (plate_<param>.png) with 'segments', both with 'both'. The selector itself
+# is saved as viewers/plate_maps.html.
+# ═══════════════════════════════════════════════════════════════════════════════
+import numpy as np
+import pandas as pd
+from pathlib import Path
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+WRITE_STATIC_MAPS = True
+_SNR = f'{MIN_SNR_DB:g}'
+
+# ── widgets ───────────────────────────────────────────────────────────────────
+# _widget, result_dir, selected_conditions and describe_source all live in the
+# widgets / Run Dashboard cells now. This cell used to carry its own copy of
+# the first one and its own idea of where results live, which is precisely how
+# it drifted away from the run cell and started showing another condition.
+_LEEPA = str(LEEPA)   # the order, or csv_<folder> for CSV
+# The SNR PRINTED must be the SNR LOOKED UP, or the heading is decoration.
+# Both are MIN_SNR_DB, the value the run cell built its config from.
+_SNR = f'{MIN_SNR_DB:g}'
+
+# _snr_dir_names, _find_gold_csv and _available_snrs used to live here. They
+# encoded the cache layout a second time, and a second copy of a path shape is
+# a copy that goes stale: the run cell now writes
+# <cond>/mode_<mode>/snr_<v>_<digest>/, which none of them knew about. The one
+# implementation is _cache_dir(), reached through result_dir().
+
+
+# ── which conditions, and which CSV for each ─────────────────────────────────
+# ONLY the conditions the widgets asked for. Never "everything on the Volume".
+_COND_GOLD: dict[str, tuple[Path, str]] = {}
+_MISSING: list[str] = []
+
+print(f'  plate {_LEEPA}   SNR {_SNR or "(not set)"}   '
+      f'mode {EVALUATION_MODE}   selected: {", ".join(selected_conditions())}')
+
+for cond in selected_conditions():
+    _d, _prov = result_dir(_LEEPA, cond)
+    print(describe_source(cond, _d, _prov))
+    if _d is None:
+        _MISSING.append(cond)
+        continue
+    _csv = None
+    for _rel in ('gold/plate_summary.csv', 'plate_summary.csv'):
+        if (_d / _rel).is_file():
+            _csv = _d / _rel
+            break
+    if _csv is None:
+        _hits = sorted(Path(_d).rglob('plate_summary.csv'))
+        _csv = _hits[0] if _hits else None
+    if _csv is None:
+        print(f'    no plate_summary.csv here -- gold did not run, or '
+              f'stop_after was set below gold')
+        _MISSING.append(cond)
+        continue
+    _COND_GOLD[cond] = (_csv, _prov)
+
+if _MISSING:
+    print(f'\n  No map drawn for: {", ".join(_MISSING)}. Nothing else is '
+          f'shown in their place -- a map from a condition you did not select '
+          f'is worse than no map.')
+if not _COND_GOLD:
+    print('  Run the pipeline cell for this condition, mode and SNR first.')
+
+
+_title = (f'{_LEEPA} / SNR {_SNR or "default"}'
+          f' — {geom.plate(PLATE).title}')   # the plate the maps are drawn on
+_maps_html = viewers.plate_maps(
+    {c: csv for c, (csv, _p) in sorted(_COND_GOLD.items(),
+                                       key=lambda kv: condition_sort_key(kv[0]))},
+    title=_title)
+displayHTML(_maps_html)
+# the same viewer (Condition / Parameter / View) as viewers/plate_maps.html
+if _COND_GOLD:
+    save_viewer(_maps_html, 'plate_maps', f'Plate maps — {_title}')
+
+if WRITE_STATIC_MAPS:
+    for cond, (gold_csv, prov) in sorted(_COND_GOLD.items(),
+                                         key=lambda kv: condition_sort_key(kv[0])):
+        _flds = viewers.plate_fields(gold_csv)
+        _classes = _flds[0].classes if _flds else {}
+        for fd in _flds:
+            for _rd in plate_figure.renders(HEATMAP_STYLE):
+                fig = plate_figure.draw_flow_plate(
+                    fd.values, fd.key, classes=_classes, label=fd.label,
+                    unit=fd.unit, decimals=fd.decimals, render=_rd,
+                    title=f'{_LEEPA} / {cond} / SNR {_SNR or "default"}')
+                fig.savefig(str(gold_csv.parent / f'plate_{fd.key}{plate_figure.suffix(_rd)}.png'),
+                            dpi=200, bbox_inches='tight', facecolor=fig.get_facecolor())
+                plt.close(fig)
+        print(f'  {cond}: static maps written to {gold_csv.parent}')
+
+# COMMAND ----------
+
+# DBTITLE 1,MF4 Test-Stand Parameters: all channels for the selected order
+# ═══════════════════════════════════════════════════════════════════════════════
+# MF4 TEST-STAND PARAMETERS — every recorded channel for the selected order
+#
+# Reads the .mf4 measurement file(s) from the Gamry Volume, filters by the
+# selected Leepa order ID, and draws ONE interactive figure (bench_plots.py):
+#
+#   * the "parameter" dropdown (top right) picks what is drawn: a single
+#     parameter, e.g. "Temperature · Coolant inlet (T_Si_CL)", or a whole
+#     group that shares a unit, e.g. "Temperature — all [°C]"
+#       1. Electrical  (voltage, current, power, HFR)
+#       2. Temperature (inlet/outlet anode, cathode, coolant)
+#       3. Flow rates  (H2, air, N2, coolant)
+#       4. Pressure    (inlet/outlet anode, cathode, coolant)
+#       5. Humidity    (RH anode/cathode, dew points)
+#       6. Other channels in the file (MF4_INCLUDE_ALL_CHANNELS)
+#   * the legend toggles: click an entry to hide/show it, double-click to see
+#     it alone
+#   * move the cursor over the plot to read every visible value at that time;
+#     drag the range slider under it to zoom in time
+#
+# The FAMOS plate temperature sensors (temp1..temp4, from bronze for each
+# selected condition) are drawn as dotted reference lines on every °C view,
+# so the plate temperature can be read against the bench's coolant and gas
+# temperatures directly. temp1 sits at x = 0 (H2-inlet / air-outlet end),
+# temp4 at x = 252 mm (air-inlet and coolant-inlet end) -- see
+# config.COOLANT_INLET_END.
+# ═══════════════════════════════════════════════════════════════════════════════
+if not skip_for_csv('MF4 test-stand parameters'):
+    try:
+        import asammdf  # noqa: F401
+    except ImportError:
+        import subprocess, sys
+        subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q', 'asammdf', 'zstandard'])
+
+    import json
+    from pathlib import Path
+
+    import bench_plots
+
+    _MF4_DIR = Path('/Volumes/ps_xplatform_dev/rvadvtec_dev/ev_rvadvtec_dev/Gamry')
+    _LEEPA_MF4 = str(_widget('leepa_id', 'LEEPA', 'leepa'))
+    MF4_INCLUDE_ALL_CHANNELS = True   # False: only the channels in the groups above
+    MF4_MAX_POINTS = 3000             # per channel; min/max kept, spikes survive
+
+    # ── Find MF4 files for the selected order ─────────────────────────────────────
+    _mf4_files = sorted(
+        [f for f in _MF4_DIR.glob('*.mf4') if f'RO{_LEEPA_MF4}' in f.name]
+        + [f for f in _MF4_DIR.glob('*.MF4') if f'RO{_LEEPA_MF4}' in f.name]
+    )
+
+    if not _mf4_files:
+        print(f'  No MF4 files found for order {_LEEPA_MF4} in {_MF4_DIR}')
+    else:
+        print(f'  Order {_LEEPA_MF4}: {len(_mf4_files)} MF4 file(s)')
+        for _f in _mf4_files:
+            print(f'    {_f.name}  ({_f.stat().st_size / 1e6:.1f} MB)')
+
+        # Use the LARGEST file (the main measurement, not Anfang/Ende snapshots)
+        _main_mf4 = max(_mf4_files, key=lambda f: f.stat().st_size)
+        print(f'\n  Reading: {_main_mf4.name}')
+        _t0 = bench_plots.mf4_start_time(_main_mf4)
+
+        _chans = bench_plots.read_mf4(_main_mf4,
+                                      include_others=MF4_INCLUDE_ALL_CHANNELS,
+                                      max_points=MF4_MAX_POINTS)
+        _by_group = {}
+        for _c in _chans:
+            _by_group.setdefault(_c.group, []).append(_c.name)
+        for _g, _names in _by_group.items():
+            print(f'  {_g}: {len(_names)} channel(s)')
+        _wanted = {n for _g in bench_plots.CHANNEL_GROUPS.values() for n, _, _ in _g}
+        _absent = sorted(_wanted - {c.name for c in _chans})
+        if _absent:
+            print(f'  not in this file: {", ".join(_absent)}')
+
+        # ── FAMOS plate sensors for the selected condition(s), as °C references ──
+        _refs = []
+        for _cond in selected_conditions():
+            try:
+                _d, _ = result_dir(_LEEPA_MF4, _cond)
+                _man = Path(_d) / 'bronze' / 'bronze_manifest.json' if _d else None
+                _sens = (json.loads(_man.read_text()).get('sensor_T_degC', {})
+                         if _man is not None and _man.is_file() else {})
+            except Exception as _e:                                # noqa: BLE001
+                _sens = {}
+            for _k in sorted(_sens):
+                _x = geom.TEMP_SENSOR_X_MM.get(_k)
+                _refs.append((f'FAMOS {_k} ({_x:.0f} mm) — {_cond}'
+                              if _x is not None else f'FAMOS {_k} — {_cond}',
+                              '°C', float(_sens[_k])))
+        if _refs:
+            print(f'  FAMOS plate sensors overlaid: {len(_refs)} line(s) '
+                  f'({", ".join(selected_conditions())})')
+
+        _fig = bench_plots.bench_figure(
+            _chans, start='Temperature', reference_lines=_refs,
+            title=(f'{_LEEPA_MF4} — {_main_mf4.name}'
+                   + (f' (start {_t0:%Y-%m-%d %H:%M:%S})' if _t0 else '')))
+        displayHTML(_fig.to_html(full_html=False, include_plotlyjs='cdn'))
+        print(f'\n  Done — {_main_mf4.name}: {len(_chans)} channels; pick one in '
+              f'the "parameter" dropdown, click legend entries to toggle them')
+
+# COMMAND ----------
+
+# DBTITLE 1,ECM Fitting: Rs + L + (Rct1 || CPE1) + (Rct2 || CPE2)
+# ═══════════════════════════════════════════════════════════════════════════════
+# ECM FIT — every segment and the whole-cell aggregate, in ONE figure
+#
+# Model:  Z(f) = Rs + jwL + sum_k  R_k / (1 + (jw*tau_k)^n_k)
+#
+# Parameterised by tau, not by the CPE admittance Y0.  The two forms are the
+# same circuit (Y0 = tau^n / R), but with Y0 the three parameters of an arc
+# trade against each other over six decades and the optimiser walks a curved
+# valley to a false optimum that still reports success=True.  With tau each
+# arc has a location, a size and a shape, and two arcs whose taus differ by
+# decades actually separate.
+#
+# The arc count is chosen by AICc rather than fixed at two: fitting two arcs
+# to a one-arc spectrum splits one relaxation into two coincident halves
+# whose individual R and tau mean nothing while their SUM still looks fine.
+#
+# This is csv_pipeline.choose_n_arcs — the fitter the pipeline itself uses,
+# so the notebook and gold/plate_summary.csv report the same numbers.
+# ═══════════════════════════════════════════════════════════════════════════════
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from pathlib import Path
+ 
+import csv_pipeline as _cp
+import standard_eis as _se
+
+# THE STANDARD FIT, the same one the pipeline's maps use (standard_eis.py):
+# R_ohmic from the high-frequency intercept, then R_ohmic + jwL +
+# (R_ct||CPE) + (R_mt||CPE) by complex non-linear least squares.
+_Z_MODEL = _cp.z_model          # same circuit and parameter order
+_CHOOSE  = _se.choose_n_arcs
+ 
+ 
+def _p_vector(res):
+    """params dict -> the flat vector z_model expects."""
+    p = res["params"]
+    v = [p["Rs"], p["L"]]
+    for k in range(res["n_arcs"]):
+        v += [p[f"R{k+1}"], p[f"tau{k+1}"], p[f"n{k+1}"]]
+    return np.asarray(v, float)
+ 
+ 
+def _fit_one(f_hz, Z_mohm, sigma_rel=None):
+    """Fit one spectrum given in mOhm.cm2.  Returns everything the plots need."""
+    f = np.asarray(f_hz, float)
+    Z = np.asarray(Z_mohm, complex)
+    keep = np.isfinite(f) & np.isfinite(Z.real) & np.isfinite(Z.imag) & (f > 0)
+    f, Z = f[keep], Z[keep]
+    if sigma_rel is not None:
+        sigma_rel = np.asarray(sigma_rel, float)[keep]
+    if str(globals().get('SOURCE_FORMAT', 'famos')) == 'csv':
+        # The bench tool's spectra loop back towards Z' = 0 above the HFR
+        # intercept (~2 kHz) -- the measuring chain, not the cell. Fit the
+        # capacitive band only, as the CSV pipeline does.
+        _k = csv_pipeline.capacitive_band(f, Z)
+        f, Z = f[_k], Z[_k]
+        if sigma_rel is not None:
+            sigma_rel = sigma_rel[_k]
+    if f.size < 6:
+        return {"ok": False, "reason": f"{f.size} usable points"}
+ 
+    r = _CHOOSE(f, Z / 1000.0, sigma_rel)          # fitter works in Ohm.cm2
+    if not r.get("ok"):
+        return r
+ 
+    pv = _p_vector(r)
+    r["freq"] = f
+    r["Z_meas"] = Z
+    r["Z_fit"] = 1000.0 * _Z_MODEL(pv, f, r["n_arcs"])
+    # Smooth curve for the Nyquist line: the measured grid is too coarse to
+    # draw an arc, and a polyline through 25 points is not the model.
+    f_s = np.logspace(np.log10(f.min()), np.log10(f.max()), 400)
+    r["freq_smooth"] = f_s
+    r["Z_fit_smooth"] = 1000.0 * _Z_MODEL(pv, f_s, r["n_arcs"])
+    r["res_pct"] = 100.0 * np.abs(Z - r["Z_fit"]) / np.abs(Z)
+    return r
+ 
+ 
+# ─── Fit every segment + the aggregate, per condition ───
+ECM_ALL = {}        # {cond: {'segments': {seg: res}, 'aggregate': res|None}}
+ 
+for cond, pr in PIPELINE_RESULTS.items():
+    if pr is None:
+        continue
+    out_dir = Path(pr['out_dir'])
+    sp_path = spectra_csv(out_dir)
+    if sp_path is None or not Path(sp_path).exists():
+        print(f"  {cond}: no spectra_clean.csv -> skip ECM")
+        continue
+ 
+    df = pd.read_csv(sp_path)
+    seg_fits, failed = {}, {}
+    for seg in sorted(df['segment'].unique(), key=int):
+        sd = df[df['segment'] == seg].sort_values('freq_hz')
+        sig = sd['sigma_rel'].values if 'sigma_rel' in sd.columns else None
+        r = _fit_one(sd['freq_hz'].values,
+                     sd['z_re_mohm_cm2'].values + 1j * sd['z_im_mohm_cm2'].values,
+                     sig)
+        if r.get("ok"):
+            seg_fits[int(seg)] = r
+        else:
+            failed[int(seg)] = r.get("reason", "?")
+ 
+    # ── whole-cell aggregate: Z_cell = A_cell / sum_s (A_s / Z_s) ──
+    agg_fit = None
+    for _cand in (out_dir / 'silver' / 'cell_aggregate.csv',
+                  out_dir / 'csv' / 'cell_aggregate.csv'):
+        if _cand.exists():
+            ad = pd.read_csv(_cand).sort_values('freq_hz')
+            agg_fit = _fit_one(ad['freq_hz'].values,
+                               ad['z_re_mohm_cm2'].values + 1j * ad['z_im_mohm_cm2'].values)
+            if not agg_fit.get("ok"):
+                print(f"  {cond}: aggregate fit failed — {agg_fit.get('reason')}")
+                agg_fit = None
+            break
+    else:
+        print(f"  {cond}: no cell_aggregate.csv — run at least the silver stage")
+ 
+    ECM_ALL[cond] = {'segments': seg_fits, 'aggregate': agg_fit}
+ 
+    n1 = sum(1 for r in seg_fits.values() if r['n_arcs'] == 1)
+    good = [r for r in seg_fits.values() if r['verdict'] == 'good']
+    print(f"  {cond}: {len(seg_fits)}/{len(seg_fits)+len(failed)} segments fitted "
+          f"({n1} one-arc, {len(seg_fits)-n1} two-arc), "
+          f"{len(good)} with a fit residual ≤ 3 %")
+    if failed:
+        print(f"      not fitted: {failed}")
+
+# COMMAND ----------
+
+# DBTITLE 1,ECM fit per segment — Condition and View drop-downs
+# ═══════════════════════════════════════════════════════════════════════════════
+# ONE figure per condition.  The dropdown picks what is drawn:
+#   "All segments"  — every segment overlaid, colour-graded by Rs
+#   "Aggregate"     — the whole-cell parallel sum and its own overall ECM fit
+#   "Seg N"         — one segment, its fit, and its residual trace
+# Left panel: Nyquist (measured markers + fitted line).
+# Right panel: |dZ|/|Z| against frequency, with the 2 % and 5 % guides.
+# ═══════════════════════════════════════════════════════════════════════════════
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import numpy as np
+ 
+try:
+    import plotly.express as _px
+    _SEQ = _px.colors.sequential.Viridis
+except Exception:
+    _SEQ = ['#440154', '#3b528b', '#21918c', '#5ec962', '#fde725']
+ 
+ 
+def _grade(v, lo, hi):
+    """Pick a colour from the sequential ramp for value v."""
+    if not np.isfinite(v) or hi <= lo:
+        return _SEQ[len(_SEQ) // 2]
+    t = min(max((v - lo) / (hi - lo), 0.0), 1.0)
+    return _SEQ[int(round(t * (len(_SEQ) - 1)))]
+ 
+ 
+_ecm_figs = {}
+for cond, blob in ECM_ALL.items():
+    seg_fits, agg_fit = blob['segments'], blob['aggregate']
+    if not seg_fits and agg_fit is None:
+        continue
+ 
+    segs = sorted(seg_fits)
+    rs_all = [seg_fits[s]['params']['Rs'] * 1000 for s in segs]
+    rs_lo, rs_hi = (np.percentile(rs_all, [5, 95]) if rs_all else (0, 1))
+ 
+    fig = make_subplots(
+        rows=1, cols=2, column_widths=[0.56, 0.44],
+        subplot_titles=['Nyquist — measured vs ECM', 'Residual |ΔZ|/|Z|'],
+        horizontal_spacing=0.09)
+ 
+    # trace_owner[i] = 'seg:<n>' | 'agg' — used to build the dropdown masks
+    owner = []
+ 
+    def _add(o, tr, row, col):
+        fig.add_trace(tr, row=row, col=col)
+        owner.append(o)
+ 
+    for s in segs:
+        r = seg_fits[s]
+        clr = _grade(r['params']['Rs'] * 1000, rs_lo, rs_hi)
+        tag = f"{r['n_arcs']} arc, fit rms {r.get('rms_pct', float('nan')):.1f} %"
+        _add(f'seg:{s}', go.Scatter(
+            x=r['Z_meas'].real, y=-r['Z_meas'].imag, mode='markers',
+            marker=dict(size=5, color=clr, opacity=0.75,
+                        line=dict(width=0.4, color='#333')),
+            name=f'Seg {s}', legendgroup=f'seg{s}', showlegend=True,
+            hovertemplate=(f'<b>Seg {s}</b> ({tag})<br>'
+                           "Z'=%{x:.1f}<br>-Z''=%{y:.1f} mΩ·cm²<extra></extra>")),
+            1, 1)
+        _add(f'seg:{s}', go.Scatter(
+            x=r['Z_fit_smooth'].real, y=-r['Z_fit_smooth'].imag, mode='lines',
+            line=dict(color=clr, width=1.6),
+            name=f'Seg {s} fit', legendgroup=f'seg{s}', showlegend=False,
+            hoverinfo='skip'), 1, 1)
+        _add(f'seg:{s}', go.Scatter(
+            x=r['freq'], y=r['res_pct'], mode='lines+markers',
+            marker=dict(size=3, color=clr), line=dict(width=1, color=clr),
+            name=f'Seg {s} res', legendgroup=f'seg{s}', showlegend=False,
+            hovertemplate=f'Seg {s}<br>f=%{{x:.3g}} Hz<br>|res|=%{{y:.2f}} %<extra></extra>'),
+            1, 2)
+ 
+    if agg_fit is not None:
+        a = agg_fit
+        atag = (f"{a['n_arcs']} arc, fit rms {a.get('rms_pct', float('nan')):.1f} %, "
+                f"Rs={a['params']['Rs']*1000:.1f} mΩ·cm²")
+        _add('agg', go.Scatter(
+            x=a['Z_meas'].real, y=-a['Z_meas'].imag, mode='markers',
+            marker=dict(size=8, color='#c0392b', symbol='circle-open',
+                        line=dict(width=2)),
+            name='Aggregate (whole cell)', legendgroup='agg',
+            hovertemplate=("<b>Aggregate</b><br>Z'=%{x:.1f}<br>"
+                           "-Z''=%{y:.1f} mΩ·cm²<extra></extra>")), 1, 1)
+        _add('agg', go.Scatter(
+            x=a['Z_fit_smooth'].real, y=-a['Z_fit_smooth'].imag, mode='lines',
+            line=dict(color='#111', width=3),
+            name=f'Overall ECM fit — {atag}', legendgroup='agg',
+            hoverinfo='skip'), 1, 1)
+        _add('agg', go.Scatter(
+            x=a['freq'], y=a['res_pct'], mode='lines+markers',
+            marker=dict(size=5, color='#c0392b'),
+            line=dict(width=2, color='#c0392b'),
+            name='Aggregate res', legendgroup='agg', showlegend=False,
+            hovertemplate='Aggregate<br>f=%{x:.3g} Hz<br>|res|=%{y:.2f} %<extra></extra>'),
+            1, 2)
+ 
+    owner = np.array(owner)
+ 
+    # ─── Dropdown ───
+    def _mask(pred):
+        return [bool(pred(o)) for o in owner]
+ 
+    buttons = [
+        dict(label=f'All segments ({len(segs)})', method='update',
+             args=[{'visible': _mask(lambda o: o.startswith('seg:'))},
+                   {'title.text': f'<b>ECM fit — all {len(segs)} segments — '
+                                  f'Leepa {LEEPA}, {cond}</b>'}]),
+        dict(label='All segments + aggregate', method='update',
+             args=[{'visible': _mask(lambda o: True)},
+                   {'title.text': f'<b>ECM fit — all segments + whole-cell '
+                                  f'aggregate — Leepa {LEEPA}, {cond}</b>'}]),
+    ]
+    if agg_fit is not None:
+        a = agg_fit
+        p = a['params']
+        arcs = ', '.join(f"R{k+1}={p[f'R{k+1}']*1000:.1f} τ{k+1}={p[f'tau{k+1}']*1e3:.3g} ms "
+                         f"n{k+1}={p[f'n{k+1}']:.2f}" for k in range(a['n_arcs']))
+        buttons.append(dict(
+            label='Aggregate only (overall fit)', method='update',
+            args=[{'visible': _mask(lambda o: o == 'agg')},
+                  {'title.text': f'<b>Overall ECM fit — whole-cell aggregate — '
+                                 f'Leepa {LEEPA}, {cond}</b><br>'
+                                 f'<sup>Rs={p["Rs"]*1000:.1f} mΩ·cm², {arcs}, '
+                                 f'fit rms {a.get("rms_pct", float("nan")):.1f} % ({a["verdict"]})</sup>'}]))
+    for s in segs:
+        r = seg_fits[s]
+        p = r['params']
+        arcs = ', '.join(f"R{k+1}={p[f'R{k+1}']*1000:.1f} mΩ·cm² "
+                         f"τ{k+1}={p[f'tau{k+1}']*1e3:.3g} ms n{k+1}={p[f'n{k+1}']:.2f}"
+                         for k in range(r['n_arcs']))
+        buttons.append(dict(
+            label=f'Seg {s}', method='update',
+            args=[{'visible': _mask(lambda o, s=s: o == f'seg:{s}')},
+                  {'title.text': f'<b>ECM fit — segment {s} — Leepa {LEEPA}, '
+                                 f'{cond}</b><br><sup>Rs={p["Rs"]*1000:.1f} mΩ·cm², '
+                                 f'{arcs}, fit rms {r.get("rms_pct", float("nan")):.1f} % ({r["verdict"]})</sup>'}]))
+ 
+    fig.add_hline(y=2, line=dict(color='green', dash='dash', width=1), row=1, col=2)
+    fig.add_hline(y=5, line=dict(color='orange', dash='dash', width=1), row=1, col=2)
+ 
+    fig.update_xaxes(title_text="Z' [mΩ·cm²]", showgrid=True, gridcolor='#eee',
+                     row=1, col=1)
+    fig.update_yaxes(title_text="-Z'' [mΩ·cm²]", showgrid=True, gridcolor='#eee',
+                     scaleanchor='x', scaleratio=1, row=1, col=1)
+    fig.update_xaxes(title_text='f [Hz]', type='log', showgrid=True,
+                     gridcolor='#eee', row=1, col=2)
+    fig.update_yaxes(title_text='|ΔZ|/|Z| [%]', rangemode='tozero',
+                     showgrid=True, gridcolor='#eee', row=1, col=2)
+ 
+    fig.update_layout(
+        title=dict(text=f'<b>ECM fit — all {len(segs)} segments — '
+                        f'Leepa {LEEPA}, {cond}</b>'),
+        height=680, width=1500, paper_bgcolor='white', plot_bgcolor='white',
+        hovermode='closest', margin=dict(t=130, r=250),
+        legend=dict(font=dict(size=9), y=0.5, yanchor='middle',
+                    tracegroupgap=0),
+        updatemenus=[dict(buttons=buttons, direction='down', showactive=True,
+                          x=0.0, xanchor='left', y=1.16, yanchor='top',
+                          bgcolor='white', bordercolor='#999')])
+ 
+    # start on "All segments"
+    for i, o in enumerate(owner):
+        fig.data[i].visible = o.startswith('seg:')
+ 
+    _ecm_figs[cond] = fig
+
+show_by_condition(_ecm_figs, title=f'ECM fit per segment — Leepa {LEEPA}')
+
+# COMMAND ----------
+
+# DBTITLE 1,Overall ECM fit on the aggregate impedance (Nyquist + Bode + residual)
+# ═══════════════════════════════════════════════════════════════════════════════
+# The whole-cell aggregate with ONE overall ECM fit through it, in the same
+# 3-panel form as the Gamry validation cell so the two can be read side by
+# side.  The per-segment median is drawn beside it: an ECM fitted to the
+# aggregate is NOT the average of the segment ECMs — the segments combine in
+# parallel, so a spread in Rs pulls the aggregate below the mean — and seeing
+# the two together is the point.
+# ═══════════════════════════════════════════════════════════════════════════════
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+ 
+AGG_ECM = {}      # {cond: params dict in mOhm.cm2}
+ 
+_ecm_agg_figs = {}
+for cond, blob in ECM_ALL.items():
+    a = blob['aggregate']
+    if a is None:
+        print(f"  {cond}: no aggregate fit to show")
+        continue
+ 
+    p = a['params']
+    Zm, Zf = a['Z_meas'], a['Z_fit']
+    Zs, fs = a['Z_fit_smooth'], a['freq_smooth']
+    f = a['freq']
+ 
+    fig = make_subplots(rows=1, cols=3, horizontal_spacing=0.075,
+                        subplot_titles=['Nyquist', '|Z|(f)', 'Residual |ΔZ|/|Z|'])
+    MEAS, FIT = '#c0392b', '#111111'
+ 
+    fig.add_trace(go.Scatter(x=Zm.real, y=-Zm.imag, mode='markers',
+        marker=dict(size=7, color=MEAS), name='Aggregate (measured)',
+        hovertemplate="Z'=%{x:.1f}<br>-Z''=%{y:.1f} mΩ·cm²<extra></extra>"),
+        row=1, col=1)
+    fig.add_trace(go.Scatter(x=Zs.real, y=-Zs.imag, mode='lines',
+        line=dict(color=FIT, width=2.5), name='Overall ECM fit',
+        hoverinfo='skip'), row=1, col=1)
+    # Rs and Rs+R_pol markers: where the model says the arc starts and ends
+    _rs, _rpol = p['Rs'] * 1000, a['R_pol'] * 1000
+    fig.add_trace(go.Scatter(x=[_rs, _rs + _rpol], y=[0, 0], mode='markers',
+        marker=dict(symbol='star', size=13, color='#1f77b4'),
+        name=f'Rs={_rs:.1f} · Rs+Rpol={_rs+_rpol:.1f}'), row=1, col=1)
+ 
+    # |Z| Bode, measured points against the fitted curve
+    fig.add_trace(go.Scatter(x=f, y=np.abs(Zm), mode='markers',
+        marker=dict(size=6, color=MEAS), showlegend=False,
+        hovertemplate='f=%{x:.3g} Hz<br>|Z|=%{y:.1f} mΩ·cm²<extra></extra>'),
+        row=1, col=2)
+    fig.add_trace(go.Scatter(x=fs, y=np.abs(Zs), mode='lines',
+        line=dict(color=FIT, width=2.5), showlegend=False,
+        hoverinfo='skip'), row=1, col=2)
+    fig.update_xaxes(title_text='f [Hz]', type='log', row=1, col=2)
+    fig.update_yaxes(title_text='|Z| [mΩ·cm²]', type='log', row=1, col=2)
+ 
+    fig.add_trace(go.Scatter(x=f, y=a['res_pct'], mode='lines+markers',
+        marker=dict(size=5, color=MEAS), line=dict(width=1.5, color=MEAS),
+        showlegend=False,
+        hovertemplate='f=%{x:.3g} Hz<br>|res|=%{y:.2f} %<extra></extra>'),
+        row=1, col=3)
+    fig.add_hline(y=2, line=dict(color='green', dash='dash', width=1), row=1, col=3)
+    fig.add_hline(y=5, line=dict(color='orange', dash='dash', width=1), row=1, col=3)
+ 
+    fig.update_xaxes(title_text="Z' [mΩ·cm²]", row=1, col=1)
+    fig.update_yaxes(title_text="-Z'' [mΩ·cm²]", scaleanchor='x', scaleratio=1,
+                     row=1, col=1)
+    fig.update_xaxes(title_text='f [Hz]', type='log', row=1, col=3)
+    fig.update_yaxes(title_text='|ΔZ|/|Z| [%]', rangemode='tozero', row=1, col=3)
+    fig.update_xaxes(showgrid=True, gridcolor='#eee')
+    fig.update_yaxes(showgrid=True, gridcolor='#eee')
+ 
+    arcs = ' · '.join(f"R{k+1}={p[f'R{k+1}']*1000:.1f} mΩ·cm² "
+                      f"τ{k+1}={p[f'tau{k+1}']*1e3:.3g} ms n{k+1}={p[f'n{k+1}']:.2f}"
+                      for k in range(a['n_arcs']))
+    fig.update_layout(
+        title=(f'<b>Overall ECM fit — whole-cell aggregate — Leepa {LEEPA}, {cond}</b>'
+               f'<br><sup>Rs={_rs:.1f} · L={p["L"]*1e3:.3g} mΩ·cm²·ms · {arcs}'
+               f' · R_pol={_rpol:.1f} mΩ·cm²'
+               f' · fit rms {a.get("rms_pct", float("nan")):.1f} % ({a["verdict"]})'
+               f' · {a["n_arcs"]} arc(s) chosen by AICc</sup>'),
+        height=520, width=1550, paper_bgcolor='white', plot_bgcolor='white',
+        margin=dict(t=110, r=260), hovermode='closest',
+        legend=dict(font=dict(size=10), y=0.5, yanchor='middle'))
+    _ecm_agg_figs[cond] = fig
+ 
+    AGG_ECM[cond] = {'Rs_mohm_cm2': _rs, 'R_pol_mohm_cm2': _rpol,
+                     'R_ct_mohm_cm2': a['R_ct'] * 1000,
+                     'R_mt_mohm_cm2': a['R_mt'] * 1000,
+                     'n_arcs': a['n_arcs'], 'rms_pct': a.get('rms_pct', np.nan),
+                     'verdict': a['verdict'],
+                     'max_res_pct': float(a['res_pct'].max())}
+
+show_by_condition(_ecm_agg_figs, title=f'ECM fit of the aggregate — Leepa {LEEPA}')
+
+# COMMAND ----------
+
+# DBTITLE 1,ECM parameter tables — per segment, and aggregate vs segment median
+_ecm_tables = {}
+for cond, blob in ECM_ALL.items():
+    seg_fits, agg = blob['segments'], blob['aggregate']
+    if not seg_fits:
+        print(f"  {cond}: no segment fits")
+        continue
+ 
+    rows = []
+    for s in sorted(seg_fits):
+        r = seg_fits[s]
+        p = r['params']
+        se = r['stderr']
+        d = {'segment': s, 'n_arcs': r['n_arcs'], 'rms_pct': r.get('rms_pct', np.nan),
+             'verdict': r['verdict'],
+             'Rs_mohm_cm2': p['Rs'] * 1000, 'Rs_se': se['Rs'] * 1000,
+             'L_mohm_cm2_s': p['L'],
+             'R_ct_mohm_cm2': r['R_ct'] * 1000,
+             'R_mt_mohm_cm2': r['R_mt'] * 1000,
+             'R_pol_mohm_cm2': r['R_pol'] * 1000,
+             'tau_peak_ms': r['tau_peak'] * 1e3,
+             'max_res_pct': float(r['res_pct'].max())}
+        for k in range(r['n_arcs']):
+            d[f'R{k+1}_mohm_cm2'] = p[f'R{k+1}'] * 1000
+            d[f'tau{k+1}_ms'] = p[f'tau{k+1}'] * 1e3
+            d[f'n{k+1}'] = p[f'n{k+1}']
+        rows.append(d)
+ 
+    df_p = pd.DataFrame(rows)
+    print(f"\n{'═'*78}")
+    print(f"  ECM PARAMETERS — Leepa {LEEPA}, {cond}   ({len(df_p)} segments)")
+    print(f"  Rs + jwL + sum_k R_k/(1+(jw·τ_k)^n_k),  arc count by AICc, σ-weighted")
+    print(f"{'═'*78}")
+    for c, lbl in (('Rs_mohm_cm2', 'Rs    '), ('R_ct_mohm_cm2', 'R_ct  '),
+                   ('R_mt_mohm_cm2', 'R_mt  '), ('R_pol_mohm_cm2', 'R_pol ')):
+        v = df_p[c]
+        print(f"  {lbl} median {v.median():8.2f}   IQR "
+              f"{v.quantile(.25):7.2f}–{v.quantile(.75):7.2f}   mΩ·cm²")
+    print(f"  fit rms median {df_p['rms_pct'].median():.1f} %   "
+          f"good/acceptable/poor = "
+          f"{(df_p.verdict=='good').sum()}/{(df_p.verdict=='acceptable').sum()}/"
+          f"{(df_p.verdict=='poor').sum()}")
+    print(f"  worst residual: {df_p['max_res_pct'].max():.2f} % "
+          f"(segment {int(df_p.loc[df_p['max_res_pct'].idxmax(), 'segment'])})")
+ 
+    if agg is not None:
+        print(f"\n  {'─'*74}")
+        print(f"  {'':22s}{'aggregate fit':>16s}{'segment median':>18s}")
+        for lbl, ak, ck in (('Rs   [mΩ·cm²]', 'Rs', 'Rs_mohm_cm2'),
+                            ('R_ct [mΩ·cm²]', None, 'R_ct_mohm_cm2'),
+                            ('R_pol[mΩ·cm²]', None, 'R_pol_mohm_cm2')):
+            av = (agg['params']['Rs'] * 1000 if ak == 'Rs'
+                  else agg['R_ct'] * 1000 if ck == 'R_ct_mohm_cm2'
+                  else agg['R_pol'] * 1000)
+            print(f"  {lbl:22s}{av:16.2f}{df_p[ck].median():18.2f}")
+        print(f"  {'fit rms %':22s}{agg.get('rms_pct', float('nan')):16.2f}{df_p['rms_pct'].median():18.2f}")
+        print("  The aggregate is the parallel sum, not the mean: a spread in Rs")
+        print("  pulls it BELOW the segment median.  A large gap is a real")
+        print("  statement about heterogeneity, not a fitting error.")
+ 
+    _ecm_tables[cond] = viewers.table_html(df_p)
+
+if _ecm_tables:
+    displayHTML(viewers.selector_html({(c,): h for c, h in _ecm_tables.items()},
+                                      ['Condition'], title='ECM parameters per segment'))
+
+# COMMAND ----------
+
+# DBTITLE 1,ECM parameter plate maps (Rs, R_ct, R_pol from the fit above)
+# ═══════════════════════════════════════════════════════════════════════════════
+# The same ECM parameters, laid out on the plate.  Driven off ECM_ALL, so the
+# maps and the Nyquist overlays can never disagree about what was fitted.
+#
+# Drawn with plate_figure (the viewer's plate layout with gas and coolant
+# ports and flow arrows): the real segment outlines, the fitted VALUE printed
+# inside every segment, and the same Jet colours (plate_style) on the same
+# FIXED scale as the pipeline's own maps above (config.HEATMAP_LIMITS) -- so an
+# ECM Rs map and a pipeline HFR map can be read side by side. (This cell used to draw one dot
+# per segment centroid on an RdYlGn ramp, which showed neither the segment
+# shapes nor the numbers.)
+# ═══════════════════════════════════════════════════════════════════════════════
+import numpy as np
+import plate_plotly
+
+# Condition / Parameter / View drop-downs, as for the pipeline maps; the
+# colour scale is the pipeline's fixed scale for the same quantity
+# (Rs -> R_ohmic, R_ct, R_pol), so the two can be read side by side.
+_ecm_maps = {}
+for cond, blob in ECM_ALL.items():
+    seg_fits = blob['segments']
+    if not seg_fits:
+        continue
+    _flds = []
+    for key, label, fn in (
+            ('R_ohmic', 'Rs (ECM)',    lambda r: r['params']['Rs'] * 1000),
+            ('R_ct',    'R_ct (ECM)',  lambda r: r['R_ct'] * 1000),
+            ('R_pol',   'R_pol (ECM)', lambda r: r['R_pol'] * 1000)):
+        vals = {str(s): fn(r) for s, r in seg_fits.items()}
+        vals = {s: v for s, v in vals.items()
+                if s in geom.SEGMENTS and np.isfinite(v)}
+        if len(vals) >= 3:
+            _flds.append(plate_plotly.Field(key, label, 'mΩ·cm²', vals))
+    if _flds:
+        _ecm_maps[cond] = _flds
+if _ecm_maps:
+    displayHTML(viewers.plate_maps(_ecm_maps, title=f'Leepa {LEEPA} — ECM — '
+                                                    f'{geom.plate(PLATE).title}'))
+
+# COMMAND ----------
+
+# DBTITLE 1,Summary Table (plate_summary.csv)
+import json
+ 
+print(f"{'═'*75}")
+print(f"  PIPELINE SUMMARY — Leepa {LEEPA}")
+print(f"{'═'*75}\n")
+ 
+for cond, pr in PIPELINE_RESULTS.items():
+    if pr is None:
+        print(f"  {cond}: FAILED")
+        continue
+    
+    out_dir = pr['out_dir']
+    _manifest_path = out_dir / 'run_manifest.json'
+    
+    if _manifest_path.exists():
+        with open(_manifest_path) as f:
+            _m = json.load(f)
+        gs = _m.get('stages', {}).get('gold', {})
+        elapsed = _m.get('elapsed_s', 0)
+        print(f"  {cond}:  plate {_m.get('plate', '?')}, "
+              f"source {_m.get('source', 'famos')}")
+        if gs:
+            print(f"    Measured:  {gs.get('n_measured', '?')}/"
+                  f"{gs.get('n_total', '?')} segments")
+            print(f"    Inferred:  {gs.get('n_inferred', '?')}")
+            # mean / median over the 36 tile segments (1–36, one per 5×5-pad
+            # tile; the edge segments 37–72 inside the tiles are not counted)
+            for _p in ('R_ohmic', 'ReZ_1kHz', 'R_ct', 'R_mt', 'R_pol'):
+                r = gs.get(_p)
+                if r and 'median' in r:
+                    print(f"    {_p + ':':10s} mean {1000*r['mean']:.1f} ± "
+                          f"{1000*r['sd']:.1f}, median {1000*r['median']:.1f} "
+                          f"mΩ·cm² over {r['n_used']} of 36 tiles")
+                elif r:
+                    print(f"    {_p + ':':10s} mean {1000*r['mean']:.1f} ± "
+                          f"{1000*r['sd']:.1f} mΩ·cm² (cached run, all segments)")
+        else:
+            print(f"    Segments:  {_m.get('n_segments', '?')} with a spectrum")
+            print(f"    ECM:       {_m.get('n_ecm_ok', '?')} converged")
+            print(f"    lin-KK:    {_m.get('kk_pass', '?')}/{_m.get('kk_total', '?')} pass")
+            _sch = _m.get('schedule', {})
+            if _sch:
+                print(f"    Excitation:{_sch.get('mode', '?')}, "
+                      f"{len(_sch.get('tones', []))} tones")
+        print(f"    Time:      {elapsed:.1f} s")
+    
+    # Show plate_summary.csv if available
+    _summary_path = maps_dir(out_dir) / 'plate_summary.csv'
+    if _summary_path.exists():
+        df_s = pd.read_csv(_summary_path)
+        print(f"    Segments:  {len(df_s)} in summary table")
+    _stats_path = maps_dir(out_dir) / 'plate_statistics.csv'
+    if _stats_path.exists():
+        df_t = pd.read_csv(_stats_path)
+        print("    Plate statistics over the 36 tiles (gold/plate_statistics.csv):")
+        _tab = df_t[['parameter', 'unit', 'n_tiles', 'mean', 'median', 'sd',
+                     'cv_pct']].round(3).to_string(index=False)
+        print('      ' + _tab.replace('\n', '\n      '))
+    print()
+
+# COMMAND ----------
+
+# DBTITLE 1,Polarisation curve — FAMOS (local EIS, whole plate + flow bands)
+# ═══════════════════════════════════════════════════════════════════════════════
+# POLARISATION CURVE FROM THE FAMOS RECORDINGS
+#
+# One point per load condition that was run above:
+#   voltage  = DC level of the cell-voltage channel (POLCURVE_REF_CHANNEL,
+#              default UC2) on every card, median over the cards
+#   current  = the measured segment currents of that run
+#              (gold_manifest.json -> dc_closure), per cm2 of measured area
+# Because the plate is segmented, the same voltage also gives a LOCAL curve
+# per flow band -- air outlet / middle / air inlet -- from plate_summary.csv.
+# That is the part a whole-cell polcurve cannot show.
+#
+# If the reference channel is AC-coupled (a DC level near 0 V), the voltage
+# check below says so. Enter the cell voltages by hand in POLCURVE_V_OVERRIDE
+# (in V), e.g. from the bench log (U_S) or the Gamry cell below.
+# Drawing and reading: polcurve.py.
+# ═══════════════════════════════════════════════════════════════════════════════
+if not skip_for_csv('polarisation curve (FAMOS DC)'):
+    import importlib
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import pandas as pd
+    from pathlib import Path
+    from IPython.display import display
+    import polcurve
+    importlib.reload(polcurve)
+
+    POLCURVE_REF_CHANNEL = 'UC2'
+    POLCURVE_V_OVERRIDE = {}          # e.g. {'45A': 0.862, '60A': 0.845} in V
+    POLCURVE_BANDS = True             # also draw the three flow-band curves
+    POLCURVE_LABEL_AT = (0.1, 1.5)    # A/cm2 where the voltage is printed
+
+    _pc_runs = {}
+    for cond, pr in PIPELINE_RESULTS.items():
+        if pr is None:
+            continue
+        try:
+            _pc_files = bronze.discover_files(
+                DEFAULT.replace(dat_dir=_DAT_DIR, leepa=LEEPA, condition=cond))
+        except SystemExit:
+            _pc_files = []
+        _pc_runs[cond] = (_pc_files, Path(pr['out_dir']))
+
+    if not _pc_runs:
+        print('  no pipeline results in this session -- run the pipeline cell first')
+    else:
+        PC_FAMOS, _pc_rows = polcurve.famos_polcurves(
+            _pc_runs, ref_channel=POLCURVE_REF_CHANNEL, bands=POLCURVE_BANDS,
+            label=f'FAMOS {LEEPA}', v_override=POLCURVE_V_OVERRIDE)
+        _pc_df = pd.DataFrame(_pc_rows)
+        display(_pc_df.round(4))
+
+        # A cell voltage outside 0.2..1.2 V is not a cell voltage: the channel is
+        # AC-coupled, scaled, or not the cell-voltage monitor.
+        _bad = _pc_df[~_pc_df.v_cell_mV.between(200, 1200)]
+        if len(_bad):
+            print(f"  WARNING: {POLCURVE_REF_CHANNEL} gives "
+                  + ", ".join(f"{r.condition} = {r.v_cell_mV:.0f} mV"
+                              if np.isfinite(r.v_cell_mV)
+                              else f"{r.condition} = no FAMOS file found"
+                              for r in _bad.itertuples())
+                  + " -- not a plausible cell voltage. This channel probably "
+                    "carries no DC level; fill POLCURVE_V_OVERRIDE (in V) from "
+                    "the bench log or the Gamry cell below and re-run this cell.")
+        else:
+            fig = polcurve.plot_polcurves(
+                PC_FAMOS, title=f'Polcurve {LEEPA} — FAMOS',
+                label_at=POLCURVE_LABEL_AT)
+            _pc_out = _TMP_BASE / LEEPA / 'polcurve_famos.png'
+            _pc_out.parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(_pc_out, dpi=200, bbox_inches='tight')
+            _pc_df.to_csv(_pc_out.with_suffix('.csv'), index=False)
+            display(fig)
+            plt.close(fig)
+            print(f'  saved: {_pc_out}  (+ .csv)')
+
+# COMMAND ----------
+
+# DBTITLE 1,Polarisation curve — Gamry (whole cell, Vdc of every sweep)
+# ═══════════════════════════════════════════════════════════════════════════════
+# POLARISATION CURVE FROM THE GAMRY SWEEPS
+#
+# One point per .dta sweep of this order (the files the Gamry validation
+# uses, found by gamry_files):
+#   voltage  = the Vdc column of the ZCURVE table (median over the sweep)
+#   current  = the set point in the file name (..._CurrVal_150.dta), because
+#              the sweeps run with IDCREQ = 0 -- the bench holds the DC, the
+#              potentiostat adds only the AC -- so Idc reads ~0. A measured
+#              Idc is used instead whenever it carries the load.
+#   HFR      = the sweep's own high-frequency intercept (extrapolated when the
+#              sweep stops while still capacitive), for the iR-free curve.
+#
+# Overlays: reference curves from CSV in POLCURVE_REFERENCE_CSVS (columns
+# "current density [A/cm2]" and "voltage [mV or V]"), and the FAMOS plate
+# curve from the cell above.
+# ═══════════════════════════════════════════════════════════════════════════════
+if not skip_for_csv('polarisation curve (Gamry sweeps)'):
+    import importlib
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import pandas as pd
+    from IPython.display import display
+    import config
+    import polcurve
+    importlib.reload(polcurve)
+
+    POLCURVE_N_CELLS = 1              # divide Vdc by this for a short stack
+    POLCURVE_SHOW_IR_FREE = True      # V + j*HFR, dashed
+    POLCURVE_OVERLAY_FAMOS = True     # plate curve from the FAMOS cell above
+    POLCURVE_REFERENCE_CSVS = []      # [('/Volumes/.../PC_03_C3.1_Ref.csv', 'PC_03_C3.1_Ref_2511414_HTL')]
+    POLCURVE_LABEL_AT = (0.1, 1.5)
+
+    _pc_dta, _pc_build = gamry_files(LEEPA)
+    if not _pc_dta:
+        print(f'  no Gamry .dta sweeps found for {LEEPA} -- check GAMRY_SEARCH_ROOTS')
+    else:
+        PC_GAMRY, _pcg_rows = polcurve.gamry_polcurve(
+            _pc_dta, label=f'Gamry {LEEPA}', area_cm2=config.A_CELL_CM2,
+            n_cells=POLCURVE_N_CELLS)
+        _pcg_df = pd.DataFrame(_pcg_rows)
+        print(f'  {len(_pc_dta)} sweep(s), build {_pc_build or "UNKNOWN"}, '
+              f'area {config.A_CELL_CM2:.2f} cm2')
+        display(_pcg_df.round(4))
+
+        _curves = [PC_GAMRY]
+        if POLCURVE_SHOW_IR_FREE and np.isfinite(
+                PC_GAMRY.extra.get('hfr_mohm_cm2', np.array([np.nan]))).all():
+            _irf = PC_GAMRY.ir_free()
+            _irf.show_labels = False
+            _curves.append(_irf)
+        if POLCURVE_OVERLAY_FAMOS and 'PC_FAMOS' in globals() and PC_FAMOS:
+            import dataclasses as _dc
+            # own colour: the FAMOS cell draws its plate curve in the first
+            # series colour, which is Gamry's here
+            _curves.append(_dc.replace(PC_FAMOS[0], color=polcurve.PC_COLORS[2],
+                                       dashed=True))
+        for _p, _lab in POLCURVE_REFERENCE_CSVS:
+            _curves.append(polcurve.load_curve_csv(_p, _lab))
+
+        if not np.size(PC_GAMRY.j):
+            print('  no usable point: no Vdc column or no set point in the file names')
+        else:
+            fig = polcurve.plot_polcurves(
+                _curves, title=f'Polcurve {LEEPA} — Gamry',
+                label_at=POLCURVE_LABEL_AT)
+            _pcg_out = _TMP_BASE / LEEPA / 'polcurve_gamry.png'
+            _pcg_out.parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(_pcg_out, dpi=200, bbox_inches='tight')
+            _pcg_df.to_csv(_pcg_out.with_suffix('.csv'), index=False)
+            display(fig)
+            plt.close(fig)
+            print(f'  saved: {_pcg_out}  (+ .csv)')

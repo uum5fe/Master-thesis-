@@ -71,6 +71,34 @@ import pandas as pd
 
 F_LO_HZ = 1000.0
 LEVEL_BAND_HZ = (100.0, 1000.0)
+#: settings that change WHERE a channel's high-frequency response is measured.
+#: Runs built into one file must agree on all of them: a file estimated on
+#: runs de-skewed with 2.5 us per slot is wrong for runs that are not.
+STAGE_KEYS = ("skew_model", "channel_lag", "channel_lag_model",
+              "gamry_card_phase", "card_hf_phase", "card_gain", "gain_file")
+
+
+def stage_mismatch(cfgs: dict) -> dict:
+    """{setting: {run: value}} for every STAGE_KEYS entry the runs disagree on."""
+    out = {}
+    for k in STAGE_KEYS:
+        vals = {name: str(c.get(k)) for name, c in cfgs.items()}
+        if len(set(vals.values())) > 1:
+            out[k] = vals
+    return out
+
+
+def backup_existing(path) -> Path | None:
+    """Copy an existing response file aside before it is overwritten:
+    hf_response.csv -> hf_response_<YYYYmmdd-HHMMSS>.csv. Returns the copy."""
+    import shutil
+    from datetime import datetime
+    p = Path(path)
+    if not p.is_file():
+        return None
+    dst = p.with_name(f"{p.stem}_{datetime.now():%Y%m%d-%H%M%S}{p.suffix}")
+    shutil.copy2(p, dst)
+    return dst
 
 
 # ---------------------------------------------------------------------------
@@ -230,16 +258,23 @@ def build(run_dirs, out_dir, f_lo: float = F_LO_HZ, log=print) -> dict:
     old x residual and a second pass refines rather than undoes the first.
     """
     import utils
-    runs, prior = {}, set()
+    runs, prior, cfgs = {}, set(), {}
     for d in run_dirs:
         name, sp, cfg = load_run(d)
         runs[name] = sp
+        cfgs[name] = cfg
         prior.add(str(cfg.get("hf_response_file") or ""))
     if len(runs) < 2:
         raise ValueError("needs at least two operating points")
     if len(prior) > 1:
         raise ValueError("the runs were evaluated with different response "
                          f"files ({sorted(prior)}): re-run them alike first")
+    bad = stage_mismatch(cfgs)
+    if bad:
+        raise ValueError("the runs were evaluated with different settings at "
+                         "the stage the response is measured at: "
+                         + "; ".join(f"{k} {v}" for k, v in bad.items())
+                         + " -- re-run them alike first")
     prior_file = next(iter(prior))
     val = validate(runs, f_lo)
     h = estimate([deviations(sp) for sp in runs.values()], f_lo)
@@ -248,6 +283,9 @@ def build(run_dirs, out_dir, f_lo: float = F_LO_HZ, log=print) -> dict:
         for seg, (f, g) in h.items():
             h[seg] = (f, g * utils.gain_at(old, seg, f))
     out = Path(out_dir)
+    saved = backup_existing(out / "hf_response.csv")
+    if saved and log:
+        log(f"  previous file kept as {saved.name}")
     path = write(h, out / "hf_response.csv", f_lo,
                  note=f"from {', '.join(runs)}"
                  + (f"; composed with {prior_file}" if prior_file else ""))
@@ -262,7 +300,8 @@ def build(run_dirs, out_dir, f_lo: float = F_LO_HZ, log=print) -> dict:
                 f"largest card step {r['card_step_before_pct']:.1f} -> "
                 f"{r['card_step_after_pct']:.1f} %")
         log(f"  written: {path}")
-    return {"path": path, "validation": val, "n_segments": len(h)}
+    return {"path": path, "validation": val, "n_segments": len(h),
+            "composed_with": prior_file or "", "backup": str(saved or "")}
 
 
 def _seg_key(s):

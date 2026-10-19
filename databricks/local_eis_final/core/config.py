@@ -974,8 +974,14 @@ class Config:
     #                 The channel index comes from the FAMOS header, which IS
     #                 the ADC acquisition order.
     #   "per_card"    one free delay per card (old behaviour)
-    #   "none"        no correction
-    skew_model: str = "structural"
+    #   "none"        no correction (default since October 2026)
+    #
+    # "none" is the default: the two rewired orders 2611976 / 2612030 give a
+    # per-slot step of 0.4 +- 0.8 us (simultaneous sampling), not the 2.5 us
+    # a multiplexed ADC would need, and the structural fit's own step was
+    # rejected on every card. The channel lag (channel_lag.py) removes each
+    # segment's total delay either way; "structural" only moves part of it.
+    skew_model: str = "none"
     skew_dt_range_s: float = 300e-6
     skew_n_grid: int = 241
     skew_min_decades: float = 1.5    # below this the band cannot resolve dt

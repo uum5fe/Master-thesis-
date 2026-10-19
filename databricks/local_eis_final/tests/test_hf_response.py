@@ -98,3 +98,38 @@ def test_silver_divides_by_the_response_after_the_card_phase(tmp_path):
     hf = silver._hf_response(p)
     assert set(hf) == {"7"}
     assert silver._hf_response(None) == {}
+
+
+def _run_dir(root, cond, plate, cfg):
+    """A finished run folder as build() reads it."""
+    import json
+    d = root / cond
+    (d / "silver").mkdir(parents=True)
+    (d / "bronze").mkdir()
+    plate[["segment", "freq_hz", "z_re_mohm_cm2", "z_im_mohm_cm2"]].to_csv(
+        d / "silver" / "spectra_clean.csv", index=False)
+    plate.drop_duplicates("segment")[["segment", "card"]].to_csv(
+        d / "bronze" / "segment_meta.csv", index=False)
+    (d / "config_used.json").write_text(json.dumps({"condition": cond, **cfg}))
+    return d
+
+
+def test_runs_with_different_skew_models_are_refused(tmp_path):
+    hw = _hardware()
+    dirs = [_run_dir(tmp_path, c, _plate(lv, i, hw), {"skew_model": sk})
+            for i, (c, lv, sk) in enumerate((("60A", 2.0, "none"),
+                                             ("450A", 1.0, "structural")))]
+    with pytest.raises(ValueError, match="skew_model"):
+        hf_response.build(dirs, tmp_path / "out", log=None)
+
+
+def test_a_rebuild_keeps_the_previous_file_and_says_it_started_fresh(tmp_path):
+    hw = _hardware()
+    dirs = [_run_dir(tmp_path, c, _plate(lv, i, hw), {"skew_model": "none"})
+            for i, (c, lv) in enumerate((("60A", 2.0), ("150A", 1.4), ("450A", 1.0)))]
+    out = tmp_path / "out"
+    first = hf_response.build(dirs, out, log=None)
+    assert first["composed_with"] == "" and first["backup"] == ""
+    second = hf_response.build(dirs, out, log=None)
+    assert Path(second["backup"]).is_file()           # the old file was kept
+    assert Path(second["backup"]).read_text() == Path(first["path"]).read_text()

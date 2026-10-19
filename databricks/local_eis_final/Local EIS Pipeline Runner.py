@@ -806,6 +806,15 @@ def hf_response_file(leepa):
 # 'off' skips the stage. See silver/channel_lag.csv and the "channel lag"
 # plausibility check after each run.
 CHANNEL_LAG = 'correct'
+# Multiplexer de-skew (silver): 'none' or 'structural' (2.5 us per ADC slot).
+# 'none' since October 2026: on 2611976 vs 2612030, where 63 of 65 segments
+# changed card or slot, the residual lag against slot time gives a step of
+# 0.4 +- 0.8 us per slot (simultaneous sampling), not 2.5 us. The impedances
+# do not depend on it -- the channel lag takes over whatever this leaves --
+# but with 'structural' the chain_tau_us map carries a false 0-37.5 us ramp
+# per card. Changing it changes the cache key and needs a fresh HF response
+# (docs/REBUILD_HF_RESPONSE.md, and the HF response cell further down).
+SKEW_MODEL = 'none'
 # Gamry clock (gamry_sync.py): the FAMOS cards record the Gamry's own sweep,
 # so its .dta gives every step's exact frequency and time. 'guide' uses the
 # exact frequencies, applies a refused card lag the Gamry corroborates, and
@@ -1556,6 +1565,7 @@ def _run_identity(mode=None, f_min=None, f_max=None, snr=None):
         substitute_segments=globals().get('SUBSTITUTE_SEGMENTS', frozenset()),
         fill_missing_from_neighbours=globals().get('FILL_GAPS', False),
         channel_lag=globals().get('CHANNEL_LAG', 'correct'),
+        skew_model=globals().get('SKEW_MODEL', 'none'),
         gamry_sync=globals().get('GAMRY_SYNC', 'guide'),
         card_gain=globals().get('CARD_GAIN', 'correct'),
         uc_series_mohm_cm2=float(globals().get('UC_SERIES_MOHM_CM2', 0.0)),
@@ -2239,6 +2249,7 @@ for cond in _conditions_to_run:
         gain_file=Path(GAIN_FILE) if GAIN_FILE else None,
         hf_response_file=hf_response_file(LEEPA),
         channel_lag=CHANNEL_LAG,
+        skew_model=globals().get('SKEW_MODEL', 'none'),
         gamry_sync=GAMRY_SYNC,
         card_gain=CARD_GAIN,
         uc_series_mohm_cm2=float(UC_SERIES_MOHM_CM2),
@@ -2562,6 +2573,15 @@ if not skip_for_csv('frequency response of the FAMOS chain'):
 # applies it -- the file's content is in the cache key, so the conditions are
 # re-evaluated, not served from the cache.
 # Needs at least two conditions; all four is what it was validated on.
+#
+# A FRESH FILE (after changing SKEW_MODEL, CHANNEL_LAG, the gain file, ...):
+#   1. settings cell: HF_RESPONSE = ''      -> run the pipeline cell for ALL
+#      conditions (45/60/150/450 A); they are evaluated without any file
+#   2. this cell builds the file from those runs, from scratch (the previous
+#      file is copied aside as hf_response_<date>.csv)
+#   3. settings cell: HF_RESPONSE = 'auto'  -> run the pipeline cell again;
+#      every condition is re-evaluated with the ONE new file, then it is frozen
+# The table at the end shows which file each condition's result used.
 # ═══════════════════════════════════════════════════════════════════════════════
 import hf_response
 importlib.reload(hf_response)
@@ -2597,10 +2617,57 @@ else:
                   + ", ".join(r['held_out'] for r in _bad)
                   + " (phase sd <= 5 deg, card step <= 5 %) -- inspect before "
                     "applying; set HF_RESPONSE = '' to keep it off")
-        print("  Re-run the pipeline cell: with HF_RESPONSE = 'auto' every "
-              "condition is re-evaluated with it.")
+        if _hr.get('composed_with'):
+            print(f"  built ON TOP of {_hr['composed_with']} (the runs were "
+                  "evaluated with it). For a file from scratch: HF_RESPONSE = '' "
+                  "in the settings cell, run the pipeline cell, then this cell.")
+        else:
+            print("  built from scratch (the runs were evaluated without a file)")
+        _auto_path = (Path('/Volumes/ps_xplatform_dev/rvadvtec_dev/ev_rvadvtec_dev/'
+                           'EIS_Results') / LEEPA / f'hf_response{PLATE_TAG}'
+                      / 'hf_response.csv')
+        if Path(_hr['path']) != _auto_path:
+            print(f"  NOTE: written to {_hr['path']}, which HF_RESPONSE = 'auto' "
+                  "does not look at (cache writing is off) -- set HF_RESPONSE = "
+                  f"'{_hr['path']}' to apply it.")
+        print("  Next: HF_RESPONSE = 'auto' in the settings cell and re-run the "
+              "pipeline cell -- every condition is re-evaluated with this file.")
     except Exception as _he:                               # noqa: BLE001
         print(f"  high-frequency response not built: {_he}")
+
+# Which response file did each condition's result use? All must be the same
+# file -- otherwise the conditions are corrected differently above 1 kHz and
+# R_ohmic cannot be compared between them.
+import hashlib as _hl_hash
+def _sha12(_f):
+    try:
+        return _hl_hash.sha256(Path(_f).read_bytes()).hexdigest()[:12] if _f and Path(_f).is_file() else '-'
+    except Exception:                                      # noqa: BLE001
+        return '?'
+_hr_now = hf_response_file(LEEPA)
+print(f"\n  current file: {_hr_now or 'none'}  sha {_sha12(_hr_now)}")
+_hr_used, _hr_stale = {}, []
+for _c in (selected_conditions() if 'selected_conditions' in globals()
+           else list(PIPELINE_RESULTS)):
+    _d, _prov = result_dir(LEEPA, _c)
+    _u, _sk = '', '?'
+    _cu_p = Path(_d) / 'config_used.json' if _d is not None else None
+    if _cu_p is not None and _cu_p.is_file():
+        _cu = json.loads(_cu_p.read_text())
+        _u = str(_cu.get('hf_response_file') or '')
+        _sk = _cu.get('skew_model', '?')
+        # the file is rebuilt IN PLACE: same path, new content. A result
+        # written before the current file was is from the old content.
+        if _u and _hr_now and Path(_u) == Path(_hr_now) and \
+                Path(_hr_now).stat().st_mtime > _cu_p.stat().st_mtime:
+            _hr_stale.append(_c)
+    _hr_used[_c] = _u
+    _flag = '  <- older than the current file' if _c in _hr_stale else ''
+    print(f"    {_c:>6}: skew_model={_sk:<10} file={_u or 'none'}  ({_prov}){_flag}")
+if _hr_stale or len(set(_hr_used.values())) > 1 or \
+        (_hr_now and any(v != str(_hr_now) for v in _hr_used.values())):
+    print("  !! the conditions were NOT all evaluated with the current file -- "
+          "re-run the pipeline cell before comparing them.")
 
 # COMMAND ----------
 

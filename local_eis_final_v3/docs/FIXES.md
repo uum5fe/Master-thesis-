@@ -1,0 +1,879 @@
+# Local EIS pipeline — what was broken and what changed
+
+Data: `RO2611976-01_Current_45A_Test_01_Karte_1..5.DAT`, 45 A, 5 Dewetron cards,
+16 ch each, 10 kHz, 66 wired segments (68 present minus 33 and 59 marked
+hardware-bad).
+
+## Result
+
+| | before | after |
+|---|---|---|
+| segments with a modelled spectrum | **42** | **66** (all measured segments) |
+| frequency points per spectrum (median) | 6–18 | 25 |
+| R_Ω | 388.9 ± 196.3 mΩ·cm² (CV 50.5 %) | **82.3 ± 23.5 mΩ·cm² (CV 28.5 %)** |
+| area actually measured | 168.7 / 304.9 cm² | 289.0 / 304.9 cm² |
+| DC closure vs 45 A setpoint | 43.7 A (−2.9 %) | 43.8 A (−2.6 %) |
+| plate temperature | fallback constant 58.4 °C | 58.71 … 59.51 °C, measured |
+| cell aggregate | 16 frequencies | 27 frequencies |
+
+---
+
+## Fix 1 — the cards were never time-aligned  (`bronze.py`)
+
+`config.py` declared `align_cards = True` and `align_max_lag_s = 2.0`, but no
+code read either. The consensus schedule stores each step as raw sample
+indices taken from whichever card had the longest dwell, and `process_card`
+applied those indices to every card unshifted.
+
+The cards are armed separately. Measured offsets, recovered by
+cross-correlating the shared UC reference:
+
+| card | lag vs card 1 | peak corr |
+|---|---|---|
+| 1 | 0 | 1.000 |
+| 2 | −3 samples (−0.0003 s) | 0.997 |
+| 3 | **−57 121 samples (−5.7121 s)** | 0.982 |
+| 4 | **−25 359 samples (−2.5359 s)** | 0.982 |
+| 5 | **−25 493 samples (−2.5493 s)** | 0.983 |
+
+Direct effect on card 3: 7 of 50 steps had reference SNR ≥ 5 dB with the
+windows as-is, 15 of 50 after shifting.
+
+Note the old ceiling of 2.0 s was below the largest real offset, so even a
+wired-up version of the original setting would have failed silently.
+
+**Changed:**
+- new `estimate_card_lags()` — band-passed cross-correlation of the reference
+  channel, with the peak height reported and a weak peak refused rather than
+  applied
+- `consensus_schedule(..., lags=)` converts each card's detected steps onto a
+  common time base *before* they are pooled
+- `process_card(..., lag=)` shifts each window back onto that card's clock
+- `align_max_lag_s` raised to 12.0 s, `align_min_corr = 0.30` added
+- the lags and their correlation peaks are written to the bronze manifest
+
+## Fix 2 — polarity decided on the noisiest end of the band  (`bronze.py`)
+
+Segment 1 came out at Re Z ≈ **−460 mΩ·cm²** across its whole low-frequency
+range — an inverted but otherwise perfectly good spectrum, which the passivity
+gate then destroyed.
+
+The old sign test averaged Re Z over `freqs >= max(1.0, median(freqs))`, the
+top half of the band. Up there SNR falls to −40 dB and the per-channel
+acquisition skew rotates the phase by 80–170° at 4.5 kHz, so the sign of Re Z
+is essentially random.
+
+**Changed:** new `_fix_polarity()` decides on the *lowest decade*, SNR-weighted,
+using a weighted median and requiring >60 % of the weight to be negative before
+flipping. A delay cannot rotate a 1 Hz point (0.04° at 100 µs) and |Z| is
+largest there, so the sign is unambiguous. The weighted median plus the 60 %
+requirement preserves the Schneider *et al.* case (ECS Trans. 25(1) 937, 2009)
+that motivated the original choice — a genuinely negative low-frequency Re Z
+from down-the-channel starvation will not trigger a flip.
+
+## Fix 3 — temperature calibration never applied  (`bronze.py`)
+
+Every card logged `temperature sensors unusable - using 58.4 C`. The FAMOS
+channels are `Temp_1 … Temp_4`; lower-casing gives `temp_1`, but
+`PlateCalibration` keys are `temp1 … temp4`. The underscore meant the lookup
+never matched, in every run.
+
+Second problem: `_segment_temperatures` ran **per card**. Only cards 1 and 3
+carry temperature channels at all, so cards 2, 4 and 5 would still have fallen
+back even with the key fixed — discarding the whole inlet-to-outlet gradient.
+
+**Changed:**
+- `_sensor_key()` strips to the digits and rebuilds the key
+- `plate_temperatures()` collects every sensor on every card once and builds
+  one field for the plate, passed into `process_card`
+- an unmatched sensor or an implausible reading now warns instead of being
+  swallowed
+
+Recovered: temp1 = 58.72, temp2 = 58.71, temp3 = 59.28, temp4 = 59.52 °C,
+interpolated to 58.71 … 59.51 °C across the segments.
+
+## Fix 4 — passivity gate ran before the de-skew  (`silver.py`)
+
+`process_segment` rejected `Re Z ≤ 0` above 1 Hz *before* `apply_delay`
+corrected the phase. On segment 1 that cut 14 surviving points to 6, below the
+8-point floor, and the segment was discarded as unmodellable — deleting exactly
+the points the next line would have rotated back into the passive half-plane.
+
+**Changed:** the |Z| magnitude bound stays where it is (a delay is all-pass, so
+|Z| is invariant and safe to gate early); the sign test moved to immediately
+after `apply_delay`. Points dropped there are counted separately and appear as
+`dropped_N_non_passive_after_deskew` in the flags column.
+
+## Fix 5 — `_on_grid` ignored a rejected grid fit  (`bronze.py`)
+
+`_on_grid()` read `grid["f0"]` and `grid["ratio"]` without checking
+`grid["ok"]`. On this dataset the geometric-grid fit was rejected, yet
+`on_grid` was still being set — which swapped the SNR gate for the much looser
+`snr_floor_db` on those points. Now returns `False` when the fit was rejected.
+
+## Fix 6 — equal-area mode  (`config.py`, `r2d2_geometry.py`, `utils.py`)
+
+New `equal_areas` flag / `--equal-areas`. Replaces the true per-segment areas
+(0.678 … 8.470 cm², a factor of 12.5) with `A_CELL/72 = 4.235 cm²` for every
+segment. `utils.segment_areas(cfg)` is now the single resolution point —
+precedence `--areas` CSV > `--equal-areas` > true geometry — so silver and gold
+can no longer weight the same plate differently.
+
+This is a simplification, not a correction. Local ASR is area-free and does not
+move at all (R_Ω is identical, 82.3 ± 23.5 mΩ·cm² either way). What moves is
+everything that sums across segments:
+
+| | true areas | equal areas |
+|---|---|---|
+| measured area | 289.0 cm² | 279.5 cm² |
+| DC closure | 43.8 A (−2.6 %) | 45.7 A (+1.6 %) |
+
+The setpoint agreement is coincidentally slightly better under equal areas, but
+that is not evidence for it — the true geometry is what the plate has, and the
+edge strips really are a twelfth the size of the interior blocks. Use equal
+areas when you want every active segment weighted identically in a plate
+average, and read the current closure with that in mind.
+
+## Also worth knowing
+
+- `FAMOS_PATTERN` is `Leepa_{leepa}_Current_{cond}_Test_{test}_Karte_*.DAT`,
+  which does not match `RO2611976-01_...`. `discover_files` falls back to any
+  `*.DAT` so it works, but the log line `5 file(s) matching 'Leepa_*...'` is
+  misleading — update the template for this campaign.
+- `stage_bronze.py` / `stage_silver.py` / `stage_gold.py` pickle each stage, so
+  silver and gold re-run in ~80 s instead of re-reading 780 MB of `.DAT`.
+
+## Remaining, not fixed
+
+- **Segment 67** reads j = 0.4445 A/cm², three times the plate mean of 0.1500.
+  Its DC channel level is 0.2825 V against a typical 0.13 V. That looks like a
+  wiring or Abgleich-row problem on card 5, not electrochemistry — worth
+  checking against the plate before trusting it.
+- **Segments 15, 11, 31, 19** sit at R_Ω = 20–33 mΩ·cm² against a plate median
+  of 88, all tier C. The arc does not close inside the band, so R_Ω there is an
+  extrapolation.
+- **The HF arc is open.** |Z| bottoms out near 90 mΩ·cm² at 3 kHz, so R_Ω is
+  never measured directly at any segment — it is the model's intercept. The
+  fix is a higher sampling rate, not a better inversion.
+- **Tiers are still mostly C** (A = 2, B = 19, C = 45), driven by
+  `dropped_N_uncertain` at the top of the band. The residual per-card
+  differential skew is still 50–70 µs, which is 80–113° at 4.5 kHz.
+
+---
+
+# Recovering the top decade  (`hf_schedule.py`, September 2026)
+
+Data: `RO2612025-01_Current_45A_Test_01_Karte_4`, fs = 50 kHz, 538 s, UC2 plus
+segments 39–53.  The sweep in that file runs downward from **23.9 kHz to
+0.48 Hz** at 10 points per decade.  The shipped pipeline recovered eleven
+steps of it, topping out at 7.47 Hz.  Nothing was missing from the recording.
+
+| path | steps | band recovered |
+|---|---|---|
+| shipped — UC2 channel, `f_max_hz` = 4500 | 11 | 0.478 – 7.47 Hz |
+| same channel, cap lifted to 0.45·fs | 13 | 0.478 – 7.47 Hz |
+| stacked segment ensemble, cap lifted | 21 | 0.478 – 189 Hz |
+| + ladder extension, points/decade snapped | 42 | 0.478 – 18 900 Hz |
+
+## Fix 7 — the detector was reading the channel the cell had emptied (`bronze.py`, new `hf_schedule.py`)
+
+`consensus_schedule` ran `detect_schedule` on each card's reference channel,
+chosen in `inventory_channels` as the UC* channel with the largest standard
+deviation — the cell voltage.  The sweep is **galvanostatic**: the ac current
+amplitude is set by the load and is constant across the sweep, so the
+amplitude arriving there is
+
+    |u_ref(f)| = |i_ac| · |Z_cell(f)|
+
+and |Z_cell| falls by an order of magnitude from the bottom of the band to the
+~45 mΩ·cm² minimum near 8 kHz.  The detector was being asked to find a tone
+exactly where the cell had removed it.  No value of `min_snr_db` puts signal
+back.
+
+The segment channels behave the other way round: they measure current density,
+and current is what the sweep imposes, so their tone amplitude is flat in
+frequency.  There are ~14 per card, driven by the same tone at the same
+instant, with independent front-end noise.  Above 1 kHz the stacked ensemble
+measures **+11.2 dB narrowband over UC2** (+7.4 dB above 5 kHz, +4.3 dB above
+10 kHz).
+
+**Changed:** new `hf_schedule.py`, three layers, adding **no new estimator** —
+layer 2 hands the work to `eis_local.detect_schedule` unchanged:
+
+1. `polarity_aligned_reference()` standardises every segment channel, checks
+   each sign against a provisional sum so a reversed sense pair cannot
+   subtract, and adds them.
+2. the pipeline's own detector runs on that trace.  **The old trace is pooled
+   in, not replaced** — see "what the card set changed" below.
+3. the geometric ladder `f_k = f0·r^-k` and its dwell law are fitted on the
+   confident steps only, the missing rungs are predicted, and each prediction
+   is accepted on a frequency-domain CFAR and a rank-1 (maximum-eigenvalue)
+   test across the array — neither of which uses the ladder.
+
+Stack **per card**, not across the plate: pooling all five scored 23/26 against
+26/26 for one card, because the cards are not on a common time base until
+`estimate_card_lags` has run and the residual offsets make the sum partially
+destructive at the top of the band.  `consensus_schedule` still does the
+cross-card vote.
+
+## Fix 8 — `Step.valid` thresholded the wrong quantity  (`eis_local.py`)
+
+`Step.valid` gated on `snr_db >= min_snr_db`, and `fit3` defines `snr_db` as
+the tone amplitude over the residual rms across the whole Nyquist band.  That
+is not what determines a phasor's precision — `N·γ` is (Rife & Boorstyn),
+because a longer dwell beats the noise down.
+
+Of 23 rungs located above 100 Hz on card 4, **10 pass the 5 dB gate and all 23
+pass `sigma_rel_max` = 0.60**, with σ_rel between 0.3 % and 23 %.  The
+11.95 kHz step reports −1.5 dB and has N·γ = 2459 — a 2.0 % phasor, thrown
+away by a gate that was never meant to decide this.  `config.py` already
+argues exactly this above `sigma_rel_max`; the criterion was simply applied in
+silver, after bronze had discarded the step in `detect_schedule`.
+
+**Changed:** `Step.valid` now applies `hf_schedule.crlb_usable`, with a new
+`SNR_ABSOLUTE_FLOOR_DB = -20` backstop so that a step with no tone at all
+still fails — σ_rel alone would accept pure noise given enough samples.
+
+## Fix 9 — the band ceiling was a config constant, not Nyquist  (`config.py`)
+
+A real card header reads `dx = 1.0e-5 s`, i.e. fs = 100 kHz on 16 channels, so
+`cfg.f_hi(fs) = min(f_max_hz, 0.45·fs) = min(4500, 45000) = 4500` Hz.  The
+converter had 45 kHz of headroom it was never asked for.
+
+**Changed:** `f_max_hz` 4500 → 30000, and the `--f-max` default with it.
+Necessary but **not sufficient**: on its own it took card 4 from 11 recovered
+steps to 13, with the same 7.47 Hz top.
+
+## Fix 10 — the five UC channels are five measurements of one voltage  (`bronze.py`)
+
+Averaging segment impedances across cards is wrong — they are different
+segments.  Averaging the five UC channels is not, and it pays exactly where it
+is needed, because once detection has moved onto the segment ensemble the
+reference is the weak phasor in `Z = K·A_ref/A_seg`.
+
+**Changed:** new `pooled_reference_phasors()`, inverse-residual-variance
+weighted (`w = N/r_rms²`, the Cramér–Rao weighting), pooling only cards whose
+lag was *applied*, each rotated from its own multiplexer slot to slot 0 —
+after which `process_card` records `ref_slot = 0` so silver's structural skew
+model still reads a consistent geometry.  On the synthetic card set the median
+combined SNR went **22.9 → 29.9 dB**.
+
+## What the synthetic card set changed about the design
+
+Run against `make_synth_famos.py`, whose reference amplitude is *flat* in
+frequency, the first version of this work was a regression: 13 steps against
+the shipped path's 27, and a decade of band lost.  Four things came out of it,
+each now carrying a test in `test_hf_schedule.py`:
+
+- **Neither trace dominates.**  Where the reference amplitude is flat, the old
+  path locates the top rungs *more precisely* than the stack — 730.3 / 1169.6 /
+  1873.2 / 3000.0 Hz exactly, against the stack's 807 / 1182 / 1972 / 3070.  So
+  both candidate sets are pooled and the ladder and array tests arbitrate.
+  Nothing the shipped path would have found can be lost.
+- **A ladder must not be a subdivision of itself.**  Every step of a 10 ppd
+  sweep also lies on a 20 ppd ladder, so a fit scored by "most steps on the
+  grid" prefers the subdivision, invents the rungs between, and at the top of
+  the band those sit a fraction of a DFT bin from a real tone — so both
+  acceptance tests see the neighbour's leakage and pass.  Cost when unguarded:
+  20 spurious steps.  Guard: the gcd of the observed rung indices.
+- **The membership window has to carry the fit's own uncertainty.**  A ladder
+  fitted at 4.9013 points/decade against a true 4.8891 — a good fit — runs 4 %
+  out at the ends of the band, and a flat 2 % window then discards genuine
+  steps.  `Ladder.tol_at` widens it by `|k − k̄|·σ_ln r`.  The ladder is also
+  refitted once on its own members, which extends the lever arm from 69 Hz to
+  1182 Hz and pins the spacing to 4.8931.
+- **Two dwell laws are in common use.**  Fixed cycle count *or* fixed time.
+  Assuming the first on a record that used the second mispredicts a
+  high-frequency step's start by the length of the sweep.  Both are fitted and
+  the better one kept.
+
+## Result on the synthetic card set
+
+| | shipped path | with `hf_use_ensemble` |
+|---|---|---|
+| schedule | 27 steps | 17 steps |
+| true steps found | 17 / 18 | 17 / 18 |
+| **spurious steps** | **10** | **0** |
+| band | 1.63 – 3709 Hz (3709 is spurious) | 1.63 – **3000 Hz** (the true top) |
+| median combined SNR | 22.9 dB | **29.9 dB** |
+
+On a galvanostatic synthetic with short high-frequency dwells — the field
+symptom in miniature — 22/34 true with 7 spurious topping out at 1325 Hz
+becomes **30/34 true with 1 spurious topping out at 3166 Hz**.
+
+## New configuration
+
+    hf_use_ensemble: bool = True     # detect on the stacked segment ensemble
+    hf_ladder_extend: bool = True    # predict-and-verify the missing rungs
+    hf_ladder_snap_ppd: bool = True  # snap the fitted spacing to an integer
+    hf_ladder_tol: float = 0.02      # base window for ladder membership
+    hf_pool_reference: bool = True   # inverse-variance mean of A_uc across cards
+
+All four are A/B switches: set them false and the pipeline takes the old path
+exactly.
+
+## Fix 11 — the runner: scattered 150 A / 450 A spectra, and how results are shown  (`Local EIS Pipeline Runner.py`, `figure_panels.py`, `plate_maps.py`)
+
+**Why 150 A and 450 A came out as a scatter.**  Those plots were read from
+`<cond>/mode_permissive/snr_0.0_<digest>/`: evaluation mode *permissive*,
+Min SNR 0 dB, f_max 4500 Hz.  The earlier plot with clean arcs used the
+shipped gates.  What the three settings let through:
+
+| setting | shipped | permissive run | effect |
+|---|---|---|---|
+| `sigma_rel_max` | 0.60 | 1.5 | phasors with 150 % relative uncertainty kept |
+| `zmag_outlier_mad` | 4.5 | 8.0 | single-frequency \|Z\| spikes (1, 3, 10, 20 Hz) kept |
+| `max_thd` / `max_drift` | 0.10 / 0.25 | 0.5 / 0.5 | distorted, non-stationary dwells kept |
+| `min_cycles_per_dwell` | 3 | 1 | one-cycle phasors at the low end kept |
+| `min_snr_db` (bronze step acceptance) | 5 (old) / 10 | 0 | more off-grid steps admitted |
+| `f_max_hz` | — | 4500 | rungs above ~2 kHz read −40…−80° where the Gamry sweep reads ≈ −10° |
+
+A new **Parameter profile** widget, `recommended` by default, pins the
+widget settings; `custom` restores the widgets.  Databricks keeps a widget's
+old value when its default changes, which is why this is a profile rather
+than new defaults alone.
+
+**Correction (Fix 12).**  The first version of the profile pinned Min SNR =
+5 dB and f_max = 2000 Hz.  5 dB was wrong for low current: bronze uses
+`min_snr_db` to accept off-grid steps and to choose the steps the grid fit
+rests on, and the 45 A excitation is about a tenth of the 450 A one, so at
+45 A every step above ~90 Hz fell below 5 dB and was never detected.  The
+spectra stopped at ~90 Hz while 450 A still reached ~900 Hz.
+
+The earlier notebook that drew clean arcs (45 A up to ~1 kHz) has
+bronze/silver/gold code identical to this folder.  Only settings differ:
+
+| setting | clean script | scattered run |
+|---|---|---|
+| evaluation mode | default | permissive |
+| Min SNR (bronze) | 0 dB | 0 dB, then 5 dB |
+| f_max | 4500 Hz | 4500 Hz, then 2000 Hz |
+| `fit_common_delay` (config) | **False** | True |
+| `silver_snr_gate_db` (config) | **−40 dB** | −20 dB |
+
+The profile now pins mode = default, Min SNR = 0 dB, 0.15–4500 Hz.
+`fit_common_delay` goes back to False, as its own comment in `config.py`
+always said: dt0 is degenerate with the series inductance, and a wrong dt0
+rotates the top of the band on a whole card.  `silver_snr_gate_db` goes back
+to −40 dB.  Both, plus `silver_snr_floor_db`, are now in the cache key.  They
+had changed without changing the key, so a stale entry could have been
+served as current.
+
+**Conditions multi-select.**  `condition` (single dropdown) is replaced by
+`conditions` (multiselect): tick e.g. 45A and 450A to evaluate only those.
+ALL, or nothing ticked, means every condition on disk.  Conditions are ordered
+by current (45, 60, 150, 450 A), not as strings.
+
+**One plot per figure.**  Every Plotly cell still builds its multi-panel
+figure and passes it to `show_fig()`, which uses
+`figure_panels.split_subplots` to draw each panel as its own full-width
+figure: traces, log axes, guide lines, legend (now on every panel) and
+dropdown masks follow their panel.  `PLOTS_ONE_BY_ONE = False` in the setup
+cell restores the rows.
+
+**Plate maps with values.**  `plate_maps.draw_value_map` draws the true
+staircase outlines from `r2d2_geometry`, prints number **and value** in every
+segment, and scales colour over the 5th–95th percentile (arrow ends for
+values outside, still printed as measured).  Mean, median, sd, CV and
+min..max are printed under the title.  The HFR map now uses the same `magma`
+ramp as the mass-transport map; **Fix 12 put the HFR map back on its
+original `viridis`** (R_ct inferno, R_mt magma, R_pol magma because
+matplotlib has no `thermal`).  The ECM parameter maps use the same
+renderer instead of centroid dots.  `plate_viewer` (interactive, outside this
+folder) became optional.
+
+## Still not fixed
+
+- **Detection gain is not estimation gain.**  The array recovers *which*
+  frequency and *when*.  The per-segment impedance still rests on that one
+  segment's phasor; what the array buys there is a known f in a known window,
+  which drops the Cramér–Rao phase penalty from 6/(N·γ) to 1/(N·γ) and removes
+  the runaway-fit mechanism.
+- **Chain-response correction above 1 kHz** is still worth doing and is now
+  more valuable, because there are finally points up there to correct.  It is
+  orthogonal to everything here.
+- **Two FAMOS dialects.**  The DASYLab-native export carries one `|CN` block
+  per channel with float64 samples and a per-channel byte offset in `|CP`;
+  `eis_local.FamosFile` looks for `7,32,<name>` inside a single `|CP` field
+  with a hardcoded `<f4` and a 4·n_ch stride.  On the other dialect it raises
+  `incomplete FAMOS header`, or — if a file carries both markers — silently
+  reads garbage of exactly the right shape.  Worth confirming which dialect
+  the cards the thesis processed are in.
+- **Aliased steps above fs/2** could in principle be un-folded once the ladder
+  is known, since an aliased tone's Nyquist zone is then predictable.  Whether
+  anything survives depends entirely on the anti-alias filter in front of the
+  Dewetron converters.
+
+---
+
+## Fix — one excitation frequency per card and step  (`tone_estimation.py`, `bronze.py`)
+
+`utils.fit7_joint` re-estimated the frequency for every (reference, segment)
+pair by Gauss-Newton from the ladder rung. That only converges within about
+half a DFT bin, the ladder rung is ~0.09 % off (0.7–1 bin at the top of the
+band), and it lets weak segments wander although every channel on a card
+shares one ADC clock and therefore one frequency.
+
+`phasor_method = "card_ml"` (now the default) estimates the frequency ONCE per
+(card, step) from the reference and all segment channels together
+(`tone_estimation.card_frequency`, multichannel concentrated ML / variable
+projection, grid + bounded Brent — no start phasor, no step clamp) and then
+takes linear least-squares phasors of reference and segment at that frequency
+(`tone_estimation.phasors_at`). A step whose card estimate lands on the search
+edge falls back to `fit7_joint` and is counted in the log.
+
+The drift column is now the chi-square test `tone_estimation.stationarity_test`:
+the effect size is kept only where the change is significant (p < `drift_alpha`,
+default 1e-3), otherwise it is 0.0, so silver's `max_drift` gate rejects only
+drift that is significant AND material.
+
+End-to-end bronze on the synthetic card set (`bench/e2e_bronze.py`, 5 cards,
+36 steps, 2592 points):
+
+| | joint7 | card_ml |
+|---|---|---|
+| phase RMS error | 5.43° | 5.32° |
+| \|Z\| RMS error | 10.03 % | 10.43 % |
+| points passing the drift gate | 53.0 % | 96.8 % |
+| bronze run time | 115 s | 41 s |
+
+`--phasor joint7` (or `phasor_method="joint7"`) restores the previous
+behaviour; `--drift-alpha` sets the test level. `test_tone_estimation.py`
+covers the module and checks that the CLI no longer overrides the default.
+
+---
+
+## Fixed heat-map colour scales for R_ohmic, R_ct, R_mt, R_pol  (`config.py`)
+
+Every plate map used to scale its colours to its own run (min..max in
+`gold.plate_heatmap`, 5th..95th percentile in `plate_maps.draw_value_map`),
+so one colour meant a different value in every condition. The four
+resistance maps now use one fixed scale each, for all conditions:
+
+| | observed, order 2612030, 45 / 60 / 150 / 450 A | fixed scale [mΩ·cm²] |
+|---|---|---|
+| R_ohmic (HFR, Rs) | 45 … 77 | 40 … 80 |
+| R_ct | 37 … 209 | 25 … 225 |
+| R_mt | 9 … 273 | 0 … 300 |
+| R_pol | 62 … 419 | 50 … 450 |
+
+**Where to change it:** `config.py` → `HEATMAP_LIMITS` (and
+`HEATMAP_FIXED_SCALE = False` to go back to automatic scaling). Or, in the
+notebook, before the map cells: `config.HEATMAP_LIMITS["R_ct"] = (20, 250)`.
+Used by `gold.plate_heatmap` (map_*.png), `gold.plate_heatmap_interactive`
+(map_*.html), the notebook's static plate maps (plate_*.png), the notebook's
+ECM plate maps, and the CSV path (`csv_pipeline` → `r2d2_geometry.plot_map`).
+A value outside the range keeps the end colour, its true number is printed
+on the segment and the colour bar gets an arrow.
+
+---
+
+## Plate heat maps in the viewer layout  (`plate_figure.py`)
+
+The static R_ohmic / R_ct / R_mt / R_pol maps are now drawn like the
+interactive plate viewer: metal frame and bolts, the gasket border, the four
+manifold ports with flow arrows (O2 OUT top left, H2 OUT top right, H2 IN
+bottom left, AIR / O2 IN bottom right), sensor pins T1..T4, the true segment
+outlines, and number + value in every segment (rebuilt segments hatched,
+value starred). Colours follow the viewer's ramps (plate_figure.FIELDS) on
+the fixed scales in config.HEATMAP_LIMITS.
+
+* `gold.save` writes `gold/plate_<param>.png` for the four resistances.
+* The notebook's static-map cell and ECM-map cell use the same function.
+* Redraw from saved results: `python plate_figure.py <run>/gold/plate_summary.csv <out_dir> "<title>"`.
+
+---
+
+## Polarisation curves from FAMOS and Gamry  (`polcurve.py`, two notebook cells)
+
+Two new notebook cells, after "Summary Table", draw polarisation curves in
+the bench comparison style (bold title, "CVM1 - Voltage [mV]" over "Current
+density [A/cm²]", boxed legend, voltage printed at 0.1 and 1.5 A/cm²):
+
+* **Polarisation curve — FAMOS**: one point per load condition run in the
+  session. Voltage = DC level of the cell-voltage channel (UC2) on every card;
+  current density = the run's measured segment currents
+  (gold_manifest.json dc_closure). Also one LOCAL curve per flow band (air
+  outlet / middle / air inlet, from plate_summary.csv). If UC2 carries no DC
+  level the cell says so and takes voltages from `POLCURVE_V_OVERRIDE`.
+* **Polarisation curve — Gamry**: one point per .dta sweep of the order.
+  Voltage = the Vdc column of ZCURVE; current = the set point in the file name
+  (IDCREQ = 0, so Idc is ~0; a measured Idc is used when it carries the load);
+  HFR from the same sweep gives an iR-free curve. Reference curves from CSV
+  (`POLCURVE_REFERENCE_CSVS`) and the FAMOS plate curve can be overlaid.
+
+Both save PNG + CSV under the session's result folder (`polcurve_famos.*`,
+`polcurve_gamry.*`).
+
+---
+
+## DRT-informed ECM fit revised for the thesis  (`ecm_drt.py`, notebook)
+
+The notebook's DRT-informed fit (method B) now runs from `ecm_drt.fit_drt_ecm`:
+
+1. Arcs are sorted by tau after the fit and reported as **fast** and **slow**.
+2. Weighted by sigma = sigma_rel*|Z|; chi2_nu only with sigma. Without sigma the
+   figure of merit is `rms_rel_resid` (RMS relative residual), chi2_nu = NaN.
+3. One or two arcs, chosen by AICc.
+4. "Clean" = converged, nothing on a bound, every arc >= 1 % of R_pol, every
+   tau inside 1/(2 pi f_max) .. 1/(2 pi f_min) of the fitted band. n = 1 (ideal
+   RC) and chi2_nu are reported as notes, not as failures.
+5. Fitted only up to 1 kHz (`ECM_B_FMAX_HZ`), Rs held at the pipeline's R_ohmic
+   (`ECM_B_FIX_RS`); a fast arc with n < 0.7 is flagged and a catalyst-layer
+   transmission-line fast element competes by AICc (`ECM_B_FAST`).
+6. Points on 50/150/250 Hz (+-1.5 %) are dropped and listed.
+7. Summaries are medians (IQR) over ALL fitted segments, with the clean count.
+
+New notebook cell at the end, **ECM method comparison per condition**: method A
+(csv_pipeline.choose_n_arcs, full band) against method B, both in fast/slow
+terms. Per condition it saves `<run>/ecm_comparison/ecm_compare_nyquist.png`,
+`ecm_compare_params.png`, `ecm_compare_segments.csv`, `ecm_compare_summary.csv`
+(optionally copied to `ECM_COMPARE_DIR`).
+
+On order 2612030, method A's fast arc follows the top of the band at 45 A
+(tau_fast 0.2 ms, Rs median 47 mOhm*cm2, Rs = 0 on several segments); method
+B keeps Rs at the pipeline value (64) and the fast arc at 2.5 ms.
+
+### ECM comparison cell: interactive, like "ECM Visualization"
+
+Per condition the comparison cell now also draws ONE interactive figure with
+every segment and both methods (data markers, method A solid, method B
+dashed; Nyquist left, residual right). Click a segment in the legend to toggle
+it (double-click isolates it); the dropdown picks all segments with both
+methods, method A only, method B only, the aggregate, or one segment (its
+title then lists both fits' parameters). A second interactive figure plots A
+against B per segment for Rs, R_fast, R_slow, R_pol (hover names the segment).
+Saved as `ecm_compare_interactive.html` and `ecm_compare_params_interactive.html`
+beside the PNGs.
+
+---
+
+## Final version (October 2026)
+
+- **Evaluated band fixed at 0.15 Hz – 2.4 kHz** (`config.eval_f_max_hz`). Above ~2.5 kHz the FAMOS cards do not measure the cell:
+  - cards 3–5 show a filter response (|Z| −30 % / +20 %, phase +50…70°);
+  - cards 1–2 show a ~11 µs lead;
+  - the Gamry's own tail is a ~0.75 nH wiring loop.
+
+  Step detection keeps its wide ceiling, so the 6–20 Hz windows no longer move with the band. Evidence: `figures/band_limit/`, guide §4.
+- **Runner:** the band, SNR, profile, evaluation-mode and stop-after dropdowns are removed, and their values are fixed and in the cache key.
+- **Data source:** datago first, Volumes `.DAT` as the fallback; a failed datago query also falls back.
+- **DRT/KK inductance term:** it is now decided from the top 3 frequencies instead of the top 20 %. With the old rule, L was dropped on spectra whose top end was inductive.
+- **Small fixes:**
+  - the Gamry cell no longer shadows the widget helper `_w`;
+  - the cache list reads the `mode_*/` layout;
+  - `pipeline/main.py` runs standalone;
+  - the ledger tests use an explicit 0 dB gate.
+- **Handover guide:** `PIPELINE_GUIDE.md`.
+
+## Standard evaluation and interpolated maps only (October 2026)
+
+- **R_ohmic, R_ct, R_mt and R_pol are now computed the standard way** (`pipeline/standard_eis.py`, `config.param_method = "ecm"`). No DRT is used.
+  1. R_ohmic is the high-frequency intercept (the real-axis crossing, or Re Z extrapolated to Im Z = 0 from the top 6 points), held fixed.
+  2. R_ohmic + jωL + (R_ct‖CPE) + (R_mt‖CPE) is fitted by complex non-linear least squares with modulus weighting, both arcs peaking inside the band, the low-frequency inductive loop excluded.
+  3. R_pol = R_ct + R_mt.
+
+  The graphical R_pol (Re Z(f_min) − R_ohmic) and the fit residual are reported too. The notebook's ECM cells use the same fit. `param_method = "drt"` keeps the earlier DRT approach for comparison.
+- **450 A, 2612030, against the DRT evaluation:**
+  - R_ohmic 57.4 vs 58.6 and R_pol 109.7 vs 109.5 (plate medians, mΩ·cm²);
+  - R_mt 68 vs 29: the circuit's mass-transport arc sits at 3–10 Hz, whereas the fixed DRT cut at 16 Hz assigned part of it to R_ct;
+  - R_mt rises towards the air outlet.
+- **Maps:** only 2D interpolated plate maps (`gold/plate_<p>_interp.png`) for every parameter. The per-segment value maps (`map_*.png/.html`) and the viewer's "Values per segment" view are gone.
+- **450 A outlet scatter checked:**
+  - it is in the raw phasors (silver changes nothing below 20 Hz) and in the old v3 results too;
+  - the outlet segments are 4× noisier than the inlet and scatter together (r = 0.87), so the cell itself is changing (water at the outlet), not the computation.
+
+## Separate standard pipeline (October 2026)
+
+- **New notebook `Local EIS Standard Pipeline` and `pipeline/std_pipeline.py`:** the raw FAMOS signals are evaluated end to end with textbook steps only:
+  - lock-in location of every Gamry frequency on each card, with residual-based exact edges;
+  - sine fit over whole periods;
+  - Z = K·U/u_seg with only the chain calibration and the ADC slot delay;
+  - SNR / cycles gate;
+  - the standard circuit fit;
+  - the measured aggregate vs the Gamry;
+  - interpolated maps.
+- **`readers/datago_source.py`:** the runner's datago reader as a module (Spark passed in), so both notebooks read datago first.
+- **Tested end to end** on synthetic raw data with cards armed at different times (`tests/test_std_pipeline.py`).
+
+
+## The Gamry drawn as recorded; 450 A scatter quantified (October 2026)
+
+- **The Gamry is plotted exactly as in the `.dta`:** every point, at its own frequency, 0.19 Hz – 30 kHz.
+  - The comparison cell used to subtract a fitted series inductance from it, cut it to the local band (the rest drawn as a separate "outside local band" trace) and scale the aggregate by the DC-closure error. All gone.
+  - Hover labels showed f with one decimal (0.378 Hz read "0.4"); now 5 significant digits everywhere.
+  - The standard pipeline interpolated the Gamry onto the measured frequencies; it now uses the Gamry's own point at each step and writes the whole sweep to `gamry_full.csv`.
+- **Gamry in black with the segments** in the Nyquist / |Z| / phase viewer of both notebooks and in `gold/nyquist.png/.html`.
+- **The Gamry-vs-aggregate cell shows two curves only:** the aggregate and the Gamry (`nyquist.comparison_figure`), no segment or rebuilt traces.
+- **"â^'5" / "â€‹" on the axes and titles:** plotly.js was read as Windows-1252 inside `displayHTML`; the viewer now loads it with `charset="utf-8"`.
+- **450 A, 2612030, scatter along the air path** (13.10 run, point-to-point roughness of Z):
+
+  | zone (inlet → outlet) | < 10 Hz | 10–300 Hz | > 300 Hz | SNR < 10 Hz | THD < 10 Hz |
+  |---|---|---|---|---|---|
+  | inlet 0–0.2 | 1.5 % | 0.9 % | 1.7 % | 18 dB | 2.8 % |
+  | 0.6–0.8 | 7.4 % | 1.2 % | 1.6 % | 17 dB | 2.8 % |
+  | outlet 0.8–1 | 12.1 % | 1.9 % | 1.5 % | 10 dB | 6.5 % |
+
+  Only the low frequencies scatter, and only towards the outlet (r = 0.95 with position). The outlet segments' deviations move together (pairwise r = 0.99): the outlet region changes during the long low-frequency steps.
+
+## One pipeline, the complete band, the raw-signal audit (October 2026)
+
+- **One pipeline.** The separate `Local EIS Standard Pipeline` notebook and `pipeline/std_pipeline.py` (+ `readers/datago_source.py`) are removed; their circuit fit lives on in the runner (`ecm_compare`). They remain in the git history.
+- **Methods**: maximum-likelihood card frequency + least-squares sine fits, Cramér–Rao point uncertainties, **Bayesian DRT as the primary method** for R_ct / R_mt / R_pol, the standard circuit fitted beside it (`R_ct_ecm`, `R_mt_ecm`, `R_pol_ecm`), R_ohmic = the high-frequency intercept (`R_ohmic_drt` = the DRT's R_∞ beside it).
+- **The complete band by default** (`BAND = 'complete'`: 0.15 Hz – 0.49·fs, up to the 11.95 kHz step), with the corrections the audit made possible:
+  - each card's UC2 magnitude against card 1 above 300 Hz, step by step (`card_gain.hf_response`): the inductive pickup on cards 3–5 (UC2 −7…−18 % at 2.4–3.8 kHz, ×3.5–4.3 at 9.5 kHz);
+  - the per-card phase against the Gamry above 1 kHz (`gamry_card_phase`) and the per-channel lag, as before.
+  `BAND = 'trusted'` evaluates 0.15 Hz – 1.2 kHz, where all five cards agree uncorrected.
+- **Card voltage gain from the AC steps (1–300 Hz)**, gated on the SNR of the phasor (per-sample SNR + 10·log10(n/2)) instead of one sample's: UC2 has 0–20 dB per sample but 40–60 dB per phasor. Before, no step passed and the gain fell back to the DC level, which read card 4's −2.3 mV input offset as a −0.35 % gain. A DC ratio is now reported only. `CARD_GAIN = 'correct'` by default (card 3 +1.2 %, card 5 +0.9 %).
+- **Channel faults**: a segment whose DC current is < 0.5× or > 2× its neighbours' median is left out (segment 33: 18 %), and rebuilt from its neighbours when `FILL_GAPS` is on (`segment_fault_ratio`, `silver_manifest.json: faulty_segments`).
+- **Clipping**: a step window touching the ADC full scale (4.99 V) is dropped (segment 58 at the sweep start).
+- **Background before the sweep**: every channel is measured at every step frequency in the stretch before the first step (`utils.background_at`); a point whose coherent background exceeds 5 % of its response is dropped (silver gate `background`): 150 Hz mains on UC2 of cards 4–5, the cell's 1.75 Hz see-saw at the outlet, switching tones.
+- Confirmed unchanged: j = u/K; the air inlet is at x = 252 mm, the outlet at x ≈ 0 (matches the audit's data-based orientation).
+
+## Multi-condition review: segment 36 and the frozen high-frequency response (October 2026)
+
+- **Chain sweeps normalised by their 5–500 Hz median**, not by their first point: Kashyyyk segment 36 has a glitch at 1 Hz that put −4.1 % on its Z at every frequency (`gamry_dta.GamrySweep.z_flat`; also used by the curr.csv cross-check). Re-run the Chain response cell once.
+- **`checks/hf_response.py`**: the channels' high-frequency response (per-segment phase, per-card magnitude above 1 kHz), measured on all operating points, validated leave-one-current-out, applied by silver after the per-card phase (`hf_response_file`; runner `HF_RESPONSE = 'auto'` and the "High-frequency response across conditions" cell). On 2612030, blind: phase spread at 11.95 kHz 14° → 0.8–2.2°, largest card step 13 % → 1.9–4.6 %.
+- **Cache key includes the content** of the chain gain file and of the response file, so a rewritten file re-evaluates instead of serving old results.
+- Per-segment scale factors examined and **not** applied (the |Z|–j_dc anticorrelation is load-dependent: cell, not calibration). See guide §4.4.
+
+## Series resistance: tested, not applied (October 2026)
+
+- Final runs at 150 / 450 A with `HF_RESPONSE = 'auto'` and `UC_SERIES_MOHM_CM2` = 0 and 10, compared with the Gamry and with the bench tool's CSV spectra. The plate − Gamry offset is +7…+12 mΩ·cm² over 20 Hz–1 kHz but −1…+2 at the Gamry's HFR crossing, at every current: frequency-dependent, so not a resistance. With 0, the area-weighted harmonic mean of the segment HFRs is 44.7 / 46.7 against the Gamry's 45.2 / 44.4 and the bench tool's 45.8 / 46.9; with 10 the HFR is ~11 low, 14–17 segments lose their axis crossing and the HF phase spread returns to ~7°. **`UC_SERIES_MOHM_CM2` stays 0.**
+- `card_diagnostics.series_offset` also reports `dRe_at_hfr_mohm_cm2` (the offset at the Gamry's own crossing), and the cell judges it on the **cell aggregate** (the parallel sum the Gamry measures), not on the plate median: at the HFR the median sits 7–9 mΩ·cm² above the parallel sum because the segments spread, which is what made 10 look right before. The cell now says whether the offset is a resistance (same in the arc band and at the HFR) or not, instead of always proposing a uc_series value.
+- The HF response confirmed on the final runs (not only leave-one-out): segment phase spread vs the plate at 11.95 kHz 14.0° → 0.5° (150 A), 14.3° → 1.8° (450 A).
+
+---
+
+## Fix (2026-10-19) — datago returned UC2 under every channel of Karte_3  (`eis_local.py`, `bronze.py`, runner, `plausibility.py`)
+
+RO2612085 450 A. Karte_3 is a FAMOS-v2 file (DASYLab 14: one `|CN` block per
+channel, float32, 16 channels interleaved; each channel's column is the byte
+offset in its own `|CP`, 0, 4, …, 60). The datago import ignored that offset:
+all 16 channel names carry the UC2 waveform (segment "DC level" = 0.64528 V on
+every channel = UC2; snr_seg == snr_ref on every point). Karte_2 (FAMOS v1) is
+imported correctly — rebuilt from the raw .DAT with `bronze.process_card` it
+matches the datago run to 1e-5.
+
+What the pipeline made of it: Z = K·A_UC2/A_UC2 = K → R_Ω 286–726 mΩ·cm²
+(54, 55, 61, 68, 69, 70, 71); 59 and 64 flagged as channel faults on their DC
+(UC2's 0.645 V read as a segment voltage, 48 % of the neighbours); 56, 57, 58,
+60, 62, 63 lost all points to the magnitude gate; gold drew 56–60 and 62–64
+from their neighbours (`fill_missing_from_neighbours`). The plausibility check
+passed Karte_3 at |Z| +413 %, j_dc −37 %.
+
+From the raw .DAT (same schedule, lags, T, gains): all 15 Karte_3 segments
+measured, R_Ω 38–62 (median 56), j_dc 1.35–1.66 A/cm², 66/72 segments;
+aggregate vs Gamry |Z| +23 % → +16 %.
+
+Changes:
+- `FamosV2` reads each channel from the column its `|CP` byte offset declares
+  (fallback: `|CN` order); `position()` returns that column (the mux slot).
+- `eis_local.channel_integrity`: segment channels bit-identical to each other
+  or to the reference → `ChannelIntegrityError`, raised in
+  `bronze.inventory_channels`. Constant segment channels are logged.
+- Runner: the datago reader checks every card; a rejected card is read from
+  the Volume .DAT when one exists, otherwise the run stops with the reason.
+  Mux slots come from the .DAT header when available (datago returns channels
+  sorted as strings; the real order is e.g. Karte_2 `UC2,22,16..21,15,23..29`,
+  Karte_3 `UC2,54..64,69,70,71,68`). Segments are sorted numerically.
+- `card_factor_check`: FAIL when a card's |Z| is > 60 % or j_dc > 30 % off
+  the other cards.
+- `tests/test_channel_integrity.py` (7 tests).
+- Runner: `DATAGO_FIRST` is now a master switch with one switch per file kind:
+  `FAMOS_FROM_DATAGO = False` (FAMOS waveforms from the Volume .DAT),
+  `GAMRY_FROM_DATAGO = True`, `BENCH_FROM_DATAGO = True`. With FAMOS off, the
+  datago FAMOS lookup (named uploads and the minute-grouping fallback) is not
+  run at all, and the conditions come from the .DAT names on the Volume.
+  `tests/test_gamry_selection.py` lifts `_datago_on` with the resolver (its 5
+  failures were the missing `DATAGO_FIRST` in the lifted cell).
+
+---
+
+## Fix (2026-10-20) — synchronisation: what the time stamps can and cannot do  (`gamry_sync.py`, `gamry_compare.py`, `bronze.py`, `silver.py`, `main.py`, runner)
+
+RO2612086 60 A Test_02, Karte_2 + Karte_4 + the V26_109 Gamry sweeps.
+
+The pipeline already synchronises before it evaluates, on the SIGNALS:
+cards by cross-correlating the shared UC2 (Karte_4 = Karte_2 − 1.9962 s,
+r = 0.997, closure 0 samples), then the Gamry by matching steps (FAMOS =
+Gamry + 34.54 s, spread 0.43 s over 16 steps). The header stamps cannot do
+this: Karte_2/Karte_4 stamps 09:33:15 / 09:32:29 (46 s apart; true 2.0 s),
+Gamry STARTTIME 09:34:01 (12 s ahead of Karte_2's PC, 56 s ahead of
+Karte_4's). By its stamp Karte_4 would even end before the sweep does.
+
+What was missing:
+1. **The sweep was chosen by file name, not time.** Each current is measured
+   twice (up/down ramp: 60 A = HFR_103 08:39 and HFR_111 09:34, same ladder).
+   Volume: last name (HFR_111); datago: earliest upload (HFR_103 — wrong for
+   Test_02). Step matching cannot tell them apart. Now
+   `gamry_compare.select_sweep` picks the sweep whose run overlaps the FAMOS
+   recording (header stamps, `gamry_sync.recording_window`), then by test
+   number, then the old rule with a warning. Used by the Gamry sync, the
+   whole-cell comparison and silver's card phase.
+2. **7 of 49 in-band Gamry points were never placed** (60, 47.5, 18.9, 15,
+   7.5, 0.30, 0.19 Hz): the relocation demanded a 24-cycle lock-in window and
+   a 30-cycle dwell, more than the Gamry spends at 5–100 Hz, and below 1 Hz
+   its 3 s slot is shorter than one window. `relocate` now (a) retries with
+   3–8-cycle windows inside the slot and then the Gamry-only slot, accepting
+   only when the tone beats both ladder neighbours by ≥ 3 dB, and (b) for
+   steps ≥ 3 s long takes the window straight from the Gamry stamps
+   (previous stamp + guard + settle .. own stamp − guard), verified by the
+   segments' SNR where the CFAR test has too few bins. 42 → 49 windows; every
+   segment keeps 5 more points; band 0.24 → 0.19 Hz. Windows checked against
+   an independent lock-in scan.
+3. **The stamps were thrown away.** `gamry_sync.clock_report` now prints and
+   stores (`bronze_manifest.json: clock_check, recording_window`) how far each
+   PC clock is off, and warns above 5 min (wrong test / wrong sweep).
+4. **Test_01 / Test_02.** The runner always asked for Test_01, and the
+   fallback pattern `Test_*` could mix both tests' cards. New widget
+   `test_id`; per-test result folders (`60A_T02`) and cache key;
+   `bronze.discover_files` refuses a mix of tests. datago: all sweeps of a
+   current are written out, the pipeline picks by time.
+
+Known and left alone: the card-clock drift diagnostic fits blocks without
+sharp signal and reports e.g. −401 ppm here (true < 2 ppm); it is report-only.
+`tests/test_sync_timestamps.py` (4 tests).
+
+---
+
+## v34 (2026-10-20) — one clean notebook, ordered saved results, readable negative ticks
+
+- **Notebook**: 4 400 lines -> calls only. The code moved to `runner/`
+  (`settings.py` paths and fixed evaluation, `datago.py`, `session.py`
+  widgets / run / saved results / show_*, `views.py` figures). Kept views:
+  frequency response, Nyquist/Bode, median Nyquist (plate, cards, aggregate,
+  Gamry), heat maps, the whole MF4 bench log, ECM fits (standard and
+  DRT-informed, toggled). Every viewer is saved to `<order>/plots/`.
+- **Removed**: `Local EIS Extra Analyses.py`, `analysis/polcurve.py`,
+  `checks/card_diagnostics.py`, `checks/segment_scale.py`,
+  `checks/via_resistance.py` and their tests; the summary/parameter tables,
+  DC-closure and HF-response cells; the datago FAMOS reader (cards are always
+  read from the .DAT files). The Tikhonov DRT and its peak finder moved into
+  `analysis/ecm_drt.py` (its penalty is now scaled on the γ columns only --
+  with the band up to 12 kHz the jωL column had made γ flat).
+- **Saved results**: `EIS_Results/<order>/<cond>_Test<nn>/` instead of
+  `<cond>/mode_default/snr_0.0_<digest>/`; `rerun` overwrites, the
+  "write to cache" switch is gone; `run_identity.json` records the settings
+  and a mismatch is announced.
+- **Test_01 / Test_02**: a Test drop-down from the file names; the Gamry
+  sweep is chosen by time for every view (datago and Volume deliver all sweeps
+  of a current). `gamry_compare.run` maps `60A_Test02` folders to `60A`.
+- **"â^'50" on negative ticks** (colour bars, −Z'' axes): displayHTML hosts
+  the viewers in a page decoded as Windows-1252, and plotly.js 2.x writes the
+  minus (U+2212) from its own source. The viewer fragment is now pure ASCII
+  and repairs any UTF-8-read-as-1252 text plotly.js renders (MutationObserver,
+  every redraw). Reproduced and verified in Chromium with plotly.js 2.35.
+- **MF4**: the whole bench log, every channel, every sweep shaded and named.
+
+---
+
+## v34.1 (2026-10-20) — FAMOS cards from datago, as a checked option
+
+- `runner/settings.py`: `FAMOS_FROM_DATAGO` (default `False`), under
+  `DATAGO_FIRST` like the Gamry and bench switches.
+- `runner/datago.py`: `famos_key`, `famos_cards`, `card_channels` (one Arrow
+  transfer, sorted per channel), `write_famos_v1`, `compare_with_dat`,
+  `famos_card`. A card is rebuilt as a FAMOS-v1 `.DAT` and used only when
+  `channel_integrity` passes and, with a Volume copy, every channel equals it;
+  the slot order comes from a `.DAT` header of the same card.
+- `runner/session.py`: `famos_dir` (datago card, else the Volume card, per
+  card), datago uploads in the condition / test lists, `famos_source` in
+  `run_identity.json`.
+- Verified: RO2612086 60 A Test_02 Karte_2/Karte_4 served through a datago
+  stand-in give the same result as the Volume run; the RO2612085 Karte_3
+  failure (UC2 under every name) and a swapped channel pair are rejected
+  (`tests/test_runner_datago_famos.py`).
+- RO2611976 450 A: datago holds every sample twice (5 464 064 per channel
+  for 2 732 032 in the `.DAT`), so all five cards were rejected on length.
+  `card_channels` now drops rows repeated under the same time (and rejects a
+  card whose repeats differ); the length message gives both durations.
+  Checked on the real RO2611976 60 A Karte_2 served twice: rebuilt card
+  equals the `.DAT`.
+
+- Original uploads: `datago.raw_card` copies the card's original `.DAT`
+  from datago storage (path column of `metafiles_delta`, a folder column
+  + file name, or `DATAGO_RAW_FILE_TEMPLATE`; Volume/DBFS paths directly,
+  other URIs via Spark `binaryFile`) and checks it. Tried before the rows,
+  so FAMOS-v2 cards (Karte_3 of RO2612085/RO2612086) can come from datago
+  when datago keeps the file.
+- `famos_start_time`: DASYLab 14 pads the hour with a space
+  (`|NT,1,22,20,10,2026, 8,24,52.00;`); such stamps were not read (None) for
+  every v2 card recorded before 10:00, which left those cards out of the
+  timestamp-based sweep / test selection. Fixed (RO2612086 30 A Karte_3:
+  2026-10-20 08:24:52).
+
+---
+
+## v34.2 (2026-10-21) — RO2612090 450 A: the wrong Gamry sweep, and 30 inverted segments
+
+**Wrong sweep.** `gamry_dir` was the shared Volume folder (450 A sweeps of
+builds ?, V26_087, V26_088, V26_092, V26_109, V26_112) and no build was known.
+`select_sweep` required a STARTTIME on *every* candidate; one file without one
+switched the time test off, the test number then took the earliest 450 A
+sweep of any build: `V26_087_HFR_104` from 2026-07-03 -- another cell. The
+Gamry sync, the card phase calibration (Karte_1: -38 deg at 7.5 kHz) and the
+whole-cell comparison (HFR +60 %, |Z| +43 %, two plausibility FAILs) ran
+against it; the clock report said "clocks differ by -9506749 s".
+- `select_sweep`: by time among the sweeps that HAVE a start time; only
+  within 30 min of the FAMOS recording (`MAX_SWEEP_GAP_S`), else None (no
+  reference rather than another cell's). Without any time: sweeps of several
+  builds give None; the test number only chooses within one build. A single
+  candidate is time-checked too.
+- Callers handle None (gamry_sync.find_timeline, silver card phase,
+  gamry_compare.run).
+- Gamry sweeps exported as `.mf4` (`..._CurrVal_450.mf4`) are read
+  (`readers/mdf4_min.py`, no asammdf needed) through a cached `.dta`;
+  they are never taken as the bench log.
+- `plate_version` also searches Gamry sub-folders for the order's build.
+- Local check (Karte_2 + Karte_3, Volume-like folder with V26_088 without
+  STARTTIME, V26_109 x2, V26_112): old code took V26_109 (a day earlier),
+  HFR +29 %, |Z| +28 %; new code takes V26_112_HFR_101 (overlaps the
+  recording, Gamry clock +9 s), HFR +1.4 %, |Z| +13 %. Segment spectra moved
+  by up to 5 deg above 3 kHz (card phase calibration) and a few gated points.
+
+**Inverted segments (not Gamry).** Segments 15-28, 37-42, 44-55 came out as
+-Z at every frequency (Re -150 mOhm*cm2), the aggregate below 1 Hz at
+-4000 mOhm*cm2. The five-card consensus kept a "step" at 0.150 Hz -- a drift
+6-27 s into the record, before the sweep, fitted at ~150 dB SNR -- and
+`_fix_polarity` voted on the lowest decade weighted by raw SNR, so that one
+point outvoted the real ones. The raw Karte_2 data has the right sign
+(checked on the user's windows).
+- `_fix_polarity`: votes over all usable points, SNR weights capped at 30 dB.
+  Replayed on the run's bronze spectra it turns all 29 inverted segments back
+  and leaves none negative.
+- `_gamry_guided` (frequency/guide): steps more than 10 % outside the Gamry
+  sweep's frequency range are dropped and listed.
+
+---
+
+## v34.3 (2026-10-21) -- Naboo (gen2) calibration shipped; plate position drop-down
+
+**Naboo files.** `EIS_config/gen2/` now holds the Naboo delivery: `curr.csv`,
+`temp.csv`, `Abgleich/` (coefficients, 144 bode sweeps, Step1..12 from -40 to
+90 degC) and a `chain_gain.csv` in index-free (`shared`) mode, because the
+bode index and the curr.csv row order disagree (r = +0.41). A gen2 run no
+longer stops for missing files. The gen2 pad map is unchanged: the "8"-shaped
+tap vias on the Naboo inner copper layers sit exactly on the label pads of
+`_GEN2_LABELS` (row 1: 37, 43, 49, 51, 57, 55, 61, 67 at columns 1, 5, 11, 18,
+28, 35, 41, 45), which confirms the numbering; the row boundaries of the edge
+segments stay a reconstruction.
+
+**Plate position.** A plate put in the cell turned 180 deg (inlet and outlet
+segments swapped) used to be drawn and coloured as if it sat as drawn. New
+`Config.plate_orientation` ("standard" | "rot180"), runner drop-down **Plate
+position**, CLI `--plate-orientation`.
+- `r2d2_geometry.use_plate(plate, orientation)` binds the mounted plate: every
+  pad and label moved to its cell position, the temperature sensors with
+  them (temp1 at x = 252). `plate(name)` returns the mounted plate,
+  `plate_frame(name)` the drawn one.
+- Follows the mounting: every heat map, the Nyquist inlet -> outlet colour,
+  gold's spatial fill, neighbours, the plausibility along-flow trend.
+  Unchanged: segment numbers, areas, curr.csv rows, per-segment temperature.
+- CSV tool positions (numbering check, `csv_mirror_x`) stay on the drawing.
+- `plate_stats.tile_of` turns the 36 tiles with the plate (segment k keeps
+  its own tile); the static maps label the sensors by name (T1 is at the
+  right when rotated), not by their order on screen.
+- Results: `<order>_rot180/`; the position is in the cache key; saved
+  results without it count as "standard".
+- `tests/test_plate_orientation.py`.

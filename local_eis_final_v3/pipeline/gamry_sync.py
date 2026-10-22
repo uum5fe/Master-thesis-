@@ -155,7 +155,11 @@ def find_timeline(cfg, log=None) -> Timeline | None:
         return None
     sw = gamry_compare.select_sweep(hits, when=recording_window(cfg),
                                     test_id=getattr(cfg, "test_id", None),
-                                    log=log)
+                                    log=log,
+                                    match=getattr(cfg, "gamry_match", "file"),
+                                    order_id=getattr(cfg, "leepa", None),
+                                    version=getattr(cfg, "gamry_version", "")
+                                    or None)
     if sw is None:
         if log is not None:
             log.info(f"  gamry sync: no sweep of {want} belongs to this "
@@ -258,9 +262,13 @@ def clock_report(lags: dict, files, fs_common: float,
                     + ([abs(rep["gamry"]["clock_diff_s"])]
                        if rep["gamry"] else []), default=0.0)
         if worst > 300:
+            h = worst / 3600.0
+            tz = (" A whole number of hours: most likely a time-zone "
+                  "difference between the PCs, not another test."
+                  if worst > 3000 and abs(h - round(h)) * 60 <= 8 else "")
             log.warning(f"  a clock disagrees by {worst/60:.1f} min -- more "
                         f"than PC clocks drift. Check that every card and the "
-                        f"Gamry sweep come from the same test.")
+                        f"Gamry sweep come from the same test.{tz}")
     return rep
 
 

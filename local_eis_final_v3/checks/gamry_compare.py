@@ -363,11 +363,44 @@ def find_cell_sweeps(root, pattern: str = "*.dta",
 #: another day is another test or another cell.
 MAX_SWEEP_GAP_S = 1800.0
 
+#: How a sweep is matched to a FAMOS recording (config.gamry_match):
+#: "file" -- by the file: order / build token and current, then the test
+#:           number when one current was swept twice; the time stamps only
+#:           break a tie and never reject. For benches whose Gamry and FAMOS
+#:           clocks are not comparable (RO2612091: 1.9 h apart).
+#: "time" -- by the time stamps, rejecting a sweep more than MAX_SWEEP_GAP_S
+#:           from the recording.
+GAMRY_MATCH_MODES = ("file", "time")
+
+
+def _far(g: float) -> str:
+    return (f"{g / 86400:.0f} days" if g > 2 * 86400 else
+            f"{g / 3600:.1f} h" if g > 3600 else f"{g / 60:.0f} min")
+
+
+def _hfr_number(sw) -> int:
+    m = re.search(r"HFR_(\d+)", sw.path.name, re.I)
+    return int(m.group(1)) if m else 10 ** 6
+
 
 def select_sweep(hits: list, when=None, test_id=None, log=None,
-                 max_gap_s: float = MAX_SWEEP_GAP_S):
+                 max_gap_s: float = MAX_SWEEP_GAP_S, match: str = "file",
+                 order_id: str | None = None, version: str | None = None):
     """The ONE sweep, among those of this current, that belongs to this
     FAMOS recording -- or None when none can be shown to.
+
+    `match` = "file" (default): the sweep is identified by its FILE -- the
+    callers already keep only sweeps naming this order / build and this
+    current; one such sweep is taken whatever its time stamp says, two or
+    more (an up/down ramp) are told apart by time when a stamp lies within
+    `max_gap_s`, else by the test number (Test_01 = the first by start time,
+    then HFR number). Sweeps of several builds still give None. The clock
+    offset is then measured from the steps themselves (gamry_sync), so the
+    stamps are never needed. ONLY a file whose name says it is this cell --
+    this order (`order_id`) or this build (`version`) -- is matched this way;
+    a name silent about both still has to pass the time rules below, so a
+    shared folder cannot hand over another cell's sweep (v34.2).
+    `match` = "time": the rules below for every file.
 
     By TIME first: `when` = (start, end) of the FAMOS recording from its
     header stamps. Among the sweeps with a STARTTIME the one overlapping (or
@@ -389,6 +422,15 @@ def select_sweep(hits: list, when=None, test_id=None, log=None,
     hits = [h for h in (hits or []) if h is not None]
     if not hits:
         return None
+    if str(match or "file").lower() == "file":
+        mine = [sw for sw in hits
+                if names_order(sw.path.name, order_id) is True
+                or names_version(sw.path.name, version) is True]
+        if mine:
+            return _select_by_file(mine, when, test_id, log, max_gap_s)
+        if log is not None:
+            log.info("  Gamry sweep: no file name states this order or build "
+                     "-- matched by its time stamps instead")
 
     def span(sw):
         if sw.started is None:
@@ -416,9 +458,7 @@ def select_sweep(hits: list, when=None, test_id=None, log=None,
                 return (s0 - w1).total_seconds()
             return 0.0
 
-        def far(g):
-            return (f"{g / 86400:.0f} days" if g > 2 * 86400 else
-                    f"{g / 3600:.1f} h" if g > 3600 else f"{g / 60:.0f} min")
+        far = _far
         best = min(timed, key=gap)
         g = gap(best)
         if g > max_gap_s:
@@ -469,6 +509,96 @@ def select_sweep(hits: list, when=None, test_id=None, log=None,
                     f"({', '.join(sw.path.name for sw in hits)}) and nothing "
                     f"to choose by; using {hits[-1].path.name}")
     return hits[-1]
+
+
+def _sweep_span(sw):
+    """(start, end) of a sweep from its STARTTIME and duration, or None."""
+    if sw.started is None:
+        return None
+    dur = float(sw.meta.get("duration_s", 0) or 0)
+    if not dur:
+        try:
+            import gamry_sync
+            tl = gamry_sync.read_timeline(sw.path)
+            dur = float(np.nanmax(tl.t_s)) if tl.t_s.size else 0.0
+        except Exception:                                   # noqa: BLE001
+            dur = 0.0
+    from datetime import timedelta
+    return sw.started, sw.started + timedelta(seconds=dur)
+
+
+def _stamp_gap(sw, when) -> float | None:
+    """Seconds between a sweep and the recording window (0 = overlap)."""
+    sp = _sweep_span(sw)
+    if sp is None or when is None:
+        return None
+    (s0, s1), (w0, w1) = sp, when
+    if s1 < w0:
+        return (w0 - s1).total_seconds()
+    if s0 > w1:
+        return (s0 - w1).total_seconds()
+    return 0.0
+
+
+def _select_by_file(hits, when, test_id, log, max_gap_s):
+    """select_sweep(match="file"): identity first, stamps only as a tie-break."""
+    builds = {version_of(sw.path.name) for sw in hits}
+    if len(builds) > 1:
+        near = sorted((g, sw.path.name, sw) for sw in hits
+                      for g in [_stamp_gap(sw, when)]
+                      if g is not None and g <= max_gap_s)
+        if len(near) == 1 or (len(near) > 1 and near[1][0] > near[0][0] + 60):
+            hits = [near[0][2]]
+        else:
+            if log is not None:
+                log.warning(
+                    f"  {len(hits)} sweeps of this current from builds "
+                    f"{', '.join(sorted(b or '?' for b in builds))} -- none "
+                    f"used: the files cannot say which is this cell's (set "
+                    f"the build in PLATE_VERSION_OVERRIDE)")
+            return None
+
+    def stamp_note(sw):
+        g = _stamp_gap(sw, when)
+        if g is None:
+            return "no time stamp to compare"
+        if g == 0:
+            return "time stamps overlap"
+        h = g / 3600.0
+        tz = (" -- a whole number of hours: most likely a time-zone difference "
+              "between the Gamry and FAMOS PCs"
+              if g > 3000 and abs(h - round(h)) * 60 <= 8 else "")
+        return f"time stamps {_far(g)} apart, not used to choose{tz}"
+
+    if len(hits) == 1:
+        pick, how = hits[0], "the only sweep of this current for this cell"
+    else:
+        near = [(g, sw) for sw in hits
+                for g in [_stamp_gap(sw, when)] if g is not None]
+        near.sort(key=lambda gs: gs[0])
+        if near and near[0][0] <= max_gap_s and (
+                len(near) == 1 or near[1][0] > near[0][0] + 60):
+            pick, how = near[0][1], "the one whose time stamps match"
+        else:
+            # in measurement order: a constant clock offset does not change
+            # it; the HFR number is the order when there is no stamp
+            stamped = all(sw.started is not None for sw in hits)
+            order = sorted(hits, key=lambda sw: (
+                (sw.started, _hfr_number(sw)) if stamped
+                else (_hfr_number(sw), sw.path.name)))
+            try:
+                k = int(str(test_id)) - 1
+            except (TypeError, ValueError):
+                k = -1
+            if 0 <= k < len(order):
+                pick, how = order[k], f"test number {test_id} of {len(order)}"
+            else:
+                pick, how = order[-1], (f"the last of {len(order)} (test "
+                                        f"{test_id!r} not among them)")
+    if log is not None:
+        log.info(f"  Gamry sweep chosen by file: {pick.path.name} ({how}; "
+                 f"{stamp_note(pick)})")
+    return pick
 
 
 # ---------------------------------------------------------------------------
@@ -1048,7 +1178,7 @@ def run(results_root, gamry_root, area_cm2: float, out_dir=None,
         bench_path=None, chain_applied: bool | None = None,
         only: str | None = None, order_id: str | None = None,
         version: str | None = None, log=None, when=None,
-        test_id: str | None = None) -> list[Comparison]:
+        test_id: str | None = None, match: str = "file") -> list[Comparison]:
     """Compare every condition that has BOTH a local result and a sweep.
 
     `results_root` is a pipeline output tree laid out
@@ -1075,11 +1205,12 @@ def run(results_root, gamry_root, area_cm2: float, out_dir=None,
     picked_by_time = False
     if only and only.upper() != "ALL":
         same = [s for s in found if s.condition.upper() == only.upper()]
-        pick = select_sweep(same, when=when, test_id=test_id, log=log)
+        pick = select_sweep(same, when=when, test_id=test_id, log=log,
+                            match=match, order_id=order_id, version=version)
         found = [s for s in found if s.condition.upper() != only.upper()
                  ] + ([pick] if pick is not None else [])
         sweeps = {s.condition: s for s in found}
-        picked_by_time = pick is not None and when is not None
+        picked_by_time = pick is not None
     if len(found) != len(sweeps) and not (only and only.upper() != "ALL"):
         # Two files claiming the same current is what a mixed folder looks
         # like. Say so: the dict silently kept one of them.

@@ -1507,7 +1507,12 @@ def _gamry_guided(kept, tl, files, cards, cfg, lags, fs_seen, gs_mode, log):
             "started": str(tl.started) if tl.started else None,
             **res.summary(), "rows": res.rows}
     if not res.ok:
-        log.warning(f"  not synchronised: {res.reason} -- schedule unchanged")
+        log.warning(f"  not synchronised: {res.reason} -- schedule unchanged"
+                    + (". The sweep was chosen by its file; if its steps do "
+                       "not line up with this recording, check that it is "
+                       "the same test"
+                       if getattr(cfg, "gamry_match", "file") == "file"
+                       else ""))
         return kept, info
     v = res.summary()["verdicts"]
     log.info(f"  FAMOS = Gamry + {res.offset_s:.2f} s (spread "

@@ -877,3 +877,40 @@ position**, CLI `--plate-orientation`.
 - Results: `<order>_rot180/`; the position is in the cache key; saved
   results without it count as "standard".
 - `tests/test_plate_orientation.py`.
+
+---
+
+## v34.4 (2026-10-22) -- RO2612091: Gamry sweep matched by file; datago Karte_3
+
+**Gamry sweep refused by its time stamp.** Every datago sweep of RO2612091
+(build V26_113) carried a start time 1.9 h from the FAMOS stamps -- a
+time-zone difference between the PCs. The time rule (a sweep within 30 min)
+refused the only 45 A sweep, `HFR_106_CurrVal_45`: no Gamry sync, no card
+phase calibration against the Gamry, no whole-cell comparison, no Gamry trace
+in the plots.
+- New `Config.gamry_match` / runner `GAMRY_MATCH` = "file" (default) | "time".
+  "file": a sweep whose NAME states this order or build is matched by order,
+  build and current; a current swept twice by the test number (Test_01 = first
+  in measurement order); the stamps only break a tie and never reject. A name
+  silent about the order and the build still has to pass the time rule, and
+  sweeps of several builds still give none (the v34.2 wrong-cell protection).
+- The clock offset was never taken from the stamps: gamry_sync measures it
+  from the steps, and a file-chosen sweep whose steps do not line up is
+  reported as such. The clock report says when a disagreement is a whole
+  number of hours (time zone).
+- `gamry_match` is in the run identity; results saved before count as "time".
+- `tests/test_gamry_match_by_file.py`.
+
+**Karte_3 rejected from datago.** Not a pipeline fault: datago's import of this
+FAMOS version wrote UC2 under every channel name, so the card's 15 segment
+channels are not in datago's values table and cannot be rebuilt. The pipeline
+rejects such a card (correctly) and needs the original .DAT. It now finds it
+in more places:
+- `DATAGO_RAW_FILE_TEMPLATE` takes every column of the datago file record
+  (`{bucket}`, `{folder}`, `{source}`, ...); unknown placeholders are empty.
+- The record's bucket + folder + file name are tried as a path.
+- The Volume's FAMOS folder is searched for the card's exact file name up to
+  three sub-folders down; a hit is used as the Volume copy.
+- When none works, the run prints the record's bucket / folder / source, so
+  the template can be set once.
+- `tests/test_datago_original_card.py`.

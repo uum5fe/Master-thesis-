@@ -283,6 +283,13 @@ class Config:
     # missing windows inside their Gamry slot, each verified by a CFAR test.
     # On 2612030 / 60 A: offset 99.24 s, spread 0.44 s; 1.5-4.7 kHz misplaced.
     gamry_sync: str = "report"             # off | report | frequency | guide
+    # WHICH GAMRY SWEEP BELONGS TO THIS RECORDING (gamry_compare.select_sweep).
+    # "file": the sweep of this order / build and current, by its file name;
+    # a current swept twice is told apart by the test number. The time
+    # stamps never reject (RO2612091: Gamry and FAMOS stamps 1.9 h apart, a
+    # time-zone difference). "time": only a sweep within 30 min of the FAMOS
+    # stamps. Either way gamry_sync measures the real offset from the steps.
+    gamry_match: str = "file"              # file | time
     channel_lag: str = "correct"           # off | report | correct
     channel_lag_f_lo_hz: float = 50.0      # below: no lag is visible
     channel_lag_min_points: int = 4
@@ -1307,6 +1314,10 @@ class Config:
         g.add_argument("--gamry", dest="gamry_dir", type=Path,
                        help="folder of whole-cell Gamry .DTA sweeps to "
                             "compare the aggregated local result against")
+        g.add_argument("--gamry-match", dest="gamry_match",
+                       choices=["file", "time"], default="file",
+                       help="pick the Gamry sweep by its file (order, build, "
+                            "current, test) or by the time stamps")
         g.add_argument("--gamry-version", dest="gamry_version", default=None,
                        help="build token of the sweeps that belong to this "
                             "cell, e.g. V26_092. Required when the Gamry "

@@ -538,14 +538,34 @@ def file_record(spark, file_id) -> dict:
     return {} if pdf.empty else {k: pdf.iloc[0][k] for k in pdf.columns}
 
 
+class _Blank(dict):
+    def __missing__(self, key):
+        return ""
+
+
+def _text(v) -> str:
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return ""
+    return str(v).strip()
+
+
 def raw_file_candidates(rec: dict, order: str = "") -> list[tuple[str, str]]:
-    """[(where it came from, path or URI)] the original upload may be at."""
-    name = Path(str(rec.get("raw_file_name") or "")).name
+    """[(where it came from, path or URI)] the original upload may be at.
+
+    1. DATAGO_RAW_FILE_TEMPLATE, filled from EVERY column of the file record
+       ({bucket}, {folder}, {source}, {file_id}, ...) plus {raw_file_name}
+       and {order};
+    2. a record column that already is a path or URI;
+    3. the record's bucket / folder joined with the file name (RO2612091:
+       the record has bucket and folder, but neither is a path on its own).
+    (A copy on the Volume is found by the runner itself, by name.)"""
+    name = Path(_text(rec.get("raw_file_name"))).name
     out = []
     if S.DATAGO_RAW_FILE_TEMPLATE:
-        out.append(("DATAGO_RAW_FILE_TEMPLATE", S.DATAGO_RAW_FILE_TEMPLATE.format(
-            raw_file_name=name, file_id=rec.get("file_id", ""),
-            order=order)))
+        fill = _Blank({k: _text(v) for k, v in rec.items()})
+        fill.update(raw_file_name=name, order=order)
+        out.append(("DATAGO_RAW_FILE_TEMPLATE",
+                    S.DATAGO_RAW_FILE_TEMPLATE.format_map(fill)))
     for col, val in rec.items():
         if not isinstance(val, str) or col == "raw_file_name":
             continue
@@ -555,6 +575,20 @@ def raw_file_candidates(rec: dict, order: str = "") -> list[tuple[str, str]]:
             out.append((f"column {col}", v))
             if name and not v.lower().endswith(".dat"):   # a folder
                 out.append((f"column {col} + name", v.rstrip("/") + "/" + name))
+    bucket = _text(rec.get("bucket")).rstrip("/")
+    folder = _text(rec.get("folder")).strip("/")
+    if name and (bucket or folder):
+        rel = "/".join(p for p in (folder, name) if p)
+        if bucket.startswith(_URI) or bucket.startswith("/"):
+            out.append(("columns bucket + folder", f"{bucket}/{rel}"))
+        elif bucket:
+            for scheme in ("s3://", "gs://", "abfss://"):
+                out.append((f"columns bucket + folder ({scheme})",
+                            f"{scheme}{bucket}/{rel}"))
+        if folder and (_text(rec.get("folder")).startswith(_URI)
+                       or _text(rec.get("folder")).startswith("/")):
+            out.append(("column folder + name",
+                        _text(rec.get("folder")).rstrip("/") + "/" + name))
     seen, uniq = set(), []
     for w, v in out:
         if v not in seen:
@@ -612,9 +646,15 @@ def raw_card(spark, row, out_path, order="", say=print):
             continue
         return out_path, (f"original upload {uri} ({type(fam).__name__[-2:]}, "
                           f"{fam.n_ch} ch, {fam.n_samples:,} samples)")
+    where = ", ".join(f"{k}={_text(rec.get(k))!r}"
+                      for k in ("bucket", "folder", "source")
+                      if _text(rec.get(k)))
+    hint = (f"; the record says {where} -- set DATAGO_RAW_FILE_TEMPLATE "
+            f"from these (e.g. 'abfss://<container>@<account>.dfs.core."
+            f"windows.net/{{folder}}/{{raw_file_name}}'), or put the .DAT "
+            f"on the Volume's FAMOS folder") if where else ""
     if not tried:
         cols = ", ".join(sorted(rec)) or "none"
         return None, (f"no path to the original file in its datago record "
-                      f"(columns: {cols}); set DATAGO_RAW_FILE_TEMPLATE if "
-                      f"datago keeps the uploads somewhere")
-    return None, "original upload not usable: " + " | ".join(tried)
+                      f"(columns: {cols}){hint or '; set DATAGO_RAW_FILE_TEMPLATE if datago keeps the uploads somewhere'}")
+    return None, "original upload not usable: " + " | ".join(tried) + hint

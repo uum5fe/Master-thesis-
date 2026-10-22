@@ -68,10 +68,14 @@ FAMOS_FROM_DATAGO = False
 #: datago source that holds a FAMOS-v2 card's segment channels, because the
 #: datago rows of such a card hold UC2 under every name). Empty: found
 #: automatically from any path-like column of the datago file record
-#: (metafiles_delta). Or a template, e.g.
+#: (metafiles_delta), from its bucket + folder columns, and by the file's
+#: name under FAMOS_ROOT (three levels down). Or a template, e.g.
 #:   "abfss://landing@<account>.dfs.core.windows.net/datago/{raw_file_name}"
+#:   "abfss://{bucket}@<account>.dfs.core.windows.net/{folder}/{raw_file_name}"
 #:   "/Volumes/<catalog>/<schema>/<volume>/{order}/{raw_file_name}"
-#: with {raw_file_name}, {file_id}, {order} (e.g. RO2612086).
+#: with {raw_file_name}, {order} (e.g. RO2612086) and every column of the
+#: file record: {file_id}, {bucket}, {folder}, {source}, ... A run that
+#: cannot find the file prints the record's bucket / folder / source.
 DATAGO_RAW_FILE_TEMPLATE = ""
 
 # ---------------------------------------------------------------------------
@@ -84,16 +88,21 @@ MIN_SNR_DB = 0.0
 EVALUATION_MODE = "default"   # 'default' | 'permissive' | 'strict'
 CHANNEL_LAG = "correct"       # 'correct' | 'report' | 'off'
                               #   per-segment chain lag, removed or only written
-GAMRY_SYNC = "guide"          # 'guide' | 'frequency' | 'report' | 'off'
+GAMRY_SYNC = "report"         # 'guide' | 'frequency' | 'report' | 'off'
                               #   guide: Gamry's exact frequencies + windows
                               #   re-located in the Gamry slot; frequency: only
                               #   the exact frequencies; report: only
                               #   bronze/gamry_sync.csv, nothing changed
+GAMRY_MATCH = "file"          # 'file' | 'time'
+                              #   which Gamry sweep belongs to the run: file =
+                              #   order / build / current / test from the file
+                              #   name (stamps never reject); time = only a
+                              #   sweep within 30 min of the FAMOS stamps
 CARD_GAIN = "correct"         # 'correct' | 'report' | 'off'
                               #   each card's UC2 gain against the others,
                               #   divided out of Z or only written
 UC_SERIES_MOHM_CM2 = 0.0
-FREQ_RESPONSE = "report"      # 'report' | 'off' (never changes Z)
+FREQ_RESPONSE = "off"         # 'report' | 'off' (never changes Z)
 HEATMAP_STYLE = "interpolated"
 CSV_MIRROR_X = False
 #: 'auto': apply <RESULTS_ROOT>/<order>/hf_response/hf_response.csv when it

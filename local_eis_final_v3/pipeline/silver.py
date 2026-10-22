@@ -1963,7 +1963,11 @@ def gamry_card_phase(spectra: dict, skew: dict, lags: dict, cfg: Config,
     import gamry_sync
     sw = gamry_compare.select_sweep(hits,
                                     when=gamry_sync.recording_window(cfg),
-                                    test_id=getattr(cfg, "test_id", None))
+                                    test_id=getattr(cfg, "test_id", None),
+                                    match=getattr(cfg, "gamry_match", "file"),
+                                    order_id=getattr(cfg, "leepa", None),
+                                    version=getattr(cfg, "gamry_version", "")
+                                    or None)
     if sw is None:
         out["reason"] = (f"no {want} sweep belongs to this recording "
                          f"(time / build)")

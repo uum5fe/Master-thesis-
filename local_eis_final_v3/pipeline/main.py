@@ -531,7 +531,8 @@ def whole_cell_and_plausibility(cfg: Config, manifest: dict, log,
                 only=cfg.condition, order_id=cfg.leepa,
                 version=getattr(cfg, "gamry_version", "") or None, log=log,
                 when=_recording_window(cfg),
-                test_id=getattr(cfg, "test_id", None))
+                test_id=getattr(cfg, "test_id", None),
+                match=getattr(cfg, "gamry_match", "file"))
             manifest["stages"]["gamry"] = [c.summary() for c in comps]
             if comps and comps[0].freq.size:
                 # the reference arm of the plausibility aggregate check, in

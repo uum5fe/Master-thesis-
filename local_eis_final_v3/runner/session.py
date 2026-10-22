@@ -52,14 +52,14 @@ IDENTITY_KEYS = (
     "plate", "plate_orientation", "test_id", "f_min_hz", "f_max_hz", "full_band", "eval_f_max_hz",
     "min_snr_db", "preset_name", "gamry_version", "exclude_segments",
     "substitute_segments", "fill_missing_from_neighbours", "channel_lag",
-    "gamry_sync", "card_gain", "uc_series_mohm_cm2", "csv_mirror_x",
+    "gamry_sync", "gamry_match", "card_gain", "uc_series_mohm_cm2", "csv_mirror_x",
     "param_method", "ecm_compare", "r_ohmic_method", "ref_channel",
 )
 
 #: identity keys added after results were already saved, with the value
 #: every older result implicitly had -- a saved result without the key is
 #: not "made with other settings" when the current value is this one
-_IDENTITY_SINCE = {"plate_orientation": "standard"}
+_IDENTITY_SINCE = {"plate_orientation": "standard", "gamry_match": "time"}
 
 #: widgets of earlier runner versions, taken off the bar
 _OLD_WIDGETS = ("csv_path", "csv_dialect", "csv_tones", "gain_file",
@@ -227,6 +227,23 @@ class Session:
                 out.setdefault(k[2], f)
         return out
 
+    def _find_on_volume(self, name, depth: int = 3):
+        """A file of exactly this name under the FAMOS folder, up to `depth`
+        sub-folders down (an order's cards kept in their own folder), or
+        None."""
+        name = Path(str(name or "")).name
+        if not name:
+            return None
+        for k in range(depth + 1):
+            try:
+                hit = next(iter(sorted(self.famos_root.glob("*/" * k + name))),
+                           None)
+            except OSError:
+                hit = None
+            if hit is not None and hit.is_file():
+                return hit
+        return None
+
     def _slot_source(self, leepa, card) -> list:
         """A Volume .DAT of the same card (this order first, then any) whose
         header gives the card's channel order."""
@@ -259,6 +276,11 @@ class Session:
                          f"-> Volume")
             return self.famos_root, {}
         vol = self._volume_cards(leepa, cond, test)
+        for card, row in dg.items():          # the same file in a sub-folder
+            if card not in vol:
+                hit = self._find_on_volume(getattr(row, "raw_file_name", ""))
+                if hit is not None:
+                    vol[card] = hit
         out = self.scratch / "datago_famos" / f"RO{leepa}" / f"{cond}_Test{test}"
         shutil.rmtree(out, ignore_errors=True)
         out.mkdir(parents=True, exist_ok=True)
@@ -305,7 +327,14 @@ class Session:
                 src[card] = "Volume"
                 self.say(f"    Karte_{card}: Volume {vol[card].name}")
             else:
-                self.say(f"    Karte_{card}: left out (no usable copy)")
+                self.say(f"    Karte_{card}: left out (no usable copy) -- its "
+                         f"datago rows cannot be repaired (the datago import "
+                         f"of this FAMOS version wrote UC2 under every "
+                         f"channel), so only the original .DAT can bring its "
+                         f"segments back: put "
+                         f"{dg[card].raw_file_name} in {self.famos_root}, "
+                         f"or set DATAGO_RAW_FILE_TEMPLATE (see the line on "
+                         f"the original .DAT files above)")
         return out, src
 
     @staticmethod
@@ -331,7 +360,8 @@ class Session:
     def gamry_dir(self, leepa):
         """Folder with every whole-cell sweep of the order: datago first
         (all sweeps, as .dta with their start times), then the Volume. The
-        pipeline picks the sweep of each run by time (select_sweep)."""
+        pipeline picks the sweep of each run by file or by time
+        (settings.GAMRY_MATCH, gamry_compare.select_sweep)."""
         vol = self._volume_gamry_root(leepa)
         if S.DATAGO_FIRST and S.GAMRY_FROM_DATAGO and self.spark is not None:
             try:
@@ -555,6 +585,7 @@ class Session:
             gain_file=Path(s["gain_file"]) if s["gain_file"] else None,
             hf_response_file=self._hf_response_file(),
             channel_lag=S.CHANNEL_LAG, gamry_sync=S.GAMRY_SYNC,
+            gamry_match=getattr(S, "GAMRY_MATCH", "file"),
             card_gain=S.CARD_GAIN, uc_series_mohm_cm2=S.UC_SERIES_MOHM_CM2,
             freq_response=S.FREQ_RESPONSE,
             abgleich_bode_dir=(Path(files["abgleich"]) / "bode"

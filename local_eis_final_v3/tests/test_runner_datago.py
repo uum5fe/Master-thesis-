@@ -91,3 +91,49 @@ def test_the_bench_log_is_read_whole(monkeypatch):
     t0, vals, name = datago.bench_channels(_spark(), "2612086")
     assert "lokale_EIS" in name and t0 == pd.Timestamp("2026-10-20 06:09:00")
     assert vals["I_S"][0][-1] == 5990.0
+
+
+def test_every_current_of_the_order_gets_its_own_datago_sweep(tmp_path,
+                                                             monkeypatch):
+    """RO2612091 (V26_113): seven sweeps in datago, stamps 2 h off the FAMOS
+    recordings. Each current gets the sweep of its own current from the
+    datago folder, by file -- none from the shared Volume folder."""
+    monkeypatch.setattr(datago, "CACHE", tmp_path / "dg")
+    datago._FILES.clear()
+    cur = {101: 611, 102: 450, 103: 300, 104: 150, 105: 60, 106: 45, 107: 30}
+    files, vals = [], []
+    for n, c in cur.items():
+        t0 = pd.Timestamp("2026-10-21 09:00:00") + pd.Timedelta(minutes=10 * (n - 101))
+        files.append({"file_id": f"g{n}",
+                      "raw_file_name": f"RO2612091-01_V26_113_HFR_{n}_CurrVal_{c}.mf4",
+                      "measurement_type": "GALVEIS", "t_begin": t0,
+                      "t_end": t0 + pd.Timedelta(minutes=3), "starttime": None,
+                      "iacreq": 7, "freqinit": 30000, "freqfinal": 0.2,
+                      "ptsperdec": 10})
+        vals += _sweep_vals(f"g{n}")
+    said = []
+    d = datago.gamry_dir(_Spark(pd.DataFrame(files), pd.DataFrame(vals)),
+                         "2612091", say=said.append)
+    assert len(list(d.glob("*.dta"))) == 7
+    assert "7 from datago" in said[-1] and "30A, 45A, 60A" in said[-1]
+    found = GC.find_cell_sweeps(d, order_id="2612091", version="V26_113")
+    for n, c in cur.items():
+        hits = [s for s in found if s.condition == f"{c}A"]
+        rec = (datetime(2026, 10, 21, 15, 0), datetime(2026, 10, 21, 15, 4))
+        sw = GC.select_sweep(hits, when=rec, test_id="01",
+                             order_id="2612091", version="V26_113")
+        assert sw is not None and f"HFR_{n}_CurrVal_{c}" in sw.path.name
+
+
+def test_the_runner_says_when_the_sweeps_do_not_come_from_datago(tmp_path,
+                                                                monkeypatch):
+    import runner
+    from runner import settings as S
+    monkeypatch.setattr(S, "GAMRY_FROM_DATAGO", False)
+    said = []
+    R = runner.Session({"spark": object()}, gamry_root=tmp_path / "Gamry",
+                       famos_root=tmp_path, results_root=tmp_path / "r",
+                       config_root=tmp_path / "c", scratch=tmp_path / "s")
+    R.say = said.append
+    R.gamry_dir("2612091")
+    assert "NOT from datago" in said[-1] and "GAMRY_FROM_DATAGO" in said[-1]

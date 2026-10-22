@@ -14,7 +14,7 @@ from __future__ import annotations
 from pathlib import Path
 
 #: Shown in every run's identity file and printed by the setup cell.
-RUNNER_VERSION = "v34.7"
+RUNNER_VERSION = "v34.8"
 
 # ---------------------------------------------------------------------------
 # where things are
@@ -62,7 +62,7 @@ BENCH_FROM_DATAGO = True      # the bench .mf4 (MF4 plot)
 #: channel (multiplexer slot) order, which datago does not keep, is taken
 #: from a .DAT of the same card on the Volume. Slower than the Volume:
 #: ~30-60 s per card.
-FAMOS_FROM_DATAGO = False
+FAMOS_FROM_DATAGO = True
 #: A card whose datago copy is rejected (or missing) is read from the Volume
 #: instead -- that card only; the others stay from datago. The Volume copy is
 #: found by order, condition, test and card number anywhere under FAMOS_ROOT

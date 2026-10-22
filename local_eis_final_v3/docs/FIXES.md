@@ -983,3 +983,15 @@ in more places:
 - **Coverage.** The check passed from 60 % of the plate area, so a run with a
   whole card missing (RO2612091 60 A: 75 %) read PASS. Now PASS from 90 %;
   60-90 % is a WARN that says how much of the area rests on neighbours.
+
+---
+
+## v34.8 (2026-10-22) -- say where the Gamry sweeps come from
+
+The runner took an order's Gamry sweeps from datago, and fell back to the
+Volume WITHOUT A WORD when the switches were off, when there was no Spark
+session, or when datago held no sweep of the order (RO2612091 60-611 A: the
+shared Gamry folder with 45A.DTA ... 450A.DTA was used, so 30, 300 and 611 A
+had no reference). Every path now prints its source:
+"Gamry sweeps of RO2612091: 7 from datago -> <folder> (30A, 45A, ...)" or
+"Gamry sweeps NOT from datago: <why> -> Volume folder <folder>".

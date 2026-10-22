@@ -241,8 +241,11 @@ def gamry_dir(spark, leepa, volume_root=None, say=print):
                 f"-- left out")
     if n_dg + n_vol == 0:
         return None
-    say(f"  Gamry sweeps of {leepa}: {n_dg} from datago"
-        + (f", {n_vol} from the Volume" if n_vol else ""))
+    cur = sorted({str(r.condition) for r in rows if r.condition},
+                 key=lambda c: float(c.rstrip("A") or 0))
+    say(f"  Gamry sweeps of RO{leepa}: {n_dg} from datago"
+        + (f", {n_vol} from the Volume" if n_vol else "")
+        + f" -> {out} ({', '.join(cur)})")
     return out
 
 

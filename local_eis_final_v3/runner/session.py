@@ -448,13 +448,22 @@ class Session:
         pipeline picks the sweep of each run by file or by time
         (settings.GAMRY_MATCH, gamry_compare.select_sweep)."""
         vol = self._volume_gamry_root(leepa)
-        if S.DATAGO_FIRST and S.GAMRY_FROM_DATAGO and self.spark is not None:
+        why = ""
+        if not (S.DATAGO_FIRST and S.GAMRY_FROM_DATAGO):
+            why = ("switched off (settings DATAGO_FIRST / GAMRY_FROM_DATAGO "
+                   "is False)")
+        elif self.spark is None:
+            why = "no Spark session, so datago cannot be read"
+        else:
             try:
                 d = datago.gamry_dir(self.spark, leepa, vol, say=self.say)
                 if d is not None:
                     return d
+                why = f"datago holds no Gamry sweep of RO{leepa}"
             except Exception as exc:                        # noqa: BLE001
-                self.say(f"  datago Gamry sweeps not read ({exc}) -> Volume")
+                why = f"datago Gamry sweeps not read ({exc})"
+        self.say(f"  Gamry sweeps NOT from datago: {why} -> "
+                 + (f"Volume folder {vol}" if vol else "no Gamry reference"))
         return vol
 
     # ------------------------------------------------------------------

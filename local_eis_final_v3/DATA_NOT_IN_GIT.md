@@ -1,7 +1,7 @@
 # Not in this repository
 
 To keep the repository small, three data folders of the pipeline package are
-left out here. They are in the full package zip (`local_eis_final_v347.zip`):
+left out here. They are in the full package zip (`local_eis_final_v348.zip`):
 
 - `EIS_config/gen1/Abgleich/bode/` and `EIS_config/gen2/Abgleich/bode/`:
   Gamry bode sweeps of the Abgleich (only needed to rebuild `chain_gain.csv`,

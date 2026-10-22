@@ -218,6 +218,33 @@ class Session:
                 seen[v] = seen.get(v, 0) + 1
         return max(seen, key=seen.get) if seen else ""
 
+    def plate_hint(self, leepa, plate) -> str:
+        """'' or a warning when the order's file names (the bench .mf4:
+        ..._V26_113_lokale_EIS_6_Boxen_Naboo_1.mf4) name the OTHER plate."""
+        import site_paths
+        digits = "".join(ch for ch in str(leepa) if ch.isdigit())
+        names = []
+        for root in (self.gamry_root, self.gamry_root.parent):
+            try:
+                names += [f.name for f in Path(root).iterdir()
+                          if digits in f.name]
+            except OSError:
+                pass
+        if self.spark is not None:
+            try:
+                names += list(datago.files(self.spark, leepa)["raw_file_name"]
+                              .dropna().astype(str))
+            except Exception:                               # noqa: BLE001
+                pass
+        said = {p for p, toks in site_paths.PLATE_TOKENS.items()
+                for n in names for t in toks[:1] if t in n.lower()}
+        if said and plate not in said:
+            return (f"the files of RO{leepa} name plate "
+                    f"{'/'.join(sorted(said))} (e.g. Naboo = gen2, Kashyyyk "
+                    f"= gen1), but {plate} is selected -- check the Plate "
+                    f"drop-down")
+        return ""
+
     def _volume_cards(self, leepa, cond, test, deep: bool = False) -> dict:
         """{card: .DAT} of this order / condition / test on the Volume.
 
@@ -625,6 +652,10 @@ class Session:
             lines.append(f"  Excluded    {', '.join(sorted(s['exclude'], key=int))}")
         if s["substitute"]:
             lines.append(f"  Rebuilt     {', '.join(sorted(s['substitute'], key=int))}")
+        if s["source"] == "famos":
+            hint = self.plate_hint(s["leepa"], s["plate"])
+            if hint:
+                lines.append("  !! " + hint)
         if s["plate_files"].get("missing") and s["source"] == "famos":
             import site_paths
             lines.append("  !! " + site_paths.missing_message(s["plate_files"]))

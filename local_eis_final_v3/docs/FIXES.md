@@ -995,3 +995,14 @@ shared Gamry folder with 45A.DTA ... 450A.DTA was used, so 30, 300 and 611 A
 had no reference). Every path now prints its source:
 "Gamry sweeps of RO2612091: 7 from datago -> <folder> (30A, 45A, ...)" or
 "Gamry sweeps NOT from datago: <why> -> Volume folder <folder>".
+
+---
+
+## v34.9 (2026-10-22) -- the bench name checks the plate
+
+The bench .mf4 (`..._RO2612091-01_V26_113_lokale_EIS_6_Boxen_Naboo_1.mf4`)
+already ties the order to its build, and the build to its Gamry sweeps
+(`V26_113_HFR_101_CurrVal_611`), in the datago folder and on the Volume
+(`tests/test_gamry_by_bench_name.py`). It also names the plate: the
+selection printout now warns when the order's files say Naboo (gen2) or
+Kashyyyk (gen1) and the other plate is selected.

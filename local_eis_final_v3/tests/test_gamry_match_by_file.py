@@ -68,9 +68,12 @@ def test_an_up_down_ramp_is_told_apart_by_the_test_number():
     kw = dict(when=REC, order_id="2612091", version="V26_113")
     assert GC.select_sweep([down, up], test_id="01", **kw) is up
     assert GC.select_sweep([down, up], test_id="02", **kw) is down
-    # stamps without the time-zone error: the one that overlaps wins
+    # "file" never looks at the stamps, even when one overlaps the recording;
+    # "time" does
     down_ok = _sweep(down.path.name, datetime(2026, 10, 21, 15, 31))
-    assert GC.select_sweep([down_ok, up], test_id="01", **kw) is down_ok
+    assert GC.select_sweep([down_ok, up], test_id="01", **kw) is up
+    assert GC.select_sweep([down_ok, up], test_id="01", match="time",
+                           **kw) is down_ok
 
 
 def test_a_file_that_does_not_name_the_cell_still_needs_its_stamps():

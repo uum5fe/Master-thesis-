@@ -391,10 +391,9 @@ def select_sweep(hits: list, when=None, test_id=None, log=None,
 
     `match` = "file" (default): the sweep is identified by its FILE -- the
     callers already keep only sweeps naming this order / build and this
-    current; one such sweep is taken whatever its time stamp says, two or
-    more (an up/down ramp) are told apart by time when a stamp lies within
-    `max_gap_s`, else by the test number (Test_01 = the first by start time,
-    then HFR number). Sweeps of several builds still give None. The clock
+    current; one such sweep is taken, two or more (an up/down ramp) are told
+    apart by the test number (Test_01 = the first in HFR-number order). The
+    time stamps are not used. Sweeps of several builds still give None. The clock
     offset is then measured from the steps themselves (gamry_sync), so the
     stamps are never needed. ONLY a file whose name says it is this cell --
     this order (`order_id`) or this build (`version`) -- is matched this way;
@@ -541,22 +540,17 @@ def _stamp_gap(sw, when) -> float | None:
 
 
 def _select_by_file(hits, when, test_id, log, max_gap_s):
-    """select_sweep(match="file"): identity first, stamps only as a tie-break."""
+    """select_sweep(match="file"): by the file alone -- order / build, current,
+    test number. The time stamps are only reported, never used."""
     builds = {version_of(sw.path.name) for sw in hits}
     if len(builds) > 1:
-        near = sorted((g, sw.path.name, sw) for sw in hits
-                      for g in [_stamp_gap(sw, when)]
-                      if g is not None and g <= max_gap_s)
-        if len(near) == 1 or (len(near) > 1 and near[1][0] > near[0][0] + 60):
-            hits = [near[0][2]]
-        else:
-            if log is not None:
-                log.warning(
-                    f"  {len(hits)} sweeps of this current from builds "
-                    f"{', '.join(sorted(b or '?' for b in builds))} -- none "
-                    f"used: the files cannot say which is this cell's (set "
-                    f"the build in PLATE_VERSION_OVERRIDE)")
-            return None
+        if log is not None:
+            log.warning(
+                f"  {len(hits)} sweeps of this current from builds "
+                f"{', '.join(sorted(b or '?' for b in builds))} -- none used: "
+                f"the files cannot say which is this cell's (set the build in "
+                f"PLATE_VERSION_OVERRIDE)")
+        return None
 
     def stamp_note(sw):
         g = _stamp_gap(sw, when)
@@ -573,28 +567,21 @@ def _select_by_file(hits, when, test_id, log, max_gap_s):
     if len(hits) == 1:
         pick, how = hits[0], "the only sweep of this current for this cell"
     else:
-        near = [(g, sw) for sw in hits
-                for g in [_stamp_gap(sw, when)] if g is not None]
-        near.sort(key=lambda gs: gs[0])
-        if near and near[0][0] <= max_gap_s and (
-                len(near) == 1 or near[1][0] > near[0][0] + 60):
-            pick, how = near[0][1], "the one whose time stamps match"
+        # in measurement order -- the HFR number the Gamry gives each sweep;
+        # the stamps only where a file has none (their ORDER survives any
+        # constant clock offset, their absolute value is never used)
+        order = sorted(hits, key=lambda sw: (_hfr_number(sw),
+                                             sw.started is None,
+                                             sw.started or 0, sw.path.name))
+        try:
+            k = int(str(test_id)) - 1
+        except (TypeError, ValueError):
+            k = -1
+        if 0 <= k < len(order):
+            pick, how = order[k], f"test number {test_id} of {len(order)}"
         else:
-            # in measurement order: a constant clock offset does not change
-            # it; the HFR number is the order when there is no stamp
-            stamped = all(sw.started is not None for sw in hits)
-            order = sorted(hits, key=lambda sw: (
-                (sw.started, _hfr_number(sw)) if stamped
-                else (_hfr_number(sw), sw.path.name)))
-            try:
-                k = int(str(test_id)) - 1
-            except (TypeError, ValueError):
-                k = -1
-            if 0 <= k < len(order):
-                pick, how = order[k], f"test number {test_id} of {len(order)}"
-            else:
-                pick, how = order[-1], (f"the last of {len(order)} (test "
-                                        f"{test_id!r} not among them)")
+            pick, how = order[-1], (f"the last of {len(order)} (test "
+                                    f"{test_id!r} not among them)")
     if log is not None:
         log.info(f"  Gamry sweep chosen by file: {pick.path.name} ({how}; "
                  f"{stamp_note(pick)})")

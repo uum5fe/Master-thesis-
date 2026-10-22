@@ -218,13 +218,31 @@ class Session:
                 seen[v] = seen.get(v, 0) + 1
         return max(seen, key=seen.get) if seen else ""
 
-    def _volume_cards(self, leepa, cond, test) -> dict:
-        """{card: .DAT} of this order / condition / test on the Volume."""
+    def _volume_cards(self, leepa, cond, test, deep: bool = False) -> dict:
+        """{card: .DAT} of this order / condition / test on the Volume.
+
+        deep: also look up to three folders below FAMOS_ROOT, for any file
+        naming this order whose name reads as this condition / test / card
+        (Leepa_<order>_..., RO<order>-01_..., <order>_...)."""
         out = {}
         for f in self._famos_files(leepa):
             k = datago.famos_key(f.name)
             if k and k[0] == cond and k[1] == test:
                 out.setdefault(k[2], f)
+        if deep:
+            digits = "".join(ch for ch in str(leepa) if ch.isdigit())
+            for depth in range(1, 4):
+                try:
+                    hits = sorted(self.famos_root.glob(
+                        "*/" * depth + f"*{digits}*_Karte_*"))
+                except OSError:
+                    hits = []
+                for f in hits:
+                    if f.suffix.lower() != ".dat" or not f.is_file():
+                        continue
+                    k = datago.famos_key(f.name)
+                    if k and k[0] == cond and k[1] == test:
+                        out.setdefault(k[2], f)
         return out
 
     def _report_missing_cards(self, leepa, cond, test, have):
@@ -324,7 +342,8 @@ class Session:
                 self.say(f"    {cond} Test_{test}: no FAMOS cards in datago "
                          f"-> Volume")
             return self.famos_root, {}
-        vol = self._volume_cards(leepa, cond, test)
+        fallback = bool(getattr(S, "FAMOS_VOLUME_FALLBACK", True))
+        vol = self._volume_cards(leepa, cond, test, deep=True)
         for card, row in dg.items():          # the same file in a sub-folder
             if card not in vol:
                 hit = self._find_on_volume(getattr(row, "raw_file_name", ""))
@@ -381,22 +400,26 @@ class Session:
                 why = self._why_rows_broken(leepa, card, slot or [same])
                 if why:
                     self.say(f"      {why}")
-            if card in vol:
+            if card in vol and (fallback or card not in dg):
                 try:
                     (out / name).symlink_to(vol[card])
                 except OSError:
                     shutil.copy2(vol[card], out / name)
                 src[card] = "Volume"
-                self.say(f"    Karte_{card}: Volume {vol[card].name}")
+                self.say(f"    Karte_{card}: Volume {vol[card]}"
+                         + (" -- used for this card only, in place of the "
+                            "rejected datago copy" if card in dg else ""))
+            elif card in vol:
+                self.say(f"    Karte_{card}: left out -- the Volume has "
+                         f"{vol[card].name}, but FAMOS_VOLUME_FALLBACK is "
+                         f"False")
             else:
-                self.say(f"    Karte_{card}: left out (no usable copy) -- its "
-                         f"datago rows cannot be repaired (the datago import "
-                         f"of this FAMOS version wrote UC2 under every "
-                         f"channel), so only the original .DAT can bring its "
-                         f"segments back: put "
-                         f"{dg[card].raw_file_name} in {self.famos_root}, "
-                         f"or set DATAGO_RAW_FILE_TEMPLATE (see the line on "
-                         f"the original .DAT files above)")
+                self.say(f"    Karte_{card}: left out -- datago's copy was "
+                         f"rejected and no {cond} Test_{test} Karte_{card} "
+                         f"file of RO{leepa} is on the Volume (searched "
+                         f"{self.famos_root} and three folders below). Put "
+                         f"{dg[card].raw_file_name} there and rerun; it is "
+                         f"then used for this card only")
         return out, src
 
     @staticmethod

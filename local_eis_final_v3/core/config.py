@@ -285,10 +285,12 @@ class Config:
     gamry_sync: str = "report"             # off | report | frequency | guide
     # WHICH GAMRY SWEEP BELONGS TO THIS RECORDING (gamry_compare.select_sweep).
     # "file": the sweep of this order / build and current, by its file name;
-    # a current swept twice is told apart by the test number. The time
-    # stamps never reject (RO2612091: Gamry and FAMOS stamps 1.9 h apart, a
-    # time-zone difference). "time": only a sweep within 30 min of the FAMOS
-    # stamps. Either way gamry_sync measures the real offset from the steps.
+    # a current swept twice is told apart by the test number (HFR order).
+    # The time stamps are not used at all (RO2612091: Gamry and FAMOS stamps
+    # 1.9 h apart, a time-zone difference). "time": only a sweep within
+    # 30 min of the FAMOS stamps. Either way the clocks are synchronised on
+    # the SIGNALS: cards by their UC2 cross-correlation, FAMOS to Gamry by
+    # matching the frequency steps (gamry_sync).
     gamry_match: str = "file"              # file | time
     channel_lag: str = "correct"           # off | report | correct
     channel_lag_f_lo_hz: float = 50.0      # below: no lag is visible

@@ -63,6 +63,12 @@ BENCH_FROM_DATAGO = True      # the bench .mf4 (MF4 plot)
 #: from a .DAT of the same card on the Volume. Slower than the Volume:
 #: ~30-60 s per card.
 FAMOS_FROM_DATAGO = False
+#: A card whose datago copy is rejected (or missing) is read from the Volume
+#: instead -- that card only; the others stay from datago. The Volume copy is
+#: found by order, condition, test and card number anywhere under FAMOS_ROOT
+#: (three folders deep), whatever its naming convention. False: such a card
+#: is left out.
+FAMOS_VOLUME_FALLBACK = True
 #: Where datago keeps the ORIGINAL uploaded .DAT files, if it does. A card is
 #: first taken from its original upload (exact, any FAMOS version -- the only
 #: datago source that holds a FAMOS-v2 card's segment channels, because the
@@ -96,8 +102,10 @@ GAMRY_SYNC = "report"         # 'guide' | 'frequency' | 'report' | 'off'
 GAMRY_MATCH = "file"          # 'file' | 'time'
                               #   which Gamry sweep belongs to the run: file =
                               #   order / build / current / test from the file
-                              #   name (stamps never reject); time = only a
-                              #   sweep within 30 min of the FAMOS stamps
+                              #   name, time stamps not used; time = only a
+                              #   sweep within 30 min of the FAMOS stamps.
+                              #   Synchronisation itself never uses stamps:
+                              #   cards by UC2, Gamry by its frequency steps
 CARD_GAIN = "correct"         # 'correct' | 'report' | 'off'
                               #   each card's UC2 gain against the others,
                               #   divided out of Z or only written

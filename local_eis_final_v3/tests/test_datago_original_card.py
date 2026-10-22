@@ -109,3 +109,36 @@ def test_the_run_says_which_card_is_missing_and_why_rows_are_broken(
     assert "FAMOS-v2" in text and "UC2" in text
     assert sorted(p.name for p in d.glob("*.DAT")) == [
         "RO2612091-01_Current_60A_Test_01_Karte_2.DAT"]
+
+
+def _rejected_k3_session(tmp_path, monkeypatch, fallback):
+    monkeypatch.setattr(S, "FAMOS_VOLUME_FALLBACK", fallback)
+    sig2, sig3 = _signals(1), _signals(2)
+    files = _files(("k2", "RO2612085-01_Current_450A_Test_01_Karte_2.DAT"),
+                   ("k3", "RO2612085-01_Current_450A_Test_01_Karte_3.DAT"))
+    vals = pd.concat([_rows("k2", sig2), _rows("k3", sig3, bug=True)])
+    R, vol = _session(tmp_path, _Spark(files, vals), monkeypatch)
+    said = []
+    R.say = lambda *a: said.append(" ".join(str(x) for x in a))
+    # another naming convention, in an order folder: still this card
+    sub = vol / "2612085" / "450A"
+    sub.mkdir(parents=True)
+    _volume_dat(sub / "Leepa_2612085_Current_450A_Test_01_Karte_3.DAT", sig3)
+    _volume_dat(vol / "RO2612085-01_Current_60A_Test_02_Karte_2.DAT", sig2)
+    d, src = R.famos_dir("450A")
+    return d, src, "\n".join(said), sig3
+
+
+def test_a_rejected_datago_card_is_read_from_the_volume_for_that_card_only(
+        tmp_path, monkeypatch):
+    d, src, said, sig3 = _rejected_k3_session(tmp_path, monkeypatch, True)
+    assert src == {2: "datago (rows)", 3: "Volume"}
+    assert "used for this card only" in said
+    k3 = FamosFile(d / "RO2612085-01_Current_450A_Test_01_Karte_3.DAT")
+    assert (k3.channel("16") == sig3["16"].astype("float32")).all()
+
+
+def test_the_volume_fallback_can_be_switched_off(tmp_path, monkeypatch):
+    d, src, said, _ = _rejected_k3_session(tmp_path, monkeypatch, False)
+    assert src == {2: "datago (rows)"}
+    assert "FAMOS_VOLUME_FALLBACK is False" in said

@@ -946,3 +946,23 @@ in more places:
   (Tatooine_*.DTA); its normalised response at 4 kHz equals gen1's to 0.01
   deg in the median (-10.0 deg), per segment within 0.8 deg: the same
   amplifier design on both plates.
+
+---
+
+## v34.6 (2026-10-22) -- Volume fallback per card; no time stamps in the sweep choice
+
+- **`FAMOS_VOLUME_FALLBACK = True`** (runner settings). A card whose datago
+  copy is rejected (or missing) is read from the Volume -- that card only;
+  the other cards stay from datago. The Volume copy is found by order,
+  condition, test and card number anywhere under FAMOS_ROOT, three folders
+  deep, whatever its naming convention (`Leepa_<order>_...`,
+  `RO<order>-01_...`, `<order>_...`). False: such a card is left out, and the
+  log names the Volume file it did not use. Cards are aligned on their UC2
+  signals, so a card from the Volume and cards from datago combine like
+  cards from one source.
+- **`gamry_match = "file"` uses no time stamps at all.** A current swept twice
+  is told apart by the test number in HFR order; the overlap tie-break is
+  gone. The stamps are only reported. Synchronisation never used them:
+  cards by UC2 cross-correlation, FAMOS to Gamry by matching the frequency
+  steps. A file that names neither the order nor the build still needs the
+  time rule (the v34.2 wrong-cell protection).

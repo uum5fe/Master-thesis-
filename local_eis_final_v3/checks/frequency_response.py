@@ -431,6 +431,8 @@ def report(summary: dict, say=print) -> None:
             f"{ex['f_top_hz']:g} Hz |G_d| {top['mag_median']:.3f}, "
             f"arg {top['phase_deg_median']:+.1f} deg, segment sd "
             f"{top['phase_deg_sd']:.2f} deg")
+        if summary.get("exsitu_source"):
+            say(f"    from {summary['exsitu_source']}")
         for s, v in ex.get("not_flat", {}).items():
             say(f"    seg {s}: {v:+.1f} % off 1 between {FLAT_BAND[0]:g} and "
                 f"{FLAT_BAND[1]:g} Hz (normalisation step)")

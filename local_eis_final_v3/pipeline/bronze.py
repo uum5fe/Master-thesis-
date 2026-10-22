@@ -2207,7 +2207,10 @@ def run(cfg: Config = DEFAULT, log=None) -> BronzeRun:
     utils.banner("BRONZE  --  raw ingestion", log)
 
     files = discover_files(cfg)
-    log.info(f"  {len(files)} file(s) matching {cfg.famos_pattern()!r}")
+    log.info(f"  {len(files)} file(s) for {cfg.leepa} {cfg.condition} "
+             f"Test_{cfg.test_id} in {cfg.dat_dir}:")
+    for f in files:
+        log.info(f"    {f.name}")
 
     utils.section("channel inventory", log)
     channels, cards = inventory_channels(files, cfg, log)

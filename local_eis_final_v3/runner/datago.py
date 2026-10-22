@@ -317,6 +317,13 @@ def famos_cards(spark, leepa) -> dict:
     return out
 
 
+def famos_unparsed(spark, leepa) -> list[str]:
+    """Names of the order's .DAT uploads that famos_key cannot read."""
+    df = files(spark, leepa)
+    return sorted(str(r.raw_file_name) for r in df[df["kind"] == "famos"]
+                  .itertuples() if famos_key(r.raw_file_name) is None)
+
+
 def card_channels(spark, file_id):
     """({channel: samples}, fs, info) of one card, each channel in time order.
 
@@ -477,18 +484,24 @@ def famos_card(spark, row, out_path, slot_dat=None, same_dat=None,
     slots = (list(slot_dat) if isinstance(slot_dat, (list, tuple))
              else [slot_dat])
     same_hdr = None
+    import contextlib
+    import io
     for src in [same_dat, *slots]:
         if src is None:
             continue
-        try:
-            hdr = FamosFile(src)
+        try:                     # only the header: its |CS remarks are noise
+            with contextlib.redirect_stdout(io.StringIO()):
+                hdr = FamosFile(src)
         except Exception:                                   # noqa: BLE001
             continue
         if src is same_dat:
             same_hdr = hdr
         if sorted(hdr.names) == sorted(chans):
             names = sorted(hdr.names, key=hdr.position)
-            basis = f"from {Path(src).name}"
+            basis = (f"from {Path(src).name}" if src is same_dat else
+                     f"from {Path(src).name} (channel order only: datago "
+                     f"keeps none, so it is read from a .DAT of the same card "
+                     f"with the same channels)")
             if abs(hdr.fs - fs) < 1e-3 * fs:
                 fs = float(hdr.fs)
             if src is same_dat:

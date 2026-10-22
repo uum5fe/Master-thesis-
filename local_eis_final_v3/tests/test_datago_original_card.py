@@ -15,7 +15,8 @@ from runner import datago
 from runner import settings as S
 from eis_local import FamosFile
 
-from test_runner_datago_famos import (_Spark, _files, _rows, _session,
+from test_runner_datago_famos import (_Spark, _files, _fresh_cache,  # noqa: F401
+                                      _rows, _session,
                                       _signals, _volume_dat)
 
 NAME = "RO2612091-01_Current_45A_Test_01_Karte_3.DAT"
@@ -75,5 +76,36 @@ def test_the_original_in_a_volume_sub_folder_replaces_the_broken_rows(
     _volume_dat(vol / "RO2612085-01_Current_60A_Test_02_Karte_2.DAT", sig2)
     d, src = R.famos_dir("450A")
     assert src[3] == "Volume"
-    k3 = FamosFile(d / "Leepa_2612085_Current_450A_Test_01_Karte_3.DAT")
+    k3 = FamosFile(d / "RO2612085-01_Current_450A_Test_01_Karte_3.DAT")
     assert (k3.channel("16") != k3.channel("UC2")).any()
+
+
+def test_the_run_says_which_card_is_missing_and_why_rows_are_broken(
+        tmp_path, monkeypatch):
+    """RO2612091 60 A: Karte_4 was not in datago for 60 A Test_01 (only for
+    45 A), and Karte_3's rows were UC2 everywhere because the card is a
+    FAMOS-v2 recording. Both are said, not left to be guessed."""
+    from make_synth_famos import write_v2
+    import numpy as np
+    sig2, sig3 = _signals(1), _signals(2)
+    files = _files(("a2", "RO2612091-01_Current_60A_Test_01_Karte_2.DAT"),
+                   ("a3", "RO2612091-01_Current_60A_Test_01_Karte_3.DAT"),
+                   ("b4", "RO2612091-01_Current_45A_Test_01_Karte_4.DAT"),
+                   ("zz", "RO2612091-01_60A_Karte4.DAT"))
+    vals = pd.concat([_rows("a2", sig2), _rows("a3", sig3, bug=True)])
+    said = []
+    R, vol = _session(tmp_path, _Spark(files, vals), monkeypatch)
+    R.say = lambda *a: said.append(" ".join(str(x) for x in a))
+    R.sel = {"leepa": "2612091", "test_id": "01"}
+    names = list(sig3)
+    write_v2(vol / "RO2612090-01_Current_60A_Test_01_Karte_3.DAT", names,
+             np.vstack([sig3[n] for n in names]).T, 25000.0)
+    _volume_dat(vol / "RO2612090-01_Current_60A_Test_01_Karte_2.DAT", sig2)
+    d, src = R.famos_dir("60A")
+    text = "\n".join(said)
+    assert "Karte_4: NOT in datago for 60A Test_01" in text
+    assert "45A Test_01" in text
+    assert "RO2612091-01_60A_Karte4.DAT" in text            # unreadable name
+    assert "FAMOS-v2" in text and "UC2" in text
+    assert sorted(p.name for p in d.glob("*.DAT")) == [
+        "RO2612091-01_Current_60A_Test_01_Karte_2.DAT"]

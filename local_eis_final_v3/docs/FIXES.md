@@ -914,3 +914,35 @@ in more places:
 - When none works, the run prints the record's bucket / folder / source, so
   the template can be set once.
 - `tests/test_datago_original_card.py`.
+
+---
+
+## v34.5 (2026-10-22) -- RO2612091 60 A: what the log said, and what it left out
+
+- **Card file names.** Cards rebuilt from datago were renamed
+  `Leepa_<order>_Current_...` in the scratch folder, so bronze reported names
+  that exist nowhere. They now keep the datago upload's own prefix
+  (`RO2612091-01_Current_60A_Test_01_Karte_1.DAT`), still ONE convention for
+  every card of the run (bronze takes the first naming pattern that matches;
+  two conventions in one folder would drop cards). Bronze lists the files it
+  found instead of printing its first search pattern.
+- **Missing card.** A card of the order that is in neither datago nor the
+  Volume for the selected condition / test was skipped without a word
+  (60 A: Karte_4). The run now says so, lists the conditions datago does
+  hold that card for, and lists datago .DAT uploads whose names cannot be
+  read as `<current>_Test_<nn>_Karte_<n>`. Karte_4 carries the four plate
+  temperature sensors, so without it the plate falls back to 58.4 degC.
+- **Why Karte_3 is rejected.** When a card's datago rows are rejected, the
+  run checks the FAMOS format of the same card's other recordings on the
+  Volume and says it: Karte_3 is a FAMOS-v2 recording, the others v1.
+  datago's importer handles v1 and writes UC2 under all 16 names of a v2 card.
+- **Channel order from another order's .DAT.** datago keeps no channel
+  (multiplexer slot) order; it is read from a .DAT header of the same card
+  with the same channels -- for RO2612091 from RO2612090. The log now says
+  that it is the channel order only, and the header read no longer prints
+  the v1 `|CS declares ...` remarks of those files.
+- **Ex-situ chain source.** The frequency-response log names the bode folder
+  or gain file it read. gen2 reads `EIS_config/gen2/Abgleich/bode`
+  (Tatooine_*.DTA); its normalised response at 4 kHz equals gen1's to 0.01
+  deg in the median (-10.0 deg), per segment within 0.8 deg: the same
+  amplifier design on both plates.

@@ -235,8 +235,8 @@ def test_session_mixes_datago_and_volume_cards(tmp_path, monkeypatch):
 
     d, src = R.famos_dir("450A")
     assert src == {2: "datago (rows)", 3: "Volume"}
-    k2 = FamosFile(d / "Leepa_2612085_Current_450A_Test_01_Karte_2.DAT")
-    k3 = FamosFile(d / "Leepa_2612085_Current_450A_Test_01_Karte_3.DAT")
+    k2 = FamosFile(d / "RO2612085-01_Current_450A_Test_01_Karte_2.DAT")
+    k3 = FamosFile(d / "RO2612085-01_Current_450A_Test_01_Karte_3.DAT")
     assert k2.names == ORDER_K2              # slot order from the 60 A .DAT
     assert np.array_equal(k3.channel("55" if "55" in k3.names else "16"),
                           sig3["16"])
@@ -299,7 +299,7 @@ def test_v2_card_from_a_path_column_of_the_datago_record(tmp_path, monkeypatch):
         {"storage_path": "{up}/RO2612086-01_Current_30A_Test_01_Karte_3.DAT"})
     d, src = R.famos_dir("30A")
     assert src == {3: "datago (original file)"}
-    fam = FamosFile(d / "Leepa_2612086_Current_30A_Test_01_Karte_3.DAT")
+    fam = FamosFile(d / "RO2612086-01_Current_30A_Test_01_Karte_3.DAT")
     assert type(fam).__name__ == "FamosV2" and fam.names == V2_NAMES
     for j, nm in enumerate(V2_NAMES):           # every channel, not UC2
         assert np.allclose(fam.channel(nm), data[:, j].astype("<f4"))

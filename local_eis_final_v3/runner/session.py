@@ -227,6 +227,55 @@ class Session:
                 out.setdefault(k[2], f)
         return out
 
+    def _report_missing_cards(self, leepa, cond, test, have):
+        """Say which card of the order is absent from this condition / test,
+        and where datago does have it -- a card that is simply not uploaded
+        must not look like a card the pipeline dropped."""
+        try:
+            allc = datago.famos_cards(self.spark, leepa)
+        except Exception:                                   # noqa: BLE001
+            allc = {}
+        expected = set().union(*[set(v) for v in allc.values()]) if allc else set()
+        for card in sorted(expected - set(have)):
+            elsewhere = sorted(f"{c} Test_{t}" for (c, t), v in allc.items()
+                               if card in v)
+            self.say(f"    Karte_{card}: NOT in datago for {cond} Test_{test} "
+                     f"and not on the Volume -- nothing to evaluate"
+                     + (f" (datago has Karte_{card} for "
+                        f"{', '.join(elsewhere[:6])})" if elsewhere else ""))
+        try:
+            odd = datago.famos_unparsed(self.spark, leepa)
+        except Exception:                                   # noqa: BLE001
+            odd = []
+        if odd:
+            self.say(f"    datago .DAT uploads of RO{leepa} whose name does not "
+                     f"read as <current>_Test_<nn>_Karte_<n> (not used): "
+                     f"{', '.join(odd[:8])}")
+
+    @staticmethod
+    def _why_rows_broken(leepa, card, dats) -> str:
+        """The FAMOS format of this card's other recordings on the Volume:
+        datago reads v1 files correctly and v2 files wrongly."""
+        from eis_local import FamosFile
+        import contextlib
+        import io
+        for d in dats or []:
+            if d is None:
+                continue
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    kind = type(FamosFile(d)).__name__[-2:].lower()
+            except Exception:                               # noqa: BLE001
+                continue
+            if kind == "v2":
+                return (f"why: Karte_{card} is recorded as a FAMOS-v2 file "
+                        f"({Path(d).name} is v2; cards written as v1 are read "
+                        f"correctly). datago's importer does not apply v2's "
+                        f"per-channel byte offset and stores the first "
+                        f"column, UC2, under all 16 names -- the segment "
+                        f"channels are not in datago at all")
+        return ""
+
     def _find_on_volume(self, name, depth: int = 3):
         """A file of exactly this name under the FAMOS folder, up to `depth`
         sub-folders down (an order's cards kept in their own folder), or
@@ -284,9 +333,19 @@ class Session:
         out = self.scratch / "datago_famos" / f"RO{leepa}" / f"{cond}_Test{test}"
         shutil.rmtree(out, ignore_errors=True)
         out.mkdir(parents=True, exist_ok=True)
+        self._report_missing_cards(leepa, cond, test, set(dg) | set(vol))
+        # Every card of the run under ONE naming convention -- the datago
+        # upload's own (RO2612091-01_Current_...), so the files read as what
+        # they are. One convention, because bronze takes the first naming
+        # pattern that matches: two conventions in one folder would split the
+        # cards and silently drop some.
+        prefix = next((m.group(1) for r in dg.values()
+                       for m in [re.match(r"(.+?)_Current_",
+                                          Path(str(r.raw_file_name)).name)]
+                       if m), f"Leepa_{leepa}")
         src, raw_said = {}, False
         for card in sorted(set(dg) | set(vol)):
-            name = f"Leepa_{leepa}_Current_{cond}_Test_{test}_Karte_{card}.DAT"
+            name = f"{prefix}_Current_{cond}_Test_{test}_Karte_{card}.DAT"
             path = None
             if card in dg:
                 try:
@@ -319,6 +378,9 @@ class Session:
                                  f"correction approximate (phase above ~1 kHz)")
                     continue
                 self.say(f"    Karte_{card}: datago REJECTED -- {note}")
+                why = self._why_rows_broken(leepa, card, slot or [same])
+                if why:
+                    self.say(f"      {why}")
             if card in vol:
                 try:
                     (out / name).symlink_to(vol[card])

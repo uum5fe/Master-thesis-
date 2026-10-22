@@ -14,7 +14,7 @@ from __future__ import annotations
 from pathlib import Path
 
 #: Shown in every run's identity file and printed by the setup cell.
-RUNNER_VERSION = "v34"
+RUNNER_VERSION = "v34.7"
 
 # ---------------------------------------------------------------------------
 # where things are

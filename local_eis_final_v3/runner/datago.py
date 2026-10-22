@@ -353,7 +353,7 @@ def card_channels(spark, file_id):
         v = pdf["v"].to_numpy(float)
         del pdf, cat
     info = {"rows": int(len(t)), "repeated": 0, "conflicts": 0,
-            "t_span_s": 0.0}
+            "t_span_s": 0.0, "gaps": 0, "gap_s": 0.0}
     if len(t) == 0:
         return {}, 0.0, info
     # one channel at a time: a whole-card sort needs ~5x the card in memory
@@ -378,7 +378,19 @@ def card_channels(spark, file_id):
         d = np.diff(ts[:200001])
         d = d[d > 0]
         if d.size:
-            dts.append(float(np.median(d)))
+            dt_c = float(np.median(d))
+            dts.append(dt_c)
+            # A hole in time: samples datago does not hold. Concatenating
+            # what is there would pull every later sample earlier -- dwell
+            # windows land on the wrong tone, phases slip -- without any
+            # error, so it is counted and the card refused (famos_card).
+            step = np.diff(ts)
+            big = step > 1.5 * dt_c
+            if big.any():
+                info["gaps"] += int(np.count_nonzero(big))
+                info["gap_s"] = max(info["gap_s"],
+                                    float(np.sum(step[big] - dt_c)))
+            del step, big
         del ts, vs
     del codes, t, v
     dt = float(np.median(dts)) if dts else 0.0
@@ -477,6 +489,10 @@ def famos_card(spark, row, out_path, slot_dat=None, same_dat=None,
     if info["conflicts"]:
         return None, (f"{info['conflicts']:,} samples are held twice with "
                       f"different values (two recordings under one file_id?)")
+    if info["gaps"]:
+        return None, (f"{info['gaps']:,} gap(s) in time, {info['gap_s']:.3f} s "
+                      f"of samples missing in datago -- the record cannot be "
+                      f"put back together sample-exact")
     dup = (f", {info['repeated']:,} repeated rows dropped"
            if info["repeated"] else "")
     names, basis = None, "approximate (UC, segments by number, temperatures)"
@@ -527,7 +543,8 @@ def famos_card(spark, row, out_path, slot_dat=None, same_dat=None,
         return None, "; ".join(bad) + dup
     secs = (datetime.now() - t0).total_seconds()
     return path, (f"{fam.n_ch} ch, {fam.n_samples:,} samples at "
-                  f"{fam.fs:g} Hz, slots {basis}{dup}, {secs:.0f} s")
+                  f"{fam.fs:g} Hz, no gaps in time, slots {basis}{dup}, "
+                  f"{secs:.0f} s")
 
 
 # ---------------------------------------------------------------------------

@@ -966,3 +966,20 @@ in more places:
   cards by UC2 cross-correlation, FAMOS to Gamry by matching the frequency
   steps. A file that names neither the order nor the build still needs the
   time rule (the v34.2 wrong-cell protection).
+
+---
+
+## v34.7 (2026-10-22) -- holes in datago's rows; coverage that hides a missing card
+
+- **Gaps in time.** A card rebuilt from datago's rows was put together by
+  sorting the samples on their time and concatenating them; samples datago
+  does not hold (a hole in time) would pull every later sample earlier --
+  dwell windows on the wrong tone, phases slipped -- with no error. The time
+  steps are now checked per channel (a step > 1.5 sample intervals is a gap);
+  a card with any gap is refused and, with FAMOS_VOLUME_FALLBACK, read from
+  the Volume. An accepted card says "no gaps in time". (RO2612091 60 A /
+  150 A: the Gamry step match failed with a 9.5 s / 5.3 s spread, against
+  0.5 s on the Volume files of RO2612090 -- the symptom a hole would give.)
+- **Coverage.** The check passed from 60 % of the plate area, so a run with a
+  whole card missing (RO2612091 60 A: 75 %) read PASS. Now PASS from 90 %;
+  60-90 % is a WARN that says how much of the area rests on neighbours.

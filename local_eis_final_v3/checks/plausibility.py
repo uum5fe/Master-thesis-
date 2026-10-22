@@ -149,8 +149,13 @@ def coverage(measured: list[str], plate_key: str = "gen1") -> Check:
     detail = (f"{len(have)}/{len(areas)} segments = {100 * frac:.1f} % of the "
               f"{total:.1f} cm2 plate (counting segments would say "
               f"{100 * by_count:.1f} %)")
-    if frac >= 0.60:
+    if frac >= 0.90:
         verdict = PASS
+    elif frac >= 0.60:
+        verdict = WARN
+        detail += (f" -- {100 * (1 - frac):.0f} % of the area is not "
+                   f"measured; its segments, the plate maps there and the "
+                   f"cell aggregate rest on neighbours (a card missing?)")
     elif frac >= 0.25:
         verdict = WARN
         detail += " -- a minority of the area carries the extrapolation"

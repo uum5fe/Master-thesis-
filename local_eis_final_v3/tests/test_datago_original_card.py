@@ -142,3 +142,23 @@ def test_the_volume_fallback_can_be_switched_off(tmp_path, monkeypatch):
     d, src, said, _ = _rejected_k3_session(tmp_path, monkeypatch, False)
     assert src == {2: "datago (rows)"}
     assert "FAMOS_VOLUME_FALLBACK is False" in said
+
+
+def test_a_hole_in_datagos_rows_is_refused_not_glued_shut(tmp_path):
+    """Samples missing in the middle would pull every later sample earlier:
+    windows on the wrong tone and slipped phases, without an error. The card
+    is refused, so the Volume copy (fallback) takes its place."""
+    sig = _signals(1)
+    rows = _rows("k2", sig)
+    hole = (rows["t"] > 0.40) & (rows["t"] < 0.45)      # 50 ms, every channel
+    spark = _Spark(_files(("k2", "RO2612091-01_Current_60A_Test_01_Karte_2.DAT")),
+                   rows[~hole])
+    row = datago.files(spark, "2612091").iloc[0]
+    out, note = datago.famos_card(spark, row, tmp_path / "k2.DAT")
+    assert out is None and "gap" in note and "missing in datago" in note
+    spark_ok = _Spark(_files(("k2", "RO2612091-01_Current_60A_Test_01_Karte_2.DAT")),
+                      rows)
+    datago._FILES.clear()
+    row = datago.files(spark_ok, "2612091").iloc[0]
+    out, note = datago.famos_card(spark_ok, row, tmp_path / "k2b.DAT")
+    assert out is not None and "no gaps in time" in note

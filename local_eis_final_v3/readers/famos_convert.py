@@ -4,8 +4,9 @@ famos_convert.py
 ================
 Rewrite a FAMOS-v2 card recording (DASYLab 14: one |CN block per channel,
 float64, the buffer column given by each channel's |CP byte offset) as a
-FAMOS-v1 .DAT (every name in one |CP, float32, interleaved in slot order) --
-the dialect datago imports correctly.
+FAMOS-v1 .DAT in DASYLab's own v1 layout (famos_write.py: every name in one
+|CP, float32, interleaved in slot order) -- the layout datago imports
+correctly. Written front to back in one pass (no memory-mapped writes).
 
 WHY
 ---
@@ -45,14 +46,10 @@ CHUNK_ROWS = 1_000_000
 
 
 def v1_header(names, fs: float, n_samples: int, start=None) -> bytes:
-    """The header runner.datago.write_famos_v1 writes, for n_samples rows."""
-    cp = ",".join(f"7,32,{nm}" for nm in names)
-    nt = (f"|NT,1,13,{start:%d.%m.%Y},0,{start:%H:%M:%S}.00;"
-          if start is not None else "")
-    nbytes = 4 * len(names) * int(n_samples)
-    return (f"|CF,2,1,1;|CK,1,3,1,1;{nt}|CD,2,{1.0 / fs!r},1;"
-            f"|CR,1,{len(names)},1,0,1;|CP,{cp};|CS,1,{nbytes},"
-            ).encode("latin-1")
+    """DASYLab's own v1 header (famos_write.dasylab_v1_header): the layout
+    datago imports correctly, not merely one this pipeline can read."""
+    from famos_write import dasylab_v1_header
+    return dasylab_v1_header(names, fs, n_samples, start)
 
 
 def convert(src, dst=None, chunk_rows: int = CHUNK_ROWS, check: bool = True,
@@ -73,8 +70,10 @@ def convert(src, dst=None, chunk_rows: int = CHUNK_ROWS, check: bool = True,
     with open(dst, "wb") as fh:
         fh.write(v1_header(names, fam.fs, n, start))
         for i in range(0, n, chunk_rows):
-            np.ascontiguousarray(mm[i:i + chunk_rows, cols],
-                                 dtype="<f4").tofile(fh)
+            fh.write(np.ascontiguousarray(mm[i:i + chunk_rows, cols],
+                                          dtype="<f4").tobytes())
+        from famos_write import TRAILER
+        fh.write(TRAILER)
     del mm
     if log:
         log(f"  {src.name}: {type(fam).__name__}, {fam.n_ch} channels, "

@@ -24,6 +24,22 @@ from, it now holds TWO Karte_3 files of the same test. Upload the _v1 file
 to datago (or move one of the two elsewhere) before running the pipeline
 on that folder.
 
+THE FILE WRITTEN
+----------------
+Exactly the layout DASYLab's own v1 export uses (readers/famos_write.py;
+byte for byte as on RO2612090 Karte_2), because datago imports that layout
+correctly -- a merely "readable" v1 header is not enough:
+
+    |CF,1;|CT,1;|KS;|CE,1;|CD,1,4.000000e-005,1,0,1,1,s;|CR,1,16,...;
+    |NO,1,0;|NL,1,DASYLab;|NT,1,13,dd.mm.yyyy,132,hh:mm:ss.00;
+    |CP,3,10,64,16,7,32,UC2     ,7,32,22      ,...;|CJ,...;|CS,1,<half>,
+    <float32 samples, channel-interleaved>;|CA,1,0000000000;
+
+(|CS states half the data bytes, as DASYLab writes it; the pipeline reads
+the file size, so it prints the usual "|CS declares N bytes, 2N present".)
+The file is written front to back in one pass -- no memory-mapped writes
+and no rename, which a Databricks Volume may not allow.
+
 WHAT IS KEPT
 ------------
 every channel and its name; the column order = the multiplexer slot order
@@ -166,27 +182,45 @@ def _start_time(hdr: str):
 
 
 # ---------------------------------------------------------------------------
-# writing FAMOS v1 (the layout the pipeline's runner.datago.write_famos_v1
-# writes and eis_local.FamosV1 reads)
+# writing FAMOS v1 in DASYLab's own layout (= readers/famos_write.py)
 # ---------------------------------------------------------------------------
+TRAILER = b";|CA,1,0000000000;"
+_CR_BLOCK = "0,2,-1E+030,1E+030,0,0,0,0,1,1,V"
+
+
+def _sci3(x: float) -> str:
+    """4e-05 as DASYLab writes it: 4.000000e-005 (three exponent digits)."""
+    m, e = f"{x:.6e}".split("e")
+    sign = "-" if e.startswith("-") else "+"
+    return f"{m}e{sign}{abs(int(e)):03d}"
+
+
 def _v1_header(names, fs, n_samples, start) -> bytes:
-    cp = ",".join(f"7,32,{nm}" for nm in names)
-    nt = (f"|NT,1,13,{start:%d.%m.%Y},0,{start:%H:%M:%S}.00;"
-          if start is not None else "")
-    nbytes = 4 * len(names) * int(n_samples)
-    return (f"|CF,2,1,1;|CK,1,3,1,1;{nt}|CD,2,{1.0 / fs!r},1;"
-            f"|CR,1,{len(names)},1,0,1;|CP,{cp};|CS,1,{nbytes},"
-            ).encode("latin-1")
+    n = len(names)
+    start = start or datetime(1970, 1, 1)
+    data_bytes = n_samples * n * 4
+    hdr = ("|CF,1;|CT,1;|KS;|CE,1;"
+           f"|CD,1,{_sci3(1.0 / fs)},1,0,1,1,s;"
+           f"|CR,1,{n}," + ",".join([_CR_BLOCK] * n) + ";"
+           "|NO,1,0;|NL,1,DASYLab;"
+           f"|NT,1,13,{start:%d.%m.%Y},132,{start:%H:%M:%S}.00;"
+           # 64 = 4 bytes x 16 channels on every DASYLab card seen
+           f"|CP,3,10,64,{n}," + ",".join(f"7,32,{str(nm):<8}" for nm in names)
+           + ";"
+           f"|CJ,1,{data_bytes + len(TRAILER):010d};"
+           f"|CS,1,{n_samples * n * 2:010d},")
+    return hdr.encode("latin-1")
 
 
 def _read_v1(path):
-    """(names, fs, offset, n_samples) of a v1 file written here."""
+    """(names, fs, offset, n_samples) of a v1 file written here: the samples
+    run from the |CS field to the trailer."""
     raw = Path(path).open("rb").read(65536).decode("latin-1", errors="replace")
     fs = 1.0 / float(re.search(r"\|CD,\d+,([\d.eE+-]+)", raw).group(1))
-    names = re.findall(r"7,32,([^,;]*)", re.search(r"\|CP,([^;]*);", raw).group(1))
-    m = re.search(r"\|CS,(\d+),(\d+),", raw)
-    off = m.end()
-    n = (Path(path).stat().st_size - off) // (4 * len(names))
+    names = [nm.strip() for nm in
+             re.findall(r"7,32,([^,;]*)", re.search(r"\|CP,([^;]*);", raw).group(1))]
+    off = re.search(r"\|CS,(\d+),(\d+),", raw).end()
+    n = (Path(path).stat().st_size - off - len(TRAILER)) // (4 * len(names))
     return names, fs, off, n
 
 
@@ -214,7 +248,9 @@ def convert(src, suffix: str = SUFFIX) -> Path:
     with open(tmp, "wb") as fh:
         fh.write(_v1_header(names, card.fs, card.n_samples, card.start))
         for i in range(0, card.n_samples, CHUNK_ROWS):
-            np.ascontiguousarray(mm[i:i + CHUNK_ROWS, cols], dtype="<f4").tofile(fh)
+            fh.write(np.ascontiguousarray(mm[i:i + CHUNK_ROWS, cols],
+                                          dtype="<f4").tobytes())
+        fh.write(TRAILER)
 
     # ---- read back and compare every channel ------------------------------
     v_names, v_fs, v_off, v_n = _read_v1(tmp)
@@ -242,7 +278,7 @@ def convert(src, suffix: str = SUFFIX) -> Path:
         tmp.unlink(missing_ok=True)
         raise ValueError("conversion check failed: " + "; ".join(problems))
     print(f"written  {dst}")
-    print(f"  FAMOS v1, checked: every channel identical on 8 probes "
+    print(f"  FAMOS v1 (DASYLab layout), checked: every channel identical on 8 probes "
           f"(largest relative difference {worst:.1e}, float32 rounding)")
     print("  NOTE: this folder now holds the original AND the _v1 card -- "
           "upload the _v1 file, or move one of them before the pipeline "

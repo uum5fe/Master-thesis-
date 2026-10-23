@@ -58,3 +58,20 @@ def test_a_damaged_copy_is_caught(tmp_path):
     out.write_bytes(bytes(raw))
     with pytest.raises(ValueError, match="differ"):
         famos_convert.verify(src, out, n_probe=2, probe_len=5003, log=None)
+
+
+def test_the_three_writers_give_the_same_dasylab_file(tmp_path):
+    """famos_convert, the standalone converter and famos_write produce the
+    same bytes: DASYLab's v1 layout, with its trailer."""
+    import contextlib
+    import io
+    import convert_karte_v2_to_v1 as standalone
+    import famos_write
+    src, _ = _v2(tmp_path)
+    a = famos_convert.convert(src, tmp_path / "a.DAT", log=None)
+    b = famos_write.convert(src, tmp_path / "b.DAT")
+    with contextlib.redirect_stdout(io.StringIO()):
+        c = standalone.convert(src)
+    assert a.read_bytes() == b.read_bytes() == c.read_bytes()
+    assert a.read_bytes().startswith(b"|CF,1;|CT,1;|KS;|CE,1;|CD,1,4.000000e-005")
+    assert a.read_bytes().endswith(famos_write.TRAILER)

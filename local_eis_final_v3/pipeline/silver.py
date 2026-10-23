@@ -1351,6 +1351,17 @@ def _hf_sources(path) -> dict:
     return _HF_CACHE[key]
 
 
+def _gate_magnitude(freq, Z, segment, cfg) -> np.ndarray:
+    """Z divided by the MAGNITUDE of the frozen high-frequency response of
+    its channel (cfg.hf_response_file), for the |Z| outlier gate. Only the
+    magnitude: the gates run before the timing corrections, and a delay
+    does not change |Z|. Unchanged without a file."""
+    hf = _hf_response(getattr(cfg, "hf_response_file", None))
+    if not hf:
+        return Z
+    return Z / np.abs(utils.gain_at(hf, str(segment), np.asarray(freq, float)))
+
+
 def gate_points(sp: BronzeSpectrum, cfg: Config) -> dict:
     """The point-level gates of process_segment, on their own.
 
@@ -1472,8 +1483,12 @@ def gate_points(sp: BronzeSpectrum, cfg: Config) -> dict:
 
     # 3. LOCAL |Z| OUTLIERS.  Targets the runaway points directly instead of
     #    inferring them from SNR, so weak-but-consistent points at the top of
-    #    the band survive.  Evaluated on what is still standing.
-    Zg = np.where(keep, Z, np.nan)
+    #    the band survive.  Evaluated on what is still standing, on the
+    #    magnitude the frozen high-frequency response says the channel
+    #    really saw (_gate_magnitude): a channel that rolls off (box r5 on
+    #    2612087, |H| ~0.5 at 6 kHz) is smooth after that correction, and
+    #    without it its top steps were cut here before silver could apply it.
+    Zg = _gate_magnitude(freq, np.where(keep, Z, np.nan), sp.segment, cfg)
     bad_z = utils.zmag_outliers(freq, Zg, n_mad=cfg.zmag_outlier_mad,
                                 win=cfg.zmag_outlier_win)
     keep &= gate(~bad_z, "zmag_outlier")

@@ -274,3 +274,29 @@ def test_a_file_changed_since_the_runs_is_refused_and_a_replaced_one_kept(tmp_pa
     gone = _run_dirs(tmp_path / "c", runs, hf_file=tmp_path / "nowhere.csv")
     with pytest.raises(ValueError, match="which is not there"):
         hf_response.build(gone, tmp_path / "hf2", log=None)
+
+
+def test_the_outlier_gate_sees_the_channel_magnitude_the_file_corrects(tmp_path):
+    """A rolled-off channel's top steps fall off its own |Z| trend and the
+    gate cut them before silver applied the file; judged on the corrected
+    magnitude they are kept."""
+    import silver
+    from config import DEFAULT
+    f = np.array([100, 200, 400, 800, 946.5, 1194, 1884, 2987, 3797, 4733,
+                  5928, 7547, 9516, 11953.0])
+    z_cell = 0.05 + 0.02 / (1 + 1j * f / 300)
+    lp = np.where(f >= 1000, 1 / np.sqrt(1 + (f / 2500.0) ** 2), 1.0)
+    Z = z_cell * lp
+    p = tmp_path / "hf.csv"
+    p.write_text("segment,freq_hz,gain_real,gain_imag\n" + "\n".join(
+        f"19,{fi:.6g},{g:.8g},0" for fi, g in zip(f, lp)))
+    plain = DEFAULT.replace(hf_response_file=None)
+    with_file = DEFAULT.replace(hf_response_file=p)
+    bad_raw = utils.zmag_outliers(f, silver._gate_magnitude(f, Z, 19, plain),
+                                  n_mad=4.5, win=7)
+    bad_cor = utils.zmag_outliers(f, silver._gate_magnitude(f, Z, 19, with_file),
+                                  n_mad=4.5, win=7)
+    assert bad_raw[-2:].all()
+    assert not bad_cor.any()
+    # another segment of the same file is untouched
+    assert np.allclose(silver._gate_magnitude(f, Z, 20, with_file), Z)

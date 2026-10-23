@@ -998,6 +998,32 @@ had no reference). Every path now prints its source:
 
 ---
 
+## v35.2 (2026-10-23) -- the |Z| outlier gate sees the corrected channel
+
+450A_Test0114 (2612087, v35.1, file 38384aaa3518) against 450A_Test0112
+(the card-magnitude file):
+
+| | Test0112 | Test0114 |
+|---|---|---|
+| in-situ phase sd at 11.95 kHz | 17.9° (FAIL) | **2.4°** (pass) |
+| \|H\| step above 2 kHz, box r5 | −40.7 % | **−4.4 %** |
+| R_ohmic median r5 / r6 / others | 22.3 / 30.1 / 58.8 | **52.0 / 46.0 / 56.5** |
+| R_ohmic CV | 38 % | **17 %** |
+| HFR fit, plate vs Gamry | 56.6 vs 52.1 | **52.9 vs 52.1** |
+
+But the r5 segments still ended at 5.9–7.5 kHz: the point gates run on
+bronze's Z, BEFORE silver applies the file, so the |Z| outlier gate kept
+cutting the rolled-off top steps the file had been extended to correct.
+That gate now judges |Z| divided by the magnitude of the channel's frozen
+response (`silver._gate_magnitude`; the other gates stay on the raw signal).
+Replayed on Test0114's own points: zmag outliers 52 → 21, and 10 r5
+segments extend their band (12, 15, 16, 19, 20, 23, 24, 27 to 11.95 kHz;
+11, 58 to 9.5 kHz); 9, 35, 52 lose one top step, which the next build of
+the file refines. The code change is not part of a run's identity: re-run
+in mode `rerun`.
+
+---
+
 ## v35.1 (2026-10-23) -- the validated settings live in the runner
 
 150A_Test013 / 450A_Test0113 (2612087, v35.0) were evaluated with the

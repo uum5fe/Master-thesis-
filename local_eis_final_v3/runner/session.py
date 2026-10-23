@@ -1123,13 +1123,16 @@ class Session:
     # ------------------------------------------------------------------
     # optional: the frozen high-frequency response of the order
     # ------------------------------------------------------------------
-    def build_hf_response(self):
+    def build_hf_response(self, mag: str | None = None):
         """Build <order>/hf_response/hf_response.csv from all selected runs
         (needs two or more conditions). Applied automatically to later runs
-        (settings.HF_RESPONSE = 'auto'); rerun them to use it."""
+        (settings.HF_RESPONSE = 'auto'); rerun them to use it. `mag`:
+        'segment' | 'card', default settings.HF_RESPONSE_MAG."""
         import hf_response
         runs = list(self.run_dirs().values())
         if len(runs) < 2:
             self.say("  needs two or more conditions with results")
             return None
-        return hf_response.build(runs, self.order_dir() / "hf_response")
+        mag = mag or getattr(S, "HF_RESPONSE_MAG", "segment")
+        return hf_response.build(runs, self.order_dir() / "hf_response",
+                                 mag=mag)

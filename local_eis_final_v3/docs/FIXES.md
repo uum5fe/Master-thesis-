@@ -998,6 +998,59 @@ had no reference). Every path now prints its source:
 
 ---
 
+## v35.0 (2026-10-23) -- rolled-off channels get their own magnitude
+
+2612087 at 150 / 450 A, evaluated with its first HF response file (per-card
+magnitude): the phase spread at 11.95 kHz fell 26.5 / 27.5° → 17.5 / 17.9°,
+but 17 segments still lost their top steps to the |Z| outlier gate, and
+their R_ohmic came out ~24 mΩ·cm² against ~51–56 for the other 49 (CV
+36–38 %). The rejected points were not noise (SNR 23–24 dB): they continue a
+smooth low-pass roll-off that starts near 1 kHz. Against the plate median,
+after every correction, |H| at 5.9 kHz was:
+
+| interface box | r1 | r2 | r3 | r4 | r5 | r6 |
+|---|---|---|---|---|---|---|
+| \|H\| at 5.9 kHz (box median, 450 A) | 1.17 | 1.14 | 0.99 | 1.03 | **0.49** | **0.77** |
+
+The roll-off follows the **interface box**, not the card: r5 (11–28, 52, 58)
+lands on cards 1, 2, 3 and 5 and rolls off on all of them, while its card
+neighbours in other boxes stay flat. It is the same at 150 and 450 A
+(r = 0.995 at 3.8 kHz), so it is the wiring, not the cell. A card median over
+half rolled-off and half healthy channels (Karte_2: 8 r5 + 7 others)
+corrects neither half. Switching the gate off would not help: the points it
+drops are 50–60 % low.
+
+- **`checks/hf_response.py`, `mag="segment"` (new default):** a channel
+  whose repeatable |H| at its top steps is > 25 % below its own 100–1000 Hz
+  level gets its own magnitude, a first-order low-pass fitted to its steps
+  (fc 2.4–11 kHz) and written up to 2× above its last kept step, so the next
+  run can keep the top steps; the plate median and the card magnitudes are
+  taken without those channels. `mag="card"` is the old file. Beside the
+  file: `hf_response_segments.csv` (which channel got what).
+  On 2612087, blind (fitted on one current, applied to the other):
+
+  | held-out | phase sd 11.95 kHz | \|H\| spread at the top | rolled-off channels |
+  |---|---|---|---|
+  | 150 A | 19.6° → 1.8° | 30.7 % → 9.9 % | 20 → 2 |
+  | 450 A | 19.7° → 2.0° | 30.3 % → 9.7 % | 19 → 1 |
+
+  with `mag="card"` the |H| spread stays at 30.6 / 30.4 % and 18–19 channels
+  stay rolled off. Flagged: 22 channels, r5 (11 of 13; 28 and 59 are
+  healthy) and r6 (11 of 11).
+- **Silver flags those segments `hf_magnitude_per_segment`:** their
+  top-of-band |Z| and R_ohmic rest on their own correction, not on an
+  independent reading. Only a bench sweep through the boxes makes it one.
+- **`checks/frequency_response.py`** reports the in-situ |H| step per
+  interface box as well as per card (`insitu_box_residual.csv`, log lines,
+  the in-situ check names the box). Box map: `r2d2_geometry.interface_boxes`
+  (gen1 from the wiring drawing; gen2 not known yet, so no box view there).
+- Runner: `settings.HF_RESPONSE_MAG = "segment"`, `R.build_hf_response(mag=...)`.
+  Rebuild the file over the order's conditions (45/60/150/450 A), re-run them,
+  and build once more: the second pass refines the low-pass of the channels
+  whose top steps came back.
+
+---
+
 ## v34.9 (2026-10-22) -- the bench name checks the plate
 
 The bench .mf4 (`..._RO2612091-01_V26_113_lokale_EIS_6_Boxen_Naboo_1.mf4`)

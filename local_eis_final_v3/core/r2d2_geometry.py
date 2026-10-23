@@ -714,6 +714,36 @@ def centroids(plate_name: str | None = None) -> dict[str, tuple[float, float]]:
     return {k: (s.cx_mm, s.cy_mm) for k, s in segs.items()}
 
 
+# ---------------------------------------------------------------------------
+# Interface boxes: which connector each segment's lines run through
+# ---------------------------------------------------------------------------
+# The plate's channels leave through six interface boxes; each box serves one
+# region and its own cable. Box and card are independent: one box feeds
+# several cards and one card several boxes. On 2612087 the high-frequency
+# magnitude grouped by BOX, not by card (r5 rolled off to |H| ~0.5 by 6 kHz
+# on all four cards it feeds), so the in-situ frequency response is also
+# reported per box. r1 also carries UC1, UC2, T1, T2; r6 UC3, UC4, T3, T4.
+# Known for the gen1 plate (wiring drawing, Oct 2026); gen2 not yet.
+INTERFACE_BOXES: dict[str, dict[str, tuple[int, ...]]] = {
+    "gen1": {
+        "r1": (1, 2, 5, 6, 37, 38, 39, 43, 44, 45, 49),
+        "r2": (9, 10, 13, 14, 17, 18, 21, 22, 25, 26, 50, 51, 57),
+        "r3": (29, 30, 33, 34, 55, 56, 61, 62, 63, 67, 68, 69),
+        "r4": (3, 4, 7, 8, 40, 41, 42, 46, 47, 48, 53, 54),
+        "r5": (11, 12, 15, 16, 19, 20, 23, 24, 27, 28, 52, 58, 59),
+        "r6": (31, 32, 35, 36, 60, 64, 65, 66, 70, 71, 72),
+    },
+}
+
+
+def interface_boxes(plate_name: str | None = None) -> dict[str, str]:
+    """Segment name -> interface box ('r1'..'r6'); {} for a plate whose
+    wiring is not known."""
+    key = plate_key(plate_name) if plate_name else ACTIVE_PLATE.key
+    return {str(seg): box for box, segs in INTERFACE_BOXES.get(key, {}).items()
+            for seg in segs}
+
+
 def areas_from_csv(path) -> dict[str, float]:
     """Read an override table.  Accepts 'segment,area_cm2' with , or ; and
     an optional header.  Missing segments fall back to the built-in value

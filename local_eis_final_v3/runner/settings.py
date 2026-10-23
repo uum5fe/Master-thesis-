@@ -14,7 +14,7 @@ from __future__ import annotations
 from pathlib import Path
 
 #: Shown in every run's identity file and printed by the setup cell.
-RUNNER_VERSION = "v34.9"
+RUNNER_VERSION = "v35.0"
 
 # ---------------------------------------------------------------------------
 # where things are
@@ -116,6 +116,11 @@ CSV_MIRROR_X = False
 #: 'auto': apply <RESULTS_ROOT>/<order>/hf_response/hf_response.csv when it
 #: exists; '' never; a path: that file.
 HF_RESPONSE = "auto"
+#: R.build_hf_response(): 'segment' gives channels that roll off (|H| more
+#: than 25 % down at the top, the same at every current -- interface boxes
+#: r5 / r6 on 2612087) their own magnitude, every other channel the card's;
+#: 'card' is the card magnitude for all (the files built before v35).
+HF_RESPONSE_MAG = "segment"
 
 # ---------------------------------------------------------------------------
 # saved results: one folder per order / condition / test, named in order

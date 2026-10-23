@@ -1317,14 +1317,37 @@ REJECT_REASONS = {
 _HF_CACHE: dict = {}
 
 
+def _file_key(path) -> str:
+    """Path plus modification time and size: a file rebuilt in the same
+    session (R.build_hf_response, then a rerun) is read again."""
+    p = Path(str(path))
+    try:
+        st = p.stat()
+        return f"{p}|{st.st_mtime_ns}|{st.st_size}"
+    except OSError:
+        return str(p)
+
+
 def _hf_response(path) -> dict:
     """utils.load_gain of the frozen high-frequency response, read once."""
     if not path:
         return {}
-    key = str(path)
+    key = _file_key(path)
     if key not in _HF_CACHE:
-        p = Path(key)
+        p = Path(str(path))
         _HF_CACHE[key] = utils.load_gain(p) if p.is_file() else {}
+    return _HF_CACHE[key]
+
+
+def _hf_sources(path) -> dict:
+    """{segment: 'segment' | 'card'}: which channels the response file gives
+    their own magnitude (hf_response.segment_sources), read once."""
+    if not path:
+        return {}
+    import hf_response
+    key = "sources:" + _file_key(Path(str(path)).with_name(hf_response.SEGMENTS_CSV))
+    if key not in _HF_CACHE:
+        _HF_CACHE[key] = hf_response.segment_sources(path)
     return _HF_CACHE[key]
 
 
@@ -1549,9 +1572,12 @@ def process_segment(sp: BronzeSpectrum, skew: SkewModel, cfg: Config,
     # ---- the frozen high-frequency response (checks/hf_response.py): per
     # ---- segment phase and per card magnitude above 1 kHz, measured across
     # ---- operating points at exactly this stage -------------------------
-    hf = _hf_response(getattr(cfg, "hf_response_file", None))
+    hf_file = getattr(cfg, "hf_response_file", None)
+    hf = _hf_response(hf_file)
+    hf_mag_own = False
     if hf:
         z_corr = z_corr / utils.gain_at(hf, str(sp.segment), f)
+        hf_mag_own = _hf_sources(hf_file).get(str(sp.segment)) == "segment"
     # ---- the UC taps' own series resistance (cfg.uc_series_mohm_cm2) -----
     r_tap = float(getattr(cfg, "uc_series_mohm_cm2", 0.0) or 0.0)
     if r_tap:
@@ -1718,6 +1744,10 @@ def process_segment(sp: BronzeSpectrum, skew: SkewModel, cfg: Config,
     if n_neg_lf:
         # kept deliberately - see Schneider et al. 2009
         flags.append(f"negative_ReZ_lf_{n_neg_lf}pts")
+    if hf_mag_own:
+        # a rolled-off channel: its top-of-band |Z|, and so R_ohmic, rests on
+        # its own magnitude correction rather than on an independent reading
+        flags.append("hf_magnitude_per_segment")
 
     if chain is not None:
         if chain.status == channel_lag.CORRECTED:

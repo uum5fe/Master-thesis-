@@ -98,3 +98,103 @@ def test_silver_divides_by_the_response_after_the_card_phase(tmp_path):
     hf = silver._hf_response(p)
     assert set(hf) == {"7"}
     assert silver._hf_response(None) == {}
+    # rebuilt in the same session: read again, not served from the cache
+    p.write_text("segment,freq_hz,gain_real,gain_imag\n"
+                 "8,0.01,1,0\n8,999,1,0\n8,1000,1.2,0\n8,12000,1.2,0\n"
+                 "9,0.01,1,0\n")
+    assert set(silver._hf_response(p)) == {"8", "9"}
+
+
+# ---------------------------------------------------------------------------
+# rolled-off channels: a box of lines that low-passes, across cards
+# ---------------------------------------------------------------------------
+ROLLED = {"8", "9", "10", "11", "12"}           # cards 1 and 2, like box r5
+FC = 3000.0
+
+
+def _rolled_plate(level: float, seed: int, hw: dict, cut_top=True) -> pd.DataFrame:
+    """_plate with ROLLED low-passed (|H| only: the phase is the timing
+    stages' and the per-segment phase's) and, like the |Z| outlier gate
+    does, their two top steps missing."""
+    d = _plate(level, seed, hw)
+    lp = np.where(d.segment.isin(ROLLED),
+                  1 / np.sqrt(1 + (d.freq_hz.to_numpy() / FC) ** 2), 1.0)
+    d["Z"] = d["Z"].to_numpy() * lp
+    d["z_re_mohm_cm2"] = d["Z"].to_numpy().real
+    d["z_im_mohm_cm2"] = d["Z"].to_numpy().imag
+    if cut_top:
+        d = d[~(d.segment.isin(ROLLED) & (d.freq_hz > 8000))]
+    return d.reset_index(drop=True)
+
+
+def _rolled_runs(hw=None):
+    hw = hw or _hardware()
+    return {c: _rolled_plate(lv, i, hw) for i, (c, lv) in
+            enumerate((("45A", 2.5), ("60A", 2.0), ("150A", 1.4), ("450A", 1.0)))}
+
+
+def test_rolled_off_channels_are_found_whatever_card_they_are_on():
+    info: dict = {}
+    hf_response.estimate([hf_response.deviations(d) for d in _rolled_runs().values()],
+                         info=info)
+    assert set(info["flagged"]) == ROLLED
+    t = info["segments"].set_index("segment")
+    assert (t.loc[sorted(ROLLED), "mag_source"] == "segment").all()
+    assert (t.drop(sorted(ROLLED))["mag_source"] == "card").all()
+    # a first-order low-pass, recovered up to the card's own slope it rides on
+    assert np.allclose(t.loc[sorted(ROLLED), "fc_hz"], FC, rtol=0.2)
+
+
+def test_only_card_hardware_flags_nothing():
+    hw = _hardware()
+    info: dict = {}
+    hf_response.estimate([hf_response.deviations(_plate(lv, i, hw))
+                          for i, lv in enumerate((2.5, 1.4, 1.0))], info=info)
+    assert info["flagged"] == []
+
+
+def test_per_segment_magnitude_passes_the_blind_test_where_the_card_fails():
+    runs = _rolled_runs()
+    seg = hf_response.validate(runs, mag="segment")
+    card = hf_response.validate(runs, mag="card")
+    for s, c in zip(seg, card):
+        assert s["rolled_off_before"] == len(ROLLED)
+        assert s["rolled_off_after"] == 0
+        assert c["rolled_off_after"] >= 3
+        assert s["mag_top_sd_after_pct"] < 0.5 * c["mag_top_sd_after_pct"]
+        assert s["phase_sd_after_deg"] < 1.5
+
+
+def test_the_low_pass_is_written_above_the_last_kept_step():
+    """The gate cut the top steps; the file still covers them, so the next
+    run can keep them."""
+    runs = [hf_response.deviations(d) for d in _rolled_runs().values()]
+    h = hf_response.estimate(runs)
+    f, g = h["10"]
+    assert f.max() == pytest.approx(11953.0)
+    # the low-pass times card 1's own rise, against a plate median of ~1
+    want = (1 + 0.012 * 11.953) / np.sqrt(1 + (11953.0 / FC) ** 2)
+    assert abs(g[-1]) == pytest.approx(want, rel=0.15)
+
+
+def test_build_writes_the_sources_and_silver_flags_them(tmp_path):
+    import silver
+    dirs = []
+    for name, d in _rolled_runs().items():
+        r = tmp_path / name
+        (r / "silver").mkdir(parents=True)
+        (r / "bronze").mkdir()
+        d[["segment", "freq_hz", "z_re_mohm_cm2", "z_im_mohm_cm2"]].to_csv(
+            r / "silver" / "spectra_clean.csv", index=False)
+        d.drop_duplicates("segment")[["segment", "card"]].to_csv(
+            r / "bronze" / "segment_meta.csv", index=False)
+        (r / "config_used.json").write_text(f'{{"condition": "{name}"}}')
+        dirs.append(r)
+    out = hf_response.build(dirs, tmp_path / "hf", log=None)
+    assert set(out["flagged"]) == ROLLED
+    src = hf_response.segment_sources(out["path"])
+    assert src["10"] == "segment" and src["20"] == "card"
+    assert silver._hf_sources(out["path"])["10"] == "segment"
+    assert silver._hf_sources(None) == {}
+    # an older file without the table: nothing is per segment
+    assert hf_response.segment_sources(tmp_path / "nowhere.csv") == {}

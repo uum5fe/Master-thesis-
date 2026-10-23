@@ -131,3 +131,33 @@ def test_a_step_at_the_normalisation_point_is_caught(tmp_path):
 def test_no_gain_file_is_not_applicable(tmp_path):
     s = fr.run(_run(tmp_path), write_png=False)
     assert _check(fr.checks(s), "chain response (ex-situ)").verdict == pl.NA
+
+
+def test_a_box_that_rolls_off_shows_per_box_where_the_cards_dilute_it(tmp_path):
+    """gen1 boxes: 11, 12, 15, 16 run through r5 and land on cards 3 and 4,
+    half of each; their lines low-pass. Per card the step is halved, per box
+    it is all there."""
+    run = _run(tmp_path)
+    p = run / "silver" / "spectra_clean.csv"
+    d = pd.read_csv(p, dtype={"segment": str})
+    lp = np.where(d.segment.isin({"11", "12", "15", "16"}),
+                  1 / np.sqrt(1 + (d.freq_hz / 2500.0) ** 2), 1.0)
+    d["z_re_mohm_cm2"] *= lp
+    d["z_im_mohm_cm2"] *= lp
+    d.to_csv(p, index=False)
+    (run / "config_used.json").write_text('{"plate": "gen1"}')
+    s = fr.run(run, write_png=False)
+    box = {b["box"]: b for b in s["insitu"]["box_residual"]}
+    assert box["r5"]["mag_step_hf_pct"] < -20
+    assert box["r5"]["worst_segment"] in {"11", "12", "15", "16"}
+    assert all(abs(b["mag_step_hf_pct"]) < 5 for k, b in box.items() if k != "r5")
+    c = _check(fr.checks(s), "segment frequency response (in-situ)")
+    assert c.verdict == pl.WARN and "interface box" in c.detail
+    assert (run / "frequency_response" / "insitu_box_residual.csv").is_file()
+
+
+def test_no_box_map_for_an_unknown_plate(tmp_path):
+    run = _run(tmp_path)
+    (run / "config_used.json").write_text('{"plate": "gen2"}')
+    s = fr.run(run, write_png=False)
+    assert "box_residual" not in s["insitu"]

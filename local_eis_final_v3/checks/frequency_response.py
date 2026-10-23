@@ -36,6 +36,8 @@ WHAT IT WRITES (RUN_DIR/frequency_response/)
     exsitu_response.csv      segment, freq_hz, mag, phase_deg
     insitu_response.csv      segment, card, stage (raw|clean), freq_hz, mag, phase_deg
     insitu_card_residual.csv per card: median phase and |H| step above f_hf
+    insitu_box_residual.csv  the same per interface box (gen1 plate), plus
+                             each box's worst segment
     summary.json             the numbers the plausibility checks use
     freq_response_exsitu.png / freq_response_insitu.png
 
@@ -217,14 +219,11 @@ def insitu_summary(df: pd.DataFrame) -> dict:
     return out
 
 
-def card_residual(df: pd.DataFrame) -> pd.DataFrame:
-    """Per card, after correction: median phase above F_HF, and how far |H|
-    above F_HF moves from the same segment's own 30-1000 Hz level (a flat
-    scale factor does not count, a frequency-dependent card response does)."""
-    d = df[(df.stage == "clean") & (df.card != "")]
-    if d.empty:
-        return pd.DataFrame(columns=["card", "n_segments", "phase_hf_deg",
-                                     "mag_step_hf_pct"])
+def _segment_steps(df: pd.DataFrame) -> pd.DataFrame:
+    """Per segment, after correction: median phase above F_HF, and how far
+    |H| above F_HF moves from the same segment's own 30-1000 Hz level (a
+    flat scale factor does not count, a frequency-dependent response does)."""
+    d = df[df.stage == "clean"]
     lo, hi = LEVEL_BAND
     lvl = d[(d.freq_hz >= lo) & (d.freq_hz <= hi)].groupby("segment").mag.median()
     hf = d[d.freq_hz >= F_HF]
@@ -232,10 +231,51 @@ def card_residual(df: pd.DataFrame) -> pd.DataFrame:
                                     mag=("mag", "median"),
                                     ph=("phase_deg", "median"))
     seg["step"] = 100 * (seg.mag / lvl.reindex(seg.index) - 1.0)
+    return seg
+
+
+def card_residual(df: pd.DataFrame) -> pd.DataFrame:
+    """Per card: median phase and |H| step above F_HF (_segment_steps)."""
+    d = df[(df.stage == "clean") & (df.card != "")]
+    if d.empty:
+        return pd.DataFrame(columns=["card", "n_segments", "phase_hf_deg",
+                                     "mag_step_hf_pct"])
+    seg = _segment_steps(d)
     out = seg.groupby("card").agg(n_segments=("step", "size"),
                                   phase_hf_deg=("ph", "median"),
                                   mag_step_hf_pct=("step", "median"))
     return out.round(2).reset_index()
+
+
+def box_residual(df: pd.DataFrame, boxes: dict) -> pd.DataFrame:
+    """The same per interface box (r2d2_geometry.interface_boxes), with the
+    box's worst segment: a box whose lines roll off shows here on whatever
+    cards it lands on, where the card median hides it."""
+    cols = ["box", "n_segments", "phase_hf_deg", "mag_step_hf_pct",
+            "worst_segment", "worst_step_pct"]
+    d = df[(df.stage == "clean") & df.segment.astype(str).isin(boxes)]
+    if d.empty or not boxes:
+        return pd.DataFrame(columns=cols)
+    seg = _segment_steps(d).dropna(subset=["step"])
+    seg["box"] = seg.index.astype(str).map(boxes)
+    rows = []
+    for box, g in seg.groupby("box"):
+        w = g.step.abs().idxmax()
+        rows.append({"box": box, "n_segments": len(g),
+                     "phase_hf_deg": g.ph.median(),
+                     "mag_step_hf_pct": g.step.median(),
+                     "worst_segment": str(w), "worst_step_pct": g.step[w]})
+    return pd.DataFrame(rows, columns=cols).round(2)
+
+
+def _boxes_of(run_dir) -> dict:
+    """The interface-box map of the run's plate, {} if unknown."""
+    try:
+        cfg = json.loads((Path(run_dir) / "config_used.json").read_text())
+        import r2d2_geometry as geom
+        return geom.interface_boxes(cfg.get("plate") or None)
+    except Exception:                                       # noqa: BLE001
+        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -292,15 +332,29 @@ def checks(summary: dict) -> list:
     if cards:
         txt += "; |H| step above {:g} Hz per card: ".format(F_HF) + ", ".join(
             f"{c['card']} {c['mag_step_hf_pct']:+.1f} %" for c in cards)
+    boxes = [b for b in ins.get("box_residual", [])
+             if np.isfinite(b.get("mag_step_hf_pct", np.nan))]
+    box_steps = [b for b in boxes if abs(b["mag_step_hf_pct"]) > CARD_STEP_WARN_PCT]
+    if box_steps:
+        txt += "; per interface box: " + ", ".join(
+            f"{b['box']} {b['mag_step_hf_pct']:+.1f} %" for b in box_steps)
     rests = ("all segments sitting on one cell, so their true spectra share a "
              "shape; a real local difference in the HF arc would also show here")
     sd = cl["phase_deg_sd"]
+    box_hint = (" -- grouped by interface box: the lines through that box "
+                "roll off whatever card they reach; a per-segment magnitude "
+                "in the HF response file (hf_response.py, mag='segment') "
+                "removes it, a bench sweep through the box confirms it")
     if sd > PHASE_SD_FAIL_DEG:
         v = pl.FAIL
         txt = "segments still rotated against each other at HF -- " + txt
-    elif sd > PHASE_SD_WARN_DEG or steps:
+        if box_steps:
+            txt += box_hint
+    elif sd > PHASE_SD_WARN_DEG or steps or box_steps:
         v = pl.WARN
-        if steps:
+        if box_steps:
+            txt += box_hint
+        elif steps:
             txt += (f" -- grouped by card: a card response above {F_HF:g} Hz "
                     "that is not a pure delay, or, for a card that covers "
                     "one region of the plate, a regional effect; a bench "
@@ -409,6 +463,11 @@ def run(run_dir, gain_file=None, bode_dir=None, out_dir=None,
         card_residual(ins).to_csv(out / "insitu_card_residual.csv",
                                   index=False)
     summary["insitu"] = insitu_summary(ins)
+    boxes = _boxes_of(run_dir)
+    if boxes and not ins.empty:
+        bx = box_residual(ins, boxes)
+        bx.to_csv(out / "insitu_box_residual.csv", index=False)
+        summary["insitu"]["box_residual"] = bx.to_dict(orient="records")
     (out / "summary.json").write_text(json.dumps(summary, indent=2,
                                                  default=float))
     if write_png:
@@ -451,6 +510,10 @@ def report(summary: dict, say=print) -> None:
             say(f"    {c['card']}: above {F_HF:g} Hz phase "
                 f"{c['phase_hf_deg']:+.1f} deg, |H| step "
                 f"{c['mag_step_hf_pct']:+.1f} %")
+        for b in ins.get("box_residual", []):
+            say(f"    box {b['box']} ({b['n_segments']} seg): above {F_HF:g} Hz "
+                f"|H| step {b['mag_step_hf_pct']:+.1f} %, worst seg "
+                f"{b['worst_segment']} {b['worst_step_pct']:+.1f} %")
 
 
 def main(argv=None) -> int:

@@ -676,6 +676,9 @@ v34: the Extra Analyses notebook, polarisation curves, summary and parameter
 tables, card diagnostics, per-segment scale, via resistance, DC-closure cell.
 `R.build_hf_response()` still builds the frozen high-frequency response of an
 order (applied automatically afterwards, `settings.HF_RESPONSE = 'auto'`).
+Since v35 channels that roll off (interface boxes r5 / r6 on 2612087) get
+their own magnitude (`settings.HF_RESPONSE_MAG = 'segment'`, see FIXES v35.0);
+the list is in `<order>/hf_response/hf_response_segments.csv`.
 
 ---
 

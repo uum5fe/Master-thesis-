@@ -998,6 +998,19 @@ had no reference). Every path now prints its source:
 
 ---
 
+## v35.3 (2026-10-23) -- convert a FAMOS-v2 card to v1 before the upload
+
+`readers/famos_convert.py` rewrites a FAMOS-v2 card (DASYLab 14; Karte_3 of
+RO2612085) as FAMOS v1, the dialect datago imports correctly (its v2 import
+returns UC2 under every channel name). Read with the pipeline's own reader,
+written in chunks as float32 in the v2 buffer (= multiplexer slot) order,
+with the sample rate and |NT trigger time, then read back and compared
+channel by channel; the original is never overwritten.
+
+    python readers/famos_convert.py <card>.DAT -o <folder or file>
+
+---
+
 ## v35.2 (2026-10-23) -- the |Z| outlier gate sees the corrected channel
 
 450A_Test0114 (2612087, v35.1, file 38384aaa3518) against 450A_Test0112

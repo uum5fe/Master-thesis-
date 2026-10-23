@@ -100,7 +100,9 @@ sweep through every channel would replace it with an absolute calibration.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -118,6 +120,9 @@ LOWPASS_TOL = 0.10
 #: and is then extended at most this factor above the channel's top step
 EXTEND_MAX = 2.0
 SEGMENTS_CSV = "hf_response_segments.csv"
+#: a run whose band (the step 60 % of its segments reach) ends below this
+#: cannot be built from: it carries no correction for the top of the band
+F_TOP_MIN_HZ = 5000.0
 
 
 # ---------------------------------------------------------------------------
@@ -404,38 +409,145 @@ def write(h: dict, path, f_lo: float = F_LO_HZ, note: str = "") -> Path:
     return path
 
 
+def _sha12(path) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()[:12]
+
+
+def top_step(sp: pd.DataFrame) -> float:
+    """The highest step at least 60 % of the run's segments reach."""
+    n = sp.groupby("fk")["segment"].nunique()
+    n = n[n >= 0.6 * sp["segment"].nunique()]
+    return float(n.index.max()) if len(n) else float("nan")
+
+
+def compose(h: dict, old: dict, f_lo: float = F_LO_HZ) -> dict:
+    """old x residual on the union of both files' steps above f_lo.
+
+    Above the residual's own steps it is held at its last value (as silver
+    applies a file), so the old file's corrections there are kept, not cut
+    off at the top of the new runs' band."""
+    import utils
+    out = {}
+    for seg in sorted(set(h) | set(old), key=_seg_key):
+        f_new = h[seg][0] if seg in h else np.zeros(0)
+        f_old = old[seg][0] if seg in old else np.zeros(0)
+        f_old = f_old[f_old >= f_lo]
+        if f_new.size:
+            near = np.min(np.abs(np.log(f_old[:, None] / f_new[None, :])),
+                          axis=1) < 0.005 if f_old.size else np.zeros(0, bool)
+            f_old = f_old[~near]
+        f = np.sort(np.concatenate([f_new, f_old]))
+        if not f.size:
+            continue
+        res = utils.gain_at(h, seg, f) if seg in h else np.ones(f.size, complex)
+        out[seg] = (f, res * utils.gain_at(old, seg, f))
+    return out
+
+
+def _backup(out: Path) -> Path | None:
+    """Copy the file about to be replaced (and its tables) to
+    out/history/<sha>_<name>, so a bad build can be undone."""
+    target = out / "hf_response.csv"
+    if not target.is_file():
+        return None
+    hist = out / "history"
+    hist.mkdir(parents=True, exist_ok=True)
+    sha = _sha12(target)
+    for name in ("hf_response.csv", SEGMENTS_CSV, "hf_response_validation.csv"):
+        if (out / name).is_file():
+            shutil.copy2(out / name, hist / f"{sha}_{name}")
+    return hist / f"{sha}_hf_response.csv"
+
+
 def build(run_dirs, out_dir, f_lo: float = F_LO_HZ, log=print,
-          mag: str = "segment") -> dict:
+          mag: str = "segment", prior=None,
+          f_top_min: float = F_TOP_MIN_HZ) -> dict:
     """Estimate from all runs, validate leave-one-out, write the file.
 
     Runs already evaluated WITH a response file are composed with it: the
     new estimate is the residual on top of that file, so the written file is
     old x residual and a second pass refines rather than undoes the first.
+    `prior` names that file when it is not where the runs recorded it.
+
+    Refused, with nothing written, when
+      * a run's band ends below f_top_min (evaluated without the Gamry
+        guide / skew model / ensemble detection: such a file would carry no
+        correction for the top of the band and replace the one that did);
+      * the runs were evaluated with a file that is not there, or that has
+        changed since (its sha differs from run_identity.json: built twice
+        without re-running, which would count the residual twice).
+    The file replaced is kept in out_dir/history/.
     """
     import utils
-    runs, prior = {}, set()
+    runs, prior_rec, shas = {}, set(), set()
     for d in run_dirs:
         name, sp, cfg = load_run(d)
         runs[name] = sp
-        prior.add(str(cfg.get("hf_response_file") or ""))
+        prior_rec.add(str(cfg.get("hf_response_file") or ""))
+        idf = Path(d) / "run_identity.json"
+        if idf.is_file():
+            try:
+                ident = json.loads(idf.read_text())
+            except ValueError:
+                ident = {}
+            sha_rec = ident.get("hf_response_file_sha",
+                                (ident.get("settings") or {}).get(
+                                    "hf_response_file_sha"))
+            shas.add(str(sha_rec or ""))
     if len(runs) < 2:
         raise ValueError("needs at least two operating points")
-    if len(prior) > 1:
+    if len(prior_rec) > 1:
         raise ValueError("the runs were evaluated with different response "
-                         f"files ({sorted(prior)}): re-run them alike first")
-    prior_file = next(iter(prior))
+                         f"files ({sorted(prior_rec)}): re-run them alike first")
+    tops = {n: top_step(sp) for n, sp in runs.items()}
+    low = {n: t for n, t in tops.items() if not t >= f_top_min}
+    if low:
+        raise ValueError(
+            "the band of " + ", ".join(f"{n} ends at {t:.0f} Hz" for n, t in low.items())
+            + f" (the step 60 % of the segments reach), below {f_top_min:g} Hz: "
+            "a file built from it has no correction above that and would "
+            "replace one that has. Evaluate the runs with the validated "
+            "settings (GAMRY_SYNC='guide', SKEW_MODEL='structural', "
+            "HF_USE_ENSEMBLE / HF_LADDER_PRUNE = True, F_HI_FRAC_FS = 0.49) "
+            "and build again. Nothing written.")
+    prior_file = Path(prior) if prior else (
+        Path(next(iter(prior_rec))) if next(iter(prior_rec)) else None)
+    old = {}
+    if prior_file is not None:
+        if not prior_file.is_file():
+            raise ValueError(
+                f"the runs were evaluated with {prior_file}, which is not "
+                "there, so the new estimate (a residual on top of it) cannot "
+                "be composed; pass prior=<that file>. Nothing written.")
+        recorded = {s for s in shas if s}
+        sha = _sha12(prior_file)
+        if recorded and sha not in recorded:
+            raise ValueError(
+                f"{prior_file} is {sha}, but the runs were evaluated with "
+                f"{', '.join(sorted(recorded))}: the file changed after they "
+                "ran (built again without re-running?). Composing would "
+                "count the residual twice. Re-run the conditions, then "
+                "build. Nothing written.")
+        old = utils.load_gain(prior_file)
     val = validate(runs, f_lo, mag)
     info: dict = {}
     h = estimate([deviations(sp) for sp in runs.values()], f_lo, mag=mag,
                  info=info)
-    if prior_file and Path(prior_file).is_file():
-        old = utils.load_gain(prior_file)
-        for seg, (f, g) in h.items():
-            h[seg] = (f, g * utils.gain_at(old, seg, f))
+    if old:
+        h = compose(h, old, f_lo)
+        before = segment_sources(prior_file)
+        tab = info.get("segments")
+        if tab is not None and before:
+            was = [s for s, v in before.items() if v == "segment"]
+            tab.loc[tab["segment"].isin(was), "mag_source"] = "segment"
+            info["flagged"] = sorted(set(info.get("flagged", [])) | set(was),
+                                     key=_seg_key)
     out = Path(out_dir)
+    backup = _backup(out)
     path = write(h, out / "hf_response.csv", f_lo,
                  note=f"from {', '.join(runs)}"
-                 + (f"; composed with {prior_file}" if prior_file else ""))
+                 + (f"; composed with {prior_file} ({_sha12(prior_file)})"
+                    if old else ""))
     pd.DataFrame(val).to_csv(out / "hf_response_validation.csv", index=False)
     seg_tab = info.get("segments", pd.DataFrame())
     seg_path = out / SEGMENTS_CSV
@@ -463,9 +575,12 @@ def build(run_dirs, out_dir, f_lo: float = F_LO_HZ, log=print,
                 f"{r['card_step_after_pct']:.1f} %, |H| spread at the top "
                 f"{r['mag_top_sd_before_pct']:.1f} -> {r['mag_top_sd_after_pct']:.1f} %, "
                 f"rolled off {r['rolled_off_before']} -> {r['rolled_off_after']}")
-        log(f"  written: {path}")
+        if backup:
+            log(f"  the file it replaces: {backup}")
+        log(f"  written: {path} ({_sha12(path)})")
     return {"path": path, "validation": val, "n_segments": len(h),
-            "flagged": flagged, "segments_path": seg_path}
+            "flagged": flagged, "segments_path": seg_path, "backup": backup,
+            "top_step_hz": tops}
 
 
 def segment_sources(hf_file) -> dict[str, str]:
@@ -495,8 +610,11 @@ def main(argv=None) -> int:
     ap.add_argument("--mag", choices=MAG_MODES, default="segment",
                     help="magnitude per card, or per segment for rolled-off "
                          "channels (default)")
+    ap.add_argument("--prior", type=Path,
+                    help="the file the runs were evaluated with, when it is "
+                         "not where they recorded it")
     a = ap.parse_args(argv)
-    build(a.runs, a.out, a.f_lo, mag=a.mag)
+    build(a.runs, a.out, a.f_lo, mag=a.mag, prior=a.prior)
     return 0
 
 

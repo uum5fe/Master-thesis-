@@ -998,6 +998,58 @@ had no reference). Every path now prints its source:
 
 ---
 
+## v35.1 (2026-10-23) -- the validated settings live in the runner
+
+150A_Test013 / 450A_Test0113 (2612087, v35.0) were evaluated with the
+library defaults, because five settings that decide the top of the band
+existed only in `core/config.py` and the package update reset them. The
+band ended at 1.2–3 kHz instead of 11.95 kHz (330 points above 1 kHz
+rejected for thd / drift / background, against 41 zmag outliers before),
+R_ohmic read 66 on an open arc, and the HF response file, built on
+structural-skew runs, was applied to unskewed ones.
+
+They are now runner settings, set to the values of the validated runs
+(150A_Test012 / 450A_Test0112), passed by `Session._config` and part of
+every run's identity:
+
+| setting | runner (validated) | library default |
+|---|---|---|
+| `GAMRY_SYNC` | `guide` | `report` |
+| `SKEW_MODEL` | `structural` | `none` |
+| `HF_USE_ENSEMBLE` | `True` | `False` |
+| `HF_LADDER_PRUNE` | `True` | `False` |
+| `F_HI_FRAC_FS` | `0.49` | `0.45` |
+| `WINDOW_MIN_SNR_DB` | `-4` | `-3` |
+| `MIN_SNR_DB` | `-10` | `0` (runner) |
+| `FREQ_RESPONSE` | `report` | `off` |
+
+Results saved without the new identity keys are announced as "made with
+other settings" when loaded from the cache; re-run them.
+
+**`R.build_hf_response()` can no longer damage the file.** Built from those
+report-mode runs, it replaced the 2612087 file with one that stopped at
+1.5 kHz for 33 segments, every correction above that gone (the old file is
+not kept anywhere). `hf_response.build` now refuses, writing nothing, when
+
+- a run's band ends below 5 kHz (`F_TOP_MIN_HZ`; the step 60 % of its
+  segments reach);
+- the runs were evaluated with a file that is not there, or whose sha
+  differs from their `run_identity.json` (built twice without re-running:
+  the residual would count twice);
+
+composes on the union of both files' steps, so a correction above the new
+runs' band is kept rather than cut; and copies the file it replaces to
+`hf_response/history/<sha>_hf_response.csv`. `prior=` names the file the
+runs used when it is somewhere else.
+
+The 2612087 file, rebuilt from the validated runs (150A_Test012 /
+450A_Test0112) on top of the file they were evaluated with (cc50cb300284),
+magnitude per segment: sha 38384aaa3518, 22 rolled-off channels (r5 / r6),
+61 of 67 segments covered to 11.95 kHz; blind |H| spread at the top
+30 % → 10 %, phase spread 19.6° → 1.8–2.0°.
+
+---
+
 ## v35.0 (2026-10-23) -- rolled-off channels get their own magnitude
 
 2612087 at 150 / 450 A, evaluated with its first HF response file (per-card

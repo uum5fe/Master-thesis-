@@ -54,6 +54,8 @@ IDENTITY_KEYS = (
     "substitute_segments", "fill_missing_from_neighbours", "channel_lag",
     "gamry_sync", "gamry_match", "card_gain", "uc_series_mohm_cm2", "csv_mirror_x",
     "param_method", "ecm_compare", "r_ohmic_method", "ref_channel",
+    "skew_model", "hf_use_ensemble", "hf_ladder_prune", "f_hi_frac_fs",
+    "window_min_snr_db",
 )
 
 #: identity keys added after results were already saved, with the value
@@ -727,6 +729,12 @@ class Session:
             full_band=S.FULL_BAND, write_png=True, write_html=True,
             infer_missing_segments=False, min_snr_db=S.MIN_SNR_DB,
             min_ref_channels=2,
+            skew_model=getattr(S, "SKEW_MODEL", DEFAULT.skew_model),
+            hf_use_ensemble=getattr(S, "HF_USE_ENSEMBLE", DEFAULT.hf_use_ensemble),
+            hf_ladder_prune=getattr(S, "HF_LADDER_PRUNE", DEFAULT.hf_ladder_prune),
+            f_hi_frac_fs=getattr(S, "F_HI_FRAC_FS", DEFAULT.f_hi_frac_fs),
+            window_min_snr_db=getattr(S, "WINDOW_MIN_SNR_DB",
+                                      DEFAULT.window_min_snr_db),
             exclude_segments=s["exclude"],
             substitute_segments=s["substitute"],
             fill_missing_from_neighbours=s["fill_gaps"])
@@ -1123,16 +1131,23 @@ class Session:
     # ------------------------------------------------------------------
     # optional: the frozen high-frequency response of the order
     # ------------------------------------------------------------------
-    def build_hf_response(self, mag: str | None = None):
+    def build_hf_response(self, mag: str | None = None, prior=None):
         """Build <order>/hf_response/hf_response.csv from all selected runs
         (needs two or more conditions). Applied automatically to later runs
         (settings.HF_RESPONSE = 'auto'); rerun them to use it. `mag`:
-        'segment' | 'card', default settings.HF_RESPONSE_MAG."""
+        'segment' | 'card', default settings.HF_RESPONSE_MAG. The file it
+        replaces goes to hf_response/history/. Refused, with nothing
+        written, for runs whose band ends below 5 kHz or that were
+        evaluated with another version of the file (hf_response.build)."""
         import hf_response
         runs = list(self.run_dirs().values())
         if len(runs) < 2:
             self.say("  needs two or more conditions with results")
             return None
         mag = mag or getattr(S, "HF_RESPONSE_MAG", "segment")
-        return hf_response.build(runs, self.order_dir() / "hf_response",
-                                 mag=mag)
+        try:
+            return hf_response.build(runs, self.order_dir() / "hf_response",
+                                     mag=mag, prior=prior)
+        except ValueError as exc:
+            self.say(f"  high-frequency response NOT built: {exc}")
+            return None

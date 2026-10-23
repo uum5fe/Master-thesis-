@@ -14,7 +14,7 @@ from __future__ import annotations
 from pathlib import Path
 
 #: Shown in every run's identity file and printed by the setup cell.
-RUNNER_VERSION = "v35.0"
+RUNNER_VERSION = "v35.1"
 
 # ---------------------------------------------------------------------------
 # where things are
@@ -90,15 +90,17 @@ DATAGO_RAW_FILE_TEMPLATE = ""
 F_MIN_HZ = 0.15
 F_MAX_HZ = 30000.0            # detection ceiling; the band ends at 0.49*fs
 FULL_BAND = True              # False: the 'trusted' band, 0.15 Hz - 1.2 kHz
-MIN_SNR_DB = 0.0
+MIN_SNR_DB = -10.0            # validated on 2612087 (Test012 / Test0112)
 EVALUATION_MODE = "default"   # 'default' | 'permissive' | 'strict'
 CHANNEL_LAG = "correct"       # 'correct' | 'report' | 'off'
                               #   per-segment chain lag, removed or only written
-GAMRY_SYNC = "report"         # 'guide' | 'frequency' | 'report' | 'off'
+GAMRY_SYNC = "guide"          # 'guide' | 'frequency' | 'report' | 'off'
                               #   guide: Gamry's exact frequencies + windows
                               #   re-located in the Gamry slot; frequency: only
                               #   the exact frequencies; report: only
-                              #   bronze/gamry_sync.csv, nothing changed
+                              #   bronze/gamry_sync.csv, nothing changed.
+                              #   Without guide the top steps (>3 kHz) are
+                              #   placed blind and most of them are lost
 GAMRY_MATCH = "file"          # 'file' | 'time'
                               #   which Gamry sweep belongs to the run: file =
                               #   order / build / current / test from the file
@@ -110,7 +112,7 @@ CARD_GAIN = "correct"         # 'correct' | 'report' | 'off'
                               #   each card's UC2 gain against the others,
                               #   divided out of Z or only written
 UC_SERIES_MOHM_CM2 = 0.0
-FREQ_RESPONSE = "off"         # 'report' | 'off' (never changes Z)
+FREQ_RESPONSE = "report"      # 'report' | 'off' (never changes Z)
 HEATMAP_STYLE = "interpolated"
 CSV_MIRROR_X = False
 #: 'auto': apply <RESULTS_ROOT>/<order>/hf_response/hf_response.csv when it
@@ -121,6 +123,22 @@ HF_RESPONSE = "auto"
 #: r5 / r6 on 2612087) their own magnitude, every other channel the card's;
 #: 'card' is the card magnitude for all (the files built before v35).
 HF_RESPONSE_MAG = "segment"
+
+# ---------------------------------------------------------------------------
+# step detection and timing at high frequency (part of every run's identity)
+# ---------------------------------------------------------------------------
+# The values of the validated 2612087 runs (150A_Test012, 450A_Test0112):
+# 52-53 of 66-67 segments reach 11.95 kHz. Before v35.1 these lived only in
+# core/config.py, so a package update reset them to the library defaults
+# (report / none / False / False / 0.45 / -3: the band then ends at 1.2-3 kHz).
+SKEW_MODEL = "structural"     # 'structural' | 'parity' | ... | 'none'
+                              #   the multiplexer's slot delay; 'none' leaves
+                              #   20-35 us across a card = 86-151 deg at 12 kHz
+HF_USE_ENSEMBLE = True        # detect the steps on the stacked segment
+                              #   channels (+10 dB), not on UC2 alone
+HF_LADDER_PRUNE = True        # drop detections that miss the 10/decade ladder
+F_HI_FRAC_FS = 0.49           # detection ceiling, fraction of fs (12.25 kHz)
+WINDOW_MIN_SNR_DB = -4.0      # analysis-window SNR floor at the top steps
 
 # ---------------------------------------------------------------------------
 # saved results: one folder per order / condition / test, named in order

@@ -738,14 +738,14 @@ Every number lives in `core/config.py`, one frozen dataclass `Config`. The defau
 
 | Group | Field = default | Meaning |
 |---|---|---|
-| Band | `f_min_hz=0.15`, `eval_f_max_hz=2400`, `f_max_hz=30000`, `f_hi_frac_fs=0.45` | evaluated band; detection ceiling |
+| Band | `f_min_hz=0.15`, `eval_f_max_hz=2400`, `f_max_hz=30000`, `f_hi_frac_fs=0.45` (runner `F_HI_FRAC_FS`: 0.49) | evaluated band; detection ceiling |
 | Band (developer) | `full_band=False`, `full_band_frac_fs=0.49`, `coherent_f_max_frac_fs=0.16`, `r_ohmic_method="auto"` | full-band diagnostic |
-| Detection | `ppd=12`, `grid_tol=0.01`, `min_ref_channels=2` (runner), `min_snr_db` (runner: 0) | step grid and consensus |
+| Detection | `ppd=12`, `grid_tol=0.01`, `min_ref_channels=2` (runner), `min_snr_db` (runner `MIN_SNR_DB`: −10), `hf_use_ensemble` / `hf_ladder_prune` (runner `HF_USE_ENSEMBLE` / `HF_LADDER_PRUNE`: True) | step grid and consensus |
 | Alignment | `ref_channel="UC2"`, `align_min_corr=0.5`, `align_min_prominence=15`, `align_max_lag_s=30` | card alignment |
-| Gamry clock | `gamry_sync` (runner: `guide`), `window_confine=True`, `window_min_snr_db=-3`, `window_guard_s=0.5`, `window_settle_periods=0.5` | window placement |
+| Gamry clock | `gamry_sync` (runner: `guide`), `window_confine=True`, `window_min_snr_db=-3` (runner `WINDOW_MIN_SNR_DB`: −4), `window_guard_s=0.5`, `window_settle_periods=0.5` | window placement |
 | Phasors | `phasor_method="card_ml"`, `freq_refine=False`, `fit_at_exact_frequency=False` | estimator |
 | Silver gates | `sigma_rel_max=0.60`, `min_cycles_per_dwell=3`, `max_thd=0.10`, `max_drift=0.25`, `zmag_outlier_mad=4.5`, `passivity_gate_min_hz=1.0`, `min_points_per_spectrum=8` | §8.2 |
-| Timing | `skew_model="structural"`, `fit_common_delay=False`, `channel_lag="correct"`, `channel_lag_max_resid_deg=10`, `channel_lag_max_us=250` | §8.1 |
+| Timing | `skew_model="none"` (runner `SKEW_MODEL`: `"structural"`), `fit_common_delay=False`, `channel_lag="correct"`, `channel_lag_max_resid_deg=10`, `channel_lag_max_us=250` | §8.1 |
 | DRT | `drt_enable=True`, `drt_nonneg=True`, `drt_n_tau_per_decade=10`, `drt_tau_pad_slow=1.0` | §8.3 |
 | Grading | `kk_tol=0.02`, `mu_crit=0.85` | tiers |
 | Gold | `tau_split_ohmic_s=1e-4`, `tau_split_kinetic_s=1e-2`, `spatial_len_x_mm=70`, `spatial_len_y_mm=35`, `max_inferred_fraction=0.60` | §9 |

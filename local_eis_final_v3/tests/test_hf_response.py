@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -198,3 +199,78 @@ def test_build_writes_the_sources_and_silver_flags_them(tmp_path):
     assert silver._hf_sources(None) == {}
     # an older file without the table: nothing is per segment
     assert hf_response.segment_sources(tmp_path / "nowhere.csv") == {}
+
+
+# ---------------------------------------------------------------------------
+# build guards (2612087: a build from report-mode runs, whose band ended at
+# 1.2-1.5 kHz, replaced the file with one that stopped at 1.5 kHz)
+# ---------------------------------------------------------------------------
+def _run_dirs(tmp_path, runs: dict, hf_file=None, sha=None):
+    dirs = []
+    for name, d in runs.items():
+        r = tmp_path / name
+        (r / "silver").mkdir(parents=True, exist_ok=True)
+        (r / "bronze").mkdir(exist_ok=True)
+        d[["segment", "freq_hz", "z_re_mohm_cm2", "z_im_mohm_cm2"]].to_csv(
+            r / "silver" / "spectra_clean.csv", index=False)
+        d.drop_duplicates("segment")[["segment", "card"]].to_csv(
+            r / "bronze" / "segment_meta.csv", index=False)
+        cfg = {"condition": name}
+        if hf_file:
+            cfg["hf_response_file"] = str(hf_file)
+        (r / "config_used.json").write_text(json.dumps(cfg))
+        if sha is not None:
+            (r / "run_identity.json").write_text(json.dumps(
+                {"settings": {"hf_response_file_sha": sha}}))
+        dirs.append(r)
+    return dirs
+
+
+def test_runs_whose_band_ends_low_are_refused_and_nothing_is_written(tmp_path):
+    hw = _hardware()
+    runs = {c: _plate(lv, i, hw) for i, (c, lv) in
+            enumerate((("150A", 1.4), ("450A", 1.0)))}
+    runs = {c: d[d.freq_hz <= 1500] for c, d in runs.items()}
+    out = tmp_path / "hf"
+    out.mkdir()
+    (out / "hf_response.csv").write_text("keep me")
+    with pytest.raises(ValueError, match="ends at 1194 Hz"):
+        hf_response.build(_run_dirs(tmp_path, runs), out, log=None)
+    assert (out / "hf_response.csv").read_text() == "keep me"
+
+
+def test_composing_keeps_the_old_file_above_the_new_runs_band():
+    f_old = np.array([1000.0, 4000.0, 11953.0])
+    old = {"5": (f_old, np.array([1.0, 0.9, 0.8 + 0.1j]))}
+    new = {"5": (np.array([1000.0, 1500.0]), np.array([1.0, 1.0]))}
+    c = hf_response.compose(new, old)
+    f, g = c["5"]
+    assert f.max() == pytest.approx(11953.0)
+    assert g[-1] == pytest.approx(0.8 + 0.1j)
+    # a segment only the old file has is kept as it was
+    old["9"] = (f_old, np.array([1.0, 1.1, 1.2]))
+    assert np.allclose(hf_response.compose(new, old)["9"][1], [1.0, 1.1, 1.2])
+
+
+def test_a_file_changed_since_the_runs_is_refused_and_a_replaced_one_kept(tmp_path):
+    hw = _hardware()
+    runs = {c: _plate(lv, i, hw) for i, (c, lv) in
+            enumerate((("150A", 1.4), ("450A", 1.0)))}
+    out = tmp_path / "hf"
+    first = hf_response.build(_run_dirs(tmp_path / "a", runs), out, log=None)
+    sha = hf_response._sha12(first["path"])
+    # runs evaluated with that file: composing onto it is fine, and the old
+    # one goes to history/
+    dirs = _run_dirs(tmp_path / "b", runs, hf_file=first["path"], sha=sha)
+    second = hf_response.build(dirs, out, log=None)
+    assert (out / "history" / f"{sha}_hf_response.csv").is_file()
+    assert second["backup"] == out / "history" / f"{sha}_hf_response.csv"
+    # the same runs again: the file is no longer the one they ran with
+    new_sha = hf_response._sha12(second["path"])
+    with pytest.raises(ValueError, match="changed after they ran"):
+        hf_response.build(dirs, out, log=None)
+    assert hf_response._sha12(second["path"]) == new_sha
+    # a recorded file that is not there
+    gone = _run_dirs(tmp_path / "c", runs, hf_file=tmp_path / "nowhere.csv")
+    with pytest.raises(ValueError, match="which is not there"):
+        hf_response.build(gone, tmp_path / "hf2", log=None)

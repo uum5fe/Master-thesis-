@@ -2,6 +2,7 @@
 
 | Document | What it is |
 |---|---|
+| [`TRAINING_GUIDE.md`](TRAINING_GUIDE.md) | **Start here when you are new.** The training guide: what the software does, where it reads and stores data, every script, recipes, troubleshooting, a five-session training plan. PDF: [`Local_EIS_Training_Guide.pdf`](Local_EIS_Training_Guide.pdf); generated file index: [`TRAINING_GUIDE_FILE_INDEX.md`](TRAINING_GUIDE_FILE_INDEX.md) (`tools/make_file_index.py`, `tools/build_training_guide_pdf.py`). |
 | [`PIPELINE_GUIDE.md`](PIPELINE_GUIDE.md) | **The handover guide.** How to run, data sources, every module, outputs, formulas, cache, limitations. |
 | [`FIXES.md`](FIXES.md) | Change log: what was broken and what changed, with numbers. |
 | [`spectra_recheck.md`](spectra_recheck.md) | Re-check of the FAMOS spectra: window placement, low-frequency scatter at high current. |

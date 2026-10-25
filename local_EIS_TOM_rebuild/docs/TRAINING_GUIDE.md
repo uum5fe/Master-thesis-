@@ -1020,7 +1020,7 @@ There are exactly two places for settings. Never put a number in a notebook or a
 | Maps | `HEATMAP_STYLE = "interpolated"`, `CSV_MIRROR_X = False` | |
 | Cache | `RUN_MODES = ("cache", "rerun")` | |
 | Tables | `TABLE_SCHEMA = "ps_xplatform_dev.rvadvtec_dev"`, `TABLE_PREFIX = "local_eis_"`, `PUBLISH_TABLES = True`, `RESULTS_SOURCE = "tables"`, `CACHE_FROM_TABLES = True` | §7.3 |
-| Auto job | `AUTO_ORDERS = ()`, `AUTO_MAX_RUNS = 8`, `AUTO_PLATE = {}`, `AUTO_ORIENTATION = {}`, `AUTO_RERUN_CHANGED = True` | §18.10 |
+| Auto job | `AUTO_ORDERS = ()`, `AUTO_MAX_RUNS = 8`, `AUTO_PLATE` (2612087, 2612090 → gen1; 2612091, 2612092 → gen2), `AUTO_ORIENTATION` (2612090 → rot180; the others standard), `AUTO_RERUN_CHANGED = True` | §18.10 |
 | Plots | `PANEL_HEIGHT = 560`, `PANEL_WIDTH = 1150`, `NYQUIST_COLOUR = "flow"`, `MF4_INCLUDE_ALL_CHANNELS = True`, `MF4_MAX_POINTS = 4000` | |
 | ECM | `ECM_DRT_F_MAX_HZ = 1000`, `ECM_DRT_FIX_RS = True`, `ECM_DRT_FAST = "auto"`, `ECM_SMOOTH_POINTS = 160` | §14 |
 

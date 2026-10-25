@@ -183,9 +183,19 @@ AUTO_ORDERS: tuple = ()
 AUTO_MAX_RUNS = 8
 #: plate per order when the file names do not say it (bench .mf4 names carry
 #: "Naboo" = gen2 / "Kashyyyk" = gen1); otherwise gen1
-AUTO_PLATE: dict[str, str] = {}
+AUTO_PLATE: dict[str, str] = {
+    "2612087": "gen1",      # green / Kashyyyk
+    "2612090": "gen1",      # green / Kashyyyk
+    "2612091": "gen2",      # blue / Naboo
+    "2612092": "gen2",      # blue / Naboo
+}
 #: orders mounted turned 180 deg: {"2612095": "rot180"}; otherwise standard
-AUTO_ORIENTATION: dict[str, str] = {}
+AUTO_ORIENTATION: dict[str, str] = {
+    "2612087": "standard",
+    "2612090": "rot180",    # plate mounted turned 180 deg
+    "2612091": "standard",
+    "2612092": "standard",
+}
 #: True: a run published with OTHER settings (another digest) is evaluated
 #: again; False: only runs that were never published
 AUTO_RERUN_CHANGED = True

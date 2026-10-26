@@ -67,6 +67,7 @@ FAMOS cards (datago / Volume) + Gamry sweeps + bench .mf4
 | `01 Local EIS - Process` | 🛠 writes results and tables | widgets → `R.run()` → `R.fit_ecm()` → `R.publish()` → `R.summary()` |
 | `02 Local EIS - Results` | 📊 read-only | saved order / conditions / test → frequency response, Nyquist / Bode, median Nyquist, heat maps, MF4, ECM; across orders: `R.show_runs()`, `R.show_trends()` |
 | `03 Local EIS - Auto` | 🛠 writes (scheduled job) | `runner.auto.plan()` (dry run) / `runner.auto.run()`: every order / condition / test with FAMOS data not in the runs table (or published with other settings) |
+| `08 Local EIS - Calibration` | 🛠 writes the calibration tables | publishes a plate's `curr.csv` / `temp.csv` / `chain_gain.csv` / `Abgleich/` as a new version in `local_eis_calibration_*`; runs take the version valid at their measurement date (`CALIBRATION_SOURCE`, `CALIBRATION_VERSION` in `runner/settings.py`) |
 | `09 Local EIS - Maintenance` | ⚠️ destructive | removes one `run_key` from every table (and its folder, if asked); rebuilds all tables (`REBUILD`); no undo |
 
 **Process** (`01`):

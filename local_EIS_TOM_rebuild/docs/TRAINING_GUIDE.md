@@ -197,6 +197,7 @@ FAMOS cards (datago / Volume) + Gamry sweeps + bench .mf4
 | `01 Local EIS - Process` | writes results and tables | Setup `runner.Session(globals())` → `R.widgets()` → `R.run()` → `R.fit_ecm()` → `R.publish()` → `R.summary()` |
 | `02 Local EIS - Results` | 📊 read-only | Setup `runner.Results(globals())` → `R.widgets()` → `show_frequency_response` · `show_nyquist` · `show_median_nyquist` · `show_heatmaps` · `show_mf4` · `show_ecm` · `show_runs` · `show_trends` |
 | `03 Local EIS - Auto` | 🛠 writes (scheduled job) | Setup → job parameters `dry_run`, `max_runs`, `orders` → `runner.auto.plan(R)` or `runner.auto.run(R)` |
+| `08 Local EIS - Calibration` | 🛠 writes the calibration tables | `runner.calibration.versions(spark)` → widgets plate, folder, `valid_from`, note, publish → `runner.calibration.publish(...)` (§6.5a) |
 | `09 Local EIS - Maintenance` | ⚠️ destructive | `tables.delete_run(spark, KEY)` (key typed twice) · optional folder delete · `tables.rebuild(spark)` (type `REBUILD`) |
 
 ### 3.3 Two pipelines behind one switch
@@ -399,6 +400,25 @@ Synchronisation itself never uses time stamps: the cards are aligned by `UC2`, t
 **Building `chain_gain.csv`.** When a plate has no `chain_gain.csv` but has `Abgleich/bode/`, the Selection cell builds it once (`Session._chain_gain`) and writes it into the shared folder so the next user finds it. It first cross-checks the bode index against `curr.csv` (`gamry_dta.cross_check_abgleich`); on the Naboo delivery the pairing does not hang together (r = +0.41), so the index-free **plate median** is written (`shared` mode), which still removes the common −11° roll-off at 4.5 kHz.
 
 > **In this repository** `EIS_config/gen1/` and `gen2/` contain `curr.csv`, `temp.csv`, `chain_gain.csv` and the `Abgleich/` Step files and coefficients, but **not** the `Abgleich/bode/` sweeps or the plate drawings (`DATA_NOT_IN_GIT.md`). They are only needed to rebuild `chain_gain.csv`, which is present for both plates.
+
+### 6.5a Calibration tables: one version per upload (`runner/calibration.py`)
+
+With `CALIBRATION_SOURCE = "tables"` (default) the plate files come from Delta tables instead of `EIS_config/` on the Volume:
+
+| Table | Holds |
+|---|---|
+| `local_eis_calibration_versions` | one row per (plate, version): `valid_from`, `published`, `source` folder, `note`, the checksums of curr/temp/chain gain, `has_abgleich`, `n_files` |
+| `local_eis_calibration_files` | every file of the version, byte for byte (`curr.csv`, `temp.csv`, `chain_gain.csv`, `README.md`, `Abgleich/…`; the bode `*_Raw.DTA` waveforms are left out) |
+| `local_eis_calibration` | the coefficients, for SQL: `kind` (`curr` → `index` = segment, `temp` → `index` = sensor), `c0`, `c1` |
+| `local_eis_chain_gain` | the chain response, for SQL: `segment`, `freq_hz`, `gain_real`, `gain_imag` |
+
+- **Publish** once per delivery: notebook `08 Local EIS - Calibration`, or `runner.calibration.publish(spark, "gen1", folder, valid_from=…, note=…)`. It refuses a folder whose `curr.csv` / `temp.csv` is missing or has the wrong number of rows, and does nothing when the folder equals the newest version.
+- **A recalibration is a new version**; nothing is overwritten. The first version of a plate is valid from 2000-01-01 (every earlier measurement), later ones from the date you give (default: the publishing day).
+- **Which version a run uses:** `CALIBRATION_VERSION` when it pins one (`{"2612090": 1}` per order wins over `{"gen2": 3}` per plate), else the newest version whose `valid_from` is on or before the measurement date (FAMOS header, else datago), else the newest.
+- **The pipeline still reads files:** `calibration.materialize` writes the version's files byte for byte into `/tmp/eis_<uid>/calibration/<plate>/v<n>/` and returns what `site_paths.resolve` returns. Identical bytes mean an identical settings digest, so moving the calibration from the Volume into the tables re-evaluates nothing.
+- **Recorded with every run:** `run_identity.json` and the runs table (`calibration_version`, `calibration_json`) hold the version and the checksums of `curr.csv` / `temp.csv`. A saved run made with another calibration is announced under `cache` (`<-- made with ANOTHER calibration (version 1 -> 2)`), and the Auto job re-evaluates it (`calibration changed`, with `AUTO_RERUN_CHANGED`). Runs saved before the calibration was recorded count as made with the current one.
+- A `chain_gain.csv` built from a version's `Abgleich/bode/` (Selection cell) is published as the next version, with the same `valid_from`.
+- A plate with no version in the tables falls back to the Volume, and the Selection cell says so. `CALIBRATION_SOURCE = "volume"` switches the tables off.
 
 ### 6.6 CSV measurements
 
@@ -865,6 +885,8 @@ python readers/abgleich.py EIS_config/gen1/Abgleich --curr-cal EIS_config/gen1/c
 
 **`03 Local EIS - Auto.py`** — *notebook/job, writes.* Widgets `dry_run` (`yes` = show the plan only), `max_runs` (default `AUTO_MAX_RUNS = 8`), `orders`. Calls `runner.auto.plan(R)` or `runner.auto.run(R)`. Meant to be scheduled as a Databricks Job (e.g. nightly).
 
+**`08 Local EIS - Calibration.py`** — *notebook, writes the calibration tables.* Lists the published versions, checks a calibration folder (`calibration.check_folder`) and, with `publish = yes`, publishes it as a new version (§6.5a).
+
 **`09 Local EIS - Maintenance.py`** — *notebook, destructive.* Removes one `run_key` from every table (typed twice to confirm) and optionally its folder; "Rebuild all tables" (type `REBUILD`) calls `tables.rebuild`, which is **missing** in this package (§21.2).
 
 **`eis_paths.py`** — puts the package root and `core/ pipeline/ checks/ analysis/ plotting/ readers/` on `sys.path` once, at import time. Imported first by every notebook, `run.py`, `pipeline/main.py` and `tests/conftest.py`. Touch it when you add a new top-level code folder.
@@ -890,6 +912,8 @@ python readers/abgleich.py EIS_config/gen1/Abgleich --curr-cal EIS_config/gen1/c
 **`runner/results.py`** — class `Results(Session)`, notebook 02. Its widgets list saved order folders (`result_set`), conditions and test; `run()` and `publish()` raise. `run_dirs` restores from the tables when `RESULTS_SOURCE = "tables"` (falls back to folders), `show_runs` lists the runs table, `show_trends` plots plate median ± sd of every gold parameter against current, one curve per order and test.
 
 **`runner/tables.py`** — the Delta tables (§7.3): `FILES` (table suffix → result file), `run_key` (key columns from a folder path), `run_record` (the runs row), `tidy`, `frames`, `_align` (column types), `_write` (`replaceWhere` on `run_key`), `publish`, `delete_run`, `read`, `runs`. Touch it to add a table: add the file to `FILES`.
+
+**`runner/calibration.py`** — the plate calibration as versioned Delta tables (§6.5a): `publish`, `versions`, `select` (version for a plate, measurement date and pins), `materialize` (version → files in scratch, the dictionary `site_paths.resolve` returns), `check_folder`, `file_sha`.
 
 **`runner/auto.py`** — the incremental job. `plan(R)` lists every (order, condition, test) with FAMOS data whose run is not in the runs table, or (`AUTO_RERUN_CHANGED`) is there with another settings digest; `run(R)` evaluates the first `max_runs` with `rerun`, fits the ECM and publishes. Plate per order from `AUTO_PLATE`, else the order's file names (`Naboo` = gen2, `Kashyyyk` = gen1), else gen1; orientation from `AUTO_ORIENTATION`. A failed run is not published and is retried next time.
 
@@ -1031,6 +1055,7 @@ There are exactly two places for settings. Never put a number in a notebook or a
 | HF detection | `SKEW_MODEL = "structural"`, `HF_USE_ENSEMBLE = True`, `HF_LADDER_PRUNE = True`, `F_HI_FRAC_FS = 0.49`, `WINDOW_MIN_SNR_DB = -4.0` | Values validated on 2612087; part of the identity |
 | Maps | `HEATMAP_STYLE = "interpolated"`, `CSV_MIRROR_X = False` | |
 | Cache | `RUN_MODES = ("cache", "rerun")` | |
+| Calibration | `CALIBRATION_SOURCE = "tables"` (`"volume"`: EIS_config only), `CALIBRATION_VERSION = {}` (pins per order / plate) | §6.5a |
 | Tables | `TABLE_SCHEMA = "ps_xplatform_dev.rvadvtec_dev"`, `TABLE_PREFIX = "local_eis_"`, `PUBLISH_TABLES = True`, `RESULTS_SOURCE = "tables"`, `CACHE_FROM_TABLES = True`, `SAVE_FOLDERS = True` (False: tables only) | §7.3, §7.5 |
 | Auto job | `AUTO_ORDERS = ()`, `AUTO_MAX_RUNS = 8`, `AUTO_PLATE` (2612087, 2612090 → gen1; 2612091, 2612092 → gen2), `AUTO_ORIENTATION` (2612090 → rot180; the others standard), `AUTO_RERUN_CHANGED = True` | §18.10 |
 | Plots | `PANEL_HEIGHT = 560`, `PANEL_WIDTH = 1150`, `NYQUIST_COLOUR = "flow"`, `MF4_INCLUDE_ALL_CHANNELS = True`, `MF4_MAX_POINTS = 4000` | |
@@ -1099,7 +1124,7 @@ python readers/gamry_dta.py /path/Abgleich/bode --curr-cal /path/Abgleich/coeffi
 #   add --shared when the bode index does not match curr.csv (the Naboo delivery)
 ```
 
-The file's content hash is part of every run's identity, so runs made with the old file are announced under `cache` as made with other settings.
+The file's content hash is part of every run's identity, so runs made with the old file are announced under `cache` as made with other settings. With the calibration tables, publish the folder with the new file as a new version (`08 Local EIS - Calibration`); a `chain_gain.csv` the Selection cell builds from a version's bode sweeps is published as the next version automatically.
 
 ### 18.7 Check a new Abgleich delivery, or rebuild `curr.csv`/`temp.csv`
 
@@ -1109,6 +1134,8 @@ python readers/abgleich.py /path/Abgleich --refit-to /path/out                  
 ```
 
 The report gives linearity, the temperature coefficient (TCR ≈ 0.4 %/K for copper) and the implied area per segment; an outlier segment is named.
+
+Then publish the checked folder as a new calibration version: `08 Local EIS - Calibration` → plate, folder, `valid_from` = the date the new calibration applies from, `publish = yes`. Earlier measurements keep the version valid at their date; pin another with `CALIBRATION_VERSION` if needed.
 
 ### 18.8 Build the frozen high-frequency response of an order
 

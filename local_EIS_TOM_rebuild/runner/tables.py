@@ -167,6 +167,8 @@ def run_record(run_dir) -> dict:
         "plausibility_warn": int(sum(v == "warn" for v in verdicts)),
         "elapsed_s": float(ident.get("elapsed_s") or man.get("elapsed_s") or 0.0),
         "written": str(ident.get("written") or ""),
+        "calibration_version": str((ident.get("calibration") or {}).get("version", "")),
+        "calibration_json": json.dumps(ident.get("calibration") or {}, sort_keys=True),
         "results_dir": str(run_dir),
         "published": datetime.now().isoformat(timespec="seconds"),
     }

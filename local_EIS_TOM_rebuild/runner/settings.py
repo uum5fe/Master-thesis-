@@ -187,6 +187,19 @@ CACHE_FROM_TABLES = True
 SAVE_FOLDERS = True
 
 # ---------------------------------------------------------------------------
+# the plate calibration (runner/calibration.py)
+# ---------------------------------------------------------------------------
+#: where curr.csv, temp.csv, chain_gain.csv and the Abgleich come from:
+#:   'tables'  the calibration tables <prefix>calibration_* -- one VERSION per
+#:             upload (08 Local EIS - Calibration); a plate with no version
+#:             there falls back to the Volume, and the Selection cell says so
+#:   'volume'  EIS_CONFIG_ROOT/<plate>/ only (core/site_paths.py), as before
+CALIBRATION_SOURCE = "tables"
+#: pin a version instead of the newest one valid at the measurement date:
+#: {"2612090": 1} for one order, {"gen2": 3} for a plate (the order wins)
+CALIBRATION_VERSION: dict = {}
+
+# ---------------------------------------------------------------------------
 # the automatic job (03 Local EIS - Auto, runner/auto.py)
 # ---------------------------------------------------------------------------
 #: orders the job looks at: () = every order with FAMOS data (datago and

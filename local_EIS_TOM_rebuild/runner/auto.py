@@ -20,10 +20,12 @@ else standard; every condition and every test found.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from . import settings as S
 from . import tables
+from .session import calibration_changed
 
 
 def plate_of(R, leepa) -> str:
@@ -65,6 +67,22 @@ def published(spark) -> dict:
     return dict(zip(df["run_key"].astype(str), df["digest"].astype(str)))
 
 
+def published_calibration(spark) -> dict:
+    """{run_key: calibration record} of the runs table ({} without)."""
+    if spark is None:
+        return {}
+    df = tables.runs(spark)
+    if not len(df) or "calibration_json" not in df:
+        return {}
+    out = {}
+    for k, v in zip(df["run_key"].astype(str), df["calibration_json"]):
+        try:
+            out[k] = json.loads(v) if isinstance(v, str) and v else {}
+        except ValueError:
+            out[k] = {}
+    return out
+
+
 def _select(R, leepa, test_id="", conditions="ALL", run_mode="cache"):
     vals = dict(leepa_id=leepa, plate=plate_of(R, leepa),
                 plate_orientation=orientation_of(leepa), conditions=conditions,
@@ -78,6 +96,7 @@ def plan(R, orders=None, say=None) -> list[dict]:
     """What the job would evaluate, in order (oldest order first)."""
     say = say or R.say
     have = published(R.spark)
+    cal_have = published_calibration(R.spark)
     known = set(R.orders())
     todo = []
     for leepa in (orders or S.AUTO_ORDERS or sorted(known)):
@@ -95,11 +114,14 @@ def plan(R, orders=None, say=None) -> list[dict]:
                     continue
                 key = f"{R.order_dir().name}/{R.cond_name(cond)}"
                 cfg = R._config(cond, R.scratch / "auto_plan")
-                digest = R.identity(cfg)["digest"]
+                ident = R.identity(cfg)
                 if key not in have:
                     reason = "new"
-                elif have[key] != digest and S.AUTO_RERUN_CHANGED:
+                elif have[key] != ident["digest"] and S.AUTO_RERUN_CHANGED:
                     reason = "settings changed"
+                elif S.AUTO_RERUN_CHANGED and calibration_changed(
+                        cal_have.get(key), ident.get("calibration")):
+                    reason = "calibration changed"
                 else:
                     continue
                 todo.append(dict(order=leepa, plate=sel["plate"],

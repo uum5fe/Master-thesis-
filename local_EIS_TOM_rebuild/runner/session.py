@@ -70,6 +70,16 @@ _OLD_WIDGETS = ("csv_path", "csv_dialect", "csv_tones", "gain_file",
                 "evaluation_mode", "cache_write")
 
 
+def calibration_changed(old, new) -> bool:
+    """True when a saved run recorded a calibration and it differs from the
+    current one (curr.csv / temp.csv content). A run saved before the
+    calibration was recorded counts as made with the current one."""
+    if not old or not new:
+        return False
+    return any(old.get(k) and old.get(k) != new.get(k)
+               for k in ("curr_sha", "temp_sha"))
+
+
 def condition_key(cond) -> tuple:
     """'45A' < '60A' < '150A' < '450A'."""
     m = re.match(r"\s*([0-9]+(?:\.[0-9]+)?)", str(cond))
@@ -569,8 +579,7 @@ class Session:
                              .replace(";", ",").split(",") if x.strip())
 
         geom.use_plate(plate, orientation)
-        files = site_paths.resolve(plate, root=self.config_root,
-                                   package_dir=self.package_dir)
+        files = self._plate_files(plate, leepa)
         if source == "csv":
             leepa = ("csv" if campaign in ("", ".") else
                      "csv_" + re.sub(r"[^A-Za-z0-9]+", "_", campaign).strip("_"))
@@ -607,6 +616,61 @@ class Session:
         self._print_selection()
         return sel
 
+    def _plate_files(self, plate, leepa=None) -> dict:
+        """curr.csv, temp.csv, chain_gain.csv and the Abgleich of the plate:
+        from the calibration tables (settings.CALIBRATION_SOURCE = 'tables',
+        the version valid at the order's measurement date), else from
+        EIS_config on the Volume (core/site_paths.py)."""
+        import site_paths
+        if (getattr(S, "CALIBRATION_SOURCE", "volume") == "tables"
+                and self.spark is not None):
+            from . import calibration
+            row = None
+            try:
+                row = calibration.select(self.spark, plate,
+                                         when=self._measurement_date(leepa),
+                                         order=leepa)
+            except ValueError:
+                raise                                # a pin that does not exist
+            except Exception as exc:                        # noqa: BLE001
+                self.say(f"  calibration tables not read ({type(exc).__name__}: "
+                         f"{exc}) -> Volume")
+            if row is not None:
+                return calibration.materialize(
+                    self.spark, plate, int(row["version"]),
+                    self.scratch / "calibration", say=self.say)
+            self.say(f"  no {plate} calibration in the tables yet -> Volume "
+                     f"EIS_config (publish it once: 08 Local EIS - Calibration)")
+        return site_paths.resolve(plate, root=self.config_root,
+                                  package_dir=self.package_dir)
+
+    def _measurement_date(self, leepa):
+        """When the order was measured (FAMOS header, else datago), or None."""
+        if not leepa or str(leepa).startswith("csv"):
+            return None
+        from eis_local import famos_start_time
+        for f in self._famos_files(leepa)[:3]:
+            try:
+                t = famos_start_time(f)
+            except Exception:                               # noqa: BLE001
+                t = None
+            if t is not None:
+                return t
+        if self.spark is not None:
+            try:
+                t = pd.to_datetime(datago.files(self.spark, leepa)["t_begin"]).min()
+                return None if pd.isna(t) else t
+            except Exception:                               # noqa: BLE001
+                pass
+        return None
+
+    @staticmethod
+    def _calibration_label(files) -> str:
+        if files.get("source") == "tables":
+            return (f"tables, version {files.get('calibration_version')} "
+                    f"({files.get('target_dir')})")
+        return f"Volume {files.get('target_dir', '')}"
+
     def _chain_gain(self, plate, files) -> str:
         """The plate's chain_gain.csv; built once from the Abgleich bode
         sweeps when it does not exist yet."""
@@ -629,6 +693,19 @@ class Session:
                                      shared=not chk["ok"])
             self.say(f"  chain response built once from {len(sweeps)} Abgleich "
                      f"sweeps: {out}")
+            if files.get("source") == "tables":      # a new calibration version
+                from . import calibration
+                old = int(files["calibration_version"])
+                v = calibration.versions(self.spark, plate)
+                vf = str(v[v["version"] == old]["valid_from"].iloc[-1])
+                new = calibration.publish(
+                    self.spark, plate, files["target_dir"], valid_from=vf,
+                    note=f"chain_gain.csv built from the Abgleich bode sweeps "
+                         f"of version {old}", say=self.say)
+                files.update(calibration.materialize(
+                    self.spark, plate, new, self.scratch / "calibration",
+                    say=self.say))
+                return str(files["gain"])
             return str(out)
         except Exception as exc:                            # noqa: BLE001
             self.say(f"  chain response not built ({exc})")
@@ -648,6 +725,7 @@ class Session:
             f"  Gamry       {s.get('gamry_dir') or '(none)'}"
             + (f"   build {s['gamry_version']}" if s.get('gamry_version') else ""),
             f"  Chain gain  {s.get('gain_file') or '(none)'}",
+            f"  Calibration {self._calibration_label(s['plate_files'])}",
             f"  Results     {self.order_dir()}",
         ]
         if s["exclude"]:
@@ -785,7 +863,17 @@ class Session:
                 payload[k + "_sha"] = ""
         digest = hashlib.sha256(json.dumps(payload, sort_keys=True)
                                 .encode()).hexdigest()[:10]
-        return {"digest": digest, "settings": payload}
+        # the calibration is recorded BESIDE the digest: it does not change
+        # the digest of results saved before it was recorded (no mass
+        # re-evaluation), but a later recalibration is seen (_identity_note,
+        # auto.plan)
+        from . import calibration
+        files = self.sel.get("plate_files") or {}
+        cal = {"source": files.get("source", "volume"),
+               "version": files.get("calibration_version", ""),
+               "curr_sha": calibration.file_sha(cfg.curr_cal)[:12],
+               "temp_sha": calibration.file_sha(cfg.temp_cal)[:12]}
+        return {"digest": digest, "settings": payload, "calibration": cal}
 
     def run(self):
         """Use or compute every selected condition (run mode), one saved
@@ -972,6 +1060,11 @@ class Session:
             if diff:
                 return (f"   <-- made with OTHER settings ({', '.join(diff)}); "
                         f"choose rerun to recompute")
+        if calibration_changed(old.get("calibration"), ident.get("calibration")):
+            o, n = old["calibration"], ident["calibration"]
+            return (f"   <-- made with ANOTHER calibration (version "
+                    f"{o.get('version') or '?'} -> {n.get('version') or '?'}); "
+                    f"choose rerun to recompute")
         if old.get("runner") != S.RUNNER_VERSION:
             return (f"   (saved by runner {old.get('runner')}; rerun to "
                     f"evaluate with {S.RUNNER_VERSION})")

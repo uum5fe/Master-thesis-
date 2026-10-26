@@ -19,3 +19,4 @@ from .results import Results  # noqa: F401
 from . import settings  # noqa: F401
 from . import tables  # noqa: F401
 from . import auto  # noqa: F401
+from . import calibration  # noqa: F401

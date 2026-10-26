@@ -150,9 +150,8 @@ class Results(Session):
         plate, orient = k0["plate"], k0["orientation"]
         cfg = self._config_used(keys)
         geom.use_plate(plate, orient)
-        files = site_paths.resolve(plate, root=self.config_root,
-                                   package_dir=self.package_dir)
         order = k0["order_id"]
+        files = self._plate_files(plate, order)
         csv = order.startswith("csv")
         tag = name[len(order):]
         self.sel = dict(

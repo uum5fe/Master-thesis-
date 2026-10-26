@@ -246,7 +246,8 @@ class Results(Session):
         import viewers
         html = viewers.selector_html(figs, ["Parameter"],
                                      title="Plate parameters against current")
-        p = self.results_root / "_overview" / "trends.html"
+        p = ((self.results_root if self._save_folders() else self.scratch)
+             / "_overview" / "trends.html")
         self.html(html)
         try:
             viewers.save_page(html, p, title="Plate parameters against current")

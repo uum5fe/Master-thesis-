@@ -415,3 +415,58 @@ def test_rebuild_reads_back_runs_whose_folder_is_gone_and_never_loses_one(tmp_pa
     got = tables.rebuild(sp, root, tmp_path / "s2", say=lambda *x: None)
     assert got == {"2612090/60A_Test01": "no folder, no run_files copy"}
     assert {k: len(v) for k, v in sp.tables.items()} == n
+
+
+# ---------------------------------------------------------------------------
+# SAVE_FOLDERS = False: the tables are the only copy of a run
+# ---------------------------------------------------------------------------
+def _fake_pipeline(monkeypatch):
+    """bronze.discover_files and main.run_pipeline replaced: the 'run' writes
+    a small finished result into cfg.out_dir."""
+    import bronze
+    import main as pipeline_main
+    monkeypatch.setattr(bronze, "discover_files", lambda cfg: [Path("a"), Path("b")])
+
+    def run_pipeline(cfg, stop_after="gold"):
+        _fake_result(Path(cfg.out_dir), cond=cfg.condition)
+        return {"stages": {"gold": {"n_measured": 3}}}
+    monkeypatch.setattr(pipeline_main, "run_pipeline", run_pipeline)
+
+
+def test_tables_only_run_writes_nothing_under_the_results_root(volume, monkeypatch):
+    monkeypatch.setattr(S, "DATAGO_FIRST", False)
+    monkeypatch.setattr(S, "SAVE_FOLDERS", False)
+    _fake_pipeline(monkeypatch)
+    sp = FakeSpark()
+    R, _ = _session(volume, leepa_id="2612086", conditions="60A", test_id="02",
+                    run_mode="rerun")
+    R.widgets()
+    R.spark = sp
+    d = R.run()["60A"]
+    assert volume / "scratch" in d.parents and (d / "run_identity.json").is_file()
+    R.publish()
+    key = "2612086/60A_Test02"
+    assert key in set(tables.runs(sp)["run_key"])
+    assert "run_identity.json" in set(sp.tables[tables.table_name("run_files")]["path"])
+    assert volume / "scratch" in R.plots_dir().parents
+    assert not (volume / "EIS_Results").exists()          # nothing on the Volume
+
+    # a new session (cluster restarted, scratch gone): cache reads the tables
+    import shutil
+    shutil.rmtree(volume / "scratch")
+    R2, _ = _session(volume, leepa_id="2612086", conditions="60A", test_id="02")
+    R2.widgets()
+    R2.spark = sp
+    got = R2.run()["60A"]
+    assert "from_tables" in str(got) and R2._usable(got)
+    assert set(R2.run_dirs()) == {"60A"}
+    assert not (volume / "EIS_Results").exists()
+
+
+def test_tables_only_falls_back_to_folders_without_spark(volume, monkeypatch):
+    monkeypatch.setattr(S, "SAVE_FOLDERS", False)
+    R, _ = _session(volume)
+    assert R.spark is None and R._save_folders()        # nowhere else to keep it
+    monkeypatch.setattr(S, "SAVE_FOLDERS", True)
+    R.spark = FakeSpark()
+    assert R._save_folders()

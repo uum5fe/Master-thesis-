@@ -8,7 +8,7 @@ This is the training guide for whoever runs, maintains or extends the Local EIS 
 |---|---|
 | **What it covers** | The whole package: 4 Databricks notebooks, the `runner/` package, `core/`, `pipeline/`, `checks/`, `analysis/`, `plotting/`, `readers/`, `EIS_config/`, `tests/` |
 | **Size** | 115 Python files (59 of them in `tests/`: 56 test modules, 2 data generators, `conftest.py`), about 43,850 lines |
-| **Verified** | Test suite run on this exact package: **505 passed, 3 skipped, 12 failed** (see §21.1 for what each failure means) |
+| **Verified** | Test suite on this package: **520 passed, 1 skipped, 2 failed** with Spark + Delta installed (both failures are data / an intentional margin, not code; §21.1) |
 | **Companions** | [`TRAINING_GUIDE_FILE_INDEX.md`](TRAINING_GUIDE_FILE_INDEX.md) (every class and function, generated from the source) · [`PIPELINE_GUIDE.md`](PIPELINE_GUIDE.md) (the package's own reference manual) · [`../SETUP_SHARED_FILES.md`](../SETUP_SHARED_FILES.md) (shared calibration files) |
 
 ---
@@ -476,8 +476,9 @@ Naming rules (`Session.order_dir`, `Session.cond_name`):
 | `local_eis_gamry_comparison` | `gamry_comparison.csv` | comparison |
 | `local_eis_checks` | `plausibility.csv` | check |
 | `local_eis_ecm` | `ecm/ecm_parameters.csv` | spectrum × fit |
+| `local_eis_run_files` | **every file of the run folder**, byte for byte (CSV, JSON, PNG, HTML) | file (files over 4 MB in several `chunk` rows): `path`, `chunk`, `n_chunks`, `n_bytes`, `mtime`, `content` |
 
-Every row carries the key columns `run_key`, `order_id`, `plate`, `orientation`, `condition`, `current_a`, `test_id`, `eval_mode`; tables are partitioned by `order_id`. **Publishing replaces a run's rows** (`replaceWhere` on `run_key`), so the tables never hold two versions of one run; the `runs` row is written last, so a run listed there has all its tables. Before writing, column names are made Delta-safe and the key columns put first (`tables.tidy`), then every column is given the type it already has in the table (`tables._align`): pandas guesses a CSV column's type per file (`L_nH` = 12, 15, 9 reads as integers in one run, 12.4 as decimals in the next) and Delta cannot merge two types. A column that cannot take the table's type without losing values is **widened in the table first** (bigint → double, number → string), which rewrites that table once. (`PIPELINE_GUIDE.md` §14 describes a newer rule that refuses such a write instead; the `tables.py` shipped here widens.)
+Every row carries the key columns `run_key`, `order_id`, `plate`, `orientation`, `condition`, `current_a`, `test_id`, `eval_mode`; tables are partitioned by `order_id`. **Publishing replaces a run's rows** (`replaceWhere` on `run_key`), so the tables never hold two versions of one run; the `runs` row is written last, so a run listed there has all its tables. **One type per column** (`tables.tidy`): every number is written as `double` (only the counts of the `runs` row stay `bigint`), True/False as `boolean`, everything else as `string`, and a column that is empty in a run is left out (Delta fills it with null). Before a run is written, its columns are checked against the existing tables (`tables._align`): a column the table holds as text is written as text, a whole-number column the table holds as `bigint` (tables written by the older `tables.py`) stays integral, and any other clash is **refused before any of the run's rows are touched**, with the `DROP TABLE` that fixes it — or run 09 Maintenance "Rebuild all tables" once.
 
 Example query:
 
@@ -488,7 +489,7 @@ WHERE parameter = 'R_ohmic'
 ORDER BY order_id, current_a;
 ```
 
-> **Known gap in this package** (§21.2). The settings, the notebooks and the docs describe a 14th table, `local_eis_run_files` (every file of a run byte for byte), with `tables.restore()`, `tables.rebuild()` and `tables.file_bytes()`. The `runner/tables.py` shipped here does not contain them. Publishing the 13 tables above works; restoring a run from the tables and the Maintenance "Rebuild all tables" cell do not.
+> **`local_eis_run_files` makes the tables a complete copy.** `tables.restore(spark, run_key, folder)` writes a published run back into a folder, `tables.file_bytes(spark, run_key, path)` returns one file, `tables.rebuild(spark)` drops and refills every table from the folders — or, for a run whose folder is gone, from its `run_files` copy, read back before anything is dropped. 02 Results (`RESULTS_SOURCE = "tables"`) and 01 in Run mode `cache` (`CACHE_FROM_TABLES`) use `restore`; with `SAVE_FOLDERS = False` (§7.5) the tables are the only copy.
 
 ### 7.4 The cache: `run_identity.json` and the run modes
 
@@ -510,9 +511,20 @@ The digest is a SHA-256 over the values of `session.IDENTITY_KEYS` (the settings
 | Run mode | Saved folder usable? | What happens |
 |---|---|---|
 | `cache` | yes | loaded; the Evaluate cell prints `saved` and, if the digest differs, `<-- made with OTHER settings (…); choose rerun`, or `saved by runner vXX` |
-| `cache` | no, but the run is published | (`CACHE_FROM_TABLES`) restore from the tables — currently fails over to computing, see §21.2 |
+| `cache` | no, but the run is published | (`CACHE_FROM_TABLES`) restored from `local_eis_run_files` — into the saved folder (`SAVE_FOLDERS = True`) or into `/tmp/eis_<uid>/from_tables/<run_key>` (`SAVE_FOLDERS = False`) — not evaluated again |
 | `cache` | no | computed in scratch, then copied to the saved folder |
-| `rerun` | — | computed in scratch, then the saved folder is **deleted and replaced** |
+| `rerun` | — | computed in scratch, then the saved folder is **deleted and replaced** (with `SAVE_FOLDERS = False`: kept in scratch, published, nothing written under `RESULTS_ROOT`) |
+
+### 7.5 Tables only: `SAVE_FOLDERS = False`
+
+Set `SAVE_FOLDERS = False` in `runner/settings.py` to keep the results **only in the Delta tables**:
+
+- each run is computed in `/tmp/eis_<uid>/<order folder>/<condition>_Test<nn>/`, its ECM is fitted there, and `R.publish()` writes it — every file included, in `local_eis_run_files`. **Nothing is written under `RESULTS_ROOT`**; the scratch folder stays until the cluster restarts or that condition is rerun;
+- 01 in Run mode `cache` and 02 Results read published runs back from the tables (`CACHE_FROM_TABLES = True`, `RESULTS_SOURCE = "tables"`, both default);
+- the viewer pages (`nyquist.html`, `heatmaps.html`, `trends.html`, …) go to `/tmp/eis_<uid>/<order>/plots/` instead of `EIS_Results/<order>/plots/`;
+- the order's frozen HF response (`EIS_Results/<order>/hf_response/`, `R.build_hf_response()`) **stays on the Volume**: it is an input of later runs, like `EIS_config/`;
+- it needs `PUBLISH_TABLES = True` and a Spark session; without them the folders are saved as before, and the Evaluate cell says so. Publish every run you compute (01's Publish cell, or the Auto job does it), or the result is lost with the cluster.
+- `main.py --reevaluate` needs a folder: get one back with `tables.restore(spark, run_key, folder)`.
 
 ---
 
@@ -1019,7 +1031,7 @@ There are exactly two places for settings. Never put a number in a notebook or a
 | HF detection | `SKEW_MODEL = "structural"`, `HF_USE_ENSEMBLE = True`, `HF_LADDER_PRUNE = True`, `F_HI_FRAC_FS = 0.49`, `WINDOW_MIN_SNR_DB = -4.0` | Values validated on 2612087; part of the identity |
 | Maps | `HEATMAP_STYLE = "interpolated"`, `CSV_MIRROR_X = False` | |
 | Cache | `RUN_MODES = ("cache", "rerun")` | |
-| Tables | `TABLE_SCHEMA = "ps_xplatform_dev.rvadvtec_dev"`, `TABLE_PREFIX = "local_eis_"`, `PUBLISH_TABLES = True`, `RESULTS_SOURCE = "tables"`, `CACHE_FROM_TABLES = True` | §7.3 |
+| Tables | `TABLE_SCHEMA = "ps_xplatform_dev.rvadvtec_dev"`, `TABLE_PREFIX = "local_eis_"`, `PUBLISH_TABLES = True`, `RESULTS_SOURCE = "tables"`, `CACHE_FROM_TABLES = True`, `SAVE_FOLDERS = True` (False: tables only) | §7.3, §7.5 |
 | Auto job | `AUTO_ORDERS = ()`, `AUTO_MAX_RUNS = 8`, `AUTO_PLATE` (2612087, 2612090 → gen1; 2612091, 2612092 → gen2), `AUTO_ORIENTATION` (2612090 → rot180; the others standard), `AUTO_RERUN_CHANGED = True` | §18.10 |
 | Plots | `PANEL_HEIGHT = 560`, `PANEL_WIDTH = 1150`, `NYQUIST_COLOUR = "flow"`, `MF4_INCLUDE_ALL_CHANNELS = True`, `MF4_MAX_POINTS = 4000` | |
 | ECM | `ECM_DRT_F_MAX_HZ = 1000`, `ECM_DRT_FIX_RS = True`, `ECM_DRT_FAST = "auto"`, `ECM_SMOOTH_POINTS = 160` | §14 |
@@ -1114,7 +1126,7 @@ Put the campaign under `<Volume>/csv_files/<campaign>/` (one folder per operatin
 
 ### 18.11 Remove a run
 
-`09 Local EIS - Maintenance`: type the run key (`2612090/450A_Test01`) twice; optionally delete the folder. No undo. (The "Rebuild all tables" cell needs `tables.rebuild`, missing in this package — §21.2.)
+`09 Local EIS - Maintenance`: type the run key (`2612090/450A_Test01`) twice; optionally delete the folder. No undo. "Rebuild all tables" (type `REBUILD`) drops every `local_eis_*` table and publishes every run again, from its folder or from its `run_files` copy; a published run in neither place stops it with nothing dropped. Run it once after updating `tables.py`, so every table gets the one-type-per-column rule.
 
 ### 18.12 Add a setting that changes results
 
@@ -1236,30 +1248,19 @@ Typical values on 2612030 for orientation: segment R_ohmic 44–72 mΩ·cm² (pl
 
 ### 21.1 Test results on this package
 
-Run on the package exactly as delivered (Python 3.13, numpy, scipy, matplotlib, pandas, plotly, pyarrow installed): **505 passed, 3 skipped, 12 failed.**
+Run on this package with numpy, scipy, matplotlib, pandas, plotly, pyarrow, pytest — and pyspark, delta-spark, zstandard for the three Spark / MF4 tests — on Python 3.12 / numpy 1.26 (the Databricks + TOM `sparklix` setup) and on Python 3.13 / numpy 2 / pandas 3: **520 passed, 1 skipped, 2 failed.**
 
-| Failing test(s) | Cause | Severity |
+| Failing / skipped test | Cause | Severity |
 |---|---|---|
 | `test_card_alignment.py::test_noise_alone_produces_no_prominent_peak` | Documented, intentional: pure noise reaches prominence 8.5 against the gate of 15, the test asks for a 2× margin and gets 1.8×. Raising the gate could hide real card offsets | None — leave it |
-| 9 tests in `test_tables_results_auto.py` | `runner/tables.py` is older than the code and tests around it (§21.2) | Real: affects table restore and rebuild |
-| `test_plate_orientation.py::test_gen2_naboo_calibration_ships_with_the_package` | `EIS_config/gen2/Abgleich/bode/` is not in the package (`DATA_NOT_IN_GIT.md`) | Only matters to rebuild gen2 `chain_gain.csv` |
-| `test_runner_session.py::test_the_notebooks_are_only_calls_with_a_banner` | The banner of `01 Local EIS - Process` reads "writes results and tables" without the "🛠 Data engineering —" heading the test expects | Cosmetic |
+| `test_plate_orientation.py::test_gen2_naboo_calibration_ships_with_the_package` | `EIS_config/gen2/Abgleich/bode/` is not in the package (`DATA_NOT_IN_GIT.md`) | Only matters to rebuild gen2 `chain_gain.csv`; copy the Naboo `bode/` folder in to make it pass |
+| `test_tables_spark_types.py::test_a_real_run_goes_through_spark` (skipped) | runs only with `LOCAL_EIS_RUN_DIR=<a real run folder>` | — |
 
-Without plotly, pandas or pyarrow installed, 17 further tests fail with `ModuleNotFoundError` — install them before judging a test run.
+Without pyspark / delta-spark / zstandard, three more tests are skipped; without plotly, pandas or pyarrow, about 17 tests fail with `ModuleNotFoundError` — install them before judging a test run.
 
-### 21.2 The `runner/tables.py` gap
+### 21.2 `runner/tables.py` (fixed on the `EIS-final` branch)
 
-The settings (`RESULTS_SOURCE`, `CACHE_FROM_TABLES`), the notebooks (01, 02, 09), `runner/session.py`, `runner/results.py`, the docs and the tests all expect a `local_eis_run_files` table and three functions in `runner/tables.py`: `restore()`, `rebuild()` and `file_bytes()`. The `tables.py` shipped in this package has none of them (it also widens column types instead of refusing a clash). Effects:
-
-| Feature | Behaviour now |
-|---|---|
-| 01 Publish (`R.publish`) | Works: the 13 result tables + runs table are written; `run_files` is not |
-| 01 `cache` when a folder is gone but the run is published | `restore_run` prints "not restored from the tables (AttributeError…)" and the run is **recomputed** |
-| 02 Results with `RESULTS_SOURCE = "tables"` | Restore fails, falls back to the saved folder; a run whose folder is gone cannot be shown |
-| 09 Maintenance "Rebuild all tables" | Crashes with `AttributeError: module 'runner.tables' has no attribute 'rebuild'` |
-| 09 Maintenance "remove a run" | Works |
-
-Until `tables.py` is brought up to date, keep the run folders under `EIS_Results/` — they are the only complete copy — and consider `RESULTS_SOURCE = "folders"`.
+The delivered package had an older `tables.py`: no `local_eis_run_files` table and no `restore()`, `rebuild()`, `drop_all()`, `file_bytes()` — so restoring a run from the tables, 09's "Rebuild all tables" and 9 tests failed. `EIS-final` brings it up to date (§7.3), adds `SAVE_FOLDERS` (§7.5) and fixes the 01 banner. After deploying it, run 09 "Rebuild all tables" once: it refills every table with the uniform column types and fills `local_eis_run_files` for the runs published before.
 
 ### 21.3 Measurement limitations (from the package's own analyses)
 
@@ -1300,7 +1301,8 @@ Until `tables.py` is brought up to date, keep the run folders under `EIS_Results
 | `<-- made with OTHER settings (…)` | The saved result predates a settings change; run with `rerun` |
 | Results did not change after a code update | The cache key does not include the code; run with `rerun` |
 | Tables refuse a write / type error | A column changed type between runs; see §7.3 and the `DROP TABLE` / Maintenance route |
-| `AttributeError: … tables … rebuild/restore` | §21.2 |
+| `AttributeError: … tables … rebuild/restore` | An old `tables.py` (§21.2): deploy the `EIS-final` version |
+| `TypeClash: … the table holds bigint, this run has float64` | A table written by the old `tables.py`: run 09 "Rebuild all tables" once |
 | MF4 cell: `no bench .mf4` / asammdf error | Install `asammdf` (+ `zstandard`), or check `Gamry/*RO<order>*.mf4` exists |
 
 ---
@@ -1352,7 +1354,7 @@ Five sessions of about two hours. Each has a goal, what to read, what to do, and
 - **Questions**
   13. You changed `silver.py` and ran 01 Process with `cache`. Did the results change? Why?
   14. What two things must a new plausibility check never do?
-  15. Which features are affected by the `tables.py` gap?
+  15. With `SAVE_FOLDERS = False`, where is a run kept, and what must you not forget?
 
 ### Answers
 
@@ -1370,7 +1372,7 @@ Five sessions of about two hours. Each has a goal, what to read, what to do, and
 12. `plotting/plate_style.py`.
 13. No. `cache` loads the saved result; the digest covers settings, not code. Use `rerun`.
 14. Stop the run (it must be wrapped and report a verdict), and silently drop data (a dropped point needs a ledger reason).
-15. Restoring runs from the tables (01 `cache` with the folder gone, 02 with `RESULTS_SOURCE = "tables"`), the `run_files` table, and 09's "Rebuild all tables".
+15. Only in the Delta tables (every file in `local_eis_run_files`); the scratch copy disappears with the cluster. Publish every run you compute — 01's Publish cell (`PUBLISH_TABLES = True`) or the Auto job.
 
 ---
 

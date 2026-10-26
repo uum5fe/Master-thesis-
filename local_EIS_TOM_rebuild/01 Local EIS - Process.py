@@ -5,7 +5,7 @@ dbutils.library.restartPython()
 
 # MAGIC %md
 # MAGIC <!-- local_eis:audience-banner -->
-# MAGIC > ### writes results and tables
+# MAGIC > ### 🛠 Data engineering — writes results and tables
 # MAGIC >
 # MAGIC > Evaluates the selected order / conditions / test and **writes**: the run folders
 # MAGIC > `EIS_Results/<order>/<condition>_Test<nn>/` (Run mode `rerun` overwrites them) and,

@@ -171,6 +171,20 @@ RESULTS_SOURCE = "tables"
 #: RESULTS_ROOT but is published is restored from the tables into its
 #: folder instead of evaluated again
 CACHE_FROM_TABLES = True
+#: where a finished run is KEPT:
+#:   True   as a folder under RESULTS_ROOT (EIS_Results/<order>/<cond>_Test<nn>/)
+#:          AND, with PUBLISH_TABLES, in the tables (as before)
+#:   False  in the tables only: the run is computed in the scratch folder
+#:          (/tmp/eis_<uid>/...), its ECM fitted there and the whole folder
+#:          published, every file in <prefix>run_files; nothing is written
+#:          under RESULTS_ROOT. 01 (Run mode cache) and 02 Results read the
+#:          run back from the tables (CACHE_FROM_TABLES, RESULTS_SOURCE =
+#:          'tables'), the viewer pages go to the scratch folder. Needs
+#:          PUBLISH_TABLES = True and Spark, otherwise folders are saved.
+#:          The order's frozen HF response (RESULTS_ROOT/<order>/hf_response/,
+#:          R.build_hf_response) stays on the Volume either way: it is an
+#:          INPUT of later runs, like the files in EIS_config.
+SAVE_FOLDERS = True
 
 # ---------------------------------------------------------------------------
 # the automatic job (03 Local EIS - Auto, runner/auto.py)

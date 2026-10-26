@@ -680,6 +680,10 @@ class Session:
         return self.order_dir() / self.cond_name(cond)
 
     def plots_dir(self) -> Path:
+        if not self._save_folders():          # tables only: nothing under RESULTS_ROOT
+            d = self.scratch / self.order_dir().name / "plots"
+            d.mkdir(parents=True, exist_ok=True)
+            return d
         d = self.order_dir() / "plots"
         try:
             d.mkdir(parents=True, exist_ok=True)
@@ -690,6 +694,19 @@ class Session:
             d = self.scratch / self.order_dir().name / "plots"
             d.mkdir(parents=True, exist_ok=True)
             return d
+
+    def _save_folders(self) -> bool:
+        """settings.SAVE_FOLDERS, unless the tables cannot be written (then a
+        run kept only in the scratch folder would be lost with the cluster)."""
+        if getattr(S, "SAVE_FOLDERS", True):
+            return True
+        if not S.PUBLISH_TABLES or self.spark is None:
+            if not getattr(self, "_said_folders", False):
+                self.say("  SAVE_FOLDERS = False needs PUBLISH_TABLES = True and a "
+                         "Spark session -- the run folders are saved instead")
+                self._said_folders = True
+            return True
+        return False
 
     @staticmethod
     def _usable(d) -> bool:
@@ -798,13 +815,16 @@ class Session:
                     and S.CACHE_FROM_TABLES):
                 got = self.restore_run(cond)
                 if got is not None:
-                    saved = self._save(got, saved)
+                    saved = (self._save(got, saved) if self._save_folders()
+                             else got)
             if s["run_mode"] == "cache" and self._usable(saved):
                 self.results[cond] = saved
                 note = self._identity_note(saved, ident)
                 self.say(f"  {cond:<12}{'saved':<10}{saved}{note}")
                 continue
-            self.say(f"  {cond:<12}{'run':<10}{saved}")
+            self.say(f"  {cond:<12}{'run':<10}"
+                     + (f"{saved}" if self._save_folders()
+                        else f"{scratch}   (tables only)"))
             if scratch.exists():
                 shutil.rmtree(scratch, ignore_errors=True)
             scratch.mkdir(parents=True, exist_ok=True)
@@ -842,7 +862,8 @@ class Session:
                  "elapsed_s": round(time.time() - t0, 1),
                  "written": datetime.now().isoformat(timespec="seconds")},
                 indent=2))
-            self.results[cond] = self._save(scratch, saved)
+            self.results[cond] = (self._save(scratch, saved)
+                                  if self._save_folders() else scratch)
             gs = manifest.get("stages", {}).get("gold", {})
             self.say(f"    {cond}: {gs.get('n_measured', '?')} segments, "
                      f"{time.time() - t0:.0f} s -> {self.results[cond]}")
@@ -975,6 +996,8 @@ class Session:
         out = {}
         for cond in self.sel.get("conditions", []):
             d = self.results.get(cond) or self.saved_dir(cond)
+            if not self._usable(d) and not self._save_folders():
+                d = self.restore_run(cond) or d
             if self._usable(d):
                 out[cond] = Path(d)
         if not out:
